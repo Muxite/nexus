@@ -1,0 +1,150 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: irene
+      POSTGRES_PASSWORD: irene
+      POSTGRES_DB: irene
+    volumes:
+      - irene_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U irene"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - irene_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------------
+  # Irene services
+  # ---------------------------------------------------------------------------
+
+  scanner:
+    build:
+      context: .
+      dockerfile: scanner/Dockerfile
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - irene_model_cache:/root/.cache/huggingface
+    environment:
+      IRENE_CONFIG_PATH: /config/config.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  feeder:
+    build:
+      context: .
+      dockerfile: feeder/Dockerfile
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - irene_model_cache:/root/.cache/huggingface
+    environment:
+      IRENE_CONFIG_PATH: /config/config.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  trader:
+    build:
+      context: .
+      dockerfile: trader/Dockerfile
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    environment:
+      IRENE_CONFIG_PATH: /config/config.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  monitor:
+    build:
+      context: .
+      dockerfile: monitor/Dockerfile
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+    environment:
+      IRENE_CONFIG_PATH: /config/config.yaml
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Test runners
+  #
+  # Run a specific suite:
+  #   docker compose run --rm shared-test
+  #   docker compose run --rm scanner-test
+  #   docker compose run --rm feeder-test
+  #
+  # Enable integration tests (hits real APIs):
+  #   IRENE_INTEGRATION_TESTS=true docker compose run --rm scanner-test
+  # ---------------------------------------------------------------------------
+
+  shared-test:
+    build:
+      context: .
+      dockerfile: shared/Dockerfile.test
+    profiles: [test]
+    environment:
+      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
+
+  scanner-test:
+    build:
+      context: .
+      dockerfile: scanner/Dockerfile.test
+    profiles: [test]
+    environment:
+      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
+
+  feeder-test:
+    build:
+      context: .
+      dockerfile: feeder/Dockerfile.test
+    profiles: [test]
+    environment:
+      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
+
+  trader-test:
+    build:
+      context: .
+      dockerfile: trader/Dockerfile.test
+    profiles: [test]
+    environment:
+      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
+
+  monitor-test:
+    build:
+      context: .
+      dockerfile: monitor/Dockerfile.test
+    profiles: [test]
+    environment:
+      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
+
+volumes:
+  irene_postgres_data:
+  irene_redis_data:
+  irene_model_cache:

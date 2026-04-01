@@ -1,0 +1,3 @@
+aiohttp>=3.9
+sentence-transformers>=2.7
+numpy>=1.24

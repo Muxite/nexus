@@ -1,0 +1,89 @@
+# Irene config — copy to config.yaml and fill in your keys.
+# This file is re-read every 20 seconds. Changes take effect on the next cycle.
+# See docs/config_schema.md for full documentation.
+
+irene:
+  mode: paper        # Start in paper mode. Change to "live" only after validation.
+  drawdown_limit: 0.10
+
+polymarket:
+  clob_url: "https://clob.polymarket.com"
+  gamma_url: "https://gamma-api.polymarket.com"
+  # Live mode only — leave blank for paper trading:
+  private_key: ""
+  api_key: ""
+  api_secret: ""
+  api_passphrase: ""
+  chain_id: 137      # 137 = Polygon mainnet
+
+trading:
+  balance_usdc: 100.0
+  max_position_fraction: 0.20
+  kelly_fraction: 0.25
+  min_edge: 0.04
+  fee_buffer: 0.02
+  max_liquidity_fraction: 0.15
+  max_open_positions: 8
+  order_type: "FOK"
+  position_timeout_hours: 48
+  edge_increment_yes: 0.12
+  edge_increment_no: 0.12
+
+markets:
+  min_volume_usdc: 5000
+  max_hours_to_close: 72
+  min_hours_to_close: 2
+  exclude_keywords:
+    - "nfl"
+    - "nba"
+    - "mlb"
+    - "nhl"
+    - "premier league"
+    - "champions league"
+    - "laliga"
+    - "bundesliga"
+    - "world cup"
+    - "super bowl"
+    - "stanley cup"
+    - "march madness"
+
+signals:
+  newsapi_key: ""          # Get a free key at newsapi.org
+  newsapi_poll_seconds: 60
+  newsapi_page_size: 100
+  rss_feeds:
+    - url: "https://feeds.reuters.com/reuters/topNews"
+    - url: "https://feeds.bbci.co.uk/news/rss.xml"
+    - url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"
+  rss_poll_seconds: 45
+  similarity_threshold: 0.72
+  top_k_markets: 3
+  max_signal_age_seconds: 180
+  direction_min_confidence: 0.30
+  use_llm_direction: false
+  jitter_fraction: 0.20      # ±20% on newsapi and rss poll intervals
+  rss_startup_spread_fraction: 1.0  # feeds stagger startup by up to 1× rss_poll_seconds
+
+scanner:
+  poll_interval_seconds: 120
+  embedding_rebuild_interval_seconds: 3600
+  gamma_page_size: 200
+  jitter_fraction: 0.20      # ±20% on poll interval
+
+timing:
+  jitter_fraction: 0.20      # global default; section-level overrides take precedence
+  profile_window: 200        # samples retained per operation in the in-memory profiler
+  publish_interval_seconds: 60  # how often to push profiler summary to Redis (0=off)
+
+monitor:
+  port: 8080
+  per_market_log_days: 30
+
+database:
+  url: "postgresql://irene:irene@postgres:5432/irene"
+  pool_size: 5
+
+redis:
+  url: "redis://redis:6379/0"
+  signal_channel: "irene:signals"
+  heartbeat_channel: "irene:heartbeat"
