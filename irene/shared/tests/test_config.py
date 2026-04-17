@@ -140,6 +140,19 @@ class TestIreneConfig:
         assert cfg.trading.min_edge == pytest.approx(0.05)
         assert cfg.markets.min_volume_usdc == 10000.0
 
+    def test_signals_comma_separated_keys_in_yaml_string(self):
+        cfg = IreneConfig.model_validate(
+            {"signals": {"newsapi_keys": "aa, bb"}}
+        )
+        assert cfg.signals.newsapi_keys == ["aa", "bb"]
+
+    def test_signals_legacy_single_key_merges(self):
+        cfg = IreneConfig.model_validate(
+            {"signals": {"newsapi_key": "solo", "brave_api_key": "b1"}}
+        )
+        assert cfg.signals.newsapi_keys == ["solo"]
+        assert cfg.signals.brave_api_keys == ["b1"]
+
 
 # ---------------------------------------------------------------------------
 # ConfigManager — file loading and hot-reload

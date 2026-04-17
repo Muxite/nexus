@@ -6,7 +6,8 @@ COPY shared/ /build/shared/
 RUN pip install --no-cache-dir /build/shared/
 
 COPY feeder/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt && \
+    python -m playwright install --with-deps chromium
 
 # Feeder imports Embedder from scanner — include scanner/app on PYTHONPATH
 COPY scanner/app/ /scanner_app/

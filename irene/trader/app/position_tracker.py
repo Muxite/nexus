@@ -20,6 +20,7 @@ from typing import Optional
 from irene_shared.config import ConfigManager
 from irene_shared.db import IreneDB
 from irene_shared.models import Direction, MarketEventType
+from irene_shared.redis_client import IreneRedis
 from irene_shared.timing import ProfileStore, Timer, jittered_sleep
 
 from clob_client import ClobClient
@@ -41,10 +42,12 @@ class PositionTracker:
         config_manager: ConfigManager,
         db: IreneDB,
         profile: ProfileStore,
+        redis: IreneRedis,
     ) -> None:
         self._cfg = config_manager
         self._db = db
         self._profile = profile
+        self._redis = redis
         self._running = False
         self._rng = random.Random()
 
@@ -113,6 +116,18 @@ class PositionTracker:
         opened_at: datetime = pos["opened_at"]
         if opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=timezone.utc)
+
+        cfg = self._cfg.get()
+        if not await self._redis.try_consume_daily_budget(
+            "clob",
+            cfg.rate_limits.clob_max_per_day,
+            cost=1,
+        ):
+            logger.warning(
+                "CLOB daily rate limit — skipping position check trade_id=%s",
+                trade_id,
+            )
+            return
 
         ob = await clob.get_orderbook(token_id)
         current_price = ob.mid_price if ob else None

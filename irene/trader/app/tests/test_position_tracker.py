@@ -75,8 +75,12 @@ def _make_tracker(
     cfg.get.return_value.trading.position_timeout_hours = timeout_hours
     cfg.get.return_value.polymarket.clob_url = "https://clob.polymarket.com"
     cfg.get.return_value.timing.jitter_fraction = 0.0
+    cfg.get.return_value.rate_limits.clob_max_per_day = 20000
 
-    tracker = PositionTracker(cfg, db, MagicMock())
+    redis = MagicMock()
+    redis.try_consume_daily_budget = AsyncMock(return_value=True)
+
+    tracker = PositionTracker(cfg, db, MagicMock(), redis)
     return tracker
 
 

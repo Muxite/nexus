@@ -28,6 +28,7 @@ def _make_cfg(poll_interval: int = 120, jitter: float = 0.0):
     cfg.scanner.poll_interval_seconds = poll_interval
     cfg.scanner.jitter_fraction = jitter
     cfg.scanner.gamma_page_size = 100
+    cfg.scanner.gamma_max_pages = 20
     cfg.markets = MagicMock()
     return cfg
 
@@ -44,6 +45,13 @@ def _make_db(expired_count: int = 0):
     db.deactivate_expired_markets = AsyncMock(return_value=expired_count)
     db.log_event = AsyncMock()
     return db
+
+
+def _make_redis():
+    r = MagicMock()
+    r.set_last_seen = AsyncMock()
+    r.publish_heartbeat = AsyncMock()
+    return r
 
 
 def _make_raw_market(suffix: str = "abc") -> dict:
@@ -102,7 +110,7 @@ class TestScannerRunOnce:
             MockEmbedder.return_value.load.return_value = None
             MockEmbedder.return_value.embed_batch.return_value = [emb, emb]
 
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             await scanner._run_once()
 
         assert db.upsert_market.call_count == 2
@@ -123,7 +131,7 @@ class TestScannerRunOnce:
             MockFilter.return_value.filter.return_value = []
             MockEmbedder.return_value.load.return_value = None
 
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             await scanner._run_once()
 
         db.deactivate_expired_markets.assert_called_once()
@@ -141,7 +149,7 @@ class TestScannerRunOnce:
             MockFilter.return_value.filter.return_value = []
             MockEmbedder.return_value.load.return_value = None
 
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             await scanner._run_once()
 
         db.log_event.assert_called_once()
@@ -161,7 +169,7 @@ class TestScannerRunOnce:
             MockFilter.return_value.filter.return_value = []
             MockEmbedder.return_value.load.return_value = None
 
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             await scanner._run_once()
 
         db.upsert_market.assert_not_called()
@@ -185,7 +193,7 @@ class TestScannerRunOnce:
             MockEmbedder.return_value.load.return_value = None
             MockEmbedder.return_value.embed_batch.return_value = [emb]
 
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             await scanner._run_once()
 
         assert db.upsert_market.call_count == 1
@@ -208,7 +216,7 @@ class TestScannerRunOnce:
             MockEmbedder.return_value.load.return_value = None
             MockEmbedder.return_value.embed_batch.return_value = [emb]
 
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             await scanner._run_once()
 
         payload = db.log_event.call_args.kwargs["payload"]
@@ -233,7 +241,7 @@ class TestScannerRunOnce:
             MockEmbedder.return_value.load.return_value = None
             MockEmbedder.return_value.embed_batch.return_value = [emb]
 
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             await scanner._run_once()
 
         upsert_emb = db.upsert_market.call_args.kwargs["embedding"]
@@ -258,7 +266,7 @@ class TestScannerRunOnce:
             MockEmbedder.return_value.load.return_value = None
             MockEmbedder.return_value.embed_batch.return_value = [emb]
 
-            scanner = Scanner(_make_config_manager(cfg), db)
+            scanner = Scanner(_make_config_manager(cfg), db, _make_redis())
             await scanner._run_once()
 
         call_args = filter_instance.filter.call_args
@@ -281,7 +289,7 @@ class TestScannerLoop:
             run_once_calls.append(1)
 
         with patch("main.Embedder"), patch("main.MarketFilter"):
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             scanner._running = False
             scanner._run_once = _fake_run_once
 
@@ -307,7 +315,7 @@ class TestScannerLoop:
             return 0.0
 
         with patch("main.Embedder"), patch("main.MarketFilter"):
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             scanner._running = True
             scanner._run_once = _fake_run_once
 
@@ -341,7 +349,7 @@ class TestScannerLoop:
             return 0.0
 
         with patch("main.Embedder"), patch("main.MarketFilter"):
-            scanner = Scanner(_make_config_manager(), db)
+            scanner = Scanner(_make_config_manager(), db, _make_redis())
             scanner._running = True
             scanner._run_once = _raising_run_once
 

@@ -10,6 +10,7 @@ COPY monitor/requirements.test.txt .
 RUN pip install --no-cache-dir -r requirements.txt -r requirements.test.txt
 
 COPY monitor/app/ /app/
+COPY frontend/ /app/static/
 COPY monitor/pytest.ini /app/
 
 CMD ["python", "-m", "pytest", "tests/", "-v", "--tb=short", "-m", "not integration"]

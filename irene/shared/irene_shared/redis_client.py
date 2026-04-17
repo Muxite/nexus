@@ -14,7 +14,11 @@ from typing import AsyncIterator, Optional
 import redis.asyncio as aioredis
 from pydantic import BaseModel
 
+from irene_shared.ratelimit import RedisDailyBudgetLimiter
+
 logger = logging.getLogger(__name__)
+
+_default_daily_limiter = RedisDailyBudgetLimiter()
 
 
 class IreneRedis:
@@ -86,11 +90,19 @@ class IreneRedis:
         Async generator yielding raw JSON strings from the signal channel.
         Runs until cancelled.
 
+        Uses a dedicated Redis connection with no socket read timeout so
+        pub/sub ``listen()`` can block between messages without timing out.
+
         Usage:
             async for raw_json in redis.subscribe_signals():
                 signal = MappedSignal.model_validate_json(raw_json)
         """
-        client = self._client_required()
+        client = aioredis.from_url(
+            self._url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=None,
+        )
         pubsub = client.pubsub()
         await pubsub.subscribe(self.signal_channel)
         logger.info("Subscribed to %s", self.signal_channel)
@@ -101,10 +113,16 @@ class IreneRedis:
         finally:
             await pubsub.unsubscribe(self.signal_channel)
             await pubsub.aclose()
+            await client.aclose()
 
     async def subscribe_heartbeats(self) -> AsyncIterator[dict]:
         """Async generator yielding heartbeat dicts."""
-        client = self._client_required()
+        client = aioredis.from_url(
+            self._url,
+            decode_responses=True,
+            socket_connect_timeout=5,
+            socket_timeout=None,
+        )
         pubsub = client.pubsub()
         await pubsub.subscribe(self.heartbeat_channel)
         try:
@@ -114,6 +132,7 @@ class IreneRedis:
         finally:
             await pubsub.unsubscribe(self.heartbeat_channel)
             await pubsub.aclose()
+            await client.aclose()
 
     # ------------------------------------------------------------------
     # Simple key-value helpers (for last-seen timestamps etc.)
@@ -139,3 +158,17 @@ class IreneRedis:
         client = self._client_required()
         raw = await client.get(f"irene:profile:{service}")
         return json.loads(raw) if raw else None
+
+    async def try_consume_daily_budget(
+        self,
+        bucket: str,
+        max_per_day: int,
+        cost: int = 1,
+    ) -> bool:
+        """
+        Delegate to :class:`RedisDailyBudgetLimiter` for non-keyed buckets
+        (e.g. ``rss``, ``clob``).
+        """
+        return await _default_daily_limiter.try_consume(
+            self, bucket, max_per_day, cost
+        )

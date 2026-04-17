@@ -26,6 +26,7 @@ import aiohttp
 from irene_shared.config import ConfigManager
 from irene_shared.db import IreneDB
 from irene_shared.models import MarketEventType
+from irene_shared.redis_client import IreneRedis
 from irene_shared.timing import ProfileStore, Timer, jittered_sleep
 
 from gamma_client import GammaClient, parse_market
@@ -36,15 +37,26 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [scanner] %(levelname)s %(name)s: %(message)s",
 )
+if _log_dir := os.getenv("IRENE_LOG_DIR"):
+    os.makedirs(_log_dir, exist_ok=True)
+    _fh = logging.FileHandler(os.path.join(_log_dir, "scanner.log"))
+    _fh.setFormatter(logging.Formatter("%(asctime)s [scanner] %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_fh)
 logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = os.getenv("IRENE_CONFIG_PATH", "/config/config.yaml")
 
 
 class Scanner:
-    def __init__(self, config_manager: ConfigManager, db: IreneDB) -> None:
+    def __init__(
+        self,
+        config_manager: ConfigManager,
+        db: IreneDB,
+        redis: IreneRedis,
+    ) -> None:
         self._cfg = config_manager
         self._db = db
+        self._redis = redis
         self._filter = MarketFilter()
         self._embedder = Embedder()
         self._running = False
@@ -91,6 +103,7 @@ class Scanner:
             ) as client:
                 raw_markets = await client.fetch_open_markets(
                     page_size=cfg.scanner.gamma_page_size,
+                    max_pages=cfg.scanner.gamma_max_pages,
                 )
         logger.debug("gamma_fetch: %d markets in %.0fms", len(raw_markets), t_fetch.duration_ms)
 
@@ -101,10 +114,11 @@ class Scanner:
             filtered = self._filter.filter(parsed, cfg.markets, now)
 
         # --- Batch embedding ---
-        texts = [
-            f"{m['question']} {m.get('description') or ''}".strip()
-            for m in filtered
-        ]
+        # Embed question only (not description) so market vectors stay in the
+        # same semantic space as signal embeddings (title + description).
+        # Including the full market description (often 500+ words) pulls the
+        # vector away from short news headlines and kills cosine similarity.
+        texts = [m["question"] for m in filtered]
         with Timer("scanner", "embed_batch", self._profile) as t_embed:
             embeddings = await loop.run_in_executor(
                 None, self._embedder.embed_batch, texts
@@ -157,6 +171,9 @@ class Scanner:
             t_fetch.duration_ms, t_embed.duration_ms,
         )
 
+        await self._redis.publish_heartbeat("scanner")
+        await self._redis.set_last_seen("scanner", now.isoformat())
+
 
 # ---------------------------------------------------------------------------
 # Entrypoint
@@ -171,7 +188,14 @@ async def main() -> None:
     db = IreneDB(cfg.database.url, pool_size=cfg.database.pool_size)
     await db.connect()
 
-    scanner = Scanner(cfg_manager, db)
+    redis = IreneRedis(
+        url=cfg.redis.url,
+        signal_channel=cfg.redis.signal_channel,
+        heartbeat_channel=cfg.redis.heartbeat_channel,
+    )
+    await redis.connect()
+
+    scanner = Scanner(cfg_manager, db, redis)
 
     loop = asyncio.get_event_loop()
 
@@ -185,6 +209,7 @@ async def main() -> None:
     try:
         await scanner.start()
     finally:
+        await redis.close()
         await db.close()
         await cfg_manager.stop()
 

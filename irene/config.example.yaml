@@ -48,11 +48,16 @@ markets:
     - "march madness"
 
 signals:
-  newsapi_key: ""          # Get a free key at newsapi.org
-  newsapi_poll_seconds: 60
+  # Legacy single key, or use newsapi_keys / IRENE__SIGNALS__NEWSAPI_KEYS=key1,key2
+  newsapi_key: ""
+  newsapi_keys: []
+  newsapi_poll_seconds: 900  # Free tier: 100 req/day per key — 900s keeps you under the cap
   newsapi_page_size: 100
+  brave_api_key: ""
+  brave_api_keys: []
+  brave_poll_seconds: 900
   rss_feeds:
-    - url: "https://feeds.reuters.com/reuters/topNews"
+    - url: "https://www.theguardian.com/world/rss"
     - url: "https://feeds.bbci.co.uk/news/rss.xml"
     - url: "https://rss.nytimes.com/services/xml/rss/nyt/World.xml"
   rss_poll_seconds: 45
@@ -68,6 +73,7 @@ scanner:
   poll_interval_seconds: 120
   embedding_rebuild_interval_seconds: 3600
   gamma_page_size: 200
+  gamma_max_pages: 20        # cap Gamma HTTP requests per scan (pagination)
   jitter_fraction: 0.20      # ±20% on poll interval
 
 timing:
@@ -78,6 +84,11 @@ timing:
 monitor:
   port: 8080
   per_market_log_days: 30
+  signals_export_dir: "/data/exports"
+  signals_export_interval_seconds: 300
+  signals_export_limit: 5000
+  dashboard_text_path: "/data/exports/dashboard.txt"
+  dashboard_text_interval_seconds: 30
 
 database:
   url: "postgresql://irene:irene@postgres:5432/irene"
@@ -87,3 +98,9 @@ redis:
   url: "redis://redis:6379/0"
   signal_channel: "irene:signals"
   heartbeat_channel: "irene:heartbeat"
+
+rate_limits:
+  newsapi_max_per_day: 90
+  brave_max_per_day: 500   # paid Brave Search API (e.g. Basic); tune from dashboard
+  rss_http_max_per_day: 3000
+  clob_max_per_day: 20000

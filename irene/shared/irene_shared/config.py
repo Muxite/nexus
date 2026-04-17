@@ -96,21 +96,35 @@ class RSSFeedEntry(BaseModel):
     url: str
 
 
+class WatchedPageEntry(BaseModel):
+    url: str
+    reload_seconds: int = Field(default=300, ge=30)   # force reload after this silence window
+    jitter_fraction: float = Field(default=0.20, ge=0.0, le=1.0)  # ±% on reload_seconds
+    change_wait_seconds: int = Field(default=30, ge=5)  # inner poll interval
+    post_mode: bool = False  # extract post text instead of links (for social media)
+    max_failures: int = Field(default=5, ge=1)  # mark unreachable after N consecutive failures
+
+
 class SignalsSection(BaseModel):
     newsapi_key: str = ""
-    newsapi_poll_seconds: int = Field(default=60, ge=5)
+    newsapi_keys: list[str] = Field(default_factory=list)
+    newsapi_poll_seconds: int = Field(default=900, ge=5)  # 900s = 96 req/day on free tier
     newsapi_page_size: int = Field(default=100, ge=1, le=100)
+    brave_api_key: str = ""
+    brave_api_keys: list[str] = Field(default_factory=list)
+    brave_poll_seconds: int = Field(default=900, ge=30)  # tune with rate_limits.brave_max_per_day
     jitter_fraction: float = Field(default=0.20, ge=0.0, le=1.0)
     # Per-feed startup offset spread: each RSS feed waits a random fraction of
     # rss_poll_seconds before its first fetch, so feeds don't all fire together.
     rss_startup_spread_fraction: float = Field(default=1.0, ge=0.0, le=5.0)
     rss_feeds: list[RSSFeedEntry] = Field(
         default=[
-            RSSFeedEntry(url="https://feeds.reuters.com/reuters/topNews"),
+            RSSFeedEntry(url="https://www.theguardian.com/world/rss"),
             RSSFeedEntry(url="https://feeds.bbci.co.uk/news/rss.xml"),
         ]
     )
     rss_poll_seconds: int = Field(default=45, ge=5)
+    watched_pages: list[WatchedPageEntry] = Field(default_factory=list)
     similarity_threshold: float = Field(default=0.72, gt=0, lt=1.0)
     top_k_markets: int = Field(default=3, ge=1)
     max_signal_age_seconds: int = Field(default=180, ge=10)
@@ -120,17 +134,52 @@ class SignalsSection(BaseModel):
     yes_keywords: list[str] = Field(default=[])
     no_keywords: list[str] = Field(default=[])
 
+    @field_validator("newsapi_keys", "brave_api_keys", mode="before")
+    @classmethod
+    def _coerce_api_key_lists(cls, v):
+        """
+        Accept YAML lists or comma-separated strings (e.g. from ``.env``).
+
+        :param v: Raw list or string.
+        :returns: List of non-empty trimmed strings.
+        """
+        if v is None or v == "":
+            return []
+        if isinstance(v, str):
+            return [x.strip() for x in v.split(",") if x.strip()]
+        if isinstance(v, list):
+            return [str(x).strip() for x in v if str(x).strip()]
+        return v
+
+    @model_validator(mode="after")
+    def _merge_legacy_single_keys(self) -> "SignalsSection":
+        """
+        If only legacy ``newsapi_key`` / ``brave_api_key`` is set, treat as a
+        one-element list when the list field is empty.
+        """
+        if not self.newsapi_keys and (self.newsapi_key or "").strip():
+            self.newsapi_keys = [self.newsapi_key.strip()]
+        if not self.brave_api_keys and (self.brave_api_key or "").strip():
+            self.brave_api_keys = [self.brave_api_key.strip()]
+        return self
+
 
 class ScannerSection(BaseModel):
     poll_interval_seconds: int = Field(default=120, ge=10)
     embedding_rebuild_interval_seconds: int = Field(default=3600, ge=60)
     gamma_page_size: int = Field(default=200, ge=1, le=500)
+    gamma_max_pages: int = Field(default=20, ge=1, le=200)
     jitter_fraction: float = Field(default=0.20, ge=0.0, le=1.0)
 
 
 class MonitorSection(BaseModel):
     port: int = Field(default=8080, ge=1024, le=65535)
     per_market_log_days: int = Field(default=30, ge=1)
+    signals_export_dir: str = ""
+    signals_export_interval_seconds: int = Field(default=300, ge=0)
+    signals_export_limit: int = Field(default=5000, ge=1, le=100000)
+    dashboard_text_path: str = ""
+    dashboard_text_interval_seconds: int = Field(default=30, ge=0)
 
 
 class TimingSection(BaseModel):
@@ -144,9 +193,9 @@ class TimingSection(BaseModel):
 
 
 class LLMSection(BaseModel):
-    provider: str = "anthropic"
+    provider: str = "google"
     api_key: str = ""
-    model: str = "claude-haiku-4-5-20251001"
+    model: str = "gemini-2.5-flash"
 
 
 class DatabaseSection(BaseModel):
@@ -158,6 +207,21 @@ class RedisSection(BaseModel):
     url: str = "redis://redis:6379/0"
     signal_channel: str = "irene:signals"
     heartbeat_channel: str = "irene:heartbeat"
+
+
+class RateLimitsSection(BaseModel):
+    """
+    Soft daily caps (UTC) on outbound HTTP calls, enforced via Redis counters.
+    Set any field to 0 for unlimited.     For NewsAPI and Brave, limits apply
+    **per API key** when multiple keys are configured; each key rotates when
+    its own quota is exhausted. Brave defaults assume a **paid Brave Search API**
+    plan (e.g. Basic); set ``brave_max_per_day`` from your Brave dashboard quota.
+    """
+
+    newsapi_max_per_day: int = Field(default=90, ge=0)
+    brave_max_per_day: int = Field(default=500, ge=0)
+    rss_http_max_per_day: int = Field(default=3000, ge=0)
+    clob_max_per_day: int = Field(default=20000, ge=0)
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +241,7 @@ class IreneConfig(BaseModel):
     llm: LLMSection = Field(default_factory=LLMSection)
     database: DatabaseSection = Field(default_factory=DatabaseSection)
     redis: RedisSection = Field(default_factory=RedisSection)
+    rate_limits: RateLimitsSection = Field(default_factory=RateLimitsSection)
 
     @model_validator(mode="after")
     def live_requires_private_key(self) -> "IreneConfig":

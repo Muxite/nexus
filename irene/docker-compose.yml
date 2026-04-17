@@ -1,3 +1,6 @@
+# `${VAR:-default}` in this file is resolved by Compose from the process environment
+# and from `.env` in this directory (not the same mechanism as `env_file` on services).
+
 services:
 
   # ---------------------------------------------------------------------------
@@ -39,10 +42,23 @@ services:
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - irene_model_cache:/root/.cache/huggingface
+      - ./logs:/logs
+    env_file:
+      - path: .env
+        required: false
     environment:
       IRENE_CONFIG_PATH: /config/config.yaml
+      IRENE_LOG_DIR: /logs
+      PYTHONUNBUFFERED: "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     restart: unless-stopped
 
@@ -53,8 +69,19 @@ services:
     volumes:
       - ./config.yaml:/config/config.yaml:ro
       - irene_model_cache:/root/.cache/huggingface
+      - ./logs:/logs
+    env_file:
+      - path: .env
+        required: false
     environment:
       IRENE_CONFIG_PATH: /config/config.yaml
+      IRENE_LOG_DIR: /logs
+      PYTHONUNBUFFERED: "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,8 +95,19 @@ services:
       dockerfile: trader/Dockerfile
     volumes:
       - ./config.yaml:/config/config.yaml:ro
+      - ./logs:/logs
+    env_file:
+      - path: .env
+        required: false
     environment:
       IRENE_CONFIG_PATH: /config/config.yaml
+      IRENE_LOG_DIR: /logs
+      PYTHONUNBUFFERED: "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       postgres:
         condition: service_healthy
@@ -82,11 +120,23 @@ services:
       context: .
       dockerfile: monitor/Dockerfile
     ports:
-      - "8080:8080"
+      - "${IRENE_MONITOR_HOST_PORT:-18080}:8080"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
+      - ./data:/data/exports
+      - ./logs:/logs
+    env_file:
+      - path: .env
+        required: false
     environment:
       IRENE_CONFIG_PATH: /config/config.yaml
+      IRENE_LOG_DIR: /logs
+      PYTHONUNBUFFERED: "1"
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       postgres:
         condition: service_healthy
@@ -143,6 +193,30 @@ services:
     profiles: [test]
     environment:
       IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
+
+  # ---------------------------------------------------------------------------
+  # Integration test runner — hits real postgres + redis + Gamma API
+  #
+  # Run:
+  #   docker compose --profile integration run --rm integration-test
+  # ---------------------------------------------------------------------------
+
+  integration-test:
+    build:
+      context: .
+      dockerfile: integration_tests/Dockerfile
+    profiles: [integration]
+    environment:
+      IRENE_INTEGRATION_TESTS: "true"
+      IRENE_DATABASE_URL: "postgresql://irene:irene@postgres:5432/irene"
+      IRENE_REDIS_URL: "redis://redis:6379/0"
+      IRENE_GAMMA_URL: "https://gamma-api.polymarket.com"
+      PYTHONUNBUFFERED: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
 volumes:
   irene_postgres_data:

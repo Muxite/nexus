@@ -32,6 +32,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [trader] %(levelname)s %(name)s: %(message)s",
 )
+if _log_dir := os.getenv("IRENE_LOG_DIR"):
+    os.makedirs(_log_dir, exist_ok=True)
+    _fh = logging.FileHandler(os.path.join(_log_dir, "trader.log"))
+    _fh.setFormatter(logging.Formatter("%(asctime)s [trader] %(levelname)s %(name)s: %(message)s"))
+    logging.getLogger().addHandler(_fh)
 logger = logging.getLogger(__name__)
 
 _CONFIG_PATH = os.getenv("IRENE_CONFIG_PATH", "/config/config.yaml")
@@ -62,15 +67,50 @@ class Trader:
     async def start(self) -> None:
         logger.info("Trader starting")
         self._running = True
-        tracker = PositionTracker(self._cfg, self._db, self._profile)
+        tracker = PositionTracker(self._cfg, self._db, self._profile, self._redis)
         await asyncio.gather(
             self._signal_loop(),
             tracker.start(),
+            self._profile_loop(),
+            self._last_seen_loop(),
         )
 
     async def stop(self) -> None:
         logger.info("Trader stopping")
         self._running = False
+
+    # ------------------------------------------------------------------
+    # Profile publishing loop (Phase 7)
+    # ------------------------------------------------------------------
+
+    async def _last_seen_loop(self) -> None:
+        """
+        Refresh Redis ``irene:last_seen:trader`` while idle so the monitor
+        dashboard does not expire the key between trades.
+        """
+        while self._running:
+            try:
+                await self._redis.set_last_seen(
+                    "trader", datetime.now(timezone.utc).isoformat()
+                )
+            except Exception as exc:
+                logger.warning("Trader last_seen update failed: %s", exc)
+            await asyncio.sleep(60)
+
+    async def _profile_loop(self) -> None:
+        """Publish ProfileStore summary to Redis periodically."""
+        while self._running:
+            cfg = self._cfg.get()
+            interval = cfg.timing.publish_interval_seconds
+            if interval > 0:
+                await asyncio.sleep(interval)
+                try:
+                    await self._redis.set_profile("trader", self._profile.summary_as_dict())
+                    logger.debug("Published trader profile to Redis")
+                except Exception as exc:
+                    logger.warning("Failed to publish profile: %s", exc)
+            else:
+                await asyncio.sleep(60)
 
     # ------------------------------------------------------------------
     # Signal loop
@@ -88,6 +128,17 @@ class Trader:
 
     async def _handle_signal(self, ms: MappedSignal) -> None:
         cfg = self._cfg.get()
+
+        if not await self._redis.try_consume_daily_budget(
+            "clob",
+            cfg.rate_limits.clob_max_per_day,
+            cost=1,
+        ):
+            logger.warning(
+                "CLOB daily rate limit — skipping signal (cond=%s)",
+                ms.condition_id[:12],
+            )
+            return
 
         # Fetch orderbook for the relevant token
         token_id = ms.token_yes if ms.direction == Direction.YES else ms.token_no

@@ -52,6 +52,8 @@ class NewsAPISource:
         self._page_size = min(page_size, 100)  # API max is 100
         self._query = query
         self._source_detail = source_detail
+        # In-memory dedup: skip URLs already processed this session
+        self._seen_urls: set[str] = set()
 
     async def fetch(self, since: Optional[datetime] = None) -> list[RawSignal]:
         """
@@ -98,10 +100,13 @@ class NewsAPISource:
             title = article.get("title") or ""
             if not url or not title or title == "[Removed]":
                 continue
+            if url in self._seen_urls:
+                continue
 
             published_at = _parse_published(article.get("publishedAt"))
             description = article.get("description") or article.get("content")
 
+            self._seen_urls.add(url)
             signals.append(
                 RawSignal(
                     source=SignalSource.NEWSAPI,
@@ -114,7 +119,10 @@ class NewsAPISource:
                 )
             )
 
-        logger.info("NewsAPI: fetched %d articles", len(signals))
+        if signals:
+            logger.info("NewsAPI: %d new articles", len(signals))
+        else:
+            logger.debug("NewsAPI: 0 new articles")
         return signals
 
 

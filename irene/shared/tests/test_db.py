@@ -396,3 +396,57 @@ class TestUpsertPosition:
         conn.execute.assert_called_once()
         sql = conn.execute.call_args.args[0]
         assert "DELETE" in sql
+
+
+class TestDashboardStats:
+    @pytest.mark.asyncio
+    async def test_get_dashboard_stats_returns_expected_keys(self):
+        conn = _make_conn()
+        trades_row = {
+            "realized_pnl_total": 1.0,
+            "realized_pnl_24h": 0.5,
+            "wins": 1,
+            "losses": 1,
+            "breakeven": 0,
+            "trades_closed_total": 2,
+            "trades_executed_total": 3,
+            "trades_skipped_total": 1,
+        }
+        pos_row = {
+            "unrealized_pnl_total": 2.0,
+            "open_exposure_usdc": 50.0,
+        }
+        conn.fetchval = AsyncMock(
+            side_effect=[
+                5,
+                2,
+                100,
+                40,
+                10,
+                30,
+                4,
+                25,
+                3,
+                1,
+                None,
+                None,
+                None,
+            ]
+        )
+        conn.fetchrow = AsyncMock(side_effect=[trades_row, pos_row])
+        db, _ = _make_db(conn)
+        out = await db.get_dashboard_stats()
+        assert out["active_markets"] == 5
+        assert out["open_positions"] == 2
+        assert out["signals_total"] == 100
+        assert out["signals_mapped_total"] == 40
+        assert out["signals_ingested_24h"] == 10
+        assert out["mapped_signals_total"] == 30
+        assert out["mapped_signals_24h"] == 4
+        assert out["mapped_signals_dispatched"] == 25
+        assert out["trades_closed_24h"] == 3
+        assert out["trades_open_executed"] == 1
+        assert out["realized_pnl_total"] == 1.0
+        assert out["unrealized_pnl_total"] == 2.0
+        assert out["closed_wins"] == 1
+        assert out["generated_at"].tzinfo is not None

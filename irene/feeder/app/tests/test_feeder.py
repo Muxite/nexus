@@ -24,14 +24,23 @@ def _now() -> datetime:
 
 def _make_cfg():
     cfg = MagicMock()
-    cfg.signals.newsapi_key = "key"
+    cfg.signals.newsapi_keys = ["key"]
+    cfg.signals.brave_api_keys = []
     cfg.signals.newsapi_poll_seconds = 300
     cfg.signals.rss_poll_seconds = 300
     cfg.signals.rss_startup_spread_fraction = 0.5
     cfg.signals.jitter_fraction = 0.0
     cfg.signals.rss_feeds = []
+    cfg.signals.watched_pages = []
     cfg.signals.similarity_threshold = 0.5
     cfg.signals.top_k_markets = 3
+    cfg.signals.use_llm_direction = False   # always use keyword classifier in unit tests
+    cfg.signals.direction_min_confidence = 0.30
+    cfg.llm.api_key = ""
+    cfg.llm.model = "gemini-2.5-flash"
+    cfg.rate_limits.newsapi_max_per_day = 90
+    cfg.rate_limits.brave_max_per_day = 500
+    cfg.rate_limits.rss_http_max_per_day = 3000
     return cfg
 
 
@@ -57,6 +66,7 @@ def _make_redis():
     redis.publish_signal = AsyncMock(return_value=1)
     redis.publish_heartbeat = AsyncMock()
     redis.set_last_seen = AsyncMock()
+    redis.try_consume_daily_budget = AsyncMock(return_value=True)
     return redis
 
 
@@ -67,6 +77,19 @@ def _make_raw_signal(url: str = "https://news.example.com/a") -> RawSignal:
         url=url,
         title="Fed raises interest rates above 5%",
         description="Federal Reserve raises rates",
+        published_at=_now(),
+        ingested_at=_now(),
+    )
+
+
+def _make_neutral_signal(url: str = "https://news.example.com/neutral") -> RawSignal:
+    """Headline with no YES/NO keywords — keyword classifier returns NEUTRAL."""
+    return RawSignal(
+        source=SignalSource.NEWSAPI,
+        source_detail="newsapi",
+        url=url,
+        title="Federal Reserve meeting scheduled for Tuesday",
+        description="Officials gather to review current economic data.",
         published_at=_now(),
         ingested_at=_now(),
     )
@@ -129,9 +152,9 @@ class TestProcessSignalsEmpty:
     async def test_empty_list_still_publishes_heartbeat(self):
         redis = _make_redis()
         feeder = _make_feeder(redis=redis)
-        # _process_signals returns early without heartbeat for empty list
         await feeder._process_signals([])
-        redis.publish_heartbeat.assert_not_called()
+        redis.publish_heartbeat.assert_called_once_with("feeder")
+        redis.set_last_seen.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -216,13 +239,15 @@ class TestProcessSignalsMapping:
 
     @pytest.mark.asyncio
     async def test_skips_neutral_direction(self):
+        """Neutral headline → keyword classifier returns NEUTRAL → no Redis publish."""
         redis = _make_redis()
         feeder = _make_feeder(redis=redis)
 
         ms = _make_mapped_signal(direction=Direction.NEUTRAL)
         feeder._mapper.map = AsyncMock(return_value=[ms])
 
-        await feeder._process_signals([_make_raw_signal()])
+        # Use a headline with no YES/NO keywords so classifier stays NEUTRAL
+        await feeder._process_signals([_make_neutral_signal()])
 
         redis.publish_signal.assert_not_called()
 
@@ -296,16 +321,29 @@ class TestProcessSignalsMapping:
         assert db.insert_signal.call_count == 3
 
     @pytest.mark.asyncio
-    async def test_neutral_signal_does_not_call_insert_mapped(self):
+    async def test_neutral_signal_still_inserts_mapped_for_coverage(self):
+        """
+        NEUTRAL matches are inserted and logged (SIGNAL_MATCH with dispatched=False)
+        so the dashboard shows full edge-detection coverage.
+        They are NOT published to Redis.
+        """
         db = _make_db(signal_id=1)
-        feeder = _make_feeder(db=db)
+        redis = _make_redis()
+        feeder = _make_feeder(db=db, redis=redis)
 
         ms = _make_mapped_signal(direction=Direction.NEUTRAL)
         feeder._mapper.map = AsyncMock(return_value=[ms])
 
-        await feeder._process_signals([_make_raw_signal()])
+        # Use a headline with no YES/NO keywords so classifier stays NEUTRAL
+        await feeder._process_signals([_make_neutral_signal()])
 
-        db.insert_mapped_signal.assert_not_called()
+        # Inserted to DB (for dashboard coverage)
+        db.insert_mapped_signal.assert_called_once()
+        kwargs = db.insert_mapped_signal.call_args.kwargs
+        assert kwargs["direction"] == "NEUTRAL"
+
+        # NOT dispatched to Redis
+        redis.publish_signal.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_matches_no_publish(self):
@@ -316,3 +354,54 @@ class TestProcessSignalsMapping:
         await feeder._process_signals([_make_raw_signal()])
 
         redis.publish_signal.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _profile_loop — Phase 7 profile publishing
+# ---------------------------------------------------------------------------
+
+
+class TestProfileLoop:
+
+    @pytest.mark.asyncio
+    async def test_skips_publish_when_interval_zero(self):
+        redis = _make_redis()
+        redis.set_profile = AsyncMock()
+        feeder = _make_feeder(redis=redis)
+        feeder._running = True
+
+        cfg = _make_cfg()
+        cfg.timing = MagicMock()
+        cfg.timing.publish_interval_seconds = 0
+
+        async def _fake_sleep(secs):
+            feeder._running = False
+
+        with patch.object(feeder._cfg, "get", return_value=cfg), \
+             patch("asyncio.sleep", side_effect=_fake_sleep):
+            await feeder._profile_loop()
+
+        redis.set_profile.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_publishes_when_interval_positive(self):
+        redis = _make_redis()
+        redis.set_profile = AsyncMock()
+        feeder = _make_feeder(redis=redis)
+        feeder._running = True
+
+        cfg = _make_cfg()
+        cfg.timing = MagicMock()
+        cfg.timing.publish_interval_seconds = 60
+
+        async def _fake_sleep(secs):
+            feeder._running = False
+
+        with patch.object(feeder._cfg, "get", return_value=cfg), \
+             patch("asyncio.sleep", side_effect=_fake_sleep):
+            await feeder._profile_loop()
+
+        redis.set_profile.assert_called_once()
+        args = redis.set_profile.call_args.args
+        assert args[0] == "feeder"
+        assert isinstance(args[1], dict)

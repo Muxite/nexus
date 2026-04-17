@@ -155,10 +155,17 @@ def parse_market(raw: dict[str, Any]) -> Optional[dict[str, Any]]:
             or raw.get("usdcLiquidity")
         )
 
-        # Tokens: YES is index 0, NO is index 1
-        tokens = raw.get("tokens") or []
-        token_yes = _extract_token_id(tokens, 0)
-        token_no = _extract_token_id(tokens, 1)
+        # Tokens: YES is index 0, NO is index 1.
+        # Gamma API returns clobTokenIds as the primary source; tokens[] may be empty.
+        clob_ids = raw.get("clobTokenIds") or []
+        if len(clob_ids) >= 2:
+            token_yes = str(clob_ids[0]) if clob_ids[0] else None
+            token_no = str(clob_ids[1]) if clob_ids[1] else None
+        else:
+            # Fallback: tokens[] array (legacy format)
+            tokens = raw.get("tokens") or []
+            token_yes = _extract_token_id(tokens, 0)
+            token_no = _extract_token_id(tokens, 1)
 
         return {
             "condition_id": condition_id,

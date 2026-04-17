@@ -32,6 +32,7 @@ def _make_cfg(mode: str = "paper"):
     cfg.polymarket.clob_url = "https://clob.polymarket.com"
     cfg.trading.balance_usdc = 1000.0
     cfg.trading.max_open_positions = 10
+    cfg.rate_limits.clob_max_per_day = 20000
     return cfg
 
 
@@ -52,6 +53,7 @@ def _make_redis():
     redis = MagicMock()
     redis.subscribe_signals = MagicMock()
     redis.set_last_seen = AsyncMock()
+    redis.try_consume_daily_budget = AsyncMock(return_value=True)
     return redis
 
 
@@ -395,3 +397,54 @@ class TestSignalLoop:
 
         await trader._signal_loop()
         assert call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _profile_loop — Phase 7 profile publishing
+# ---------------------------------------------------------------------------
+
+
+class TestProfileLoop:
+
+    @pytest.mark.asyncio
+    async def test_skips_publish_when_interval_zero(self):
+        redis = _make_redis()
+        redis.set_profile = AsyncMock()
+        trader = _make_trader(redis=redis)
+        trader._running = True
+
+        cfg = _make_cfg()
+        cfg.timing = MagicMock()
+        cfg.timing.publish_interval_seconds = 0
+
+        async def _fake_sleep(secs):
+            trader._running = False
+
+        with patch.object(trader._cfg, "get", return_value=cfg), \
+             patch("asyncio.sleep", side_effect=_fake_sleep):
+            await trader._profile_loop()
+
+        redis.set_profile.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_publishes_when_interval_positive(self):
+        redis = _make_redis()
+        redis.set_profile = AsyncMock()
+        trader = _make_trader(redis=redis)
+        trader._running = True
+
+        cfg = _make_cfg()
+        cfg.timing = MagicMock()
+        cfg.timing.publish_interval_seconds = 60
+
+        async def _fake_sleep(secs):
+            trader._running = False
+
+        with patch.object(trader._cfg, "get", return_value=cfg), \
+             patch("asyncio.sleep", side_effect=_fake_sleep):
+            await trader._profile_loop()
+
+        redis.set_profile.assert_called_once()
+        args = redis.set_profile.call_args.args
+        assert args[0] == "trader"
+        assert isinstance(args[1], dict)

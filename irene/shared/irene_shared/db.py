@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 import pickle
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -214,6 +214,37 @@ class IreneDB:
                 published_at, _now(), embedding_bytes,
             )
         return row["id"] if row else None
+
+    async def get_unmapped_signals_with_embeddings(
+        self, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        """
+        Return signals that have an embedding stored but have never been
+        successfully mapped to a market (mapped=false).
+
+        Used by the feeder backfill loop to re-run the mapper over historical
+        signals after the market embedding index has been populated.
+        """
+        pool = self._pool_required()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, source, source_detail, url, title, description,
+                       published_at, ingested_at, embedding
+                FROM signals
+                WHERE mapped = false AND embedding IS NOT NULL
+                ORDER BY ingested_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+        result = []
+        for row in rows:
+            d = dict(row)
+            if d["embedding"]:
+                d["embedding"] = pickle.loads(d["embedding"])
+            result.append(d)
+        return result
 
     async def mark_signal_mapped(self, signal_id: int) -> None:
         pool = self._pool_required()
@@ -490,6 +521,119 @@ class IreneDB:
     # ------------------------------------------------------------------
     # Monitor read helpers
     # ------------------------------------------------------------------
+
+    async def get_dashboard_stats(self) -> dict[str, Any]:
+        """
+        Aggregate counts and P&L for the text dashboard (24h windows in UTC).
+
+        :returns: Counts, P&L aggregates, timestamps, and ``generated_at``.
+        """
+        pool = self._pool_required()
+        now = _now()
+        since_24h = now - timedelta(hours=24)
+        async with pool.acquire() as conn:
+            active_markets = await conn.fetchval(
+                "SELECT COUNT(*) FROM markets WHERE active = true"
+            )
+            open_positions = await conn.fetchval("SELECT COUNT(*) FROM positions")
+            signals_total = await conn.fetchval("SELECT COUNT(*) FROM signals")
+            signals_mapped = await conn.fetchval(
+                "SELECT COUNT(*) FROM signals WHERE mapped = true"
+            )
+            signals_24h = await conn.fetchval(
+                "SELECT COUNT(*) FROM signals WHERE ingested_at >= $1",
+                since_24h,
+            )
+            mapped_total = await conn.fetchval("SELECT COUNT(*) FROM mapped_signals")
+            mapped_24h = await conn.fetchval(
+                "SELECT COUNT(*) FROM mapped_signals WHERE created_at >= $1",
+                since_24h,
+            )
+            mapped_dispatched = await conn.fetchval(
+                "SELECT COUNT(*) FROM mapped_signals WHERE dispatched = true"
+            )
+            trades_closed_24h = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM trades
+                WHERE closed_at IS NOT NULL AND closed_at >= $1
+                """,
+                since_24h,
+            )
+            trades_open = await conn.fetchval(
+                """
+                SELECT COUNT(*) FROM trades
+                WHERE closed_at IS NULL AND executed = true
+                """
+            )
+            row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(SUM(CASE WHEN closed_at IS NOT NULL
+                         AND realized_pnl IS NOT NULL THEN realized_pnl END), 0)
+                        AS realized_pnl_total,
+                    COALESCE(SUM(CASE WHEN closed_at IS NOT NULL
+                         AND closed_at >= $1 AND realized_pnl IS NOT NULL
+                         THEN realized_pnl END), 0)
+                        AS realized_pnl_24h,
+                    COUNT(*) FILTER (
+                        WHERE closed_at IS NOT NULL AND realized_pnl > 0) AS wins,
+                    COUNT(*) FILTER (
+                        WHERE closed_at IS NOT NULL AND realized_pnl < 0) AS losses,
+                    COUNT(*) FILTER (
+                        WHERE closed_at IS NOT NULL AND realized_pnl IS NOT NULL
+                         AND realized_pnl = 0) AS breakeven,
+                    COUNT(*) FILTER (WHERE closed_at IS NOT NULL) AS trades_closed_total,
+                    COUNT(*) FILTER (WHERE executed = true) AS trades_executed_total,
+                    COUNT(*) FILTER (WHERE executed = false) AS trades_skipped_total
+                FROM trades
+                """,
+                since_24h,
+            )
+            pos_row = await conn.fetchrow(
+                """
+                SELECT
+                    COALESCE(SUM(unrealized_pnl), 0) AS unrealized_pnl_total,
+                    COALESCE(SUM(size_usdc), 0) AS open_exposure_usdc
+                FROM positions
+                """
+            )
+            first_signal = await conn.fetchval(
+                "SELECT MIN(ingested_at) FROM signals"
+            )
+            first_trade = await conn.fetchval(
+                "SELECT MIN(decided_at) FROM trades WHERE executed = true"
+            )
+            last_close = await conn.fetchval(
+                "SELECT MAX(closed_at) FROM trades WHERE closed_at IS NOT NULL"
+            )
+        r = dict(row) if row else {}
+        pr = dict(pos_row) if pos_row else {}
+        return {
+            "active_markets": int(active_markets or 0),
+            "open_positions": int(open_positions or 0),
+            "signals_total": int(signals_total or 0),
+            "signals_mapped_total": int(signals_mapped or 0),
+            "signals_ingested_24h": int(signals_24h or 0),
+            "mapped_signals_total": int(mapped_total or 0),
+            "mapped_signals_24h": int(mapped_24h or 0),
+            "mapped_signals_dispatched": int(mapped_dispatched or 0),
+            "trades_closed_24h": int(trades_closed_24h or 0),
+            "trades_open_executed": int(trades_open or 0),
+            "trades_closed_total": int(r.get("trades_closed_total") or 0),
+            "trades_executed_total": int(r.get("trades_executed_total") or 0),
+            "trades_skipped_total": int(r.get("trades_skipped_total") or 0),
+            "realized_pnl_total": float(r.get("realized_pnl_total") or 0),
+            "realized_pnl_24h": float(r.get("realized_pnl_24h") or 0),
+            "unrealized_pnl_total": float(pr.get("unrealized_pnl_total") or 0),
+            "open_exposure_usdc": float(pr.get("open_exposure_usdc") or 0),
+            "closed_wins": int(r.get("wins") or 0),
+            "closed_losses": int(r.get("losses") or 0),
+            "closed_breakeven": int(r.get("breakeven") or 0),
+            "first_signal_ingested_at": first_signal,
+            "first_trade_decided_at": first_trade,
+            "last_trade_closed_at": last_close,
+            "generated_at": now,
+        }
 
     async def get_active_markets(self, limit: int = 200) -> list[dict[str, Any]]:
         """Return active markets with aggregated trade counts and P&L."""

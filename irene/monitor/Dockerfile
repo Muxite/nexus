@@ -9,5 +9,6 @@ COPY monitor/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY monitor/app/ /app/
+COPY frontend/ /app/static/
 
 CMD ["python", "main.py"]
