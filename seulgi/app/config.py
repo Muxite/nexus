@@ -37,15 +37,27 @@ class WatchedSite:
 
 
 @dataclass
+class SocialAccount:
+    """A Twitter/X or Truth Social account to monitor for market-moving posts."""
+    username: str
+    platform: str = "twitter"       # "twitter" or "truth_social"
+    interval_seconds: int = 90      # poll interval
+    max_failures: int = 5
+
+
+@dataclass
 class MarketsConfig:
-    refresh_hours: float = 4.0        # re-fetch market list every N hours
+    refresh_hours: float = 4.0          # re-fetch market list every N hours
     similarity_threshold: float = 0.35  # min cosine similarity to match
-    top_k: int = 15                   # max markets per headline
+    top_k: int = 15                     # max markets per headline
+    max_tracked_markets: int = 300      # cap on markets kept in index (top N by volume)
 
 
 @dataclass
 class AIConfig:
-    model: str = "google/gemini-2.5-flash-lite-preview-06-17"
+    model: str = "google/gemini-2.5-flash-lite"
+    premium_model: str = ""            # if set, used for high-similarity batches
+    premium_sim_threshold: float = 0.70  # similarity ≥ this → use premium_model
     api_key: str = ""                  # blank = use OPENROUTER_API_KEY env var
     api_base: str = "https://openrouter.ai/api/v1"
     min_confidence: float = 0.45
@@ -61,6 +73,12 @@ class TradingConfig:
     position_timeout_hours: float = 24.0
     max_open_positions: int = 20      # hard cap on concurrent positions
     mode: str = "paper"
+
+
+@dataclass
+class NewsMemoryConfig:
+    path: str = "/data/news_chroma"           # ChromaDB persistent directory
+    dedup_distance_threshold: float = 0.12    # cosine distance below this = republish
 
 
 @dataclass
@@ -90,12 +108,14 @@ class EngineConfig:
 @dataclass
 class Config:
     watched_sites: list[WatchedSite] = field(default_factory=list)
+    social_accounts: list[SocialAccount] = field(default_factory=list)
     markets: MarketsConfig = field(default_factory=MarketsConfig)
     ai: AIConfig = field(default_factory=AIConfig)
     trading: TradingConfig = field(default_factory=TradingConfig)
     engines: list[EngineConfig] = field(default_factory=list)
     db: DBConfig = field(default_factory=DBConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    news_memory: NewsMemoryConfig = field(default_factory=NewsMemoryConfig)
     log_level: str = "INFO"
 
 
@@ -142,6 +162,18 @@ def _build_config(raw: dict) -> Config:
     t = raw.get("trading", {})
     d = raw.get("db", {})
     dash = raw.get("dashboard", {})
+    nm = raw.get("news_memory", {})
+
+    social_cfgs = [
+        SocialAccount(
+            username=str(s.get("username", "")),
+            platform=str(s.get("platform", "twitter")),
+            interval_seconds=int(s.get("interval_seconds", 90)),
+            max_failures=int(s.get("max_failures", 5)),
+        )
+        for s in raw.get("social_accounts", [])
+        if s.get("username")
+    ]
 
     engine_cfgs = [
         EngineConfig(
@@ -159,14 +191,22 @@ def _build_config(raw: dict) -> Config:
 
     return Config(
         watched_sites=sites,
+        social_accounts=social_cfgs,
         engines=engine_cfgs,
         markets=MarketsConfig(
             refresh_hours=float(m.get("refresh_hours", 4.0)),
             similarity_threshold=float(m.get("similarity_threshold", 0.35)),
             top_k=int(m.get("top_k", 15)),
+            max_tracked_markets=int(m.get("max_tracked_markets", 300)),
+        ),
+        news_memory=NewsMemoryConfig(
+            path=str(nm.get("path", "/data/news_chroma")),
+            dedup_distance_threshold=float(nm.get("dedup_distance_threshold", 0.12)),
         ),
         ai=AIConfig(
-            model=str(a.get("model", "google/gemini-2.5-flash")),
+            model=str(a.get("model", "google/gemini-2.5-flash-lite")),
+            premium_model=str(a.get("premium_model", "")),
+            premium_sim_threshold=float(a.get("premium_sim_threshold", 0.70)),
             api_key=str(a.get("api_key", "")),
             api_base=str(a.get("api_base", "https://openrouter.ai/api/v1")),
             min_confidence=float(a.get("min_confidence", 0.45)),

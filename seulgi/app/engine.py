@@ -91,36 +91,66 @@ class EngineRunner:
         index: MarketIndex,
         embedder: Embedder,
         db: SeulgiDB,
-        dashboard=None,     # Optional[Dashboard] — avoids circular import
+        dashboard=None,       # Optional[Dashboard] — avoids circular import
+        news_memory=None,     # Optional[NewsMemory] — avoids circular import
+        impact_tracker=None,  # Optional[PriceImpactTracker] — avoids circular import
     ) -> None:
         self._engines = engines
         self._index = index
         self._embedder = embedder
         self._db = db
         self._dashboard = dashboard
+        self._news_memory = news_memory
+        self._impact_tracker = impact_tracker
 
     async def process(self, headline: RawHeadline) -> None:
         """
-        Embed headline, find matches, then fan out to all engines in parallel.
-        Each engine evaluates the same matches with its own rules.
+        Embed headline, check for republish, find matches, fan out to engines.
         """
+        hid = getattr(headline, "headline_id", "")
         loop = asyncio.get_event_loop()
         try:
             embedding = await loop.run_in_executor(
                 None, self._embedder.embed, headline.headline
             )
         except Exception as exc:
-            logger.warning("[runner] embed error: %s", exc)
+            logger.warning("[runner] [hid=%s] embed error: %s", hid, exc)
             return
+
+        # Dedup check — runs in executor (ChromaDB is synchronous)
+        is_republish = False
+        similar_to: Optional[str] = None
+        if self._news_memory is not None:
+            try:
+                is_republish, similar_to = await loop.run_in_executor(
+                    None,
+                    self._news_memory.check,
+                    headline.headline,
+                    embedding,
+                    headline.site_url,
+                    headline.article_url,
+                )
+                if is_republish:
+                    logger.info(
+                        "[runner] [hid=%s] republish detected: %s",
+                        hid, headline.headline[:80],
+                    )
+            except Exception as exc:
+                logger.debug("[runner] news_memory error: %s", exc)
+
+        # Store republish context on headline for downstream use
+        headline._is_republish = is_republish
+        headline._similar_to = similar_to
 
         matches = self._index.find_matches(embedding)
         if not matches:
-            logger.debug("[runner] no matches: %s", headline.headline[:80])
+            logger.debug("[runner] [hid=%s] no matches: %s", hid, headline.headline[:80])
             return
 
+        source = getattr(headline, "source", "news")
         logger.info(
-            "[runner] '%s' matched %d markets — dispatching to %d engines",
-            headline.headline[:60], len(matches), len(self._engines),
+            "[runner] [hid=%s] '%s' matched %d markets (republish=%s) — dispatching to %d engines",
+            hid, headline.headline[:60], len(matches), is_republish, len(self._engines),
         )
 
         # Fan out to all engines concurrently
@@ -150,11 +180,46 @@ class EngineRunner:
         headline: RawHeadline,
         matches: list[MarketMatch],
     ) -> list[TradeDecision]:
+        hid = getattr(headline, "headline_id", "")
         decisions = await engine.trader.process(headline, matches)
-        await self._db.record_engine_decisions(engine.name, decisions)
+        await self._db.record_engine_decisions(engine.name, decisions, headline_id=hid)
+
+        # Price-impact tracking — only from first engine to avoid duplicate rows
+        if self._impact_tracker is not None and engine == self._engines[0]:
+            is_republish = getattr(headline, "_is_republish", False)
+            source = getattr(headline, "source", "news")
+            if not is_republish:
+                for d in decisions:
+                    # Pick the token for the AI's predicted direction
+                    match_for_d = next(
+                        (m for m in matches if m.condition_id == d.condition_id), None
+                    )
+                    token_id = None
+                    if match_for_d:
+                        token_id = (
+                            match_for_d.token_yes if d.direction.value == "YES"
+                            else match_for_d.token_no
+                        )
+                    if token_id and d.direction.value in ("YES", "NO"):
+                        asyncio.create_task(self._impact_tracker.record(
+                            headline_id=hid,
+                            headline=headline.headline,
+                            site_url=headline.site_url,
+                            condition_id=d.condition_id,
+                            question=d.question,
+                            token_id=token_id,
+                            direction=d.direction.value,
+                            ai_confidence=d.confidence,
+                            similarity=d.similarity,
+                            source=source,
+                        ))
 
         if self._dashboard:
             for d in decisions:
+                outcome = (
+                    f"TRADE ${d.size_usdc:.0f}" if d.executed
+                    else f"SKIP {d.skip_reason or ''}"
+                )
                 self._dashboard.record_trade(
                     condition_id=d.condition_id,
                     question=d.question,
@@ -168,6 +233,16 @@ class EngineRunner:
                     size_usdc=d.size_usdc,
                     skip_reason=d.skip_reason,
                     engine_name=engine.name,
+                    headline_id=hid,
+                )
+                self._dashboard.record_trace(
+                    headline_id=hid,
+                    site=headline.site_url,
+                    headline=headline.headline,
+                    market=d.question,
+                    direction=d.direction.value,
+                    confidence=d.confidence,
+                    outcome=f"[{engine.name}] {outcome}",
                 )
             self._dashboard.set_balance(
                 engine.name, engine.trader.balance

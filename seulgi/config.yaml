@@ -80,11 +80,26 @@ watched_sites:
     reload_seconds: 300
     max_failures: 5
 
+# ── Social accounts to monitor (Twitter/X and Truth Social) ──────────────────
+# These fire into the same headline pipeline as news sites.
+# Tweets/posts are tagged source="twitter" or "truth_social" in the DB.
+# Requires SEARCH_API_KEY (Brave) set in scraper's .env for Twitter.
+# Truth Social uses public RSS — no key needed.
+social_accounts:
+  - username: "elonmusk"
+    platform: "twitter"
+    interval_seconds: 90
+
+  - username: "realDonaldTrump"
+    platform: "truth_social"
+    interval_seconds: 60
+
 # ── Market index ─────────────────────────────────────────────────────────────
 markets:
-  refresh_hours: 4            # re-fetch Polymarket market list every N hours
-  similarity_threshold: 0.35  # min cosine similarity to include a market match
-  top_k: 15                   # max markets to evaluate per headline
+  refresh_hours: 4             # re-fetch Polymarket market list every N hours
+  similarity_threshold: 0.35   # min cosine similarity to include a market match
+  top_k: 15                    # max markets to evaluate per headline
+  max_tracked_markets: 300     # cap index at top-N markets by volume (0 = no cap)
 
 # ── AI direction classifier (via OpenRouter) ─────────────────────────────────
 # OpenRouter model IDs: https://openrouter.ai/models
@@ -92,10 +107,13 @@ markets:
 #               anthropic/claude-haiku-4-5  (reliable JSON)
 #               meta-llama/llama-3.1-8b-instruct  (free tier)
 ai:
-  model: "google/gemini-2.5-flash-lite-preview-06-17"
+  model: "google/gemini-2.5-flash-lite"    # cheap model for all batches
+  # premium_model: "google/gemini-2.5-flash"  # uncomment to use a better model
+  #                                            # for high-similarity (≥ threshold) batches
+  # premium_sim_threshold: 0.70               # similarity floor for premium routing
   api_key: ""                 # leave blank → uses OPENROUTER_API_KEY env var
   api_base: "https://openrouter.ai/api/v1"
-  min_confidence: 0.45        # below this → treat as NEUTRAL, skip trade
+  min_confidence: 0.35        # below this → treat as NEUTRAL, skip trade
 
 # ── Paper trading ────────────────────────────────────────────────────────────
 trading:
@@ -116,25 +134,25 @@ trading:
 # Remove this section entirely for a single default engine.
 engines:
   - name: "aggressive"
-    min_edge: 0.03
+    min_edge: 0.02
     edge_increment: 0.15
     max_position_usdc: 150.0
-    min_confidence: 0.40
+    min_confidence: 0.30
     max_open_positions: 30
 
   - name: "conservative"
-    min_edge: 0.08
+    min_edge: 0.06
     edge_increment: 0.10
     max_position_usdc: 50.0
-    min_confidence: 0.60
+    min_confidence: 0.50
     max_open_positions: 10
 
   - name: "balanced"
     # inherits all global trading defaults
-    min_edge: 0.05
+    min_edge: 0.04
     edge_increment: 0.12
     max_position_usdc: 100.0
-    min_confidence: 0.50
+    min_confidence: 0.35
 
 # ── Database ─────────────────────────────────────────────────────────────────
 db:
@@ -144,6 +162,11 @@ db:
 dashboard:
   data_dir: "/data/dashboard"   # all .txt files written here
   interval_secs: 30             # refresh interval; urgent events trigger faster
+
+# ── News deduplication (ChromaDB) ────────────────────────────────────────────
+news_memory:
+  path: "/data/news_chroma"           # ChromaDB persistent directory
+  dedup_distance_threshold: 0.12      # cosine distance below this = republish (~0.88 sim)
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 log_level: "INFO"               # DEBUG for verbose Playwright + embedding output

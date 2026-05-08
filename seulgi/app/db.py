@@ -98,12 +98,47 @@ CREATE TABLE IF NOT EXISTS positions (
 """
 
 # Idempotent migrations for columns added after initial schema
+_PRICE_IMPACT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS price_impacts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    headline_id     TEXT NOT NULL,
+    headline        TEXT NOT NULL,
+    site_url        TEXT NOT NULL,
+    condition_id    TEXT NOT NULL,
+    question        TEXT NOT NULL,
+    token_id        TEXT NOT NULL,
+    direction       TEXT NOT NULL,      -- YES or NO (which token we expect to move)
+    ai_confidence   REAL NOT NULL,
+    similarity      REAL NOT NULL,
+    price_t0        REAL,               -- price at headline detection time
+    price_t1m       REAL,               -- price 1 minute later
+    price_t5m       REAL,               -- price 5 minutes later
+    price_t15m      REAL,               -- 15 minutes later
+    price_t30m      REAL,               -- 30 minutes later
+    price_t60m      REAL,               -- 60 minutes later
+    delta_t1m       REAL,               -- price_t1m  - price_t0
+    delta_t5m       REAL,               -- price_t5m  - price_t0
+    delta_t15m      REAL,
+    delta_t30m      REAL,
+    delta_t60m      REAL,
+    detected_at     TEXT NOT NULL,      -- ISO timestamp of headline
+    source          TEXT DEFAULT 'news' -- 'news' | 'twitter' | 'truth_social'
+);
+
+CREATE INDEX IF NOT EXISTS idx_pi_headline_id ON price_impacts(headline_id);
+CREATE INDEX IF NOT EXISTS idx_pi_condition_id ON price_impacts(condition_id);
+CREATE INDEX IF NOT EXISTS idx_pi_detected_at ON price_impacts(detected_at);
+"""
+
 _MIGRATIONS = [
     "ALTER TABLE trades    ADD COLUMN question     TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE trades    ADD COLUMN realized_pnl REAL",
     "ALTER TABLE trades    ADD COLUMN closed_at    TEXT",
     "ALTER TABLE positions ADD COLUMN question     TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE positions ADD COLUMN unrealized_pnl REAL DEFAULT 0.0",
+    "ALTER TABLE signals        ADD COLUMN headline_id TEXT",
+    "ALTER TABLE trades         ADD COLUMN headline_id TEXT",
+    "ALTER TABLE engine_results ADD COLUMN headline_id TEXT",
 ]
 
 
@@ -128,6 +163,7 @@ class SeulgiDB:
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_SCHEMA)
+        await self._conn.executescript(_PRICE_IMPACT_SCHEMA)
         await self._conn.commit()
         await self._migrate()
         logger.info("SeulgiDB connected: %s", self._path)
@@ -199,10 +235,12 @@ class SeulgiDB:
     # Signals
     # ------------------------------------------------------------------
 
-    async def insert_signal(self, site_url: str, headline: str) -> int:
+    async def insert_signal(
+        self, site_url: str, headline: str, headline_id: Optional[str] = None
+    ) -> int:
         cur = await self._conn.execute(
-            "INSERT INTO signals (site_url, headline, detected_at) VALUES (?, ?, ?)",
-            (site_url, headline, _now_iso()),
+            "INSERT INTO signals (site_url, headline, detected_at, headline_id) VALUES (?, ?, ?, ?)",
+            (site_url, headline, _now_iso(), headline_id),
         )
         await self._conn.commit()
         return cur.lastrowid
@@ -223,16 +261,17 @@ class SeulgiDB:
         mid_price: Optional[float],
         size_usdc: float,
         skip_reason: Optional[str],
+        headline_id: Optional[str] = None,
     ) -> int:
         cur = await self._conn.execute(
             """
             INSERT INTO trades
               (signal_id, condition_id, question, token_id, direction, similarity,
-               p_hat, mid_price, size_usdc, skip_reason, decided_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               p_hat, mid_price, size_usdc, skip_reason, decided_at, headline_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (signal_id, condition_id, question, token_id, direction, similarity,
-             p_hat, mid_price, size_usdc, skip_reason, _now_iso()),
+             p_hat, mid_price, size_usdc, skip_reason, _now_iso(), headline_id),
         )
         await self._conn.commit()
         return cur.lastrowid
@@ -343,7 +382,7 @@ class SeulgiDB:
     # ------------------------------------------------------------------
 
     async def record_engine_decisions(
-        self, engine_name: str, decisions: list
+        self, engine_name: str, decisions: list, headline_id: Optional[str] = None
     ) -> None:
         """Bulk-insert all TradeDecision objects from one engine run."""
         now = _now_iso()
@@ -362,6 +401,7 @@ class SeulgiDB:
                 1 if d.executed else 0,
                 d.skip_reason,
                 now,
+                headline_id,
             )
             for d in decisions
         ]
@@ -370,8 +410,8 @@ class SeulgiDB:
             INSERT INTO engine_results
               (engine_name, condition_id, question, direction, confidence,
                similarity, p_hat, mid_price, edge, size_usdc, executed,
-               skip_reason, decided_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               skip_reason, decided_at, headline_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -412,6 +452,89 @@ class SeulgiDB:
             GROUP BY engine_name, skip_reason
             ORDER BY engine_name, count DESC
             """
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Price impact tracking
+    # ------------------------------------------------------------------
+
+    async def insert_price_impact(
+        self,
+        headline_id: str,
+        headline: str,
+        site_url: str,
+        condition_id: str,
+        question: str,
+        token_id: str,
+        direction: str,
+        ai_confidence: float,
+        similarity: float,
+        price_t0: Optional[float],
+        detected_at: str,
+        source: str = "news",
+    ) -> int:
+        """Create a new price impact row. Returns the row id."""
+        async with self._conn.execute(
+            """
+            INSERT INTO price_impacts
+              (headline_id, headline, site_url, condition_id, question,
+               token_id, direction, ai_confidence, similarity,
+               price_t0, detected_at, source)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (headline_id, headline, site_url, condition_id, question,
+             token_id, direction, ai_confidence, similarity,
+             price_t0, detected_at, source),
+        ) as cur:
+            row_id = cur.lastrowid
+        await self._conn.commit()
+        return row_id
+
+    async def update_price_impact_snapshot(
+        self, row_id: int, bucket: str, price: float
+    ) -> None:
+        """
+        Update one time-bucket column (t1m, t5m, t15m, t30m, t60m) and its delta.
+
+        bucket must be one of: "t1m", "t5m", "t15m", "t30m", "t60m"
+        """
+        assert bucket in ("t1m", "t5m", "t15m", "t30m", "t60m")
+        await self._conn.execute(
+            f"""
+            UPDATE price_impacts
+            SET price_{bucket} = ?,
+                delta_{bucket} = ? - price_t0
+            WHERE id = ?
+            """,
+            (price, price, row_id),
+        )
+        await self._conn.commit()
+
+    async def get_pending_price_impacts(self) -> list[dict]:
+        """Return rows that still have at least one bucket unfilled (up to 2h old)."""
+        async with self._conn.execute(
+            """
+            SELECT * FROM price_impacts
+            WHERE (price_t60m IS NULL)
+              AND detected_at > datetime('now', '-2 hours')
+            ORDER BY detected_at DESC
+            LIMIT 500
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_price_impact_stats(self, limit: int = 500) -> list[dict]:
+        """Return completed rows (price_t60m is not null) for analysis."""
+        async with self._conn.execute(
+            """
+            SELECT * FROM price_impacts
+            WHERE price_t60m IS NOT NULL
+            ORDER BY detected_at DESC LIMIT ?
+            """,
+            (limit,),
         ) as cur:
             rows = await cur.fetchall()
         return [dict(row) for row in rows]

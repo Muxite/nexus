@@ -311,7 +311,7 @@ class TestRunLoop:
         async def fake_sleep(secs):
             nonlocal call_count
             call_count += 1
-            if call_count > 10:
+            if call_count > 12:
                 raise asyncio.CancelledError()
 
         with patch("watcher.aiohttp.ClientSession", return_value=mock_session), \
@@ -332,3 +332,39 @@ class TestRunLoop:
         assert s["failures"] == 0
         assert s["total_headlines"] == 0
         assert s["is_unreachable"] is False
+
+
+# ---------------------------------------------------------------------------
+# RawHeadline.headline_id
+# ---------------------------------------------------------------------------
+
+
+def _make_raw_headline(**kwargs) -> RawHeadline:
+    from datetime import datetime, timezone
+    defaults = dict(
+        site_url="https://apnews.com",
+        headline="Test headline",
+        article_url="https://apnews.com/article/1",
+        detected_at=datetime.now(timezone.utc),
+    )
+    defaults.update(kwargs)
+    return RawHeadline(**defaults)
+
+
+class TestHeadlineId:
+    def test_headline_id_is_12_char_hex(self):
+        h = _make_raw_headline(headline="Fed cuts rates by 25bp")
+        assert isinstance(h.headline_id, str)
+        assert len(h.headline_id) == 12
+        # Must be valid hex
+        int(h.headline_id, 16)
+
+    def test_two_headlines_have_different_ids(self):
+        h1 = _make_raw_headline(headline="First headline", article_url="https://apnews.com/1")
+        h2 = _make_raw_headline(headline="Second headline", article_url="https://apnews.com/2")
+        assert h1.headline_id != h2.headline_id
+
+    def test_headline_id_stable_after_creation(self):
+        h = _make_raw_headline(headline="Stable headline")
+        first = h.headline_id
+        assert h.headline_id == first

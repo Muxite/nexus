@@ -29,6 +29,7 @@ import aiohttp
 import numpy as np
 
 from config import Config
+from profiler import prof
 from db import SeulgiDB
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,18 @@ async def _fetch_gamma_markets(session: aiohttp.ClientSession) -> list[dict]:
     return markets
 
 
+async def _fetch_gamma_markets_capped(
+    session: aiohttp.ClientSession, max_markets: int = 0
+) -> list[dict]:
+    """Fetch markets and cap to top-N by volume (0 = no cap)."""
+    markets = await _fetch_gamma_markets(session)
+    if max_markets > 0 and len(markets) > max_markets:
+        markets.sort(key=lambda r: float(r.get("volume", 0) or 0), reverse=True)
+        markets = markets[:max_markets]
+        logger.info("Gamma API: trimmed to top %d markets by volume", max_markets)
+    return markets
+
+
 def _parse_market(raw: dict) -> Optional[Market]:
     """
     Extract the fields we care about from a raw Gamma API market dict.
@@ -156,6 +169,7 @@ class Embedder:
         self._model = SentenceTransformer(self._MODEL_NAME)
         logger.info("Embedding model ready (dim=%d)", self._model.get_sentence_embedding_dimension())
 
+    @prof.traced("markets/embed")
     def embed(self, text: str) -> np.ndarray:
         """Embed a single string → normalised float32 vector of shape (384,)."""
         if self._model is None:
@@ -221,7 +235,9 @@ class MarketIndex:
         logger.info("MarketIndex: refreshing …")
 
         async with aiohttp.ClientSession() as session:
-            raw_markets = await _fetch_gamma_markets(session)
+            raw_markets = await _fetch_gamma_markets_capped(
+                session, max_markets=self._cfg.markets.max_tracked_markets
+            )
 
         markets: list[Market] = []
         for raw in raw_markets:
@@ -282,6 +298,7 @@ class MarketIndex:
         logger.info("MarketIndex: loaded %d markets from DB", len(self._markets))
         return len(self._markets)
 
+    @prof.traced("markets/search")
     def find_matches(self, query_embedding: np.ndarray) -> list[MarketMatch]:
         """
         Find the top-K markets most similar to the given embedding.

@@ -32,7 +32,9 @@ from dashboard import Dashboard, WatcherStatus, PositionEvent
 from db import SeulgiDB
 from engine import EngineRunner, build_engines
 from markets import Embedder, MarketIndex
-from watcher import RawHeadline, SiteWatcher
+from impact_tracker import PriceImpactTracker
+from news_memory import NewsMemory
+from watcher import RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher
 
 
 def _setup_logging(level: str) -> None:
@@ -195,7 +197,13 @@ async def main() -> None:
     api_key = cfg.ai.api_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         logger.warning("[main] No OPENROUTER_API_KEY — AI classification will fail")
-    classifier = DirectionClassifier(api_key=api_key, model=cfg.ai.model, api_base=cfg.ai.api_base)
+    classifier = DirectionClassifier(
+        api_key=api_key,
+        model=cfg.ai.model,
+        api_base=cfg.ai.api_base,
+        premium_model=cfg.ai.premium_model or None,
+        premium_sim_threshold=cfg.ai.premium_sim_threshold,
+    )
 
     # Build engines
     engines = build_engines(cfg, db, classifier)
@@ -205,8 +213,25 @@ async def main() -> None:
 
     logger.info("[main] engines: %s", [e.name for e in engines])
 
+    # News memory (semantic deduplication)
+    news_memory = NewsMemory(
+        path=cfg.news_memory.path,
+        embedder=embedder,
+        threshold=cfg.news_memory.dedup_distance_threshold,
+    )
+    logger.info("[main] NewsMemory ready — %d headlines stored", news_memory.size)
+
+    # Price-impact tracker (hypothesis testing)
+    impact_tracker = PriceImpactTracker(db=db, dashboard_dir=cfg.dashboard.data_dir)
+    await impact_tracker.start()
+    logger.info("[main] PriceImpactTracker started")
+
     # Engine runner (fans out headlines to all engines)
-    runner = EngineRunner(engines=engines, index=index, embedder=embedder, db=db, dashboard=dash)
+    runner = EngineRunner(
+        engines=engines, index=index, embedder=embedder,
+        db=db, dashboard=dash, news_memory=news_memory,
+        impact_tracker=impact_tracker,
+    )
 
     # Watchers
     queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
@@ -227,9 +252,32 @@ async def main() -> None:
             is_unreachable=False,
         ))
 
+    # Social account watchers
+    social_watchers: list = []
+    for acc in cfg.social_accounts:
+        if acc.platform == "twitter":
+            sw = TwitterAccountWatcher(
+                username=acc.username,
+                interval_seconds=acc.interval_seconds,
+                max_failures=acc.max_failures,
+            )
+        elif acc.platform == "truth_social":
+            sw = TruthSocialWatcher(
+                username=acc.username,
+                interval_seconds=acc.interval_seconds,
+                max_failures=acc.max_failures,
+            )
+        else:
+            logger.warning("[main] unknown platform %r for %s — skipping", acc.platform, acc.username)
+            continue
+        social_watchers.append(sw)
+        logger.info("[main] social watcher: @%s (%s, interval=%ds)",
+                    acc.username, acc.platform, acc.interval_seconds)
+
+    all_watchers = watchers + social_watchers
     watcher_tasks = [
-        asyncio.create_task(w.run(queue), name=f"watcher-{w._url}")
-        for w in watchers
+        asyncio.create_task(w.run(queue), name=f"watcher-{getattr(w, '_url', getattr(w, '_username', '?'))}")
+        for w in all_watchers
     ]
 
     refresh_secs = cfg.markets.refresh_hours * 3600
@@ -265,10 +313,12 @@ async def main() -> None:
         task.cancel()
     await asyncio.gather(*all_tasks, return_exceptions=True)
 
-    for w in watchers:
+    for w in all_watchers:
         await w.close()
 
     await classifier.close()
+    await news_memory.close()
+    await impact_tracker.close()
     for engine in engines:
         await engine.trader.close()
     await db.close()

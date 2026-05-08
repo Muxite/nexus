@@ -56,6 +56,7 @@ class NewsEvent:
     headline: str
     article_url: str
     detected_at: datetime
+    headline_id: str = ""
 
 
 @dataclass
@@ -83,6 +84,7 @@ class TradeEvent:
     skip_reason: Optional[str]
     edge: float             # p_hat - mid_price (0 if no price)
     decided_at: datetime
+    headline_id: str = ""
 
 
 @dataclass
@@ -145,6 +147,7 @@ class Dashboard:
         self._near_miss: collections.deque[TradeEvent] = collections.deque(maxlen=_MAX_BUFFER)
         self._closed: collections.deque[ClosedEvent] = collections.deque(maxlen=_MAX_BUFFER)
         self._activity: collections.deque[str] = collections.deque(maxlen=_MAX_ACTIVITY)
+        self._traces: collections.deque[str] = collections.deque(maxlen=200)
 
         # Live state
         self._open_positions: list[PositionEvent] = []
@@ -171,11 +174,16 @@ class Dashboard:
     # Record methods — called by pipeline components
     # ------------------------------------------------------------------
 
-    def record_news(self, site_url: str, headline: str, article_url: str) -> None:
+    def record_news(
+        self, site_url: str, headline: str, article_url: str,
+        headline_id: str = "",
+    ) -> None:
         now = datetime.now(timezone.utc)
-        self._news.appendleft(NewsEvent(site_url, headline, article_url, now))
+        ev = NewsEvent(site_url, headline, article_url, now, headline_id=headline_id)
+        self._news.appendleft(ev)
+        hid = f"[hid={headline_id[:8]}] " if headline_id else ""
         self._activity.appendleft(
-            f"[{_ts(now)}] NEWS  {_short(site_url)}  {headline[:100]}"
+            f"[{_ts(now)}] NEWS  {hid}{_short(site_url)}  {headline[:100]}"
         )
 
     def record_ai(
@@ -186,6 +194,25 @@ class Dashboard:
         self._activity.appendleft(
             f"[{_ts(now)}] AI    {direction} {confidence:.0%}  {headline[:80]}"
         )
+
+    def record_trace(
+        self,
+        headline_id: str,
+        site: str,
+        headline: str,
+        market: str,
+        direction: str,
+        confidence: float,
+        outcome: str,
+    ) -> None:
+        """Append a single end-to-end trace line to the trace log."""
+        now = datetime.now(timezone.utc)
+        line = (
+            f"{_ts(now)} | hid={headline_id[:8]} | {_short(site)} | "
+            f"{headline[:60]} | {market[:50]} | "
+            f"{direction} {confidence:.0%} | {outcome}"
+        )
+        self._traces.appendleft(line)
 
     def record_trade(
         self,
@@ -201,6 +228,7 @@ class Dashboard:
         size_usdc: float,
         skip_reason: Optional[str],
         engine_name: str = "default",
+        headline_id: str = "",
     ) -> None:
         now = datetime.now(timezone.utc)
         edge = (p_hat - mid_price) if mid_price is not None else 0.0
@@ -218,19 +246,21 @@ class Dashboard:
             skip_reason=skip_reason,
             edge=edge,
             decided_at=now,
+            headline_id=headline_id,
         )
         pfx = f"[{engine_name}]" if engine_name != "default" else ""
+        hid = f"[hid={headline_id[:8]}] " if headline_id else ""
         if skip_reason is None:
             self._executed.appendleft(ev)
             self._activity.appendleft(
-                f"[{_ts(now)}]{pfx} TRADE {direction} ${size_usdc:.0f} @ {mid_price:.3f}  "
+                f"[{_ts(now)}]{pfx} TRADE {hid}{direction} ${size_usdc:.0f} @ {mid_price:.3f}  "
                 f"edge={edge:+.3f}  {question[:70]}"
             )
             self._flush_now.set()
         else:
             self._declined.appendleft(ev)
             self._activity.appendleft(
-                f"[{_ts(now)}]{pfx} SKIP  {direction} {skip_reason}  {question[:70]}"
+                f"[{_ts(now)}]{pfx} SKIP  {hid}{direction} {skip_reason}  {question[:70]}"
             )
             # Near miss: edge is positive but below threshold
             if skip_reason.startswith("edge_too_small") and edge > _NEAR_MISS_EDGE:
@@ -323,6 +353,7 @@ class Dashboard:
             self._write_market_index(),
             self._write_engine_comparison(),
             self._write_activity_log(),
+            self._write_trace_log(),
         )
 
     # ------------------------------------------------------------------
@@ -396,7 +427,7 @@ class Dashboard:
                          f"{last_skip.question[:60]}")
         lines.append("")
         lines.append("  See positions_open.txt · trades_executed.txt · near_miss.txt")
-        lines.append("      trades_declined.txt · news_seen.txt · activity_log.txt")
+        lines.append("      trades_declined.txt · news_seen.txt · activity_log.txt · profile.txt")
 
         _write(self._path("dashboard.txt"), "\n".join(lines) + "\n")
 
@@ -558,6 +589,19 @@ class Dashboard:
         lines.extend(self._activity)
         _write(self._path("activity_log.txt"), "\n".join(lines) + "\n")
 
+    async def _write_trace_log(self) -> None:
+        """Write end-to-end trace log: hid → site → headline → market → AI → outcome."""
+        lines = [_header("TRACE LOG  (newest first)")]
+        lines.append(
+            f"  {'TIMESTAMP':<19}  {'HID':<10}  {'SITE':<20}  "
+            f"{'HEADLINE':<62}  {'MARKET':<52}  {'AI':<12}  OUTCOME"
+        )
+        lines.append("  " + "-" * 200)
+        lines.extend(f"  {t}" for t in self._traces)
+        if not self._traces:
+            lines.append("  (no traces yet)")
+        _write(self._path("trace_log.txt"), "\n".join(lines) + "\n")
+
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -593,7 +637,7 @@ def _trade_block(lines: list[str], ev: TradeEvent) -> None:
         f"  [{_ts(ev.decided_at)}]  {ev.direction:<4}  conf={ev.confidence:.0%}  "
         f"sim={ev.similarity:.2f}  edge={edge_str}"
     )
-    if ev.executed:
+    if ev.skip_reason is None:
         lines.append(f"    EXECUTED  ${ev.size_usdc:.2f} @ {ev.mid_price:.3f}")
     else:
         lines.append(f"    SKIPPED   reason={ev.skip_reason}")

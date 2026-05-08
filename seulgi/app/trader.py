@@ -209,17 +209,17 @@ class PaperTrader:
         signal_id = await self._db.insert_signal(
             site_url=headline.site_url,
             headline=headline.headline,
+            headline_id=getattr(headline, "headline_id", None),
         )
 
-        # Classify all matches concurrently
-        classify_results: list[ClassifyResult] = await asyncio.gather(
-            *[
-                self._classifier.classify(
-                    headline=headline.headline,
-                    question=match.question,
-                )
-                for match in matches
-            ]
+        # Classify all matches in ONE batched API call (10-15× cheaper)
+        is_republish = getattr(headline, "_is_republish", False)
+        similar_to   = getattr(headline, "_similar_to",   None)
+        classify_results: list[ClassifyResult] = await self._classifier.classify_batch(
+            headline=headline.headline,
+            matches=matches,
+            is_republish=is_republish,
+            similar_to=similar_to,
         )
 
         session = self._get_session()
