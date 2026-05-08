@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Irene — signals</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; background: #111; color: #e8e8e8; }
+    body { margin: 0; padding: 1rem; max-width: 1200px; margin-inline: auto; }
+    h1 { font-size: 1.25rem; font-weight: 600; }
+    .meta { color: #888; font-size: 0.85rem; margin-bottom: 1rem; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 0.5rem 0.4rem; border-bottom: 1px solid #333; vertical-align: top; }
+    th { color: #aaa; font-weight: 500; }
+    tr:hover td { background: #1a1a1a; }
+    a { color: #7ad; }
+    .err { color: #f66; }
+    .n { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>Signals</h1>
+  <p class="meta" id="meta">Loading…</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Ingested</th>
+        <th>Source</th>
+        <th>Matches</th>
+        <th>Title</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <script>
+    async function load() {
+      const meta = document.getElementById("meta");
+      const rows = document.getElementById("rows");
+      try {
+        const r = await fetch("/signals?limit=500");
+        if (!r.ok) throw new Error(r.status + " " + r.statusText);
+        const data = await r.json();
+        const list = data.signals || [];
+        meta.textContent = "Showing " + list.length + " (newest first). Refreshes every 30s.";
+        rows.innerHTML = list.map(function (s) {
+          var ing = s.ingested_at || "";
+          var title = (s.title || "").replace(/</g, "&lt;");
+          var href = s.url ? '<a href="' + encodeURI(s.url) + '" target="_blank" rel="noopener">link</a>' : '<span class="n">—</span>';
+          return "<tr><td>" + ing + "</td><td>" + (s.source || "") + "</td><td>" + (s.match_count != null ? s.match_count : "0") + "</td><td>" + title + " " + href + "</td></tr>";
+        }).join("");
+      } catch (e) {
+        meta.innerHTML = '<span class="err">Failed to load /signals: ' + String(e) + "</span>";
+        rows.innerHTML = "";
+      }
+    }
+    load();
+    setInterval(load, 30000);
+  </script>
+</body>
+</html>

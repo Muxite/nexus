@@ -1,0 +1,6 @@
+pytest>=7.4
+pytest-asyncio>=0.23
+aiohttp>=3.9
+asyncpg>=0.29
+aioredis>=2.0
+numpy>=1.26

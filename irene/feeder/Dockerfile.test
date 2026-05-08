@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY shared/ /build/shared/
+RUN pip install --no-cache-dir /build/shared/
+
+COPY feeder/requirements.txt .
+COPY feeder/requirements.test.txt .
+RUN pip install --no-cache-dir -r requirements.txt -r requirements.test.txt
+
+COPY scanner/app/ /scanner_app/
+COPY trader/app/ /trader_app/
+COPY feeder/app/ /app/
+
+ENV PYTHONPATH="/scanner_app:/trader_app:${PYTHONPATH}"
+
+CMD ["python", "-m", "pytest", "tests/", "-v", "--tb=short", "-m", "not integration"]
