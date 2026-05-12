@@ -213,6 +213,7 @@ class MarketIndex:
         self._markets: list[Market] = []
         self._matrix: Optional[np.ndarray] = None  # shape (N, 384)
         self._last_refresh: float = 0.0
+        self._heat_scores: dict[str, int] = {}  # condition_id → match_count
 
     @property
     def market_count(self) -> int:
@@ -275,6 +276,14 @@ class MarketIndex:
         logger.info("MarketIndex: index built with %d markets", len(markets))
         return len(markets)
 
+    async def load_heat_from_db(self) -> None:
+        """Load market heat scores (match_count) from DB into memory."""
+        async with self._db._conn.execute(
+            "SELECT condition_id, match_count FROM markets WHERE match_count > 0"
+        ) as cur:
+            rows = await cur.fetchall()
+        self._heat_scores = {r["condition_id"]: r["match_count"] for r in rows}
+
     async def load_from_db(self) -> int:
         """
         Load the market index from the database (used on startup if DB exists).
@@ -313,6 +322,13 @@ class MarketIndex:
 
         # Single matrix multiply: shape (N,)
         scores = self._matrix @ query_embedding
+
+        # Apply heat boost — frequently-matched markets score slightly higher (capped at +5%)
+        if self._heat_scores:
+            for i, m in enumerate(self._markets):
+                heat = self._heat_scores.get(m.condition_id, 0)
+                if heat > 0:
+                    scores[i] = min(1.0, float(scores[i]) + min(heat / 100.0, 0.05))
 
         # Filter and sort
         threshold = self._cfg.markets.similarity_threshold

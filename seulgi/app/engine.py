@@ -40,11 +40,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 
 from ai import DirectionClassifier
-from config import TradingConfig
+from config import TradingConfig, AIConfig
 from db import SeulgiDB
 from markets import MarketIndex, Embedder, MarketMatch
 from trader import PaperTrader, TradeDecision
@@ -107,6 +108,7 @@ class EngineRunner:
         """
         Embed headline, check for republish, find matches, fan out to engines.
         """
+        _t0 = time.monotonic()
         hid = getattr(headline, "headline_id", "")
         loop = asyncio.get_event_loop()
         try:
@@ -147,16 +149,22 @@ class EngineRunner:
             logger.debug("[runner] [hid=%s] no matches: %s", hid, headline.headline[:80])
             return
 
-        source = getattr(headline, "source", "news")
+        # Bump heat scores for matched markets (fire-and-forget)
+        asyncio.create_task(self._db.bump_market_heat([m.condition_id for m in matches]))
+
+        source = headline.source
         logger.info(
             "[runner] [hid=%s] '%s' matched %d markets (republish=%s) — dispatching to %d engines",
             hid, headline.headline[:60], len(matches), is_republish, len(self._engines),
         )
 
+        # Embed + dedup + match time — passed in; AI call time is measured per-engine
+        pre_ms = (time.monotonic() - _t0) * 1000.0
+
         # Fan out to all engines concurrently
         results: list[list[TradeDecision]] = await asyncio.gather(
             *[
-                self._run_engine(engine, headline, matches)
+                self._run_engine(engine, headline, matches, pre_ms)
                 for engine in self._engines
             ],
             return_exceptions=True,
@@ -179,15 +187,25 @@ class EngineRunner:
         engine: Engine,
         headline: RawHeadline,
         matches: list[MarketMatch],
+        pre_ms: float = 0.0,
     ) -> list[TradeDecision]:
+        """
+        Run one engine on the matches. Total signal latency = pre_ms (embed +
+        dedup + similarity) + the AI classification call inside trader.process().
+        This captures end-to-end headline-to-decision time.
+        """
         hid = getattr(headline, "headline_id", "")
+        _t_engine = time.monotonic()
         decisions = await engine.trader.process(headline, matches)
-        await self._db.record_engine_decisions(engine.name, decisions, headline_id=hid)
+        total_latency_ms = pre_ms + (time.monotonic() - _t_engine) * 1000.0
+        await self._db.record_engine_decisions(
+            engine.name, decisions, headline_id=hid, signal_latency_ms=total_latency_ms
+        )
 
         # Price-impact tracking — only from first engine to avoid duplicate rows
         if self._impact_tracker is not None and engine == self._engines[0]:
             is_republish = getattr(headline, "_is_republish", False)
-            source = getattr(headline, "source", "news")
+            source = headline.source
             if not is_republish:
                 for d in decisions:
                     # Pick the token for the AI's predicted direction
@@ -215,6 +233,23 @@ class EngineRunner:
                         ))
 
         if self._dashboard:
+            for d in decisions:
+                if d.direction.value != "NEUTRAL":
+                    if d.executed:
+                        outcome = f"TRADED ${d.size_usdc:.0f} @ {d.mid_price:.3f}  edge={d.edge:+.4f}"
+                    else:
+                        outcome = f"SKIP  {d.skip_reason or 'unknown'}"
+                    self._dashboard.record_signal_journal(
+                        headline=headline.headline,
+                        market=d.question,
+                        direction=d.direction.value,
+                        confidence=d.confidence,
+                        similarity=d.similarity,
+                        engine_name=engine.name,
+                        outcome=outcome,
+                        headline_id=hid,
+                    )
+
             for d in decisions:
                 outcome = (
                     f"TRADE ${d.size_usdc:.0f}" if d.executed
@@ -284,15 +319,22 @@ def build_engines(
     if not engine_cfgs:
         return [Engine(
             name="default",
-            trader=PaperTrader(db=db, classifier=classifier, cfg=cfg.trading, ai_cfg=cfg.ai),
+            trader=PaperTrader(
+                db=db, classifier=classifier, cfg=cfg.trading, ai_cfg=cfg.ai,
+                engine_name="default",
+            ),
         )]
 
     engines = []
     for ec in engine_cfgs:
         trading_cfg = _merge_trading_cfg(cfg.trading, ec)
+        ai_cfg = _merge_ai_cfg(cfg.ai, ec)
         engines.append(Engine(
             name=ec.name,
-            trader=PaperTrader(db=db, classifier=classifier, cfg=trading_cfg, ai_cfg=cfg.ai),
+            trader=PaperTrader(
+                db=db, classifier=classifier, cfg=trading_cfg, ai_cfg=ai_cfg,
+                engine_name=ec.name,
+            ),
         ))
 
     logger.info("[engine] built %d engines: %s", len(engines), [e.name for e in engines])
@@ -315,5 +357,16 @@ def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
         edge_increment=_pick("edge_increment", base.edge_increment),
         position_timeout_hours=_pick("position_timeout_hours", base.position_timeout_hours),
         max_open_positions=_pick("max_open_positions", base.max_open_positions),
+        max_unique_markets=base.max_unique_markets,
+        cold_position_hours=base.cold_position_hours,
         mode=base.mode,
     )
+
+
+def _merge_ai_cfg(base: AIConfig, override) -> AIConfig:
+    """Return a copy of base AIConfig with per-engine min_confidence override applied."""
+    from dataclasses import replace
+    min_conf = getattr(override, "min_confidence", None)
+    if min_conf is not None:
+        return replace(base, min_confidence=min_conf)
+    return base

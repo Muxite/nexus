@@ -26,6 +26,7 @@ The scraper container address is read from SCRAPER_URL env var
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 import os
 import random
@@ -51,17 +52,58 @@ _BACKOFF_LEVELS = [30, 60, 120, 240, 480, 900, 1800]
 
 
 # ---------------------------------------------------------------------------
+# Search budget
+# ---------------------------------------------------------------------------
+
+
+class SearchBudget:
+    """
+    Rolling 1-hour token bucket for Brave Search API calls.
+
+    Shared across all TwitterAccountWatcher instances so the total call rate
+    stays within the configured cap regardless of how many accounts are watched.
+
+    Not thread-safe — designed for single-event-loop use (all asyncio).
+    """
+
+    def __init__(self, per_hour: int = 20) -> None:
+        self._per_hour = per_hour
+        self._calls: collections.deque[float] = collections.deque()
+
+    def can_spend(self) -> bool:
+        """Return True if a call fits within the current hourly budget."""
+        self._evict()
+        return len(self._calls) < self._per_hour
+
+    def spend(self) -> None:
+        """Record that one call was made right now."""
+        self._calls.append(time.monotonic())
+
+    def _evict(self) -> None:
+        cutoff = time.monotonic() - 3600.0
+        while self._calls and self._calls[0] < cutoff:
+            self._calls.popleft()
+
+    @property
+    def usage(self) -> tuple[int, int]:
+        """Return (calls_in_last_hour, per_hour_limit)."""
+        self._evict()
+        return len(self._calls), self._per_hour
+
+
+# ---------------------------------------------------------------------------
 # Output type
 # ---------------------------------------------------------------------------
 
 @dataclass
 class RawHeadline:
-    """A newly detected headline from a watched news site."""
+    """A newly detected headline from a watched news site or social post."""
     site_url:    str
     headline:    str       # link title / article headline
     article_url: str       # cleaned href
     detected_at: datetime
     headline_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    source:      str = "news"   # "news" | "twitter" | "truth_social"
 
 
 # ---------------------------------------------------------------------------
@@ -350,11 +392,13 @@ class TwitterAccountWatcher:
         interval_seconds: int = 120,
         scraper_url: str = _SCRAPER_URL,
         max_failures: int = 5,
+        budget: Optional["SearchBudget"] = None,
     ) -> None:
         self._username = username.lstrip("@")
         self._interval = interval_seconds
         self._scraper_url = scraper_url.rstrip("/")
         self._max_failures = max_failures
+        self._budget = budget
         self._seen: set[str] = set()  # tweet URLs
         self._session: Optional[aiohttp.ClientSession] = None
         self._consecutive_failures = 0
@@ -373,12 +417,15 @@ class TwitterAccountWatcher:
 
     @property
     def status(self) -> dict:
+        used, limit = self._budget.usage if self._budget else (0, 0)
         return {
             "username": self._username,
             "type": "twitter",
             "total_tweets": self._total_tweets,
             "last_tweet_at": self._last_tweet_at.isoformat() if self._last_tweet_at else None,
             "failures": self._consecutive_failures,
+            "budget_used": used,
+            "budget_limit": limit,
         }
 
     async def run(self, queue: asyncio.Queue) -> None:
@@ -386,7 +433,18 @@ class TwitterAccountWatcher:
                     self._username, self._scraper_url, self._interval)
         while True:
             try:
+                # Budget check: skip this poll if Brave API hourly cap is reached
+                if self._budget is not None and not self._budget.can_spend():
+                    used, limit = self._budget.usage
+                    logger.info("[twitter] @%s: budget %d/%d/hr — skipping poll",
+                                self._username, used, limit)
+                    wait = max(10, random.gauss(self._interval, self._interval * 0.15))
+                    await asyncio.sleep(wait)
+                    continue
+
                 tweets = await self._fetch_tweets()
+                if self._budget is not None:
+                    self._budget.spend()
                 self._consecutive_failures = 0
                 self._backoff_level = 0
 
@@ -440,14 +498,13 @@ class TwitterAccountWatcher:
             if len(text) < 15:
                 continue
             self._seen.add(tweet_url)
-            # Tag with source so impact_tracker records it correctly
             headline = RawHeadline(
                 site_url=f"https://x.com/@{self._username}",
                 headline=text,
                 article_url=tweet_url,
                 detected_at=now,
+                source="twitter",
             )
-            headline.source = "twitter"  # type: ignore[attr-defined]
             results.append(headline)
         return results
 
@@ -574,7 +631,7 @@ class TruthSocialWatcher:
                 headline=title,
                 article_url=item_url,
                 detected_at=now,
+                source="truth_social",
             )
-            post.source = "truth_social"  # type: ignore[attr-defined]
             results.append(post)
         return results

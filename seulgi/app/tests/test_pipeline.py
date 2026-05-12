@@ -71,6 +71,8 @@ def _make_trader(balance: float = 1000.0):
     db.close_trade = AsyncMock()
     db.count_open_positions = AsyncMock(return_value=0)
     db.has_open_position = AsyncMock(return_value=False)
+    db.count_unique_open_markets = AsyncMock(return_value=0)
+    db.get_cold_losing_positions = AsyncMock(return_value=[])
     db.update_position_price = AsyncMock()
 
     cfg = MagicMock()
@@ -81,6 +83,8 @@ def _make_trader(balance: float = 1000.0):
     cfg.edge_increment = 0.12
     cfg.position_timeout_hours = 24.0
     cfg.max_open_positions = 20
+    cfg.max_unique_markets = 15
+    cfg.cold_position_hours = 12.0
 
     ai_cfg = MagicMock()
     ai_cfg.min_confidence = 0.45
@@ -115,8 +119,8 @@ class TestYesEdgePipeline:
         assert len(matches) == 1
 
         trader, db = _make_trader(balance=500.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.88, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.88, "bullish")]
         )
 
         # edge = 0.12 * (2*0.88-1) = 0.0912 > min_edge(0.04) → execute
@@ -137,8 +141,8 @@ class TestYesEdgePipeline:
         matches = idx.find_matches(_query_vec())
 
         trader, db = _make_trader(balance=1000.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.90, "very bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.90, "very bullish")]
         )
 
         entry_price = 0.45
@@ -186,8 +190,8 @@ class TestNoEdgePipeline:
         matches = idx.find_matches(_query_vec())
 
         trader, db = _make_trader(balance=500.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.NO, 0.80, "bearish for YES")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.NO, 0.80, "bearish for YES")]
         )
 
         # NO token: edge = 0.12*(2*0.80-1) = 0.072 > 0.04 → execute
@@ -206,8 +210,8 @@ class TestNoEdgePipeline:
         matches = idx.find_matches(_query_vec())
 
         trader, db = _make_trader(balance=1000.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.NO, 0.85, "trade deal unlikely")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.NO, 0.85, "trade deal unlikely")]
         )
 
         entry_price = 0.38
@@ -290,8 +294,8 @@ class TestDuplicatePositionGuard:
         matches = idx.find_matches(_query_vec())
 
         trader, db = _make_trader(balance=1000.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.88, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.88, "bullish")]
         )
 
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):
@@ -322,8 +326,8 @@ class TestMaxPositionsGuard:
 
         idx = _make_market_index(["Will X happen?"])
         matches = idx.find_matches(_query_vec())
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.88, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.88, "bullish")]
         )
 
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):

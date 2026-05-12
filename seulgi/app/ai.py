@@ -97,7 +97,7 @@ Rules:
 - NEUTRAL = not clearly related, ambiguous, or already priced in
 - confidence = how certain you are (0.5 = barely, 1.0 = certain)
 - If current mid price already reflects the news (≥0.85 or ≤0.15), return NEUTRAL
-- Respond with a JSON array of {n} objects, one per question, ordered by idx.
+- Respond with EXACTLY this JSON shape: {{"results": [<array of {n} objects, ordered by idx>]}}
 """
 
 _REPUBLISH_BLOCK = """\
@@ -409,18 +409,21 @@ def _parse_batch_response(data: dict, n: int) -> Optional[list[ClassifyResult]]:
             return None
         parsed = json.loads(text)
 
-        # Unwrap common wrapper keys
+        # Expected shape: {"results": [...]}. Some models still wrap differently;
+        # accept a small set of fallback keys before giving up.
         if isinstance(parsed, dict):
-            for key in ("results", "classifications", "answers", "items", "data"):
-                if key in parsed and isinstance(parsed[key], list):
-                    parsed = parsed[key]
-                    break
+            inner = (
+                parsed.get("results")
+                or parsed.get("classifications")
+                or parsed.get("answers")
+            )
+            if isinstance(inner, list):
+                parsed = inner
+            elif "direction" in parsed:
+                # Single object pretending to be a one-element array
+                parsed = [parsed]
             else:
-                # Maybe it's a single object pretending to be the whole array
-                if "direction" in parsed:
-                    parsed = [parsed]
-                else:
-                    return None
+                return None
 
         if not isinstance(parsed, list):
             return None

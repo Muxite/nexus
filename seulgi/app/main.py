@@ -34,7 +34,8 @@ from engine import EngineRunner, build_engines
 from markets import Embedder, MarketIndex
 from impact_tracker import PriceImpactTracker
 from news_memory import NewsMemory
-from watcher import RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher
+from plotter import QuantPlotter
+from watcher import RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher, SearchBudget
 
 
 def _setup_logging(level: str) -> None:
@@ -60,6 +61,7 @@ async def _market_refresh_loop(
             await asyncio.sleep(interval_secs)
             if index.needs_refresh:
                 count = await index.refresh()
+                await index.load_heat_from_db()
                 dash.set_market_index(count)
                 logger.info("[main] market refresh: %d markets", count)
         except asyncio.CancelledError:
@@ -112,6 +114,15 @@ async def _position_monitor_loop(
             skips = await db.get_engine_skip_reasons()
             dash.set_engine_summary(summary, skips)
 
+            # Quant stats refresh — all-time + 24h + calibration + IC + source + decay
+            quant = await db.get_quant_stats()
+            quant["impact_24h"] = (await db.get_quant_stats(since_hours=24.0))["impact"]
+            quant["calibration"] = await db.get_calibration_curve()
+            quant["ic_pairs"] = await db.get_ic_pairs()
+            quant["source_stats"] = await db.get_source_stats()
+            quant["alpha_decay"] = await db.get_alpha_decay()
+            dash.set_quant_stats(quant)
+
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -119,21 +130,25 @@ async def _position_monitor_loop(
 
 
 async def _watcher_status_loop(
-    watchers: list[SiteWatcher], dash: Dashboard, interval_secs: float = 30.0
+    watchers: list, dash: Dashboard, interval_secs: float = 30.0
 ) -> None:
     while True:
         try:
             await asyncio.sleep(interval_secs)
             for w in watchers:
                 s = w.status
+                # SiteWatcher status uses "url" key; social watchers use "username"
+                url = s.get("url") or f"@{s.get('username', '?')} ({s.get('type', 'social')})"
                 dash.set_watcher_status(WatcherStatus(
-                    url=s["url"],
-                    reachable=s["reachable"],
-                    failures=s["failures"],
-                    last_headline_at=s["last_headline_at"],
-                    last_headline=s["last_headline"],
-                    total_headlines=s["total_headlines"],
-                    is_unreachable=s["is_unreachable"],
+                    url=url,
+                    reachable=s.get("reachable", True),
+                    failures=s.get("failures", 0),
+                    last_headline_at=s.get("last_headline_at") or s.get("last_tweet_at"),
+                    last_headline=s.get("last_headline", ""),
+                    total_headlines=s.get("total_headlines") or s.get("total_tweets") or 0,
+                    is_unreachable=s.get("is_unreachable", False),
+                    budget_used=s.get("budget_used"),
+                    budget_limit=s.get("budget_limit"),
                 ))
         except asyncio.CancelledError:
             break
@@ -180,9 +195,11 @@ async def main() -> None:
     embedder = Embedder()
     index = MarketIndex(db=db, embedder=embedder, cfg=cfg)
     cached = await index.load_from_db()
+    await index.load_heat_from_db()
     if cached == 0 or index.needs_refresh:
         try:
             count = await index.refresh()
+            await index.load_heat_from_db()  # refresh may have added new markets
             dash.set_market_index(count)
             logger.info("[main] market index ready: %d markets", count)
         except Exception as exc:
@@ -252,6 +269,10 @@ async def main() -> None:
             is_unreachable=False,
         ))
 
+    # Shared Brave Search budget across all Twitter watchers
+    brave_budget = SearchBudget(per_hour=cfg.search_budget.brave_per_hour)
+    logger.info("[main] Brave Search budget: %d calls/hour", cfg.search_budget.brave_per_hour)
+
     # Social account watchers
     social_watchers: list = []
     for acc in cfg.social_accounts:
@@ -260,6 +281,7 @@ async def main() -> None:
                 username=acc.username,
                 interval_seconds=acc.interval_seconds,
                 max_failures=acc.max_failures,
+                budget=brave_budget,
             )
         elif acc.platform == "truth_social":
             sw = TruthSocialWatcher(
@@ -281,12 +303,21 @@ async def main() -> None:
     ]
 
     refresh_secs = cfg.markets.refresh_hours * 3600
+
+    # Periodic matplotlib quant plots (every 10 minutes by default)
+    plotter = QuantPlotter(
+        db=db,
+        dashboard_dir=cfg.dashboard.data_dir,
+        interval_secs=cfg.plotter.interval_secs,
+    )
+
     bg_tasks = [
         asyncio.create_task(dash.run(), name="dashboard"),
         asyncio.create_task(_market_refresh_loop(index, refresh_secs, dash), name="market-refresh"),
         asyncio.create_task(_position_monitor_loop(runner, db, dash), name="position-monitor"),
-        asyncio.create_task(_watcher_status_loop(watchers, dash), name="watcher-status"),
+        asyncio.create_task(_watcher_status_loop(all_watchers, dash), name="watcher-status"),
         asyncio.create_task(_headline_drain_loop(queue, runner, dash), name="drain"),
+        asyncio.create_task(plotter.run(), name="quant-plotter"),
     ]
 
     all_tasks = watcher_tasks + bg_tasks

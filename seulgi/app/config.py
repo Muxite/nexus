@@ -72,6 +72,8 @@ class TradingConfig:
     edge_increment: float = 0.12      # max edge boost at confidence=1.0
     position_timeout_hours: float = 24.0
     max_open_positions: int = 20      # hard cap on concurrent positions
+    max_unique_markets: int = 15      # max distinct condition_ids with open positions
+    cold_position_hours: float = 12.0 # hours since last match before a market is "cold"
     mode: str = "paper"
 
 
@@ -93,6 +95,18 @@ class DashboardConfig:
 
 
 @dataclass
+class PlotterConfig:
+    """Periodic matplotlib renderer of quant stats."""
+    interval_secs: float = 600.0   # 10 minutes
+
+
+@dataclass
+class SearchBudgetConfig:
+    """Caps on expensive external API calls."""
+    brave_per_hour: int = 20   # max Brave Search API calls per hour across all Twitter watchers
+
+
+@dataclass
 class EngineConfig:
     """Per-engine trading rule overrides. Unset fields fall back to global trading config."""
     name: str = "default"
@@ -103,6 +117,7 @@ class EngineConfig:
     edge_increment: Optional[float] = None
     position_timeout_hours: Optional[float] = None
     max_open_positions: Optional[int] = None
+    min_confidence: Optional[float] = None   # per-engine override for ai.min_confidence
 
 
 @dataclass
@@ -116,6 +131,8 @@ class Config:
     db: DBConfig = field(default_factory=DBConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     news_memory: NewsMemoryConfig = field(default_factory=NewsMemoryConfig)
+    search_budget: SearchBudgetConfig = field(default_factory=SearchBudgetConfig)
+    plotter: PlotterConfig = field(default_factory=PlotterConfig)
     log_level: str = "INFO"
 
 
@@ -163,6 +180,7 @@ def _build_config(raw: dict) -> Config:
     d = raw.get("db", {})
     dash = raw.get("dashboard", {})
     nm = raw.get("news_memory", {})
+    sb = raw.get("search_budget", {})
 
     social_cfgs = [
         SocialAccount(
@@ -185,6 +203,7 @@ def _build_config(raw: dict) -> Config:
             edge_increment=_opt_float(e.get("edge_increment")),
             position_timeout_hours=_opt_float(e.get("position_timeout_hours")),
             max_open_positions=int(e["max_open_positions"]) if "max_open_positions" in e else None,
+            min_confidence=_opt_float(e.get("min_confidence")),
         )
         for i, e in enumerate(raw.get("engines", []))
     ]
@@ -219,12 +238,20 @@ def _build_config(raw: dict) -> Config:
             edge_increment=float(t.get("edge_increment", 0.12)),
             position_timeout_hours=float(t.get("position_timeout_hours", 24.0)),
             max_open_positions=int(t.get("max_open_positions", 20)),
+            max_unique_markets=int(t.get("max_unique_markets", 15)),
+            cold_position_hours=float(t.get("cold_position_hours", 12.0)),
             mode=str(t.get("mode", "paper")),
         ),
         db=DBConfig(path=str(d.get("path", "/data/seulgi.db"))),
         dashboard=DashboardConfig(
             data_dir=str(dash.get("data_dir", "/data/dashboard")),
             interval_secs=float(dash.get("interval_secs", 30.0)),
+        ),
+        search_budget=SearchBudgetConfig(
+            brave_per_hour=int(sb.get("brave_per_hour", 20)),
+        ),
+        plotter=PlotterConfig(
+            interval_secs=float(raw.get("plotter", {}).get("interval_secs", 600.0)),
         ),
         log_level=str(raw.get("log_level", "INFO")),
     )

@@ -364,4 +364,28 @@ def _hypothesis_summary(rows: list[dict]) -> list[str]:
                      f"Max |Δ5m| = {max(all_d5):.4f}  n={len(all_d5)}")
         lines.append("  (>0.01 Δ5m suggests markets do react to news within 5 minutes)")
 
+    # Per-source breakdown
+    by_source: dict[str, dict] = {}
+    for r in rows:
+        d = r.get("direction", "")
+        d5 = r.get("delta_t5m")
+        src = r.get("source") or "news"
+        if d5 is None or d not in ("YES", "NO"):
+            continue
+        s = by_source.setdefault(src, {"n": 0, "hits": 0, "abs_sum": 0.0})
+        s["n"] += 1
+        s["abs_sum"] += abs(d5)
+        if (d == "YES" and d5 > 0) or (d == "NO" and d5 < 0):
+            s["hits"] += 1
+    if by_source:
+        lines.append("")
+        lines.append("  BY SOURCE:")
+        for src, s in sorted(by_source.items(), key=lambda kv: -kv[1]["n"]):
+            n = s["n"]
+            rate = 100 * s["hits"] / n if n else 0
+            avg_abs = s["abs_sum"] / n if n else 0.0
+            lines.append(
+                f"    {src:<14} n={n:>4}  hit_rate={rate:>3.0f}%  avg|Δ5m|={avg_abs:.4f}"
+            )
+
     return lines

@@ -230,7 +230,7 @@ class TestDirectionClassifier:
             result = await clf.classify("headline", "question?")
 
         assert result.direction == Direction.NEUTRAL
-        assert result.reason == "rate_limited"
+        assert result.reason == "api_error"
 
     @pytest.mark.asyncio
     async def test_semaphore_limits_concurrency(self):

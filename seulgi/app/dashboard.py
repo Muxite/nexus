@@ -122,6 +122,8 @@ class WatcherStatus:
     last_headline: str
     total_headlines: int
     is_unreachable: bool
+    budget_used: Optional[int] = None    # Brave calls in last hour (Twitter watchers only)
+    budget_limit: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -160,6 +162,12 @@ class Dashboard:
         # Engine comparison summary rows (from DB query)
         self._engine_summary: list[dict] = []
         self._engine_skip_reasons: list[dict] = []
+
+        # Signal journal (non-NEUTRAL AI decisions with outcomes)
+        self._journal: collections.deque[dict] = collections.deque(maxlen=200)
+
+        # Quant stats (updated from DB periodically)
+        self._quant_stats: dict = {}
 
         self._flush_now = asyncio.Event()
 
@@ -307,6 +315,32 @@ class Dashboard:
     def set_watcher_status(self, status: WatcherStatus) -> None:
         self._watcher_statuses[status.url] = status
 
+    def record_signal_journal(
+        self,
+        headline: str,
+        market: str,
+        direction: str,
+        confidence: float,
+        similarity: float,
+        engine_name: str,
+        outcome: str,
+        headline_id: str = "",
+    ) -> None:
+        self._journal.appendleft({
+            "ts": datetime.now(timezone.utc),
+            "headline": headline,
+            "market": market,
+            "direction": direction,
+            "confidence": confidence,
+            "similarity": similarity,
+            "engine": engine_name,
+            "outcome": outcome,
+            "headline_id": headline_id,
+        })
+
+    def set_quant_stats(self, stats: dict) -> None:
+        self._quant_stats = stats
+
     def set_market_index(self, count: int) -> None:
         self._market_count = count
         self._market_last_refresh = datetime.now(timezone.utc)
@@ -354,6 +388,8 @@ class Dashboard:
             self._write_engine_comparison(),
             self._write_activity_log(),
             self._write_trace_log(),
+            self._write_signal_journal(),
+            self._write_quant_stats(),
         )
 
     # ------------------------------------------------------------------
@@ -528,6 +564,9 @@ class Dashboard:
                 lines.append(f"    Total headlines: {ws.total_headlines}")
                 if ws.last_headline:
                     lines.append(f"    Latest         : {ws.last_headline[:90]}")
+                if ws.budget_limit:
+                    pct = int((ws.budget_used or 0) / ws.budget_limit * 100)
+                    lines.append(f"    Brave budget   : {ws.budget_used}/{ws.budget_limit} calls/hr  ({pct}%)")
                 lines.append("")
         _write(self._path("watcher_status.txt"), "\n".join(lines) + "\n")
 
@@ -555,17 +594,19 @@ class Dashboard:
             # Header row
             lines.append(
                 f"  {'ENGINE':<20} {'EXEC':>6} {'SKIP':>6} {'STAKED':>9}  "
-                f"{'AVG EDGE':>9}  {'AVG CONF':>9}  {'BALANCE':>10}  FIRST → LAST"
+                f"{'AVG EDGE':>9}  {'AVG CONF':>9}  {'LAT ms':>7}  {'BALANCE':>10}  FIRST → LAST"
             )
-            lines.append("  " + "─" * 100)
+            lines.append("  " + "─" * 110)
             for row in self._engine_summary:
                 name = row["engine_name"]
                 bal = self._engine_balances.get(name, 0.0)
+                lat = row.get("avg_latency_ms") or 0.0
                 lines.append(
                     f"  {name:<20} {row['executed_count']:>6} {row['skipped_count']:>6} "
                     f"${row['total_staked']:>8.2f}  "
                     f"{row['avg_edge']:>+9.4f}  "
                     f"{row['avg_confidence']:>8.1%}  "
+                    f"{lat:>6.0f}ms  "
                     f"${bal:>9.2f}  "
                     f"{(row['first_trade'] or '')[:16]} → {(row['last_trade'] or '')[:16]}"
                 )
@@ -583,6 +624,162 @@ class Dashboard:
         lines.append("")
         lines.append("  See engine_results table in seulgi.db for full history.")
         _write(self._path("engine_comparison.txt"), "\n".join(lines) + "\n")
+
+    async def _write_signal_journal(self) -> None:
+        lines = [
+            _header("SIGNAL JOURNAL  (non-NEUTRAL AI decisions, newest first)"),
+            "  Every non-NEUTRAL signal from any engine — whether traded or skipped.",
+            "  Use this to see if the AI is reasoning about the right markets.",
+            "",
+        ]
+        if not self._journal:
+            lines.append("  (no non-NEUTRAL signals yet — AI may be returning mostly NEUTRAL)")
+        else:
+            _DIR_SYMBOL = {"YES": "▲", "NO": "▼"}
+            for e in self._journal:
+                sym = _DIR_SYMBOL.get(e["direction"], "?")
+                lines.append(
+                    f"  [{_ts(e['ts'])}] [{e['engine']:<12}] "
+                    f"{sym} {e['direction']:<4}  conf={e['confidence']:.0%}  sim={e['similarity']:.2f}"
+                )
+                lines.append(f"    Headline : {e['headline'][:95]}")
+                lines.append(f"    Market   : {e['market'][:95]}")
+                lines.append(f"    Outcome  : {e['outcome']}")
+                if e["headline_id"]:
+                    lines.append(f"    hid={e['headline_id'][:8]}")
+                lines.append("")
+        _write(self._path("signal_journal.txt"), "\n".join(lines) + "\n")
+
+    async def _write_quant_stats(self) -> None:
+        lines = [_header("QUANT STATS  — bring to quant meeting")]
+        if not self._quant_stats:
+            lines.append("  (no data yet — run for at least 1 hour to collect price impacts)")
+            _write(self._path("quant_stats.txt"), "\n".join(lines) + "\n")
+            return
+
+        impact = self._quant_stats.get("impact", [])
+        impact_24h = self._quant_stats.get("impact_24h", [])
+        lat = self._quant_stats.get("latency", {})
+        calibration = self._quant_stats.get("calibration", [])
+        ic_pairs = self._quant_stats.get("ic_pairs", [])
+        source_stats = self._quant_stats.get("source_stats", [])
+        alpha_decay = self._quant_stats.get("alpha_decay", [])
+
+        # ── 1. PREDICTION ACCURACY with Wilson CI + 24h rolling column ───────
+        lines.append("")
+        lines.append("  PREDICTION ACCURACY  (did price move in predicted direction within 5m?)")
+        lines.append(
+            f"  {'DIR':<4} {'N':>5} {'PREC':>7}  {'95% CI':>16}  "
+            f"{'AVG Δ5m':>9} {'AVG|Δ5m|':>9}   {'24h N':>6} {'24h PREC':>9}"
+        )
+        lines.append("  " + "─" * 84)
+        by_dir_24h = {r["direction"]: r for r in impact_24h}
+        for row in impact:
+            n = row["n"] or 0
+            hits = row["hits"] or 0
+            prec = hits / n if n else 0.0
+            lo, hi = _wilson_ci(hits, n)
+            avg_d = row["avg_delta_t5m"] or 0.0
+            avg_abs = row["avg_abs_delta_t5m"] or 0.0
+            r24 = by_dir_24h.get(row["direction"], {})
+            n24 = r24.get("n") or 0
+            prec24 = (r24.get("hits") or 0) / n24 if n24 else 0.0
+            ci_str = f"{lo:.1%}–{hi:.1%}"
+            sig = " ✓" if n >= 30 and lo > 0.50 else ""
+            lines.append(
+                f"  {row['direction']:<4} {n:>5} {prec:>6.1%}  {ci_str:>16}  "
+                f"{avg_d:>+8.4f} {avg_abs:>8.4f}   {n24:>6} {prec24:>8.1%}{sig}"
+            )
+        lines.append("")
+        lines.append("  ✓ = lower CI bound > 50% with N ≥ 30  (statistically significant alpha)")
+
+        # ── 2. INFORMATION COEFFICIENT ──────────────────────────────────────
+        if ic_pairs:
+            xs = [p[0] for p in ic_pairs]
+            ys = [p[1] for p in ic_pairs]
+            ic = _pearson(xs, ys)
+            lines.append("")
+            lines.append("  INFORMATION COEFFICIENT  (Pearson correlation: signed_confidence vs Δ5m)")
+            lines.append(f"    IC = {ic:+.4f}   N = {len(ic_pairs)}")
+            if abs(ic) >= 0.10:
+                lines.append("    Interpretation: STRONG signal (|IC| ≥ 0.10).")
+            elif abs(ic) >= 0.05:
+                lines.append("    Interpretation: useful alpha (0.05 ≤ |IC| < 0.10).")
+            else:
+                lines.append("    Interpretation: weak / noise (|IC| < 0.05).")
+
+        # ── 3. CALIBRATION CURVE ────────────────────────────────────────────
+        if calibration:
+            lines.append("")
+            lines.append("  CALIBRATION  (does conf=0.7 → 70% hit rate?)")
+            lines.append(f"  {'CONF':<5} {'N':>5}  {'HIT RATE':>9}  {'AVG|Δ5m|':>10}")
+            lines.append("  " + "─" * 38)
+            for row in calibration:
+                n = row["n"] or 0
+                hits = row["hits"] or 0
+                rate = hits / n if n else 0.0
+                avg_abs = row["avg_abs_delta"] or 0.0
+                lines.append(
+                    f"  {row['conf_bucket']:<5.1f} {n:>5}  {rate:>8.1%}  {avg_abs:>9.4f}"
+                )
+            lines.append("  Monotonically rising = model is well-calibrated.")
+            lines.append("  Flat line = overconfident; threshold tuning may help.")
+
+        # ── 4. SOURCE STRATIFICATION ────────────────────────────────────────
+        if source_stats:
+            lines.append("")
+            lines.append("  BY SOURCE  (news vs twitter vs truth_social)")
+            lines.append(
+                f"  {'SOURCE':<14} {'N':>5}  {'HIT RATE':>9}  {'AVG|Δ5m|':>10}  {'AVG CONF':>9}"
+            )
+            lines.append("  " + "─" * 60)
+            for row in source_stats:
+                n = row["n"] or 0
+                hits = row["hits"] or 0
+                rate = hits / n if n else 0.0
+                avg_abs = row["avg_abs_delta"] or 0.0
+                avg_conf = row["avg_confidence"] or 0.0
+                lines.append(
+                    f"  {row['source']:<14} {n:>5}  {rate:>8.1%}  "
+                    f"{avg_abs:>9.4f}  {avg_conf:>8.1%}"
+                )
+
+        # ── 5. ALPHA DECAY ──────────────────────────────────────────────────
+        if alpha_decay:
+            lines.append("")
+            lines.append("  ALPHA DECAY  (hit rate at each time bucket; rows where 60m is filled)")
+            lines.append(
+                f"  {'DIR':<4} {'N':>5}  {'1m':>6} {'5m':>6} {'15m':>6} {'30m':>6} {'60m':>6}"
+            )
+            lines.append("  " + "─" * 46)
+            for row in alpha_decay:
+                lines.append(
+                    f"  {row['direction']:<4} {row['n']:>5}  "
+                    f"{(row['hit_t1m']  or 0):>5.1%} "
+                    f"{(row['hit_t5m']  or 0):>5.1%} "
+                    f"{(row['hit_t15m'] or 0):>5.1%} "
+                    f"{(row['hit_t30m'] or 0):>5.1%} "
+                    f"{(row['hit_t60m'] or 0):>5.1%}"
+                )
+            lines.append("  hit(1m) > hit(60m) → alpha decays fast → speed matters.")
+            lines.append("  hit(60m) > hit(1m) → market digests slowly → wide entry window.")
+
+        # ── 6. SIGNAL LATENCY ───────────────────────────────────────────────
+        lines.append("")
+        lines.append("  SIGNAL LATENCY  (headline detection → trade decision, includes AI call)")
+        n_lat = lat.get("n") or 0
+        if n_lat:
+            lines.append(f"    Samples : {n_lat}")
+            lines.append(f"    Average : {lat.get('avg_ms') or 0:.0f} ms")
+            lines.append(f"    Min     : {lat.get('min_ms') or 0:.0f} ms")
+            lines.append(f"    Max     : {lat.get('max_ms') or 0:.0f} ms")
+            lines.append("")
+            lines.append("    Target: < 5000ms (5s) headline-to-trade.")
+            lines.append("    Even at 30s we beat human traders — FPGAs are sub-1ms.")
+        else:
+            lines.append("    (no latency data yet)")
+
+        _write(self._path("quant_stats.txt"), "\n".join(lines) + "\n")
 
     async def _write_activity_log(self) -> None:
         lines = [_header("ACTIVITY LOG  (newest first)")]
@@ -613,6 +810,35 @@ class Dashboard:
 # ---------------------------------------------------------------------------
 # File/format utilities
 # ---------------------------------------------------------------------------
+
+
+def _wilson_ci(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """
+    95% Wilson confidence interval for a binomial proportion.
+
+    Returns (low, high). Stable for small N (unlike the normal-approximation CI).
+    """
+    if n == 0:
+        return 0.0, 1.0
+    p = hits / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return max(0.0, centre - margin), min(1.0, centre + margin)
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float:
+    """Pearson correlation. Pure stdlib — no numpy/scipy."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sx2 = sum((x - mx) ** 2 for x in xs)
+    sy2 = sum((y - my) ** 2 for y in ys)
+    den = (sx2 * sy2) ** 0.5
+    return num / den if den else 0.0
 
 
 def _ts(dt: Optional[datetime]) -> str:

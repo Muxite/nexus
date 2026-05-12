@@ -71,6 +71,7 @@ def _make_engine(name="eng", balance=1000.0) -> Engine:
 def _make_runner(engines=None, n_matches=1):
     db = MagicMock()
     db.record_engine_decisions = AsyncMock()
+    db.bump_market_heat = AsyncMock()
     embedder = MagicMock()
     vec = np.ones(384, dtype=np.float32)
     vec /= np.linalg.norm(vec)

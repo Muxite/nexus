@@ -43,6 +43,8 @@ def _make_cfg(
     edge_increment=0.12,
     timeout_hours=24.0,
     max_open=20,
+    max_unique_markets=15,
+    cold_position_hours=12.0,
 ):
     cfg = MagicMock()
     cfg.balance_usdc = balance
@@ -52,6 +54,8 @@ def _make_cfg(
     cfg.edge_increment = edge_increment
     cfg.position_timeout_hours = timeout_hours
     cfg.max_open_positions = max_open
+    cfg.max_unique_markets = max_unique_markets
+    cfg.cold_position_hours = cold_position_hours
     return cfg
 
 
@@ -70,6 +74,8 @@ def _make_trader(balance=1000.0, min_edge=0.04, max_open=20):
     db.close_trade = AsyncMock()
     db.count_open_positions = AsyncMock(return_value=0)
     db.has_open_position = AsyncMock(return_value=False)
+    db.count_unique_open_markets = AsyncMock(return_value=0)
+    db.get_cold_losing_positions = AsyncMock(return_value=[])
     db.update_position_price = AsyncMock()
 
     cfg = _make_cfg(balance=balance, min_edge=min_edge, max_open=max_open)
@@ -115,8 +121,8 @@ class TestEdgeModel:
     @pytest.mark.asyncio
     async def test_edge_scales_with_confidence(self):
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.85, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.85, "bullish")]
         )
         mid = 0.45
         # expected: edge = 0.12 * (2*0.85 - 1) = 0.12 * 0.7 = 0.084
@@ -133,8 +139,8 @@ class TestEdgeModel:
         trader, db = _make_trader()
         # Force past the min_confidence filter (set it to 0)
         trader._ai_cfg.min_confidence = 0.0
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.5, "meh")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.5, "meh")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -145,8 +151,8 @@ class TestEdgeModel:
     async def test_no_direction_uses_no_token(self):
         """NO direction should use token_no, not token_yes."""
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.NO, 0.80, "bearish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.NO, 0.80, "bearish")]
         )
         calls = []
         async def _track_price(session, token_id):
@@ -162,8 +168,8 @@ class TestEdgeModel:
     @pytest.mark.asyncio
     async def test_yes_direction_uses_yes_token(self):
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.80, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.80, "bullish")]
         )
         calls = []
         async def _track_price(session, token_id):
@@ -185,8 +191,8 @@ class TestProcessSkips:
     @pytest.mark.asyncio
     async def test_neutral_skipped(self):
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.NEUTRAL, 0.5, "unclear")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.NEUTRAL, 0.5, "unclear")]
         )
         decisions = await trader.process(_make_headline(), [_make_match()])
         assert not decisions[0].executed
@@ -196,8 +202,8 @@ class TestProcessSkips:
     @pytest.mark.asyncio
     async def test_low_confidence_skipped(self):
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.30, "not sure")  # < 0.45
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.30, "not sure")]  # < 0.45
         )
         decisions = await trader.process(_make_headline(), [_make_match()])
         assert not decisions[0].executed
@@ -206,8 +212,8 @@ class TestProcessSkips:
     @pytest.mark.asyncio
     async def test_no_token_skipped(self):
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.8, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.8, "bullish")]
         )
         decisions = await trader.process(_make_headline(), [_make_match(token_yes=None, token_no=None)])
         assert not decisions[0].executed
@@ -216,8 +222,8 @@ class TestProcessSkips:
     @pytest.mark.asyncio
     async def test_no_price_skipped(self):
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.8, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.8, "bullish")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=None)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -229,8 +235,8 @@ class TestProcessSkips:
         # conf=0.8, edge_increment=0.12 → edge = 0.12*(1.6-1) = 0.072
         # min_edge=0.20 → skip
         trader, db = _make_trader(min_edge=0.20)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.80, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.80, "bullish")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -240,8 +246,8 @@ class TestProcessSkips:
     @pytest.mark.asyncio
     async def test_no_balance_skipped(self):
         trader, db = _make_trader(balance=0.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.8, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.8, "bullish")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -254,8 +260,8 @@ class TestProcessSkips:
     async def test_max_positions_skipped(self):
         trader, db = _make_trader(max_open=2)
         db.count_open_positions = AsyncMock(return_value=2)  # already at limit
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.85, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.85, "bullish")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -266,8 +272,8 @@ class TestProcessSkips:
     async def test_duplicate_position_skipped(self):
         trader, db = _make_trader()
         db.has_open_position = AsyncMock(return_value=True)  # already open
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.85, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.85, "bullish")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -284,8 +290,8 @@ class TestProcessExecution:
     @pytest.mark.asyncio
     async def test_yes_trade_executed(self):
         trader, db = _make_trader(balance=1000.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.85, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.YES, 0.85, "bullish")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.45)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -299,8 +305,8 @@ class TestProcessExecution:
     @pytest.mark.asyncio
     async def test_no_trade_executed(self):
         trader, db = _make_trader()
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.NO, 0.75, "bearish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[ClassifyResult(Direction.NO, 0.75, "bearish")]
         )
         with patch("trader._fetch_mid_price", AsyncMock(return_value=0.40)):
             decisions = await trader.process(_make_headline(), [_make_match()])
@@ -317,8 +323,11 @@ class TestProcessExecution:
     @pytest.mark.asyncio
     async def test_multiple_matches_evaluated(self):
         trader, db = _make_trader(balance=1000.0)
-        trader._classifier.classify = AsyncMock(
-            return_value=ClassifyResult(Direction.YES, 0.85, "bullish")
+        trader._classifier.classify_batch = AsyncMock(
+            return_value=[
+                ClassifyResult(Direction.YES, 0.85, "bullish"),
+                ClassifyResult(Direction.YES, 0.85, "bullish"),
+            ]
         )
         matches = [
             MarketMatch("cid1", "Q1?", "ty1", "tn1", 0.80),
@@ -328,36 +337,26 @@ class TestProcessExecution:
             decisions = await trader.process(_make_headline(), matches)
 
         assert len(decisions) == 2
-        # First should execute; second is a duplicate (same cid — wait, different cid)
         # Both should execute since they have different condition_ids
         executed = [d for d in decisions if d.executed]
         assert len(executed) == 2
 
     @pytest.mark.asyncio
-    async def test_ai_calls_are_parallel(self):
-        """All AI classify calls for a batch of matches should be issued concurrently."""
+    async def test_ai_calls_are_batched(self):
+        """All matches for a headline should be classified in one batch call."""
         trader, db = _make_trader()
-        call_order = []
-
-        async def _slow_classify(headline, question):
-            call_order.append(question)
-            await asyncio.sleep(0.01)
-            return ClassifyResult(Direction.NEUTRAL, 0.5, "neutral")
-
-        trader._classifier.classify = _slow_classify
         matches = [
             MarketMatch(f"cid{i}", f"Q{i}?", f"ty{i}", f"tn{i}", 0.7)
             for i in range(5)
         ]
+        batch_results = [ClassifyResult(Direction.NEUTRAL, 0.5, "neutral")] * 5
+        trader._classifier.classify_batch = AsyncMock(return_value=batch_results)
 
-        import time
-        t0 = time.monotonic()
-        await trader.process(_make_headline(), matches)
-        elapsed = time.monotonic() - t0
+        decisions = await trader.process(_make_headline(), matches)
 
-        # If sequential: ≥ 5×0.01 = 0.05s; if parallel: ~0.01s
-        assert elapsed < 0.04, f"Classify calls appear sequential (took {elapsed:.3f}s)"
-        assert len(call_order) == 5
+        # classify_batch should be called once for the whole batch
+        trader._classifier.classify_batch.assert_called_once()
+        assert len(decisions) == 5
 
 
 # ---------------------------------------------------------------------------

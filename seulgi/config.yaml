@@ -125,6 +125,8 @@ trading:
                               # edge = edge_increment × (2×confidence − 1)
   position_timeout_hours: 24  # close any position open longer than this
   max_open_positions: 20      # hard cap on concurrent open positions
+  max_unique_markets: 15      # max distinct markets with open positions at once
+  cold_position_hours: 12.0   # hours since last headline match before a losing market is culled
   mode: "paper"
 
 # ── Trading engines ──────────────────────────────────────────────────────────
@@ -134,25 +136,25 @@ trading:
 # Remove this section entirely for a single default engine.
 engines:
   - name: "aggressive"
-    min_edge: 0.02
-    edge_increment: 0.15
+    min_edge: 0.005           # fire on almost any positive edge
+    edge_increment: 0.20
     max_position_usdc: 150.0
-    min_confidence: 0.30
+    min_confidence: 0.25      # fires at conf ≥ 0.51 (edge = 0.20 × 0.02 > 0.005)
     max_open_positions: 30
+
+  - name: "balanced"
+    min_edge: 0.03
+    edge_increment: 0.12
+    max_position_usdc: 100.0
+    min_confidence: 0.40
+    max_open_positions: 20
 
   - name: "conservative"
     min_edge: 0.06
     edge_increment: 0.10
     max_position_usdc: 50.0
-    min_confidence: 0.50
+    min_confidence: 0.55
     max_open_positions: 10
-
-  - name: "balanced"
-    # inherits all global trading defaults
-    min_edge: 0.04
-    edge_increment: 0.12
-    max_position_usdc: 100.0
-    min_confidence: 0.35
 
 # ── Database ─────────────────────────────────────────────────────────────────
 db:
@@ -167,6 +169,18 @@ dashboard:
 news_memory:
   path: "/data/news_chroma"           # ChromaDB persistent directory
   dedup_distance_threshold: 0.12      # cosine distance below this = republish (~0.88 sim)
+
+# ── Brave Search budget ──────────────────────────────────────────────────────
+# Shared across all Twitter watchers. Free tier = 2000/month (~67/day, ~3/hr).
+# Set to 20 to be safe; increase if you upgrade your plan.
+search_budget:
+  brave_per_hour: 20
+
+# ── Quant plotter ────────────────────────────────────────────────────────────
+# Periodically renders matplotlib charts of price-impact stats to
+# data/dashboard/plots/*.png. Uses ALL available data — longer run = richer plot.
+plotter:
+  interval_secs: 600   # 10 minutes
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 log_level: "INFO"               # DEBUG for verbose Playwright + embedding output

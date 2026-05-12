@@ -139,6 +139,13 @@ _MIGRATIONS = [
     "ALTER TABLE signals        ADD COLUMN headline_id TEXT",
     "ALTER TABLE trades         ADD COLUMN headline_id TEXT",
     "ALTER TABLE engine_results ADD COLUMN headline_id TEXT",
+    # market heat tracking
+    "ALTER TABLE markets ADD COLUMN match_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE markets ADD COLUMN last_matched_at TEXT",
+    # signal latency
+    "ALTER TABLE engine_results ADD COLUMN signal_latency_ms REAL",
+    # per-engine position isolation
+    "ALTER TABLE positions ADD COLUMN engine_name TEXT NOT NULL DEFAULT 'default'",
 ]
 
 
@@ -197,11 +204,21 @@ class SeulgiDB:
         embedding: Optional[np.ndarray],
     ) -> None:
         emb_bytes = embedding.tobytes() if embedding is not None else None
+        # NOTE: do NOT use INSERT OR REPLACE — it would wipe match_count/last_matched_at
+        # (REPLACE = DELETE + INSERT, defaulting columns not in VALUES).
         await self._conn.execute(
             """
-            INSERT OR REPLACE INTO markets
+            INSERT INTO markets
               (condition_id, question, token_yes, token_no, end_date, volume_usdc, embedding, fetched_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(condition_id) DO UPDATE SET
+              question    = excluded.question,
+              token_yes   = excluded.token_yes,
+              token_no    = excluded.token_no,
+              end_date    = excluded.end_date,
+              volume_usdc = excluded.volume_usdc,
+              embedding   = excluded.embedding,
+              fetched_at  = excluded.fetched_at
             """,
             (condition_id, question, token_yes, token_no, end_date,
              volume_usdc, emb_bytes, _now_iso()),
@@ -312,40 +329,70 @@ class SeulgiDB:
         size_usdc: float,
         entry_price: float,
         p_hat: float,
+        engine_name: str = "default",
     ) -> None:
         await self._conn.execute(
             """
             INSERT OR REPLACE INTO positions
               (trade_id, condition_id, question, token_id, direction,
-               size_usdc, entry_price, opened_at, last_price, unrealized_pnl, p_hat)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?)
+               size_usdc, entry_price, opened_at, last_price, unrealized_pnl, p_hat,
+               engine_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?)
             """,
             (trade_id, condition_id, question, token_id, direction,
-             size_usdc, entry_price, _now_iso(), entry_price, p_hat),
+             size_usdc, entry_price, _now_iso(), entry_price, p_hat, engine_name),
         )
         await self._conn.commit()
 
-    async def get_open_positions(self) -> list[dict]:
-        async with self._conn.execute("SELECT * FROM positions") as cur:
-            rows = await cur.fetchall()
+    async def get_open_positions(self, engine_name: Optional[str] = None) -> list[dict]:
+        """Return open positions, optionally filtered to one engine."""
+        if engine_name is None:
+            async with self._conn.execute("SELECT * FROM positions") as cur:
+                rows = await cur.fetchall()
+        else:
+            async with self._conn.execute(
+                "SELECT * FROM positions WHERE engine_name = ?", (engine_name,)
+            ) as cur:
+                rows = await cur.fetchall()
         return [dict(row) for row in rows]
 
-    async def has_open_position(self, condition_id: str) -> bool:
+    async def has_open_position(
+        self, condition_id: str, engine_name: Optional[str] = None
+    ) -> bool:
+        if engine_name is None:
+            async with self._conn.execute(
+                "SELECT 1 FROM positions WHERE condition_id = ? LIMIT 1",
+                (condition_id,),
+            ) as cur:
+                return await cur.fetchone() is not None
         async with self._conn.execute(
-            "SELECT 1 FROM positions WHERE condition_id = ? LIMIT 1",
-            (condition_id,),
+            "SELECT 1 FROM positions WHERE condition_id = ? AND engine_name = ? LIMIT 1",
+            (condition_id, engine_name),
         ) as cur:
             return await cur.fetchone() is not None
 
-    async def count_open_positions(self) -> int:
-        async with self._conn.execute("SELECT COUNT(*) FROM positions") as cur:
+    async def count_open_positions(self, engine_name: Optional[str] = None) -> int:
+        if engine_name is None:
+            async with self._conn.execute("SELECT COUNT(*) FROM positions") as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
+        async with self._conn.execute(
+            "SELECT COUNT(*) FROM positions WHERE engine_name = ?", (engine_name,)
+        ) as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
 
-    async def get_committed_usdc(self) -> float:
-        """Sum of size_usdc across all open positions — used to restore balance."""
+    async def get_committed_usdc(self, engine_name: Optional[str] = None) -> float:
+        """Sum of size_usdc across open positions — used to restore balance per engine."""
+        if engine_name is None:
+            async with self._conn.execute(
+                "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions"
+            ) as cur:
+                row = await cur.fetchone()
+                return float(row[0]) if row else 0.0
         async with self._conn.execute(
-            "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions"
+            "SELECT COALESCE(SUM(size_usdc), 0.0) FROM positions WHERE engine_name = ?",
+            (engine_name,),
         ) as cur:
             row = await cur.fetchone()
             return float(row[0]) if row else 0.0
@@ -382,7 +429,11 @@ class SeulgiDB:
     # ------------------------------------------------------------------
 
     async def record_engine_decisions(
-        self, engine_name: str, decisions: list, headline_id: Optional[str] = None
+        self,
+        engine_name: str,
+        decisions: list,
+        headline_id: Optional[str] = None,
+        signal_latency_ms: Optional[float] = None,
     ) -> None:
         """Bulk-insert all TradeDecision objects from one engine run."""
         now = _now_iso()
@@ -402,6 +453,7 @@ class SeulgiDB:
                 d.skip_reason,
                 now,
                 headline_id,
+                signal_latency_ms,
             )
             for d in decisions
         ]
@@ -410,8 +462,8 @@ class SeulgiDB:
             INSERT INTO engine_results
               (engine_name, condition_id, question, direction, confidence,
                similarity, p_hat, mid_price, edge, size_usdc, executed,
-               skip_reason, decided_at, headline_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               skip_reason, decided_at, headline_id, signal_latency_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -432,6 +484,7 @@ class SeulgiDB:
                 COALESCE(SUM(CASE WHEN executed=1 THEN size_usdc END), 0) AS total_staked,
                 COALESCE(AVG(CASE WHEN executed=1 THEN edge END), 0)      AS avg_edge,
                 COALESCE(AVG(CASE WHEN executed=1 THEN confidence END), 0) AS avg_confidence,
+                COALESCE(AVG(signal_latency_ms), 0)             AS avg_latency_ms,
                 MIN(decided_at)                                 AS first_trade,
                 MAX(decided_at)                                 AS last_trade
             FROM engine_results
@@ -552,3 +605,203 @@ class SeulgiDB:
         ) as cur:
             rows = await cur.fetchall()
         return [dict(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Market heat tracking
+    # ------------------------------------------------------------------
+
+    async def bump_market_heat(self, condition_ids: list[str]) -> None:
+        """Increment match_count and update last_matched_at for matched markets."""
+        if not condition_ids:
+            return
+        now = _now_iso()
+        await self._conn.executemany(
+            "UPDATE markets SET match_count = match_count + 1, last_matched_at = ? WHERE condition_id = ?",
+            [(now, cid) for cid in condition_ids],
+        )
+        await self._conn.commit()
+
+    async def count_unique_open_markets(self, engine_name: Optional[str] = None) -> int:
+        """Return number of distinct condition_ids with open positions (optionally per engine)."""
+        if engine_name is None:
+            async with self._conn.execute(
+                "SELECT COUNT(DISTINCT condition_id) FROM positions"
+            ) as cur:
+                row = await cur.fetchone()
+                return row[0] if row else 0
+        async with self._conn.execute(
+            "SELECT COUNT(DISTINCT condition_id) FROM positions WHERE engine_name = ?",
+            (engine_name,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    async def get_cold_losing_positions(
+        self,
+        cold_threshold_hours: float = 12.0,
+        engine_name: Optional[str] = None,
+    ) -> list[dict]:
+        """Return losing positions in markets that haven't matched any headline recently."""
+        sql = """
+            SELECT p.trade_id, p.condition_id, p.token_id, p.direction,
+                   p.size_usdc, p.entry_price, p.unrealized_pnl, p.engine_name
+            FROM positions p
+            LEFT JOIN markets m ON p.condition_id = m.condition_id
+            WHERE p.unrealized_pnl < 0
+              AND (m.last_matched_at IS NULL
+                   OR m.last_matched_at < datetime('now', ? || ' hours'))
+        """
+        params: tuple = (f"-{cold_threshold_hours:.0f}",)
+        if engine_name is not None:
+            sql += " AND p.engine_name = ?"
+            params = params + (engine_name,)
+        async with self._conn.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_quant_stats(self, since_hours: Optional[float] = None) -> dict:
+        """
+        Return prediction accuracy and signal latency stats for quant analysis.
+
+        If `since_hours` is set, only consider rows newer than that window
+        (used to produce a rolling 24h column alongside all-time).
+        """
+        time_clause = (
+            f" AND detected_at > datetime('now', '-{since_hours:.0f} hours')"
+            if since_hours is not None else ""
+        )
+        lat_time_clause = (
+            f" AND decided_at > datetime('now', '-{since_hours:.0f} hours')"
+            if since_hours is not None else ""
+        )
+        async with self._conn.execute(
+            f"""
+            SELECT direction,
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN (direction='YES' AND delta_t5m > 0)
+                                 OR (direction='NO' AND delta_t5m < 0) THEN 1 ELSE 0 END) AS hits,
+                   AVG(delta_t5m) AS avg_delta_t5m,
+                   AVG(ABS(delta_t5m)) AS avg_abs_delta_t5m
+            FROM price_impacts
+            WHERE delta_t5m IS NOT NULL AND direction IN ('YES','NO')
+            {time_clause}
+            GROUP BY direction
+            """
+        ) as cur:
+            impact = [dict(r) for r in await cur.fetchall()]
+        async with self._conn.execute(
+            f"""
+            SELECT AVG(signal_latency_ms) AS avg_ms,
+                   MIN(signal_latency_ms) AS min_ms,
+                   MAX(signal_latency_ms) AS max_ms,
+                   COUNT(signal_latency_ms) AS n
+            FROM engine_results
+            WHERE signal_latency_ms IS NOT NULL
+            {lat_time_clause}
+            """
+        ) as cur:
+            lat = dict(await cur.fetchone() or {})
+        return {"impact": impact, "latency": lat}
+
+    # ------------------------------------------------------------------
+    # Statistical analysis — calibration, IC, source split, alpha decay
+    # ------------------------------------------------------------------
+
+    async def get_calibration_curve(self) -> list[dict]:
+        """
+        Return hit rate bucketed by confidence decile.
+        A well-calibrated model: conf=0.7 → ~70% hit rate.
+        """
+        async with self._conn.execute(
+            """
+            SELECT ROUND(ai_confidence * 10) / 10.0 AS conf_bucket,
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN (direction='YES' AND delta_t5m > 0)
+                                 OR (direction='NO' AND delta_t5m < 0)
+                            THEN 1 ELSE 0 END) AS hits,
+                   AVG(ABS(delta_t5m)) AS avg_abs_delta
+            FROM price_impacts
+            WHERE delta_t5m IS NOT NULL AND direction IN ('YES','NO')
+            GROUP BY conf_bucket
+            ORDER BY conf_bucket
+            """
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_ic_pairs(self) -> list[tuple[float, float]]:
+        """
+        Return (signed_confidence, delta_t5m) pairs for IC computation.
+        signed_confidence = +conf if direction=YES, -conf if direction=NO.
+        Computed in Python (no scipy dep): see dashboard for pearson().
+        """
+        async with self._conn.execute(
+            """
+            SELECT direction, ai_confidence, delta_t5m
+            FROM price_impacts
+            WHERE delta_t5m IS NOT NULL AND direction IN ('YES','NO')
+            """
+        ) as cur:
+            rows = await cur.fetchall()
+        pairs = []
+        for r in rows:
+            signed = r["ai_confidence"] if r["direction"] == "YES" else -r["ai_confidence"]
+            pairs.append((signed, r["delta_t5m"]))
+        return pairs
+
+    async def get_source_stats(self) -> list[dict]:
+        """Per-source precision: news vs twitter vs truth_social."""
+        async with self._conn.execute(
+            """
+            SELECT source,
+                   COUNT(*) AS n,
+                   SUM(CASE WHEN (direction='YES' AND delta_t5m > 0)
+                                 OR (direction='NO' AND delta_t5m < 0)
+                            THEN 1 ELSE 0 END) AS hits,
+                   AVG(ABS(delta_t5m)) AS avg_abs_delta,
+                   AVG(ai_confidence) AS avg_confidence
+            FROM price_impacts
+            WHERE delta_t5m IS NOT NULL AND direction IN ('YES','NO')
+            GROUP BY source
+            ORDER BY n DESC
+            """
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_alpha_decay(self) -> list[dict]:
+        """
+        Hit rate at each time bucket. Reveals whether alpha decays fast
+        (speed matters) or persists (wide entry window).
+
+        Only rows with delta_t60m filled are included so every bucket
+        has the same denominator.
+        """
+        async with self._conn.execute(
+            """
+            SELECT direction,
+                   COUNT(*) AS n,
+                   1.0 * SUM(CASE WHEN (direction='YES' AND delta_t1m > 0)
+                                       OR (direction='NO' AND delta_t1m < 0)
+                                  THEN 1 ELSE 0 END) / COUNT(*) AS hit_t1m,
+                   1.0 * SUM(CASE WHEN (direction='YES' AND delta_t5m > 0)
+                                       OR (direction='NO' AND delta_t5m < 0)
+                                  THEN 1 ELSE 0 END) / COUNT(*) AS hit_t5m,
+                   1.0 * SUM(CASE WHEN (direction='YES' AND delta_t15m > 0)
+                                       OR (direction='NO' AND delta_t15m < 0)
+                                  THEN 1 ELSE 0 END) / COUNT(*) AS hit_t15m,
+                   1.0 * SUM(CASE WHEN (direction='YES' AND delta_t30m > 0)
+                                       OR (direction='NO' AND delta_t30m < 0)
+                                  THEN 1 ELSE 0 END) / COUNT(*) AS hit_t30m,
+                   1.0 * SUM(CASE WHEN (direction='YES' AND delta_t60m > 0)
+                                       OR (direction='NO' AND delta_t60m < 0)
+                                  THEN 1 ELSE 0 END) / COUNT(*) AS hit_t60m,
+                   AVG(ABS(delta_t1m))  AS avg_abs_d1m,
+                   AVG(ABS(delta_t5m))  AS avg_abs_d5m,
+                   AVG(ABS(delta_t15m)) AS avg_abs_d15m,
+                   AVG(ABS(delta_t30m)) AS avg_abs_d30m,
+                   AVG(ABS(delta_t60m)) AS avg_abs_d60m
+            FROM price_impacts
+            WHERE delta_t60m IS NOT NULL AND direction IN ('YES','NO')
+            GROUP BY direction
+            """
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]

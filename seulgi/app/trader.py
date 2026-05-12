@@ -141,11 +141,13 @@ class PaperTrader:
         classifier: DirectionClassifier,
         cfg,    # TradingConfig
         ai_cfg, # AIConfig
+        engine_name: str = "default",
     ) -> None:
         self._db = db
         self._classifier = classifier
         self._cfg = cfg
         self._ai_cfg = ai_cfg
+        self._engine_name = engine_name
         self._balance: float = cfg.balance_usdc
         self._lock = asyncio.Lock()
         self._session: Optional[aiohttp.ClientSession] = None
@@ -156,19 +158,20 @@ class PaperTrader:
 
     async def init_from_db(self) -> None:
         """
-        Restore balance from DB by subtracting committed capital.
+        Restore balance from DB by subtracting committed capital for THIS engine.
 
         Call once after connect(). Prevents double-spending on restart.
         Safe to skip in tests where DB state is irrelevant.
         """
-        committed = await self._db.get_committed_usdc()
+        committed = await self._db.get_committed_usdc(engine_name=self._engine_name)
         if committed > 0:
             self._balance = self._cfg.balance_usdc - committed
             logger.info(
-                "[trader] restored: balance=%.2f (%.2f committed in %d positions)",
+                "[trader] [%s] restored: balance=%.2f (%.2f committed in %d positions)",
+                self._engine_name,
                 self._balance,
                 committed,
-                await self._db.count_open_positions(),
+                await self._db.count_open_positions(engine_name=self._engine_name),
             )
         else:
             self._balance = self._cfg.balance_usdc
@@ -307,16 +310,26 @@ class PaperTrader:
 
         # ── Balance / position guards (under lock) ────────────────────
         async with self._lock:
-            # Check max open positions
-            open_count = await self._db.count_open_positions()
+            # Per-engine open position cap
+            open_count = await self._db.count_open_positions(engine_name=self._engine_name)
             if open_count >= self._cfg.max_open_positions:
                 decision = _skip(f"max_positions:{open_count}", p_hat=p_hat, mid=mid_price)
                 await self._record(signal_id, decision, token_id=token_id)
                 return decision
 
-            # No doubling-up on the same market
-            if await self._db.has_open_position(match.condition_id):
+            # Per-engine duplicate position check (one engine can hold a market
+            # even if another engine is in the same market)
+            already_open = await self._db.has_open_position(
+                match.condition_id, engine_name=self._engine_name
+            )
+            if already_open:
                 decision = _skip("duplicate_position", p_hat=p_hat, mid=mid_price)
+                await self._record(signal_id, decision, token_id=token_id)
+                return decision
+
+            unique = await self._db.count_unique_open_markets(engine_name=self._engine_name)
+            if unique >= self._cfg.max_unique_markets:
+                decision = _skip(f"max_unique_markets:{unique}", p_hat=p_hat, mid=mid_price)
                 await self._record(signal_id, decision, token_id=token_id)
                 return decision
 
@@ -351,6 +364,7 @@ class PaperTrader:
                 size_usdc=size,
                 entry_price=mid_price,
                 p_hat=p_hat,
+                engine_name=self._engine_name,
             )
 
         logger.info(
@@ -410,7 +424,27 @@ class PaperTrader:
         Price fetches run concurrently for all positions.
         Balance updates are applied under the lock.
         """
-        positions = await self._db.get_open_positions()
+        # Proactively cull cold losing positions (losing + no recent headline match)
+        session = self._get_session()
+        cold = await self._db.get_cold_losing_positions(
+            self._cfg.cold_position_hours, engine_name=self._engine_name
+        )
+        for pos in cold:
+            price = await _fetch_mid_price(session, pos["token_id"])
+            if price is None:
+                continue
+            shares = pos["size_usdc"] / pos["entry_price"]
+            pnl = (price - pos["entry_price"]) * shares
+            async with self._lock:
+                self._balance += pos["size_usdc"] + pnl
+                await self._db.close_position(pos["trade_id"])
+                await self._db.close_trade(pos["trade_id"], pnl)
+            logger.info(
+                "[trader] COLD_CULL %s %s  exit=%.3f  pnl=%.2f",
+                pos["direction"], pos["condition_id"][:12], price, pnl,
+            )
+
+        positions = await self._db.get_open_positions(engine_name=self._engine_name)
         if not positions:
             return
 
