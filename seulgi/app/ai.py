@@ -190,12 +190,14 @@ class DirectionClassifier:
             if is_republish and similar_to else ""
         )
 
-        # Build the numbered question block
+        # Build the numbered question block. mid_yes is the YES-token mid,
+        # which is what "current likelihood of YES" maps to in [0,1].
         lines = []
         for i, m in enumerate(matches):
-            mid_str = f"{m.mid_price:.3f}" if getattr(m, "mid_price", None) is not None else "unknown"
+            mid = getattr(m, "mid_yes", None)
+            mid_str = f"{mid:.3f}" if mid is not None else "unknown"
             lines.append(
-                f"{i}. [{mid_str} mid | sim={m.similarity:.2f}] {m.question}"
+                f"{i}. [YES mid={mid_str} | sim={m.similarity:.2f}] {m.question}"
             )
         questions_block = "\n".join(lines)
 

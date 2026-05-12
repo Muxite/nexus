@@ -19,6 +19,7 @@ Polymarket scale (~2000 markets, dim=384) this takes <5ms.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -58,6 +59,10 @@ class MarketMatch:
     token_yes: Optional[str]
     token_no: Optional[str]
     similarity: float
+    # Pre-fetched mid prices (populated in EngineRunner BEFORE the AI call so
+    # the model sees real prices and so the trader doesn't re-fetch per engine).
+    mid_yes: Optional[float] = None
+    mid_no:  Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -116,11 +121,11 @@ async def _fetch_gamma_markets_capped(
     return markets
 
 
-def _parse_market(raw: dict) -> Optional[Market]:
+def _parse_market(raw: dict) -> Optional[tuple[Market, Optional[str]]]:
     """
     Extract the fields we care about from a raw Gamma API market dict.
 
-    Returns None if condition_id or question is missing.
+    Returns (Market, end_date_iso) or None if condition_id or question is missing.
     Token IDs come from clobTokenIds (the correct field — tokens[] is always empty).
     """
     condition_id = raw.get("conditionId") or raw.get("condition_id") or ""
@@ -128,16 +133,33 @@ def _parse_market(raw: dict) -> Optional[Market]:
     if not condition_id or not question:
         return None
 
-    # clobTokenIds is the authoritative source (tokens[] is always [])
-    clob_ids = raw.get("clobTokenIds") or []
+    # CRITICAL: Gamma returns clobTokenIds as a JSON-encoded *string*, not a
+    # native JSON array (e.g. '["171...","987..."]'). Old code did `clob_ids[0]`
+    # on that string and got just the character "[", which then fed the CLOB
+    # midpoint endpoint and returned 404 for every market → 100% no_price skips.
+    clob_raw = raw.get("clobTokenIds")
+    clob_ids: list = []
+    if isinstance(clob_raw, list):
+        clob_ids = clob_raw
+    elif isinstance(clob_raw, str) and clob_raw.strip().startswith("["):
+        try:
+            parsed_ids = json.loads(clob_raw)
+            if isinstance(parsed_ids, list):
+                clob_ids = parsed_ids
+        except (json.JSONDecodeError, ValueError):
+            clob_ids = []
     token_yes = str(clob_ids[0]) if len(clob_ids) >= 1 and clob_ids[0] else None
     token_no = str(clob_ids[1]) if len(clob_ids) >= 2 and clob_ids[1] else None
+    end_date = raw.get("endDate") or raw.get("end_date") or None
 
-    return Market(
-        condition_id=condition_id,
-        question=question,
-        token_yes=token_yes,
-        token_no=token_no,
+    return (
+        Market(
+            condition_id=condition_id,
+            question=question,
+            token_yes=token_yes,
+            token_no=token_no,
+        ),
+        end_date,
     )
 
 
@@ -241,10 +263,15 @@ class MarketIndex:
             )
 
         markets: list[Market] = []
+        end_dates: list[Optional[str]] = []
         for raw in raw_markets:
-            m = _parse_market(raw)
-            if m and (m.token_yes or m.token_no):
+            parsed = _parse_market(raw)
+            if parsed is None:
+                continue
+            m, end_date = parsed
+            if m.token_yes or m.token_no:
                 markets.append(m)
+                end_dates.append(end_date)
 
         logger.info("MarketIndex: %d markets with tokens (of %d fetched)", len(markets), len(raw_markets))
 
@@ -258,16 +285,26 @@ class MarketIndex:
         embeddings = await loop.run_in_executor(None, self._embedder.embed_batch, questions)
 
         # Persist to DB and build in-memory matrix
-        for market, emb in zip(markets, embeddings):
+        for market, emb, end_date in zip(markets, embeddings, end_dates):
             await self._db.upsert_market(
                 condition_id=market.condition_id,
                 question=market.question,
                 token_yes=market.token_yes,
                 token_no=market.token_no,
-                end_date=None,
+                end_date=end_date,
                 volume_usdc=None,
                 embedding=emb,
             )
+
+        # Prune: anything in the DB that wasn't in this fetch is now closed
+        open_ids = [m.condition_id for m in markets]
+        closed_n = await self._db.mark_markets_closed(open_ids)
+        if closed_n:
+            logger.info("MarketIndex: marked %d markets closed (dropped from Gamma open list)", closed_n)
+        # Hard-delete markets that have been closed > 30 days
+        pruned = await self._db.prune_closed_markets(older_than_days=30)
+        if pruned:
+            logger.info("MarketIndex: hard-pruned %d markets closed > 30d", pruned)
 
         self._markets = markets
         self._matrix = embeddings  # shape (N, 384)

@@ -422,7 +422,7 @@ class TwitterAccountWatcher:
             "username": self._username,
             "type": "twitter",
             "total_tweets": self._total_tweets,
-            "last_tweet_at": self._last_tweet_at.isoformat() if self._last_tweet_at else None,
+            "last_tweet_at": self._last_tweet_at,
             "failures": self._consecutive_failures,
             "budget_used": used,
             "budget_limit": limit,
@@ -563,7 +563,7 @@ class TruthSocialWatcher:
             "username": self._username,
             "type": "truth_social",
             "total_posts": self._total_posts,
-            "last_post_at": self._last_post_at.isoformat() if self._last_post_at else None,
+            "last_post_at": self._last_post_at,
             "failures": self._consecutive_failures,
         }
 

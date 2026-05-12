@@ -841,9 +841,14 @@ def _pearson(xs: list[float], ys: list[float]) -> float:
     return num / den if den else 0.0
 
 
-def _ts(dt: Optional[datetime]) -> str:
+def _ts(dt) -> str:
     if dt is None:
         return "—"
+    if isinstance(dt, str):
+        try:
+            dt = datetime.fromisoformat(dt)
+        except (ValueError, TypeError):
+            return dt[:19]  # best effort: truncate ISO string
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 

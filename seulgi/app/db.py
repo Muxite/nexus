@@ -146,6 +146,10 @@ _MIGRATIONS = [
     "ALTER TABLE engine_results ADD COLUMN signal_latency_ms REAL",
     # per-engine position isolation
     "ALTER TABLE positions ADD COLUMN engine_name TEXT NOT NULL DEFAULT 'default'",
+    # closed-market tracking — set when Gamma drops the market from its open list,
+    # or when end_date passes. Filtering by `closed_at IS NULL` excludes stale markets.
+    "ALTER TABLE markets ADD COLUMN closed_at TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_markets_closed_at ON markets(closed_at)",
 ]
 
 
@@ -227,8 +231,12 @@ class SeulgiDB:
 
     async def get_markets_with_embeddings(self) -> list[dict]:
         async with self._conn.execute(
-            "SELECT condition_id, question, token_yes, token_no, embedding "
-            "FROM markets WHERE embedding IS NOT NULL"
+            """
+            SELECT condition_id, question, token_yes, token_no, embedding
+            FROM markets
+            WHERE embedding IS NOT NULL
+              AND closed_at IS NULL
+            """
         ) as cur:
             rows = await cur.fetchall()
         result = []
@@ -243,10 +251,84 @@ class SeulgiDB:
             })
         return result
 
-    async def count_markets(self) -> int:
-        async with self._conn.execute("SELECT COUNT(*) FROM markets") as cur:
+    async def count_markets(self, include_closed: bool = False) -> int:
+        sql = "SELECT COUNT(*) FROM markets"
+        if not include_closed:
+            sql += " WHERE closed_at IS NULL"
+        async with self._conn.execute(sql) as cur:
             row = await cur.fetchone()
             return row[0] if row else 0
+
+    async def mark_markets_closed(self, keep_condition_ids: list[str]) -> int:
+        """
+        Mark any market NOT in `keep_condition_ids` as closed (sets closed_at = now).
+        Also marks markets whose end_date has passed.
+        Returns the number of markets newly marked closed.
+
+        Called once per refresh — keeps the in-memory index in sync with Gamma's
+        open-markets list and prevents stale matches against resolved markets.
+        """
+        now = _now_iso()
+        # 1) Mark by absence from the latest fetch (chunked to avoid SQLite's
+        #    999-param limit; we typically pass ≤300 IDs but be defensive)
+        newly_closed_by_fetch = 0
+        if keep_condition_ids:
+            chunk = 500
+            for i in range(0, len(keep_condition_ids), chunk):
+                ids = keep_condition_ids[i:i + chunk]
+                placeholders = ",".join(["?"] * len(ids))
+                # First batch resets nothing; subsequent batches restrict the
+                # update to rows not in any chunk. Simplest path: collect all
+                # "not in" deletions once with a temporary table.
+            # Switch strategy: load existing open IDs, diff in Python (clearer).
+            async with self._conn.execute(
+                "SELECT condition_id FROM markets WHERE closed_at IS NULL"
+            ) as cur:
+                existing = {row[0] for row in await cur.fetchall()}
+            keep_set = set(keep_condition_ids)
+            to_close = list(existing - keep_set)
+            if to_close:
+                # Chunked UPDATE to dodge param limits
+                for i in range(0, len(to_close), chunk):
+                    ids = to_close[i:i + chunk]
+                    placeholders = ",".join(["?"] * len(ids))
+                    await self._conn.execute(
+                        f"UPDATE markets SET closed_at = ? "
+                        f"WHERE condition_id IN ({placeholders})",
+                        (now, *ids),
+                    )
+                newly_closed_by_fetch = len(to_close)
+
+        # 2) Also mark anything with end_date in the past
+        await self._conn.execute(
+            """
+            UPDATE markets
+               SET closed_at = ?
+             WHERE closed_at IS NULL
+               AND end_date IS NOT NULL
+               AND end_date < ?
+            """,
+            (now, now),
+        )
+        await self._conn.commit()
+        return newly_closed_by_fetch
+
+    async def prune_closed_markets(self, older_than_days: int = 30) -> int:
+        """
+        Hard-delete markets that have been closed for more than `older_than_days`.
+        Keeps recent closures around so heat history isn't wiped immediately.
+        Returns the number of rows deleted.
+        """
+        cur = await self._conn.execute(
+            """
+            DELETE FROM markets
+             WHERE closed_at IS NOT NULL
+               AND closed_at < datetime('now', ? || ' days')
+            """,
+            (f"-{older_than_days}",),
+        )
+        await self._conn.commit()
+        return cur.rowcount or 0
 
     # ------------------------------------------------------------------
     # Signals

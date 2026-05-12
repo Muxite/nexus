@@ -44,11 +44,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Optional
 
+import aiohttp
+
 from ai import DirectionClassifier
 from config import TradingConfig, AIConfig
 from db import SeulgiDB
 from markets import MarketIndex, Embedder, MarketMatch
-from trader import PaperTrader, TradeDecision
+from trader import PaperTrader, TradeDecision, _fetch_mid_price
 from watcher import RawHeadline
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,17 @@ class EngineRunner:
         self._dashboard = dashboard
         self._news_memory = news_memory
         self._impact_tracker = impact_tracker
+        # Single shared aiohttp session for parallel price prefetches
+        self._price_session: Optional[aiohttp.ClientSession] = None
+
+    def _get_price_session(self) -> aiohttp.ClientSession:
+        if self._price_session is None or self._price_session.closed:
+            self._price_session = aiohttp.ClientSession()
+        return self._price_session
+
+    async def close(self) -> None:
+        if self._price_session and not self._price_session.closed:
+            await self._price_session.close()
 
     async def process(self, headline: RawHeadline) -> None:
         """
@@ -152,6 +165,16 @@ class EngineRunner:
         # Bump heat scores for matched markets (fire-and-forget)
         asyncio.create_task(self._db.bump_market_heat([m.condition_id for m in matches]))
 
+        # ── Parallel mid-price prefetch ─────────────────────────────────────
+        # Fetch every match's YES and NO mid price in ONE gather. Drops matches
+        # where neither token has a price (almost always a closed market) BEFORE
+        # the AI sees them, saving tokens and producing meaningful AI input.
+        matches = await self._prefetch_prices(matches, hid)
+        if not matches:
+            logger.info("[runner] [hid=%s] all matches dropped (no_price) — likely stale tokens",
+                        hid)
+            return
+
         source = headline.source
         logger.info(
             "[runner] [hid=%s] '%s' matched %d markets (republish=%s) — dispatching to %d engines",
@@ -181,6 +204,48 @@ class EngineRunner:
                     engine.name, len(executed), len(engine_results),
                     engine.trader.balance,
                 )
+
+    async def _prefetch_prices(
+        self, matches: list[MarketMatch], hid: str
+    ) -> list[MarketMatch]:
+        """
+        Fetch mid_yes + mid_no for every match in parallel via one gather.
+        Mutates each MarketMatch with the prices. Returns the subset of matches
+        where at least one side has a price (drops fully-stale markets).
+
+        Net effect:
+          • 1 round-trip latency instead of N sequential per-trader fetches
+          • 3 engines share the same fetched prices (no duplicate HTTP)
+          • AI sees real mid prices in the prompt → fewer false signals
+          • Closed-market matches get dropped before the AI call
+        """
+        session = self._get_price_session()
+        tasks: list = []
+        index_map: list[tuple[int, str]] = []  # (match_idx, "yes"|"no")
+        for i, m in enumerate(matches):
+            if m.token_yes:
+                tasks.append(_fetch_mid_price(session, m.token_yes))
+                index_map.append((i, "yes"))
+            if m.token_no:
+                tasks.append(_fetch_mid_price(session, m.token_no))
+                index_map.append((i, "no"))
+
+        if not tasks:
+            return []
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for (i, side), value in zip(index_map, results):
+            price = value if isinstance(value, float) else None
+            if side == "yes":
+                matches[i].mid_yes = price
+            else:
+                matches[i].mid_no = price
+
+        kept = [m for m in matches if m.mid_yes is not None or m.mid_no is not None]
+        if len(kept) != len(matches):
+            logger.info("[runner] [hid=%s] dropped %d/%d no-price matches",
+                        hid, len(matches) - len(kept), len(matches))
+        return kept
 
     async def _run_engine(
         self,

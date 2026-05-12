@@ -350,6 +350,7 @@ async def main() -> None:
     await classifier.close()
     await news_memory.close()
     await impact_tracker.close()
+    await runner.close()
     for engine in engines:
         await engine.trader.close()
     await db.close()

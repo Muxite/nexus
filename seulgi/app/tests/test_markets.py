@@ -31,8 +31,9 @@ class TestParseMarket:
             "question": "Will X happen?",
             "clobTokenIds": ["token_yes_1", "token_no_1"],
         }
-        m = _parse_market(raw)
-        assert m is not None
+        parsed = _parse_market(raw)
+        assert parsed is not None
+        m, _end = parsed
         assert m.condition_id == "abc123"
         assert m.question == "Will X happen?"
         assert m.token_yes == "token_yes_1"
@@ -48,15 +49,17 @@ class TestParseMarket:
 
     def test_no_clob_tokens(self):
         raw = {"conditionId": "abc", "question": "Will X happen?", "clobTokenIds": []}
-        m = _parse_market(raw)
-        assert m is not None
+        parsed = _parse_market(raw)
+        assert parsed is not None
+        m, _end = parsed
         assert m.token_yes is None
         assert m.token_no is None
 
     def test_one_clob_token(self):
         raw = {"conditionId": "abc", "question": "Will X?", "clobTokenIds": ["yes_only"]}
-        m = _parse_market(raw)
-        assert m is not None
+        parsed = _parse_market(raw)
+        assert parsed is not None
+        m, _end = parsed
         assert m.token_yes == "yes_only"
         assert m.token_no is None
 
@@ -66,7 +69,9 @@ class TestParseMarket:
             "question": "Will Y happen?",
             "clobTokenIds": ["a", "b"],
         }
-        m = _parse_market(raw)
+        parsed = _parse_market(raw)
+        assert parsed is not None
+        m, _end = parsed
         assert m.condition_id == "fallback_id"
 
 

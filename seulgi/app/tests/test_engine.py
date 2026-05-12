@@ -146,7 +146,21 @@ class TestBuildEngines:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=False)
+def _mock_prefetch_prices():
+    """Patches engine._fetch_mid_price to a constant so the prefetch in
+    EngineRunner.process() returns prices instead of None (which would
+    drop every match as 'no_price')."""
+    with patch("engine._fetch_mid_price", AsyncMock(return_value=0.5)):
+        yield
+
+
 class TestEngineRunnerProcess:
+    @pytest.fixture(autouse=True)
+    def _setup(self, _mock_prefetch_prices):
+        # Activate the prefetch-price patch for every test in this class
+        pass
+
     @pytest.mark.asyncio
     async def test_no_matches_skips_all_engines(self):
         """If no market matches, engines are never called."""

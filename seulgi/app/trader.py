@@ -276,19 +276,24 @@ class PaperTrader:
             await self._record(signal_id, decision, token_id=None)
             return decision
 
-        # ── Token selection ───────────────────────────────────────────
+        # ── Token + price selection ───────────────────────────────────
+        # Prefer the price that was prefetched in EngineRunner.process()
+        # (one parallel gather instead of N serial HTTP calls per engine).
         if result.direction == Direction.YES:
             token_id = match.token_yes
+            mid_price = match.mid_yes
         else:
             token_id = match.token_no
+            mid_price = match.mid_no
 
         if not token_id:
             decision = _skip("no_token")
             await self._record(signal_id, decision, token_id=None)
             return decision
 
-        # ── Market price ──────────────────────────────────────────────
-        mid_price = await _fetch_mid_price(session, token_id)
+        # Fallback: refetch only if prefetch missed this side
+        if mid_price is None:
+            mid_price = await _fetch_mid_price(session, token_id)
         if mid_price is None:
             decision = _skip("no_price")
             await self._record(signal_id, decision, token_id=token_id)
