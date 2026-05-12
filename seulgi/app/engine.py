@@ -434,6 +434,7 @@ def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
         max_open_positions=_pick("max_open_positions", base.max_open_positions),
         max_unique_markets=base.max_unique_markets,
         cold_position_hours=base.cold_position_hours,
+        infinite_balance=base.infinite_balance,   # propagate global flag to every engine
         mode=base.mode,
     )
 
