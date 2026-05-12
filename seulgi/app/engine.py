@@ -267,6 +267,16 @@ class EngineRunner:
             engine.name, decisions, headline_id=hid, signal_latency_ms=total_latency_ms
         )
 
+        # Log AI tokens consumed by this engine's batch call for this headline.
+        # PaperTrader.process stashes the batch's total on _last_tokens_used.
+        tokens_used = getattr(engine.trader, "_last_tokens_used", 0) or 0
+        if tokens_used:
+            asyncio.create_task(self._db.log_usage(
+                kind="ai_tokens", count=float(tokens_used),
+                provider=getattr(engine.trader._ai_cfg, "model", None),
+                meta=f'{{"engine":"{engine.name}","hid":"{hid}"}}',
+            ))
+
         # Price-impact tracking — only from first engine to avoid duplicate rows
         if self._impact_tracker is not None and engine == self._engines[0]:
             is_republish = getattr(headline, "_is_republish", False)

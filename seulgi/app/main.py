@@ -82,9 +82,10 @@ async def _position_monitor_loop(
             await asyncio.sleep(interval_secs)
             await runner.monitor_all_positions()
 
-            # Update per-engine balances on dashboard
+            # Update per-engine balances + staked on dashboard
             for engine in runner.engines:
                 dash.set_balance(engine.name, engine.trader.balance)
+                dash.set_engine_staked(engine.name, engine.trader.total_staked)
 
             # Update open positions display
             raw_positions = await db.get_open_positions()
@@ -122,6 +123,10 @@ async def _position_monitor_loop(
             quant["source_stats"] = await db.get_source_stats()
             quant["alpha_decay"] = await db.get_alpha_decay()
             dash.set_quant_stats(quant)
+
+            # External usage (AI tokens + Brave searches)
+            usage = await db.get_usage_totals()
+            dash.set_usage(usage)
 
         except asyncio.CancelledError:
             break
@@ -224,9 +229,11 @@ async def main() -> None:
 
     # Build engines
     engines = build_engines(cfg, db, classifier)
+    dash.set_infinite_balance(cfg.trading.infinite_balance)
     for engine in engines:
         await engine.trader.init_from_db()
         dash.set_balance(engine.name, engine.trader.balance)
+        dash.set_engine_staked(engine.name, engine.trader.total_staked)
 
     logger.info("[main] engines: %s", [e.name for e in engines])
 
@@ -270,7 +277,7 @@ async def main() -> None:
         ))
 
     # Shared Brave Search budget across all Twitter watchers
-    brave_budget = SearchBudget(per_hour=cfg.search_budget.brave_per_hour)
+    brave_budget = SearchBudget(per_hour=cfg.search_budget.brave_per_hour, db=db)
     logger.info("[main] Brave Search budget: %d calls/hour", cfg.search_budget.brave_per_hour)
 
     # Social account watchers

@@ -85,6 +85,7 @@ def _make_trader(balance: float = 1000.0):
     cfg.max_open_positions = 20
     cfg.max_unique_markets = 15
     cfg.cold_position_hours = 12.0
+    cfg.infinite_balance = False
 
     ai_cfg = MagicMock()
     ai_cfg.min_confidence = 0.45

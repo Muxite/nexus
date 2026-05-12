@@ -56,6 +56,7 @@ def _make_cfg(
     cfg.max_open_positions = max_open
     cfg.max_unique_markets = max_unique_markets
     cfg.cold_position_hours = cold_position_hours
+    cfg.infinite_balance = False
     return cfg
 
 

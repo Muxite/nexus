@@ -169,6 +169,13 @@ class Dashboard:
         # Quant stats (updated from DB periodically)
         self._quant_stats: dict = {}
 
+        # External usage totals (AI tokens, Brave Search) — updated periodically
+        self._usage: dict = {}
+
+        # Per-engine totals: engine_name → total_staked
+        self._engine_staked: dict[str, float] = {}
+        self._infinite_balance: bool = False
+
         self._flush_now = asyncio.Event()
 
         os.makedirs(data_dir, exist_ok=True)
@@ -341,6 +348,15 @@ class Dashboard:
     def set_quant_stats(self, stats: dict) -> None:
         self._quant_stats = stats
 
+    def set_usage(self, usage: dict) -> None:
+        self._usage = usage
+
+    def set_engine_staked(self, engine_name: str, staked: float) -> None:
+        self._engine_staked[engine_name] = staked
+
+    def set_infinite_balance(self, infinite: bool) -> None:
+        self._infinite_balance = infinite
+
     def set_market_index(self, count: int) -> None:
         self._market_count = count
         self._market_last_refresh = datetime.now(timezone.utc)
@@ -390,6 +406,7 @@ class Dashboard:
             self._write_trace_log(),
             self._write_signal_journal(),
             self._write_quant_stats(),
+            self._write_usage(),
         )
 
     # ------------------------------------------------------------------
@@ -412,6 +429,8 @@ class Dashboard:
         last_skip = self._declined[0] if self._declined else None
 
         total_balance = sum(self._engine_balances.values()) if self._engine_balances else 0.0
+        total_staked = sum(self._engine_staked.values()) if self._engine_staked else 0.0
+        mode_label = "INFINITE MODE — gain tracked vs staked" if self._infinite_balance else "PAPER TRADING"
         lines = [
             "╔══════════════════════════════════════════════════════════════╗",
             "║                    SEULGI  DASHBOARD                        ║",
@@ -420,11 +439,26 @@ class Dashboard:
             f"  Updated : {_ts(now)}",
             f"  Uptime  : {hours}h {mins}m",
             "",
-            "── PAPER TRADING ──────────────────────────────────────────────",
-            f"  Total balance   : ${total_balance:>10.2f} USDC",
+            f"── {mode_label} " + "─" * (66 - len(mode_label) - 5),
         ]
-        for eng_name, eng_bal in sorted(self._engine_balances.items()):
-            lines.append(f"    [{eng_name}]  ${eng_bal:.2f}")
+        if self._infinite_balance:
+            roi = (total_balance / total_staked * 100.0) if total_staked > 0 else 0.0
+            sign = "+" if total_balance >= 0 else ""
+            lines.append(f"  Total realized gain : {sign}${total_balance:>10.2f} USDC")
+            lines.append(f"  Total staked        : ${total_staked:>10.2f} USDC")
+            lines.append(f"  ROI                 : {roi:>+6.2f}%")
+            lines.append("")
+            for eng_name in sorted(set(self._engine_balances) | set(self._engine_staked)):
+                gain = self._engine_balances.get(eng_name, 0.0)
+                staked = self._engine_staked.get(eng_name, 0.0)
+                eng_roi = (gain / staked * 100.0) if staked > 0 else 0.0
+                lines.append(
+                    f"    [{eng_name}]  gain={gain:+.2f}  staked={staked:.2f}  ROI={eng_roi:+.2f}%"
+                )
+        else:
+            lines.append(f"  Total balance   : ${total_balance:>10.2f} USDC")
+            for eng_name, eng_bal in sorted(self._engine_balances.items()):
+                lines.append(f"    [{eng_name}]  ${eng_bal:.2f}")
         lines += [
             f"  Open positions  : {n_open}",
             f"  Unrealized PnL  : {sign}${abs(unrealized):.2f}",
@@ -780,6 +814,55 @@ class Dashboard:
             lines.append("    (no latency data yet)")
 
         _write(self._path("quant_stats.txt"), "\n".join(lines) + "\n")
+
+    async def _write_usage(self) -> None:
+        """
+        External-spend log: cumulative AI tokens and Brave Search calls.
+        Includes a rough cost estimate at $0.10/M tokens (gemini-flash-lite)
+        and $3/M for premium. Brave free tier = 2k/month.
+        """
+        lines = [
+            _header("EXTERNAL USAGE  (lifetime tokens + searches)"),
+            "  Tracks every AI token consumed and every Brave Search API call",
+            "  across all engines and watchers. Use it to spot runaway costs.",
+            "",
+        ]
+        if not self._usage:
+            lines.append("  (no usage data yet)")
+            _write(self._path("usage.txt"), "\n".join(lines) + "\n")
+            return
+
+        ai_total = int(self._usage.get("ai_total") or 0)
+        brave_total = int(self._usage.get("brave_total") or 0)
+        ai_24h = int(self._usage.get("ai_24h") or 0)
+        brave_24h = int(self._usage.get("brave_24h") or 0)
+        ai_by_provider = self._usage.get("ai_by_provider", [])
+
+        # Rough cost: assume flash-lite price $0.10/M input + $0.40/M output ≈ $0.25/M blended
+        est_cost = ai_total / 1_000_000.0 * 0.25
+        est_cost_24h = ai_24h / 1_000_000.0 * 0.25
+
+        lines.append("  AI TOKENS (OpenRouter / Gemini)")
+        lines.append(f"    Lifetime : {ai_total:>10,}  tokens  (~${est_cost:.4f} blended)")
+        lines.append(f"    Last 24h : {ai_24h:>10,}  tokens  (~${est_cost_24h:.4f})")
+        if ai_by_provider:
+            lines.append("    By model:")
+            for row in ai_by_provider:
+                p = row.get("provider") or "?"
+                n = int(row.get("n") or 0)
+                t = int(row.get("tokens") or 0)
+                lines.append(f"      {p:<40} calls={n:>6}  tokens={t:>10,}")
+        lines.append("")
+
+        lines.append("  BRAVE SEARCH  (Twitter watchers)")
+        lines.append(f"    Lifetime : {brave_total:>6}  searches")
+        lines.append(f"    Last 24h : {brave_24h:>6}  searches")
+        lines.append("    Free tier cap : ~2,000/month  (~67/day)")
+        if brave_24h > 67:
+            lines.append("    ⚠  24h usage exceeds free-tier daily quota.")
+        lines.append("")
+        lines.append("  Real-time hourly rate visible in watcher_status.txt.")
+        _write(self._path("usage.txt"), "\n".join(lines) + "\n")
 
     async def _write_activity_log(self) -> None:
         lines = [_header("ACTIVITY LOG  (newest first)")]

@@ -117,7 +117,7 @@ ai:
 
 # ── Paper trading ────────────────────────────────────────────────────────────
 trading:
-  balance_usdc: 1000.0
+  balance_usdc: 1000.0        # only used when infinite_balance is false
   max_position_usdc: 100.0    # max USDC staked per single trade
   min_trade_usdc: 5.0         # never trade below this size (avoids rounding noise)
   min_edge: 0.04              # minimum edge (p_hat − mid) required to execute
@@ -127,6 +127,11 @@ trading:
   max_open_positions: 20      # hard cap on concurrent open positions
   max_unique_markets: 15      # max distinct markets with open positions at once
   cold_position_hours: 12.0   # hours since last headline match before a losing market is culled
+  # When true: never block on balance. Keep buying until position caps or
+  # timeouts close trades. The "balance" displayed is then cumulative
+  # realized PnL (gain). Position-side caps (max_open / max_unique /
+  # cold-cull / timeout / WIN / LOSS) still apply.
+  infinite_balance: true
   mode: "paper"
 
 # ── Trading engines ──────────────────────────────────────────────────────────

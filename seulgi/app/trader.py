@@ -148,7 +148,13 @@ class PaperTrader:
         self._cfg = cfg
         self._ai_cfg = ai_cfg
         self._engine_name = engine_name
-        self._balance: float = cfg.balance_usdc
+        # In infinite-balance mode, `_balance` represents cumulative *realized*
+        # PnL (the "gain"), starting at 0. There's no capital constraint —
+        # position-side caps (max_open / max_unique / cold-cull) gate trades.
+        # In normal mode it's the live USDC bankroll.
+        self._balance: float = 0.0 if cfg.infinite_balance else cfg.balance_usdc
+        self._total_staked: float = 0.0     # lifetime USDC put at risk
+        self._last_tokens_used: int = 0     # tokens consumed by most recent process()
         self._lock = asyncio.Lock()
         self._session: Optional[aiohttp.ClientSession] = None
 
@@ -158,11 +164,23 @@ class PaperTrader:
 
     async def init_from_db(self) -> None:
         """
-        Restore balance from DB by subtracting committed capital for THIS engine.
+        Restore balance/gain from DB.
 
-        Call once after connect(). Prevents double-spending on restart.
-        Safe to skip in tests where DB state is irrelevant.
+        Infinite mode: balance is "cumulative realized PnL". Restore as the
+            sum of realized_pnl for this engine's closed trades.
+        Normal mode: balance = starting balance minus currently committed.
         """
+        if self._cfg.infinite_balance:
+            # Cumulative realized gain so far + total staked across all trades
+            gain, staked = await self._db.get_engine_gain_and_staked(self._engine_name)
+            self._balance = gain
+            self._total_staked = staked
+            logger.info(
+                "[trader] [%s] infinite mode restored: gain=%+.2f  staked=%.2f",
+                self._engine_name, self._balance, self._total_staked,
+            )
+            return
+
         committed = await self._db.get_committed_usdc(engine_name=self._engine_name)
         if committed > 0:
             self._balance = self._cfg.balance_usdc - committed
@@ -224,6 +242,8 @@ class PaperTrader:
             is_republish=is_republish,
             similar_to=similar_to,
         )
+        # tokens_used was distributed evenly across results inside classify_batch
+        self._last_tokens_used = sum(r.tokens_used for r in classify_results)
 
         session = self._get_session()
         decisions: list[TradeDecision] = []
@@ -338,16 +358,23 @@ class PaperTrader:
                 await self._record(signal_id, decision, token_id=token_id)
                 return decision
 
-            # Compute actual trade size
-            size = min(self._cfg.max_position_usdc, self._balance)
-            if size < self._cfg.min_trade_usdc:
-                reason = "no_balance" if self._balance <= 0 else f"size_too_small:{size:.2f}"
-                decision = _skip(reason, p_hat=p_hat, mid=mid_price)
-                await self._record(signal_id, decision, token_id=token_id)
-                return decision
+            # Compute actual trade size.
+            # Infinite mode: always trade max_position_usdc (no balance gating).
+            # Normal mode: capped by remaining balance, must clear min_trade_usdc.
+            if self._cfg.infinite_balance:
+                size = self._cfg.max_position_usdc
+            else:
+                size = min(self._cfg.max_position_usdc, self._balance)
+                if size < self._cfg.min_trade_usdc:
+                    reason = "no_balance" if self._balance <= 0 else f"size_too_small:{size:.2f}"
+                    decision = _skip(reason, p_hat=p_hat, mid=mid_price)
+                    await self._record(signal_id, decision, token_id=token_id)
+                    return decision
 
-            # Execute — deduct balance before any await
-            self._balance -= size
+            # Execute — debit balance only in normal mode; either way track stake.
+            if not self._cfg.infinite_balance:
+                self._balance -= size
+            self._total_staked += size
             trade_id = await self._db.insert_trade(
                 signal_id=signal_id,
                 condition_id=match.condition_id,
@@ -441,7 +468,12 @@ class PaperTrader:
             shares = pos["size_usdc"] / pos["entry_price"]
             pnl = (price - pos["entry_price"]) * shares
             async with self._lock:
-                self._balance += pos["size_usdc"] + pnl
+                # Infinite mode: balance == cumulative realized PnL, so add PnL only.
+                # Normal mode: credit stake + PnL back to bankroll.
+                if self._cfg.infinite_balance:
+                    self._balance += pnl
+                else:
+                    self._balance += pos["size_usdc"] + pnl
                 await self._db.close_position(pos["trade_id"])
                 await self._db.close_trade(pos["trade_id"], pnl)
             logger.info(
@@ -495,7 +527,10 @@ class PaperTrader:
             realized_pnl = (current_price - entry_price) * shares
 
             async with self._lock:
-                self._balance += size_usdc + realized_pnl
+                if self._cfg.infinite_balance:
+                    self._balance += realized_pnl
+                else:
+                    self._balance += size_usdc + realized_pnl
                 await self._db.close_position(trade_id)
                 await self._db.close_trade(trade_id, realized_pnl)
 
@@ -517,4 +552,14 @@ class PaperTrader:
 
     @property
     def balance(self) -> float:
+        """In infinite mode this is cumulative realized PnL; else live USDC."""
         return self._balance
+
+    @property
+    def total_staked(self) -> float:
+        """Lifetime USDC put at risk by this engine."""
+        return self._total_staked
+
+    @property
+    def infinite_balance(self) -> bool:
+        return self._cfg.infinite_balance

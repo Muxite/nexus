@@ -74,6 +74,10 @@ class TradingConfig:
     max_open_positions: int = 20      # hard cap on concurrent positions
     max_unique_markets: int = 15      # max distinct condition_ids with open positions
     cold_position_hours: float = 12.0 # hours since last match before a market is "cold"
+    infinite_balance: bool = False    # if True, never block trades on balance — keep
+                                      # buying until max_open_positions /
+                                      # max_unique_markets / cold-cull / timeout / WIN /
+                                      # LOSS handles exit. Position caps still apply.
     mode: str = "paper"
 
 
@@ -240,6 +244,7 @@ def _build_config(raw: dict) -> Config:
             max_open_positions=int(t.get("max_open_positions", 20)),
             max_unique_markets=int(t.get("max_unique_markets", 15)),
             cold_position_hours=float(t.get("cold_position_hours", 12.0)),
+            infinite_balance=bool(t.get("infinite_balance", False)),
             mode=str(t.get("mode", "paper")),
         ),
         db=DBConfig(path=str(d.get("path", "/data/seulgi.db"))),

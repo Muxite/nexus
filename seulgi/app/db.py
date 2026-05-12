@@ -150,6 +150,18 @@ _MIGRATIONS = [
     # or when end_date passes. Filtering by `closed_at IS NULL` excludes stale markets.
     "ALTER TABLE markets ADD COLUMN closed_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_markets_closed_at ON markets(closed_at)",
+    # External usage logging (OpenRouter tokens + Brave Search calls).
+    # Append-only event log; aggregate via SUM() at read time.
+    """CREATE TABLE IF NOT EXISTS usage_events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          TEXT NOT NULL,
+        kind        TEXT NOT NULL,   -- 'ai_tokens' | 'brave_search'
+        provider    TEXT,            -- e.g. 'google/gemini-2.5-flash-lite' or 'brave'
+        count       REAL NOT NULL,   -- token count or 1.0 per Brave call
+        meta        TEXT             -- optional JSON (engine_name, hid, etc.)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_usage_ts   ON usage_events(ts)",
+    "CREATE INDEX IF NOT EXISTS idx_usage_kind ON usage_events(kind)",
 ]
 
 
@@ -506,6 +518,47 @@ class SeulgiDB:
             row = await cur.fetchone()
             return float(row[0]) if row else 0.0
 
+    async def get_engine_gain_and_staked(
+        self, engine_name: str
+    ) -> tuple[float, float]:
+        """
+        Return (realized_gain, total_staked) for ONE engine, restoring from DB.
+
+        realized_gain = sum of realized_pnl for closed trades (matching engine).
+        total_staked  = sum of size_usdc across executed engine_results rows.
+
+        Used by infinite-balance mode to restart with the cumulative gain
+        already credited and the staked total visible.
+        """
+        async with self._conn.execute(
+            """
+            SELECT COALESCE(SUM(t.realized_pnl), 0.0) AS gain
+            FROM trades t
+            JOIN engine_results er
+              ON er.headline_id = t.headline_id
+             AND er.condition_id = t.condition_id
+             AND er.executed = 1
+            WHERE er.engine_name = ?
+              AND t.realized_pnl IS NOT NULL
+            """,
+            (engine_name,),
+        ) as cur:
+            row = await cur.fetchone()
+            gain = float(row[0]) if row else 0.0
+
+        async with self._conn.execute(
+            """
+            SELECT COALESCE(SUM(size_usdc), 0.0)
+            FROM engine_results
+            WHERE engine_name = ? AND executed = 1
+            """,
+            (engine_name,),
+        ) as cur:
+            row = await cur.fetchone()
+            staked = float(row[0]) if row else 0.0
+
+        return gain, staked
+
     # ------------------------------------------------------------------
     # Engine results (multi-engine comparison)
     # ------------------------------------------------------------------
@@ -848,6 +901,57 @@ class SeulgiDB:
             """
         ) as cur:
             return [dict(r) for r in await cur.fetchall()]
+
+    # ------------------------------------------------------------------
+    # Usage tracking — AI tokens + Brave Search calls
+    # ------------------------------------------------------------------
+
+    async def log_usage(
+        self,
+        kind: str,
+        count: float,
+        provider: Optional[str] = None,
+        meta: Optional[str] = None,
+    ) -> None:
+        """Append a usage event (AI tokens or Brave search). Cheap, batched OK."""
+        await self._conn.execute(
+            "INSERT INTO usage_events (ts, kind, provider, count, meta) VALUES (?, ?, ?, ?, ?)",
+            (_now_iso(), kind, provider, count, meta),
+        )
+        await self._conn.commit()
+
+    async def get_usage_totals(self) -> dict:
+        """
+        Return cumulative usage:
+            { 'ai_tokens_total': int, 'brave_search_total': int,
+              'ai_by_provider': [{provider,n,tokens}, ...],
+              'ai_tokens_24h': int, 'brave_search_24h': int }
+        """
+        async with self._conn.execute(
+            """
+            SELECT
+              COALESCE(SUM(CASE WHEN kind='ai_tokens'    THEN count END), 0) AS ai_total,
+              COALESCE(SUM(CASE WHEN kind='brave_search' THEN count END), 0) AS brave_total,
+              COALESCE(SUM(CASE WHEN kind='ai_tokens'    AND ts > datetime('now','-24 hours')
+                                THEN count END), 0) AS ai_24h,
+              COALESCE(SUM(CASE WHEN kind='brave_search' AND ts > datetime('now','-24 hours')
+                                THEN count END), 0) AS brave_24h
+            FROM usage_events
+            """
+        ) as cur:
+            totals = dict(await cur.fetchone() or {})
+
+        async with self._conn.execute(
+            """
+            SELECT provider, COUNT(*) AS n, COALESCE(SUM(count), 0) AS tokens
+            FROM usage_events
+            WHERE kind = 'ai_tokens'
+            GROUP BY provider
+            ORDER BY tokens DESC
+            """
+        ) as cur:
+            totals["ai_by_provider"] = [dict(r) for r in await cur.fetchall()]
+        return totals
 
     async def get_alpha_decay(self) -> list[dict]:
         """

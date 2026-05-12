@@ -63,21 +63,33 @@ class SearchBudget:
     Shared across all TwitterAccountWatcher instances so the total call rate
     stays within the configured cap regardless of how many accounts are watched.
 
+    If a `db` is provided, every spend() is also logged as a `brave_search`
+    usage event for lifetime accounting (kept independent of the in-memory
+    rolling counter, which only reflects the last hour).
+
     Not thread-safe — designed for single-event-loop use (all asyncio).
     """
 
-    def __init__(self, per_hour: int = 20) -> None:
+    def __init__(self, per_hour: int = 20, db=None) -> None:
         self._per_hour = per_hour
         self._calls: collections.deque[float] = collections.deque()
+        self._db = db
+        self._lifetime: int = 0   # in-process counter; DB is the persisted source of truth
 
     def can_spend(self) -> bool:
         """Return True if a call fits within the current hourly budget."""
         self._evict()
         return len(self._calls) < self._per_hour
 
-    def spend(self) -> None:
-        """Record that one call was made right now."""
+    def spend(self, username: Optional[str] = None) -> None:
+        """Record that one call was made right now. Fire-and-forget DB log."""
         self._calls.append(time.monotonic())
+        self._lifetime += 1
+        if self._db is not None:
+            meta = f'{{"username":"{username}"}}' if username else None
+            asyncio.create_task(self._db.log_usage(
+                kind="brave_search", count=1.0, provider="brave", meta=meta,
+            ))
 
     def _evict(self) -> None:
         cutoff = time.monotonic() - 3600.0
@@ -444,7 +456,7 @@ class TwitterAccountWatcher:
 
                 tweets = await self._fetch_tweets()
                 if self._budget is not None:
-                    self._budget.spend()
+                    self._budget.spend(self._username)
                 self._consecutive_failures = 0
                 self._backoff_level = 0
 
