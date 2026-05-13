@@ -107,6 +107,11 @@ class EngineRunner:
         self._impact_tracker = impact_tracker
         # Single shared aiohttp session for parallel price prefetches
         self._price_session: Optional[aiohttp.ClientSession] = None
+        # Mid-price TTL cache shared across headlines — cuts CLOB API traffic
+        # dramatically when a burst of headlines hits the same markets.
+        # token_id → (price_or_None, monotonic_expiry_secs)
+        self._price_cache: dict[str, tuple[Optional[float], float]] = {}
+        self._price_cache_ttl: float = 10.0   # seconds
 
     def _get_price_session(self) -> aiohttp.ClientSession:
         if self._price_session is None or self._price_session.closed:
@@ -209,37 +214,60 @@ class EngineRunner:
         self, matches: list[MarketMatch], hid: str
     ) -> list[MarketMatch]:
         """
-        Fetch mid_yes + mid_no for every match in parallel via one gather.
-        Mutates each MarketMatch with the prices. Returns the subset of matches
-        where at least one side has a price (drops fully-stale markets).
+        Fetch ONE side per match in parallel (preferring YES). Derive the other
+        side via binary-market symmetry: mid_no ≈ 1 − mid_yes. This halves
+        CLOB API calls vs fetching both sides while staying within ~1¢ of true
+        mid (well below typical spread + our trading thresholds).
 
-        Net effect:
-          • 1 round-trip latency instead of N sequential per-trader fetches
-          • 3 engines share the same fetched prices (no duplicate HTTP)
-          • AI sees real mid prices in the prompt → fewer false signals
-          • Closed-market matches get dropped before the AI call
+        Mutates each MarketMatch with the prices. Returns the subset where at
+        least one side has a price (drops fully-stale markets).
+
+        A 10-second TTL cache further reduces traffic during burst events
+        (multiple headlines hitting the same hot market within seconds).
         """
         session = self._get_price_session()
+        now_mono = time.monotonic()
+        # Evict expired cache entries
+        for k in [k for k, (_, exp) in self._price_cache.items() if exp <= now_mono]:
+            self._price_cache.pop(k, None)
+
         tasks: list = []
-        index_map: list[tuple[int, str]] = []  # (match_idx, "yes"|"no")
+        index_map: list[tuple[int, str]] = []  # (match_idx, side_fetched: "yes"|"no")
         for i, m in enumerate(matches):
-            if m.token_yes:
-                tasks.append(_fetch_mid_price(session, m.token_yes))
-                index_map.append((i, "yes"))
-            if m.token_no:
-                tasks.append(_fetch_mid_price(session, m.token_no))
-                index_map.append((i, "no"))
+            # Prefer YES (one canonical side per market). Fall back to NO if
+            # this market has no YES token.
+            side = "yes" if m.token_yes else ("no" if m.token_no else None)
+            if side is None:
+                continue
+            token = m.token_yes if side == "yes" else m.token_no
+            cached = self._price_cache.get(token)
+            if cached is not None:
+                price = cached[0]
+                if side == "yes":
+                    m.mid_yes = price
+                    m.mid_no = (1.0 - price) if price is not None else None
+                else:
+                    m.mid_no = price
+                    m.mid_yes = (1.0 - price) if price is not None else None
+                continue
+            tasks.append(_fetch_mid_price(session, token))
+            index_map.append((i, side))
 
-        if not tasks:
-            return []
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for (i, side), value in zip(index_map, results):
-            price = value if isinstance(value, float) else None
-            if side == "yes":
-                matches[i].mid_yes = price
-            else:
-                matches[i].mid_no = price
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            exp_at = time.monotonic() + self._price_cache_ttl
+            for (i, side), value in zip(index_map, results):
+                price = value if isinstance(value, float) else None
+                m = matches[i]
+                token = m.token_yes if side == "yes" else m.token_no
+                if token is not None:
+                    self._price_cache[token] = (price, exp_at)
+                if side == "yes":
+                    m.mid_yes = price
+                    m.mid_no = (1.0 - price) if price is not None else None
+                else:
+                    m.mid_no = price
+                    m.mid_yes = (1.0 - price) if price is not None else None
 
         kept = [m for m in matches if m.mid_yes is not None or m.mid_no is not None]
         if len(kept) != len(matches):

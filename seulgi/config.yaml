@@ -99,7 +99,7 @@ markets:
   refresh_hours: 4             # re-fetch Polymarket market list every N hours
   similarity_threshold: 0.35   # min cosine similarity to include a market match
   top_k: 15                    # max markets to evaluate per headline
-  max_tracked_markets: 300     # cap index at top-N markets by volume (0 = no cap)
+  max_tracked_markets: 5000    # cap index at top-N markets by volume (0 = no cap)
 
 # ── AI direction classifier (via OpenRouter) ─────────────────────────────────
 # OpenRouter model IDs: https://openrouter.ai/models
