@@ -79,6 +79,82 @@ class QuantPlotter:
         except Exception as exc:
             logger.warning("[plotter] matplotlib render failed: %s", exc)
 
+        # Trade-example charts (price history + event lines + headline text).
+        # Variable file set, written into plots/trade_examples/. Independent
+        # of the 13 fixed dashboards.
+        try:
+            examples = await self._collect_trade_examples()
+            if examples:
+                out_dir = str(self._plots_dir / "trade_examples")
+                await loop.run_in_executor(
+                    None, _render_trade_examples, examples, out_dir,
+                )
+                logger.info(
+                    "[plotter] rendered %d trade-example charts to %s",
+                    len(examples), out_dir,
+                )
+        except Exception as exc:
+            logger.warning("[plotter] trade-example render failed: %s", exc)
+
+    async def _collect_trade_examples(self) -> list[dict]:
+        """
+        Sample 1/4 of plot-eligible price_impacts (those with full timeseries
+        backfill) across all four missed-alpha buckets so the user sees a mix
+        of too_slow / captured / no_signal / wrong_dir. Each returned dict has
+        the impact metadata, trade timing, and the full price series.
+        """
+        from impact_tracker import classify_missed_alpha  # local import to avoid cycle
+
+        candidates = await self._db.get_plot_candidate_impacts(limit=400, min_samples=30)
+        # Group by bucket so we sample evenly. Avoids one big bucket dominating.
+        by_bucket: dict[str, list[dict]] = {
+            "too_slow": [], "captured": [], "no_signal": [], "wrong_dir": [],
+        }
+        for row in candidates:
+            bucket = classify_missed_alpha(
+                row.get("direction"),
+                row.get("delta_pre_60s"),
+                row.get("delta_t5m"),
+            )
+            if bucket is None:
+                continue
+            by_bucket[bucket].append(row)
+
+        # Deterministic 1/4 sample per bucket: take every 4th row (already
+        # ordered newest-first by the query). Stable across plotter ticks
+        # within a single trial so the user can spot trends.
+        sampled: list[dict] = []
+        for bucket_rows in by_bucket.values():
+            sampled.extend(bucket_rows[::4])
+
+        # Attach timeseries + cap total examples per render to avoid
+        # IO spikes. Newest first.
+        sampled.sort(key=lambda r: r.get("detected_at") or "", reverse=True)
+        sampled = sampled[:24]
+        result = []
+        for row in sampled:
+            series = await self._db.get_timeseries_for_impact(row["id"])
+            if len(series) < 30:
+                continue
+            row["_series"] = series
+            row["_bucket"] = classify_missed_alpha(
+                row.get("direction"),
+                row.get("delta_pre_60s"),
+                row.get("delta_t5m"),
+            )
+            # Fetch article body for context if available
+            try:
+                async with self._db._conn.execute(
+                    "SELECT body FROM headline_articles WHERE headline_id = ?",
+                    (row["headline_id"],),
+                ) as cur:
+                    art = await cur.fetchone()
+                    row["_article_body"] = art[0] if art else None
+            except Exception:
+                row["_article_body"] = None
+            result.append(row)
+        return result
+
     async def _collect_data(self) -> dict:
         """Pull every DB query needed by the renderer."""
         return {
@@ -179,35 +255,20 @@ async def _fetch_edge_vs_pnl(db: SeulgiDB) -> list[dict]:
 
 async def _fetch_close_reasons(db: SeulgiDB) -> dict[str, int]:
     """
-    Bucket closed trades by why they closed. We infer from final price:
-      exit ≥ 0.95 → WIN
-      exit ≤ 0.05 → LOSS
-      else        → TIMEOUT or COLD_CULL (lumped together as 'OTHER')
+    Bucket closed trades by why they closed, using the close_reason persisted
+    by the trader. Legacy trades that closed before the column existed are
+    grouped under "UNKNOWN" so the pie chart still renders.
     """
     async with db._conn.execute(
         """
-        SELECT
-          SUM(CASE WHEN (last_price IS NOT NULL AND last_price >= 0.95) THEN 1 ELSE 0 END) AS wins,
-          SUM(CASE WHEN (last_price IS NOT NULL AND last_price <= 0.05) THEN 1 ELSE 0 END) AS losses,
-          SUM(CASE WHEN (last_price IS NOT NULL
-                         AND last_price > 0.05 AND last_price < 0.95) THEN 1 ELSE 0 END) AS other,
-          COUNT(*) AS total
-        FROM (
-          SELECT t.realized_pnl, p.last_price
-          FROM trades t
-          LEFT JOIN positions p ON p.trade_id = t.id
-          WHERE t.realized_pnl IS NOT NULL
-        )
+        SELECT COALESCE(close_reason, 'UNKNOWN') AS reason, COUNT(*) AS n
+        FROM trades
+        WHERE closed_at IS NOT NULL
+        GROUP BY reason
         """
     ) as cur:
-        row = await cur.fetchone()
-        if not row:
-            return {"WIN": 0, "LOSS": 0, "OTHER": 0}
-        return {
-            "WIN":   int(row["wins"]   or 0),
-            "LOSS":  int(row["losses"] or 0),
-            "OTHER": int(row["other"]  or 0),
-        }
+        rows = await cur.fetchall()
+    return {row["reason"]: int(row["n"]) for row in rows}
 
 
 async def _fetch_confidence_distribution(db: SeulgiDB) -> list[float]:
@@ -442,8 +503,11 @@ def _plot_edge_vs_pnl(plt, data: dict, path: str, ts: str) -> None:
 
 
 def _plot_close_reasons(plt, data: dict, path: str, ts: str) -> None:
-    """Pie of WIN / LOSS / OTHER (timeout + cold-cull) closes."""
-    counts = data["close_reasons"]
+    """
+    Pie of close reasons (WIN/LOSS/TP/SL/TRAIL/TIMEOUT/COLD_CULL/UNKNOWN).
+    Sourced from `trades.close_reason` populated by the trader on close.
+    """
+    counts: dict[str, int] = data["close_reasons"]
     fig, ax = plt.subplots(figsize=(6, 6))
     total = sum(counts.values())
     if total == 0:
@@ -451,17 +515,23 @@ def _plot_close_reasons(plt, data: dict, path: str, ts: str) -> None:
                 ha="center", va="center", transform=ax.transAxes)
         ax.set_xticks([]); ax.set_yticks([])
     else:
-        labels = []
-        values = []
-        colors = {"WIN": "seagreen", "LOSS": "crimson", "OTHER": "steelblue"}
-        for k in ("WIN", "LOSS", "OTHER"):
-            v = counts.get(k, 0)
-            if v > 0:
-                pct = 100 * v / total
-                labels.append(f"{k}  ({v}, {pct:.0f}%)")
-                values.append(v)
-        ax.pie(values, labels=labels,
-               colors=[colors[k] for k in ("WIN", "LOSS", "OTHER") if counts.get(k, 0) > 0],
+        # Deterministic colour mapping; anything unrecognized falls back to grey.
+        color_map = {
+            "WIN":       "seagreen",
+            "LOSS":      "crimson",
+            "TP":        "mediumseagreen",
+            "SL":        "indianred",
+            "TRAIL":     "goldenrod",
+            "TIMEOUT":   "steelblue",
+            "COLD_CULL": "slategrey",
+            "UNKNOWN":   "lightgrey",
+        }
+        # Render in descending-count order so the biggest wedge starts at 0deg.
+        ordered = sorted(counts.items(), key=lambda kv: -kv[1])
+        labels = [f"{k}  ({v}, {100*v/total:.0f}%)" for k, v in ordered]
+        values = [v for _, v in ordered]
+        colors = [color_map.get(k, "lightgrey") for k, _ in ordered]
+        ax.pie(values, labels=labels, colors=colors,
                autopct="", startangle=90, wedgeprops={"edgecolor": "white"})
     ax.set_title(f"Close-reason breakdown  N={total}  ({ts})")
     fig.savefig(path)
@@ -634,27 +704,56 @@ def _plot_scatter_ic(plt, data: dict, path: str, ts: str) -> None:
 
 
 def _plot_latency_hist(plt, data: dict, path: str, ts: str) -> None:
+    """
+    Histogram of signal_latency_ms. When the distribution spans several
+    orders of magnitude (it routinely does — typical run has p50 ~5s and
+    p99 ~300s+) a linear-x histogram collapses everything into one bin, so
+    we use log-spaced bins on a log x-axis. The y-axis stays linear; counts
+    in the modal bin are still informative.
+    """
     latencies = data["latencies"]
     fig, ax = plt.subplots(figsize=(7, 5))
     if not latencies:
         ax.text(0.5, 0.5, "no data yet", ha="center", va="center", transform=ax.transAxes)
     else:
-        # Clip extreme tail at 99th percentile so the histogram remains readable
-        latencies_sorted = sorted(latencies)
-        clip = latencies_sorted[int(0.99 * len(latencies_sorted))]
-        clipped = [min(x, clip) for x in latencies]
-        ax.hist(clipped, bins=40, color="steelblue", edgecolor="black", alpha=0.85)
-        avg = sum(latencies) / len(latencies)
-        ax.axvline(avg, color="red", linestyle="--", linewidth=1.2,
+        # Filter zeros/negatives so log binning is safe; clip at p99 to keep
+        # the tail readable.
+        positive = [max(1.0, x) for x in latencies if x is not None and x > 0]
+        positive_sorted = sorted(positive)
+        clip = positive_sorted[int(0.99 * len(positive_sorted))]
+        # log10 bin edges from the smallest sample to the p99 clip.
+        import math
+        lo = max(1.0, positive_sorted[0])
+        bins = [10 ** x for x in
+                _linspace(math.log10(lo), math.log10(max(clip, lo * 10)), 41)]
+        clipped = [min(x, clip) for x in positive]
+        ax.hist(clipped, bins=bins, color="steelblue", edgecolor="black", alpha=0.85)
+        avg = sum(positive) / len(positive)
+        p50 = positive_sorted[len(positive_sorted) // 2]
+        p99 = positive_sorted[int(0.99 * len(positive_sorted))]
+        ax.axvline(avg,  color="red",       linestyle="--", linewidth=1.2,
                    label=f"mean = {avg:.0f} ms")
-        ax.axvline(5000, color="darkgreen", linestyle=":", linewidth=1.2,
+        ax.axvline(p50,  color="orange",    linestyle="-",  linewidth=1.0,
+                   label=f"p50 = {p50:.0f} ms")
+        ax.axvline(p99,  color="darkred",   linestyle=":",  linewidth=1.0,
+                   label=f"p99 = {p99:.0f} ms")
+        ax.axvline(5000, color="darkgreen", linestyle=":",  linewidth=1.2,
                    label="5s target")
-    ax.set_xlabel("Signal latency (ms, clipped at p99)")
+        ax.set_xscale("log")
+    ax.set_xlabel("Signal latency (ms, log scale, clipped at p99)")
     ax.set_ylabel("Count")
     ax.set_title(f"Signal latency distribution  ({ts})")
     ax.legend()
     fig.savefig(path)
     plt.close(fig)
+
+
+def _linspace(start: float, stop: float, n: int) -> list[float]:
+    """Tiny linspace stand-in to avoid pulling numpy here."""
+    if n <= 1:
+        return [start]
+    step = (stop - start) / (n - 1)
+    return [start + step * i for i in range(n)]
 
 
 def _plot_precision_timeseries(plt, data: dict, path: str, ts: str) -> None:
@@ -715,3 +814,163 @@ def _pearson(xs: list[float], ys: list[float]) -> float:
     sy2 = sum((y - my) ** 2 for y in ys)
     den = (sx2 * sy2) ** 0.5
     return num / den if den else 0.0
+
+
+# ---------------------------------------------------------------------------
+# Trade-example charts (price history with event lines + headline text)
+# ---------------------------------------------------------------------------
+
+_BUCKET_COLORS = {
+    "too_slow":  "#d97706",  # amber — we were late to a real signal
+    "captured":  "#16a34a",  # green — caught alpha
+    "no_signal": "#6b7280",  # gray — flat
+    "wrong_dir": "#dc2626",  # red — picked the wrong side
+}
+
+
+def _iso_to_unix(iso: str | None) -> int | None:
+    if not iso:
+        return None
+    try:
+        # SQLite mixes "T" and " " separators; isoformat handles both via fromisoformat
+        from datetime import datetime as _dt, timezone as _tz
+        dt = _dt.fromisoformat(iso.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return int(dt.timestamp())
+    except Exception:
+        return None
+
+
+def _wrap_text(text: str, width: int = 90, max_lines: int = 4) -> str:
+    import textwrap
+    if not text:
+        return ""
+    wrapped = textwrap.wrap(text, width=width)
+    if len(wrapped) > max_lines:
+        wrapped = wrapped[:max_lines]
+        wrapped[-1] = wrapped[-1][: max(0, width - 1)] + "…"
+    return "\n".join(wrapped)
+
+
+def _render_trade_examples(examples: list[dict], out_dir: str) -> None:
+    """Render one PNG per example. Writes to out_dir/<bucket>_<id>.png."""
+    os.environ.setdefault("MPLBACKEND", "Agg")
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt  # noqa: E402
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+
+    plt.rcParams["figure.dpi"] = 110
+    plt.rcParams["savefig.bbox"] = "tight"
+
+    for row in examples:
+        try:
+            _plot_one_trade_example(plt, row, out_dir)
+        except Exception as exc:
+            logger.warning(
+                "[plotter] trade-example id=%s failed: %s", row.get("id"), exc,
+            )
+
+
+def _plot_one_trade_example(plt, row: dict, out_dir: str) -> None:
+    series = row.get("_series") or []
+    if len(series) < 2:
+        return
+
+    bucket = row.get("_bucket") or "no_signal"
+    color  = _BUCKET_COLORS.get(bucket, "#374151")
+
+    # Anchor: impact detection time. price_timeseries.relative_s is already
+    # signed seconds from this anchor, so we plot directly in those units
+    # (minutes for readability).
+    detected_unix = _iso_to_unix(row.get("detected_at")) or 0
+    xs = [s["relative_s"] / 60.0 for s in series]   # minutes from impact-track time
+    ys = [s["price"] for s in series]
+
+    fig, ax = plt.subplots(figsize=(11, 6.2))
+    ax.plot(xs, ys, color=color, linewidth=1.8, marker="o", markersize=2.2,
+            alpha=0.9, label=f"market price ({bucket})")
+
+    # Event lines: we_saw (signals.detected_at), we_tracked (relative_s=0),
+    # we_acted (trades.decided_at), we_exited (trades.closed_at).
+    def _add_vline(t_unix: int | None, label: str, style: str, c: str):
+        if t_unix is None or detected_unix == 0:
+            return
+        x_min = (t_unix - detected_unix) / 60.0
+        if x_min < min(xs) - 5 or x_min > max(xs) + 5:
+            return  # off-axis — don't clutter
+        ax.axvline(x_min, color=c, linestyle=style, linewidth=1.4, alpha=0.85)
+        ax.text(
+            x_min, ax.get_ylim()[1] if False else max(ys),
+            f"  {label}", color=c, fontsize=8, rotation=90,
+            verticalalignment="top", alpha=0.95,
+        )
+
+    seen_unix  = _iso_to_unix(row.get("seen_at"))
+    acted_unix = _iso_to_unix(row.get("trade_decided_at"))
+    exit_unix  = _iso_to_unix(row.get("trade_closed_at"))
+
+    _add_vline(seen_unix,    "saw headline",                    "--", "#2563eb")
+    # impact-tracker reference (relative_s == 0)
+    ax.axvline(0, color="#000000", linestyle=":", linewidth=1.2, alpha=0.55)
+    ax.text(0, max(ys), "  tracked", color="#000000", fontsize=8,
+            rotation=90, verticalalignment="top", alpha=0.7)
+
+    direction = row.get("trade_direction") or row.get("direction") or "?"
+    size = row.get("trade_size_usdc")
+    acted_label = f"bought {direction}"
+    if size:
+        acted_label += f" ${size:.0f}"
+    _add_vline(acted_unix, acted_label, "--", "#16a34a")
+
+    pnl = row.get("trade_realized_pnl")
+    exit_label = "closed"
+    if pnl is not None:
+        exit_label += f" pnl={pnl:+.2f}"
+    _add_vline(exit_unix, exit_label, "--", "#dc2626")
+
+    # Pre/post delta annotations in a small text box
+    dpre = row.get("delta_pre_60s")
+    d5   = row.get("delta_t5m")
+    info = [
+        f"bucket: {bucket}",
+        f"direction (AI): {row.get('direction','?')}  conf={row.get('ai_confidence', 0):.2f}  sim={row.get('similarity', 0):.2f}",
+        f"price_t0={row.get('price_t0', 0):.3f}"
+        + (f"   Δpre60s={dpre:+.4f}" if dpre is not None else "")
+        + (f"   Δt5m={d5:+.4f}"   if d5   is not None else ""),
+    ]
+    ax.text(
+        0.01, 0.98, "\n".join(info),
+        transform=ax.transAxes, fontsize=8.5,
+        verticalalignment="top", family="monospace",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white",
+                  edgecolor="#cccccc", alpha=0.92),
+    )
+
+    # Title: market question (one line)
+    question = (row.get("question") or "").strip()
+    ax.set_title(f"{question}", fontsize=11, loc="left")
+
+    ax.set_xlabel("Minutes from impact tracking (t=0)")
+    ax.set_ylabel("Token price (probability)")
+    ax.set_ylim(max(0.0, min(ys) - 0.02), min(1.0, max(ys) + 0.04))
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="lower right", fontsize=8)
+
+    # Headline + source + (optional) first-paragraph body below the chart.
+    headline = (row.get("headline") or "").strip()
+    source   = (row.get("site_url") or "").strip()
+    body     = (row.get("_article_body") or "").strip()
+    footer   = f"HEADLINE: {headline}  —  {source}" if source else f"HEADLINE: {headline}"
+    footer   = _wrap_text(footer, width=120, max_lines=2)
+    if body:
+        footer += "\n" + _wrap_text(body, width=120, max_lines=4)
+
+    fig.text(0.02, -0.02, footer, fontsize=8.5, family="sans-serif",
+             color="#1f2937", verticalalignment="top")
+
+    fname = f"{bucket}_{row['id']:06d}.png"
+    fig.savefig(os.path.join(out_dir, fname))
+    plt.close(fig)

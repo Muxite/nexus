@@ -56,6 +56,10 @@ from db import SeulgiDB
 logger = logging.getLogger(__name__)
 
 _CLOB_PRICE_URL = "https://clob.polymarket.com/midpoint?token_id={token_id}"
+_CLOB_HISTORY_URL = (
+    "https://clob.polymarket.com/prices-history"
+    "?market={token_id}&startTs={start_ts}&endTs={end_ts}&fidelity=1"
+)
 
 # Minimum thresholds to bother tracking a match
 MIN_CONFIDENCE = 0.50
@@ -85,6 +89,73 @@ async def _fetch_price(session: aiohttp.ClientSession, token_id: str) -> Optiona
     except Exception as exc:
         logger.debug("[impact] price fetch failed %s: %s", token_id[:12], exc)
         return None
+
+
+async def _fetch_pre_move(
+    session: aiohttp.ClientSession,
+    token_id: str,
+    detected_unix: int,
+) -> tuple[Optional[float], Optional[float]]:
+    """
+    Return (price_pre_60s, price_pre_300s): the CLOB midpoint observed roughly
+    60s and 300s before headline detection. Used to distinguish "no signal"
+    from "we were too slow." Returns (None, None) on error.
+
+    Polymarket /prices-history has 1-minute fidelity, so price_pre_60s is the
+    last sample at or before detected_unix - 60s.
+    """
+    url = _CLOB_HISTORY_URL.format(
+        token_id=token_id,
+        start_ts=detected_unix - 600,   # look back 10 min for a safety buffer
+        end_ts=detected_unix,
+    )
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+            if resp.status != 200:
+                return (None, None)
+            data = await resp.json()
+            history = data.get("history") or []
+    except Exception as exc:
+        logger.debug("[impact] history fetch failed %s: %s", token_id[:12], exc)
+        return (None, None)
+
+    def _at_or_before(target_ts: int) -> Optional[float]:
+        best: Optional[float] = None
+        for entry in history:
+            t = entry.get("t")
+            if t is None:
+                continue
+            if t <= target_ts:
+                best = entry.get("p")
+            else:
+                break
+        return float(best) if best is not None else None
+
+    return (_at_or_before(detected_unix - 60), _at_or_before(detected_unix - 300))
+
+
+async def _fetch_price_history_window(
+    session: aiohttp.ClientSession,
+    token_id: str,
+    start_ts: int,
+    end_ts: int,
+) -> list[dict]:
+    """
+    Fetch the full price history between two unix timestamps (1m fidelity).
+    Returns the raw [{t, p}, ...] list — empty on any error.
+    """
+    url = _CLOB_HISTORY_URL.format(
+        token_id=token_id, start_ts=start_ts, end_ts=end_ts,
+    )
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            return data.get("history") or []
+    except Exception as exc:
+        logger.debug("[impact] window fetch failed %s: %s", token_id[:12], exc)
+        return []
 
 
 class PriceImpactTracker:
@@ -143,7 +214,11 @@ class PriceImpactTracker:
             return
 
         session = self._get_session()
-        price_t0 = await _fetch_price(session, token_id)
+        detected_unix = int(time.time())
+        price_t0, (price_pre_60s, price_pre_300s) = await asyncio.gather(
+            _fetch_price(session, token_id),
+            _fetch_pre_move(session, token_id, detected_unix),
+        )
         detected_at = datetime.now(timezone.utc).isoformat()
 
         row_id = await self._db.insert_price_impact(
@@ -159,15 +234,26 @@ class PriceImpactTracker:
             price_t0=price_t0,
             detected_at=detected_at,
             source=source,
+            price_pre_60s=price_pre_60s,
+            price_pre_300s=price_pre_300s,
         )
 
         self._pending[row_id] = time.time()
+        # Pre-move sign vs predicted direction: + = market already moved our way
+        # (we were probably too slow), - = market moved the opposite way.
+        pre_move = (
+            (price_t0 - price_pre_60s)
+            if (price_t0 is not None and price_pre_60s is not None) else None
+        )
         logger.info(
             "[impact] [hid=%s] tracking %s  dir=%s  conf=%.2f  sim=%.2f  "
-            "p0=%.3f  q=%s",
+            "p0=%.3f  pre60s=%s  pre_move=%s  q=%s",
             headline_id, condition_id[:12], direction,
             ai_confidence, similarity,
-            price_t0 or -1, question[:60],
+            price_t0 or -1,
+            "%.3f" % price_pre_60s if price_pre_60s is not None else "n/a",
+            "%+.4f" % pre_move if pre_move is not None else "n/a",
+            question[:60],
         )
 
     # ------------------------------------------------------------------
@@ -191,6 +277,7 @@ class PriceImpactTracker:
 
         asyncio.create_task(self._poll_loop())
         asyncio.create_task(self._dashboard_loop())
+        asyncio.create_task(self._timeseries_backfill_loop())
 
     async def _poll_loop(self) -> None:
         """Periodically fill in time-bucket price snapshots."""
@@ -246,6 +333,67 @@ class PriceImpactTracker:
             await asyncio.sleep(60)
             await self._write_dashboard()
 
+    # ------------------------------------------------------------------
+    # Full time-series backfill (-1h..+1h around each impact, 1m fidelity)
+    # ------------------------------------------------------------------
+
+    async def _timeseries_backfill_loop(self) -> None:
+        """
+        Every 5 minutes, find impact rows whose detection window has fully
+        elapsed (≥ 65 minutes ago) and which have not yet been backfilled.
+        For each, fetch the full -1h..+1h CLOB history in ONE call and store
+        every minute sample in price_timeseries. Survives restarts because
+        state lives in DB (timeseries_backfilled_at column).
+        """
+        # Small initial delay so the bot can warm up first.
+        await asyncio.sleep(30)
+        while self._running:
+            try:
+                rows = await self._db.get_impacts_needing_timeseries(
+                    min_age_seconds=3900,  # 65 min
+                    limit=50,
+                )
+                if rows:
+                    session = self._get_session()
+                    # Run all backfills concurrently — they hit different tokens.
+                    await asyncio.gather(
+                        *(self._backfill_one(session, r) for r in rows),
+                        return_exceptions=True,
+                    )
+            except Exception as exc:
+                logger.debug("[impact] backfill loop error: %s", exc)
+            await asyncio.sleep(300)  # 5 min between sweeps
+
+    async def _backfill_one(self, session: aiohttp.ClientSession, row: dict) -> None:
+        detected_dt = datetime.fromisoformat(row["detected_at"])
+        if detected_dt.tzinfo is None:
+            detected_dt = detected_dt.replace(tzinfo=timezone.utc)
+        detected_unix = int(detected_dt.timestamp())
+        history = await _fetch_price_history_window(
+            session, row["token_id"],
+            start_ts=detected_unix - 3600,
+            end_ts=detected_unix + 3600,
+        )
+        if not history:
+            # Mark as backfilled anyway so we don't retry forever on dead tokens.
+            await self._db.mark_timeseries_backfilled(row["id"])
+            return
+        batch = [
+            (
+                row["id"], row["headline_id"], row["condition_id"], row["token_id"],
+                int(entry["t"]), float(entry["p"]), int(entry["t"]) - detected_unix,
+            )
+            for entry in history
+            if entry.get("t") is not None and entry.get("p") is not None
+        ]
+        if batch:
+            await self._db.insert_price_timeseries_batch(batch)
+        await self._db.mark_timeseries_backfilled(row["id"])
+        logger.info(
+            "[impact] [hid=%s] backfilled %d samples (-1h..+1h) for %s",
+            row["headline_id"], len(batch), condition_id_short(row["condition_id"]),
+        )
+
     async def _write_dashboard(self) -> None:
         try:
             rows = await self._db.get_price_impact_stats(limit=100)
@@ -276,6 +424,7 @@ def _format_dashboard(completed: list[dict], pending: list[dict]) -> str:
     # Hypothesis summary from completed rows
     if completed:
         lines += _hypothesis_summary(completed)
+        lines += _missed_alpha_summary(completed)
         lines += ["", "── TOP MOVES (sorted by |Δ5m|) ─────────────────────────────────────", ""]
         sorted_rows = sorted(
             completed,
@@ -284,15 +433,16 @@ def _format_dashboard(completed: list[dict], pending: list[dict]) -> str:
         )[:30]
         lines.append(
             f"  {'HEADLINE':<50} {'DIR':>4} {'CONF':>5} {'SIM':>5} "
-            f"{'p0':>6} {'Δ1m':>6} {'Δ5m':>6} {'Δ15m':>7} {'Δ60m':>7}"
+            f"{'p0':>6} {'pre60':>7} {'Δ1m':>6} {'Δ5m':>6} {'Δ15m':>7} {'Δ60m':>7}"
         )
-        lines.append("  " + "─" * 105)
+        lines.append("  " + "─" * 115)
         for r in sorted_rows:
             hl = (r.get("headline") or "")[:49]
             d = r.get("direction", "?")
             conf = r.get("ai_confidence") or 0.0
             sim  = r.get("similarity") or 0.0
             p0   = r.get("price_t0")
+            dpre = r.get("delta_pre_60s")
             d1   = r.get("delta_t1m")
             d5   = r.get("delta_t5m")
             d15  = r.get("delta_t15m")
@@ -304,7 +454,7 @@ def _format_dashboard(completed: list[dict], pending: list[dict]) -> str:
 
             lines.append(
                 f"  {hl:<50} {d:>4} {conf:>5.2f} {sim:>5.2f} "
-                f"{(p0 or 0):>6.3f} {fmt(d1):>6} {fmt(d5):>6} "
+                f"{(p0 or 0):>6.3f} {fmt(dpre):>7} {fmt(d1):>6} {fmt(d5):>6} "
                 f"{fmt(d15):>7} {fmt(d60):>7}  [{src}]"
             )
 
@@ -387,5 +537,119 @@ def _hypothesis_summary(rows: list[dict]) -> list[str]:
             lines.append(
                 f"    {src:<14} n={n:>4}  hit_rate={rate:>3.0f}%  avg|Δ5m|={avg_abs:.4f}"
             )
+
+    return lines
+
+
+# Threshold used everywhere to call a price move "meaningful".
+# 0.5 percentage points of probability; below this is dominated by spread noise.
+MISSED_ALPHA_THRESH = 0.005
+
+
+def classify_missed_alpha(direction: str, delta_pre_60s, delta_t5m) -> str | None:
+    """
+    Bucket a price_impacts row into one of:
+      "too_slow"  -- pre-move already in our direction (latency-limited alpha)
+      "captured"  -- no pre-move, post-move in our direction (real alpha caught)
+      "no_signal" -- neither pre nor post moved meaningfully
+      "wrong_dir" -- pre or post move against our predicted direction
+
+    Returns None if the row lacks the data needed to classify (missing direction,
+    or missing pre/post deltas). Single source of truth for plotter + dashboard.
+
+    NOTE: these buckets are diagnostic — they MUST NOT be summed into PnL.
+    """
+    if direction not in ("YES", "NO"):
+        return None
+    if delta_pre_60s is None or delta_t5m is None:
+        return None
+    signed_pre = delta_pre_60s if direction == "YES" else -delta_pre_60s
+    signed_post = delta_t5m if direction == "YES" else -delta_t5m
+    if signed_pre >= MISSED_ALPHA_THRESH:
+        return "too_slow"
+    if signed_pre <= -MISSED_ALPHA_THRESH:
+        return "wrong_dir"
+    if abs(signed_post) < MISSED_ALPHA_THRESH:
+        return "no_signal"
+    if signed_post >= MISSED_ALPHA_THRESH:
+        return "captured"
+    return "wrong_dir"
+
+
+def _missed_alpha_summary(rows: list[dict]) -> list[str]:
+    """
+    Distinguish two failure modes using the pre-detection price window:
+      • too_slow   : market already moved in our predicted direction by
+                     |delta_pre_60s| ≥ 0.005 before we touched it. The signal
+                     was real; we just missed it. Recoverable via lower latency.
+      • no_signal  : |delta_pre_60s| and |delta_t5m| both < 0.005. Headline did
+                     not move the market on either side of our entry.
+      • captured   : we entered before any meaningful pre-move AND post-move
+                     went in our direction with |delta_t5m| ≥ 0.005.
+                     This is real, attributable alpha.
+
+    These counts MUST NOT be summed into PnL — they are diagnostic only.
+    """
+    THRESH = MISSED_ALPHA_THRESH
+    lines = [
+        "",
+        "── PRE-MOVE DIAGNOSIS  (split-second post-mortem, NOT profit) ───────",
+        "",
+        "  Window: 60s before headline detection → 5m after.",
+        "  Threshold for a 'real move': |Δ| ≥ 0.005 in our predicted direction.",
+        "",
+    ]
+
+    too_slow = 0
+    no_signal = 0
+    captured = 0
+    wrong_dir = 0    # pre-move was against us (price already moved opposite)
+    measured = 0
+    pre_moves_with_dir: list[float] = []  # signed by direction
+
+    counts = {"too_slow": 0, "captured": 0, "no_signal": 0, "wrong_dir": 0}
+    for r in rows:
+        d = r.get("direction", "")
+        dpre = r.get("delta_pre_60s")
+        d5 = r.get("delta_t5m")
+        bucket = classify_missed_alpha(d, dpre, d5)
+        if bucket is None:
+            continue
+        measured += 1
+        counts[bucket] += 1
+        # Sign convention: positive = market moved in our predicted direction.
+        signed_pre = dpre if d == "YES" else -dpre
+        pre_moves_with_dir.append(signed_pre)
+    too_slow = counts["too_slow"]
+    captured = counts["captured"]
+    no_signal = counts["no_signal"]
+    wrong_dir = counts["wrong_dir"]
+
+    if measured == 0:
+        lines.append("  (no rows with pre-move data yet — wait one polling cycle)")
+        return lines
+
+    def pct(n: int) -> str:
+        return f"{100 * n / measured:>4.1f}%"
+
+    lines.append(f"  measured rows  : {measured}")
+    lines.append(f"  too_slow       : {too_slow:>4}  ({pct(too_slow)})  pre-move already in our direction")
+    lines.append(f"  captured       : {captured:>4}  ({pct(captured)})  no pre-move, post-move in our direction")
+    lines.append(f"  no_signal      : {no_signal:>4}  ({pct(no_signal)})  market never moved")
+    lines.append(f"  wrong_dir      : {wrong_dir:>4}  ({pct(wrong_dir)})  pre or post move against us")
+
+    if pre_moves_with_dir:
+        avg_signed = sum(pre_moves_with_dir) / len(pre_moves_with_dir)
+        abs_vals = [abs(v) for v in pre_moves_with_dir]
+        lines.append("")
+        lines.append(
+            f"  mean signed pre-move = {avg_signed:+.4f}   "
+            f"mean |pre-move| = {sum(abs_vals)/len(abs_vals):.4f}   "
+            f"max |pre-move| = {max(abs_vals):.4f}"
+        )
+        lines.append(
+            "  Positive mean signed pre-move = AI direction agrees with pre-headline drift "
+            "(latency-limited alpha)."
+        )
 
     return lines

@@ -74,11 +74,39 @@ class TradingConfig:
     max_open_positions: int = 20      # hard cap on concurrent positions
     max_unique_markets: int = 15      # max distinct condition_ids with open positions
     cold_position_hours: float = 12.0 # hours since last match before a market is "cold"
+    # Technical exit policy — closes positions on small price moves so capital
+    # recycles fast instead of sitting in 24h timeouts. All four units are in
+    # *probability points* (0.005 = half a cent on a 0..1 token). Setting any
+    # of these to 0 disables that exit path. The legacy WIN/LOSS price cutoffs
+    # (0.95 / 0.05) stay active as backstops.
+    take_profit: float = 0.0          # close once (current - entry) * dir_sign >= take_profit
+    stop_loss: float = 0.0            # close once (current - entry) * dir_sign <= -stop_loss
+    trailing_stop: float = 0.0        # after the position has been in profit, close once
+                                      # MTM drops by this much from the high-water mark
+    min_hold_seconds: float = 0.0     # don't apply the three above before this age
     infinite_balance: bool = False    # if True, never block trades on balance — keep
                                       # buying until max_open_positions /
                                       # max_unique_markets / cold-cull / timeout / WIN /
                                       # LOSS handles exit. Position caps still apply.
     mode: str = "paper"
+    # Rail-skip: refuse trades where the entry-side mid price is within
+    # `rail_skip_threshold` of 0 or 1 (i.e. p ∈ [thr, 1-thr] is allowed).
+    # Saturated markets can't move meaningfully — 99% no_signal at p≥0.95 in
+    # the 6h run. Set to 0 to disable. Per-engine override available.
+    rail_skip_threshold: float = 0.0
+    # Hard rail floor that applies to EVERY engine (no opt-out via per-engine
+    # override of `rail_skip_threshold` reaches here). At mid ≥ 1-thr or
+    # ≤ thr the bid-ask spread alone routinely exceeds tight stop-losses
+    # (e.g. aggressive's SL=0.015), so SL fires on spread movement before any
+    # signal arrives. Default 0.02 = refuse anything inside [0, 0.02] ∪
+    # [0.98, 1]. Set to 0 to disable. Per-engine override IS respected so
+    # this is still a knob, but the default protects aggressive too.
+    entry_rail_skip_threshold: float = 0.02
+    # Invert direction when AI is highly confident in a non-rail market.
+    # Empirically conf ≥ 0.85 is anti-informative (IC < 0). Off by default;
+    # opt-in per engine as a shadow strategy.
+    invert_high_conf: bool = False
+    invert_conf_threshold: float = 0.85
 
 
 @dataclass
@@ -122,6 +150,14 @@ class EngineConfig:
     position_timeout_hours: Optional[float] = None
     max_open_positions: Optional[int] = None
     min_confidence: Optional[float] = None   # per-engine override for ai.min_confidence
+    take_profit: Optional[float] = None
+    stop_loss: Optional[float] = None
+    trailing_stop: Optional[float] = None
+    min_hold_seconds: Optional[float] = None
+    rail_skip_threshold: Optional[float] = None
+    entry_rail_skip_threshold: Optional[float] = None
+    invert_high_conf: Optional[bool] = None
+    invert_conf_threshold: Optional[float] = None
 
 
 @dataclass
@@ -208,6 +244,14 @@ def _build_config(raw: dict) -> Config:
             position_timeout_hours=_opt_float(e.get("position_timeout_hours")),
             max_open_positions=int(e["max_open_positions"]) if "max_open_positions" in e else None,
             min_confidence=_opt_float(e.get("min_confidence")),
+            take_profit=_opt_float(e.get("take_profit")),
+            stop_loss=_opt_float(e.get("stop_loss")),
+            trailing_stop=_opt_float(e.get("trailing_stop")),
+            min_hold_seconds=_opt_float(e.get("min_hold_seconds")),
+            rail_skip_threshold=_opt_float(e.get("rail_skip_threshold")),
+            entry_rail_skip_threshold=_opt_float(e.get("entry_rail_skip_threshold")),
+            invert_high_conf=e["invert_high_conf"] if "invert_high_conf" in e else None,
+            invert_conf_threshold=_opt_float(e.get("invert_conf_threshold")),
         )
         for i, e in enumerate(raw.get("engines", []))
     ]
@@ -244,8 +288,16 @@ def _build_config(raw: dict) -> Config:
             max_open_positions=int(t.get("max_open_positions", 20)),
             max_unique_markets=int(t.get("max_unique_markets", 15)),
             cold_position_hours=float(t.get("cold_position_hours", 12.0)),
+            take_profit=float(t.get("take_profit", 0.0)),
+            stop_loss=float(t.get("stop_loss", 0.0)),
+            trailing_stop=float(t.get("trailing_stop", 0.0)),
+            min_hold_seconds=float(t.get("min_hold_seconds", 0.0)),
             infinite_balance=bool(t.get("infinite_balance", False)),
             mode=str(t.get("mode", "paper")),
+            rail_skip_threshold=float(t.get("rail_skip_threshold", 0.0)),
+            entry_rail_skip_threshold=float(t.get("entry_rail_skip_threshold", 0.02)),
+            invert_high_conf=bool(t.get("invert_high_conf", False)),
+            invert_conf_threshold=float(t.get("invert_conf_threshold", 0.85)),
         ),
         db=DBConfig(path=str(d.get("path", "/data/seulgi.db"))),
         dashboard=DashboardConfig(

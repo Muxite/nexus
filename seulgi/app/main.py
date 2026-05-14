@@ -28,14 +28,19 @@ from datetime import datetime, timezone
 
 from ai import DirectionClassifier
 from config import load_config
-from dashboard import Dashboard, WatcherStatus, PositionEvent
+from dashboard import Dashboard, WatcherStatus, PositionEvent, SystemHealth
 from db import SeulgiDB
+from article_fetch import ArticleFetcher
 from engine import EngineRunner, build_engines
+from rules import RuleEngine
 from markets import Embedder, MarketIndex
 from impact_tracker import PriceImpactTracker
 from news_memory import NewsMemory
 from plotter import QuantPlotter
-from watcher import RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher, SearchBudget
+from watcher import (
+    RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher,
+    SearchBudget, ScraperHealthPoller,
+)
 
 
 def _setup_logging(level: str) -> None:
@@ -107,6 +112,7 @@ async def _position_monitor_loop(
                     p_hat=p.get("p_hat") or 0.0,
                     opened_at=opened,
                     age_hours=age_h,
+                    engine_name=p.get("engine_name") or "default",
                 ))
             dash.set_open_positions(pos_events)
 
@@ -134,6 +140,42 @@ async def _position_monitor_loop(
             logger.warning("[main] position monitor error: %s", exc)
 
 
+async def _system_health_loop(
+    poller: ScraperHealthPoller,
+    db: SeulgiDB,
+    dash: Dashboard,
+    api_key_present: bool,
+    interval_secs: float = 30.0,
+) -> None:
+    """
+    Aggregate the cheap health signals (scraper reachability from the poller,
+    AI 1h neutral rate from engine_results, DB last write) and push a single
+    SystemHealth snapshot to the dashboard each tick.
+    """
+    log = logging.getLogger(__name__)
+    while True:
+        try:
+            await asyncio.sleep(interval_secs)
+            s = poller.status
+            neutral_rate, n_decisions = await db.get_recent_neutral_rate(hours=1.0)
+            last_insert = await db.get_last_signal_at()
+            dash.set_system_health(SystemHealth(
+                scraper_reachable=s["reachable"],
+                scraper_url=s["scraper_url"],
+                scraper_last_ok_at=s["last_ok_at"],
+                scraper_last_error=s.get("last_error") or "",
+                scraper_latency_ms=s.get("latency_ms"),
+                ai_key_present=api_key_present,
+                ai_neutral_rate_1h=neutral_rate,
+                ai_total_decisions_1h=n_decisions,
+                db_last_insert_at=last_insert,
+            ))
+        except asyncio.CancelledError:
+            break
+        except Exception as exc:
+            log.debug("[main] system_health loop error: %s", exc)
+
+
 async def _watcher_status_loop(
     watchers: list, dash: Dashboard, interval_secs: float = 30.0
 ) -> None:
@@ -148,12 +190,13 @@ async def _watcher_status_loop(
                     url=url,
                     reachable=s.get("reachable", True),
                     failures=s.get("failures", 0),
-                    last_headline_at=s.get("last_headline_at") or s.get("last_tweet_at"),
+                    last_headline_at=s.get("last_headline_at") or s.get("last_tweet_at") or s.get("last_post_at"),
                     last_headline=s.get("last_headline", ""),
-                    total_headlines=s.get("total_headlines") or s.get("total_tweets") or 0,
+                    total_headlines=s.get("total_headlines") or s.get("total_tweets") or s.get("total_posts") or 0,
                     is_unreachable=s.get("is_unreachable", False),
                     budget_used=s.get("budget_used"),
                     budget_limit=s.get("budget_limit"),
+                    last_error=s.get("last_error", ""),
                 ))
         except asyncio.CancelledError:
             break
@@ -227,9 +270,20 @@ async def main() -> None:
         premium_sim_threshold=cfg.ai.premium_sim_threshold,
     )
 
+    # Manual-planning rules engine — shared across trading engines.
+    # Rules live in /app/rules/ (baked into the image so reload-on-restart is
+    # the source of truth). Loaded once at startup; restart to pick up edits.
+    from pathlib import Path as _Path
+    rules_dir = _Path(__file__).resolve().parent / "rules"
+    rule_engine = RuleEngine(rules_dir=rules_dir)
+
     # Build engines
-    engines = build_engines(cfg, db, classifier)
+    engines = build_engines(cfg, db, classifier, rule_engine=rule_engine)
     dash.set_infinite_balance(cfg.trading.infinite_balance)
+    # Pre-seed all engine names so the dashboard's per-engine block always
+    # lists every engine, even before init_from_db has filled in real values.
+    # Avoids a startup race where the render loop intermittently drops engines.
+    dash.register_engines([e.name for e in engines])
     for engine in engines:
         await engine.trader.init_from_db()
         dash.set_balance(engine.name, engine.trader.balance)
@@ -250,11 +304,16 @@ async def main() -> None:
     await impact_tracker.start()
     logger.info("[main] PriceImpactTracker started")
 
+    # Article body fetcher (fire-and-forget; first paragraph capture for analysis)
+    article_fetcher = ArticleFetcher(db=db)
+    logger.info("[main] ArticleFetcher ready")
+
     # Engine runner (fans out headlines to all engines)
     runner = EngineRunner(
         engines=engines, index=index, embedder=embedder,
         db=db, dashboard=dash, news_memory=news_memory,
         impact_tracker=impact_tracker,
+        article_fetcher=article_fetcher,
     )
 
     # Watchers
@@ -318,11 +377,20 @@ async def main() -> None:
         interval_secs=cfg.plotter.interval_secs,
     )
 
+    # Scraper health poller — surfaces a single root cause when every watcher
+    # is dead at once because the shared scraper is unreachable.
+    scraper_poller = ScraperHealthPoller()
+    await scraper_poller.start()
+
     bg_tasks = [
         asyncio.create_task(dash.run(), name="dashboard"),
         asyncio.create_task(_market_refresh_loop(index, refresh_secs, dash), name="market-refresh"),
         asyncio.create_task(_position_monitor_loop(runner, db, dash), name="position-monitor"),
         asyncio.create_task(_watcher_status_loop(all_watchers, dash), name="watcher-status"),
+        asyncio.create_task(
+            _system_health_loop(scraper_poller, db, dash, api_key_present=bool(api_key)),
+            name="system-health",
+        ),
         asyncio.create_task(_headline_drain_loop(queue, runner, dash), name="drain"),
         asyncio.create_task(plotter.run(), name="quant-plotter"),
     ]
@@ -357,6 +425,7 @@ async def main() -> None:
     await classifier.close()
     await news_memory.close()
     await impact_tracker.close()
+    await article_fetcher.close()
     await runner.close()
     for engine in engines:
         await engine.trader.close()

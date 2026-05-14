@@ -207,6 +207,7 @@ class SiteWatcher:
         # Failure / backoff state
         self._consecutive_failures: int = 0
         self._backoff_level:        int = 0  # index into _BACKOFF_LEVELS
+        self._last_error:           str = ""
 
         # Metrics
         self._last_headline_at: Optional[datetime] = None
@@ -238,6 +239,7 @@ class SiteWatcher:
             "last_headline":    self._last_headline,
             "total_headlines":  self._total_headlines,
             "is_unreachable":   self.is_unreachable,
+            "last_error":       self._last_error,
         }
 
     # ------------------------------------------------------------------
@@ -283,6 +285,7 @@ class SiteWatcher:
                     )
                 self._consecutive_failures = 0
                 self._backoff_level        = 0
+                self._last_error           = ""
 
             except asyncio.CancelledError:
                 logger.info("[watcher] %s: cancelled", self._url)
@@ -290,6 +293,7 @@ class SiteWatcher:
 
             except (_FetchError, Exception) as exc:
                 self._consecutive_failures += 1
+                self._last_error = str(exc)[:80]
                 logger.warning(
                     "[watcher] %s: failure #%d: %s",
                     self._url, self._consecutive_failures, exc,
@@ -415,6 +419,7 @@ class TwitterAccountWatcher:
         self._session: Optional[aiohttp.ClientSession] = None
         self._consecutive_failures = 0
         self._backoff_level = 0
+        self._last_error: str = ""
         self._total_tweets = 0
         self._last_tweet_at: Optional[datetime] = None
 
@@ -438,6 +443,7 @@ class TwitterAccountWatcher:
             "failures": self._consecutive_failures,
             "budget_used": used,
             "budget_limit": limit,
+            "last_error": self._last_error,
         }
 
     async def run(self, queue: asyncio.Queue) -> None:
@@ -459,6 +465,7 @@ class TwitterAccountWatcher:
                     self._budget.spend(self._username)
                 self._consecutive_failures = 0
                 self._backoff_level = 0
+                self._last_error = ""
 
                 for tweet in tweets:
                     self._total_tweets += 1
@@ -471,6 +478,7 @@ class TwitterAccountWatcher:
 
             except Exception as exc:
                 self._consecutive_failures += 1
+                self._last_error = str(exc)[:80]
                 if self._consecutive_failures >= self._max_failures:
                     self._backoff_level = min(
                         self._backoff_level + 1, len(_BACKOFF_LEVELS) - 1
@@ -557,6 +565,7 @@ class TruthSocialWatcher:
         self._session: Optional[aiohttp.ClientSession] = None
         self._consecutive_failures = 0
         self._backoff_level = 0
+        self._last_error: str = ""
         self._total_posts = 0
         self._last_post_at: Optional[datetime] = None
 
@@ -577,6 +586,7 @@ class TruthSocialWatcher:
             "total_posts": self._total_posts,
             "last_post_at": self._last_post_at,
             "failures": self._consecutive_failures,
+            "last_error": self._last_error,
         }
 
     async def run(self, queue: asyncio.Queue) -> None:
@@ -587,6 +597,7 @@ class TruthSocialWatcher:
                 posts = await self._fetch_posts()
                 self._consecutive_failures = 0
                 self._backoff_level = 0
+                self._last_error = ""
 
                 for post in posts:
                     self._total_posts += 1
@@ -599,6 +610,7 @@ class TruthSocialWatcher:
 
             except Exception as exc:
                 self._consecutive_failures += 1
+                self._last_error = str(exc)[:80]
                 if self._consecutive_failures >= self._max_failures:
                     self._backoff_level = min(
                         self._backoff_level + 1, len(_BACKOFF_LEVELS) - 1
@@ -647,3 +659,107 @@ class TruthSocialWatcher:
             )
             results.append(post)
         return results
+
+
+# ---------------------------------------------------------------------------
+# Scraper health poller
+# ---------------------------------------------------------------------------
+
+
+class ScraperHealthPoller:
+    """
+    Probes the scraper's GET /health endpoint on a fixed interval and exposes
+    last-known reachability for the dashboard.
+
+    All watchers share a single scraper service; when it goes down every
+    watcher fails identically. This poller surfaces that root cause once,
+    instead of forcing the operator to guess from 17 identical failures.
+    """
+
+    def __init__(
+        self,
+        scraper_url: str = _SCRAPER_URL,
+        interval_seconds: float = 15.0,
+        on_status_change=None,   # Optional[Callable[[dict], None]]
+    ) -> None:
+        self._url = scraper_url.rstrip("/") + "/health"
+        self._interval = interval_seconds
+        self._on_status_change = on_status_change
+
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._reachable: bool = False
+        self._last_ok_at: Optional[datetime] = None
+        self._last_checked_at: Optional[datetime] = None
+        self._last_error: str = "never probed"
+        self._latency_ms: Optional[float] = None
+        self._running = False
+
+    @property
+    def status(self) -> dict:
+        return {
+            "scraper_url":     self._url,
+            "reachable":       self._reachable,
+            "last_ok_at":      self._last_ok_at,
+            "last_checked_at": self._last_checked_at,
+            "last_error":      self._last_error,
+            "latency_ms":      self._latency_ms,
+        }
+
+    async def start(self) -> None:
+        self._running = True
+        asyncio.create_task(self._loop(), name="scraper_health_poller")
+
+    async def close(self) -> None:
+        self._running = False
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def probe_once(self) -> dict:
+        """Single probe; returns the same shape as `status` after running."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        prev_reachable = self._reachable
+        t0 = time.monotonic()
+        try:
+            async with self._session.get(
+                self._url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                self._latency_ms = (time.monotonic() - t0) * 1000.0
+                self._last_checked_at = datetime.now(timezone.utc)
+                if resp.status == 200:
+                    self._reachable = True
+                    self._last_ok_at = self._last_checked_at
+                    self._last_error = ""
+                else:
+                    self._reachable = False
+                    self._last_error = f"HTTP {resp.status}"
+        except Exception as exc:
+            self._latency_ms = (time.monotonic() - t0) * 1000.0
+            self._last_checked_at = datetime.now(timezone.utc)
+            self._reachable = False
+            self._last_error = str(exc)[:80]
+
+        if prev_reachable != self._reachable:
+            if self._reachable:
+                logger.warning("[scraper_health] recovered (latency=%.0fms)", self._latency_ms or 0)
+            else:
+                logger.error(
+                    "[scraper_health] UNREACHABLE: %s (url=%s)",
+                    self._last_error, self._url,
+                )
+            if self._on_status_change is not None:
+                try:
+                    self._on_status_change(self.status)
+                except Exception:
+                    pass
+        return self.status
+
+    async def _loop(self) -> None:
+        while self._running:
+            try:
+                await self.probe_once()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.debug("[scraper_health] probe loop error: %s", exc)
+            await asyncio.sleep(self._interval)

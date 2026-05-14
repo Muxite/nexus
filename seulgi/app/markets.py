@@ -49,6 +49,9 @@ class Market:
     question: str
     token_yes: Optional[str]
     token_no: Optional[str]
+    # Coarse classification populated by scripts/postmortem/tag_market_types.py.
+    # None on legacy rows or freshly-fetched markets the tagger hasn't seen yet.
+    market_type: Optional[str] = None
 
 
 @dataclass
@@ -63,6 +66,9 @@ class MarketMatch:
     # the model sees real prices and so the trader doesn't re-fetch per engine).
     mid_yes: Optional[float] = None
     mid_no:  Optional[float] = None
+    # Forwarded from `Market.market_type` so the rules engine can gate without
+    # hitting the DB per match.
+    market_type: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -337,6 +343,7 @@ class MarketIndex:
                 question=r["question"],
                 token_yes=r["token_yes"],
                 token_no=r["token_no"],
+                market_type=(r["market_type"] if "market_type" in r.keys() else None),
             )
             for r in rows
         ]
@@ -385,6 +392,7 @@ class MarketIndex:
                 token_yes=market.token_yes,
                 token_no=market.token_no,
                 similarity=sim,
+                market_type=market.market_type,
             ))
             if len(results) >= top_k:
                 break

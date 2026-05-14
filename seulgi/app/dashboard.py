@@ -99,6 +99,7 @@ class PositionEvent:
     p_hat: float
     opened_at: datetime
     age_hours: float
+    engine_name: str = "default"
 
 
 @dataclass
@@ -124,6 +125,21 @@ class WatcherStatus:
     is_unreachable: bool
     budget_used: Optional[int] = None    # Brave calls in last hour (Twitter watchers only)
     budget_limit: Optional[int] = None
+    last_error: str = ""                  # last fetch exception (truncated)
+
+
+@dataclass
+class SystemHealth:
+    """Aggregate health snapshot rendered in the SYSTEM HEALTH dashboard block."""
+    scraper_reachable: bool = False
+    scraper_url: str = ""
+    scraper_last_ok_at: Optional[datetime] = None
+    scraper_last_error: str = "never probed"
+    scraper_latency_ms: Optional[float] = None
+    ai_key_present: bool = False
+    ai_neutral_rate_1h: Optional[float] = None   # 0..1; how flat the AI is
+    ai_total_decisions_1h: int = 0
+    db_last_insert_at: Optional[datetime] = None
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +170,7 @@ class Dashboard:
         # Live state
         self._open_positions: list[PositionEvent] = []
         self._watcher_statuses: dict[str, WatcherStatus] = {}
+        self._system_health: SystemHealth = SystemHealth()
         self._market_count: int = 0
         self._market_last_refresh: Optional[datetime] = None
         # Per-engine balances: engine_name → balance
@@ -311,6 +328,18 @@ class Dashboard:
     def set_balance(self, engine_name: str, balance: float) -> None:
         self._engine_balances[engine_name] = balance
 
+    def register_engines(self, engine_names: list[str]) -> None:
+        """
+        Pre-seed the per-engine balance/staked dicts to 0.0 so every engine
+        appears in the dashboard from the first tick — even before init_from_db
+        completes. Without this, the dashboard render loop can race the
+        sequential init in main.py and intermittently drop engines from the
+        per-engine block.
+        """
+        for name in engine_names:
+            self._engine_balances.setdefault(name, 0.0)
+            self._engine_staked.setdefault(name, 0.0)
+
     def set_engine_summary(self, summary: list[dict], skip_reasons: list[dict]) -> None:
         """Refresh engine comparison data (called after each position monitor cycle)."""
         self._engine_summary = summary
@@ -318,6 +347,10 @@ class Dashboard:
 
     def set_open_positions(self, positions: list[PositionEvent]) -> None:
         self._open_positions = positions
+
+    def set_system_health(self, health: "SystemHealth") -> None:
+        self._system_health = health
+        self._flush_now.set()
 
     def set_watcher_status(self, status: WatcherStatus) -> None:
         self._watcher_statuses[status.url] = status
@@ -419,9 +452,9 @@ class Dashboard:
         hours, rem = divmod(int(uptime.total_seconds()), 3600)
         mins = rem // 60
 
-        n_open = len(self._open_positions)
+        n_open_total = len(self._open_positions)
         unrealized = sum(p.unrealized_pnl for p in self._open_positions)
-        sign = "+" if unrealized >= 0 else ""
+        unreal_sign = "+" if unrealized >= 0 else "-"
 
         last_news = self._news[0] if self._news else None
         last_trade = self._executed[0] if self._executed else None
@@ -441,27 +474,58 @@ class Dashboard:
             "",
             f"── {mode_label} " + "─" * (66 - len(mode_label) - 5),
         ]
+        # Per-engine unrealized PnL & open-position count (computed once,
+        # reused below)
+        per_engine_unreal: dict[str, float] = {}
+        per_engine_open: dict[str, int] = {}
+        for p in self._open_positions:
+            eng = p.engine_name or "default"
+            per_engine_unreal[eng] = per_engine_unreal.get(eng, 0.0) + p.unrealized_pnl
+            per_engine_open[eng] = per_engine_open.get(eng, 0) + 1
+
+        engine_names = sorted(set(self._engine_balances) | set(self._engine_staked))
+        # Widen name column to fit the longest engine name (min 14).
+        name_w = max(14, *(len(n) for n in engine_names)) if engine_names else 14
+
         if self._infinite_balance:
+            tb_sign = "+" if total_balance >= 0 else "-"
             roi = (total_balance / total_staked * 100.0) if total_staked > 0 else 0.0
-            sign = "+" if total_balance >= 0 else ""
-            lines.append(f"  Total realized gain : {sign}${total_balance:>10.2f} USDC")
+            lines.append(f"  Total realized gain : {tb_sign}${abs(total_balance):>10.2f} USDC")
             lines.append(f"  Total staked        : ${total_staked:>10.2f} USDC")
             lines.append(f"  ROI                 : {roi:>+6.2f}%")
             lines.append("")
-            for eng_name in sorted(set(self._engine_balances) | set(self._engine_staked)):
+            # Aligned per-engine PnL table
+            lines.append(
+                f"  {'ENGINE':<{name_w}}  {'GAIN':>10}  {'STAKED':>10}  {'ROI':>8}  "
+                f"{'OPEN':>5}  {'UNREALIZED':>11}"
+            )
+            lines.append("  " + "─" * (name_w + 2 + 10 + 2 + 10 + 2 + 8 + 2 + 5 + 2 + 11))
+            for eng_name in engine_names:
                 gain = self._engine_balances.get(eng_name, 0.0)
                 staked = self._engine_staked.get(eng_name, 0.0)
                 eng_roi = (gain / staked * 100.0) if staked > 0 else 0.0
+                unreal = per_engine_unreal.get(eng_name, 0.0)
+                eng_open = per_engine_open.get(eng_name, 0)
                 lines.append(
-                    f"    [{eng_name}]  gain={gain:+.2f}  staked={staked:.2f}  ROI={eng_roi:+.2f}%"
+                    f"  {eng_name:<{name_w}}  {gain:>+10.2f}  {staked:>10.2f}  "
+                    f"{eng_roi:>+7.2f}%  {eng_open:>5d}  {unreal:>+11.2f}"
                 )
         else:
             lines.append(f"  Total balance   : ${total_balance:>10.2f} USDC")
-            for eng_name, eng_bal in sorted(self._engine_balances.items()):
-                lines.append(f"    [{eng_name}]  ${eng_bal:.2f}")
+            lines.append("")
+            lines.append(f"  {'ENGINE':<{name_w}}  {'BALANCE':>10}  {'OPEN':>5}  {'UNREALIZED':>11}")
+            lines.append("  " + "─" * (name_w + 2 + 10 + 2 + 5 + 2 + 11))
+            for eng_name in engine_names:
+                eng_bal = self._engine_balances.get(eng_name, 0.0)
+                unreal = per_engine_unreal.get(eng_name, 0.0)
+                eng_open = per_engine_open.get(eng_name, 0)
+                lines.append(
+                    f"  {eng_name:<{name_w}}  {eng_bal:>+10.2f}  {eng_open:>5d}  {unreal:>+11.2f}"
+                )
         lines += [
-            f"  Open positions  : {n_open}",
-            f"  Unrealized PnL  : {sign}${abs(unrealized):.2f}",
+            "",
+            f"  Open positions  : {n_open_total}",
+            f"  Unrealized PnL  : {unreal_sign}${abs(unrealized):.2f}",
             f"  Realized PnL    : {'+' if self._total_realized_pnl >= 0 else ''}${self._total_realized_pnl:.2f}",
             f"  Trades executed : {len(self._executed)}",
             f"  Trades declined : {len(self._declined)}",
@@ -471,12 +535,41 @@ class Dashboard:
             f"  Markets tracked : {self._market_count}",
             f"  Last refresh    : {_ts(self._market_last_refresh) if self._market_last_refresh else 'never'}",
             "",
-            "── WATCHERS ────────────────────────────────────────────────────",
+            "── SYSTEM HEALTH ───────────────────────────────────────────────",
         ]
+        sh = self._system_health
+        scraper_glyph = "✓" if sh.scraper_reachable else "✗"
+        scraper_summary = (
+            f"reachable  (last OK {_ts(sh.scraper_last_ok_at)}"
+            + (f", latency {sh.scraper_latency_ms:.0f}ms)" if sh.scraper_latency_ms is not None else ")")
+            if sh.scraper_reachable
+            else f"UNREACHABLE — {sh.scraper_last_error or 'unknown'}"
+        )
+        lines.append(f"  {scraper_glyph} scraper      : {scraper_summary}")
+        lines.append(
+            f"    AI key      : {'✓ present' if sh.ai_key_present else '✗ MISSING'}"
+        )
+        if sh.ai_total_decisions_1h > 0 and sh.ai_neutral_rate_1h is not None:
+            warn = "  ⚠ signal starved" if sh.ai_neutral_rate_1h >= 0.85 else ""
+            lines.append(
+                f"    AI 1h       : {sh.ai_neutral_rate_1h*100:>5.1f}% NEUTRAL "
+                f"(n={sh.ai_total_decisions_1h}){warn}"
+            )
+        if sh.db_last_insert_at is not None:
+            lines.append(f"    DB last write : {_ts(sh.db_last_insert_at)}")
+        lines.append("")
+
+        lines.append("── WATCHERS ────────────────────────────────────────────────────")
+        if not sh.scraper_reachable and self._watcher_statuses:
+            lines.append("  ⚠ scraper unreachable — every watcher below will report failures")
         for url, ws in self._watcher_statuses.items():
             status = "DEAD" if ws.is_unreachable else f"fail={ws.failures}"
             since = _ts(ws.last_headline_at) if ws.last_headline_at else "never"
-            lines.append(f"  {'✓' if not ws.is_unreachable else '✗'} {_short(url):<30} last={since}  {status}")
+            tail = f"  err={ws.last_error[:40]}" if ws.last_error else ""
+            lines.append(
+                f"  {'✓' if not ws.is_unreachable else '✗'} {_short(url):<30} "
+                f"last={since}  {status}{tail}"
+            )
         if not self._watcher_statuses:
             lines.append("  (no watchers registered yet)")
         lines.append("")

@@ -97,9 +97,20 @@ social_accounts:
 # ── Market index ─────────────────────────────────────────────────────────────
 markets:
   refresh_hours: 4             # re-fetch Polymarket market list every N hours
-  similarity_threshold: 0.35   # min cosine similarity to include a market match
-  top_k: 15                    # max markets to evaluate per headline
-  max_tracked_markets: 5000    # cap index at top-N markets by volume (0 = no cap)
+  similarity_threshold: 0.55   # min cosine similarity to include a market match
+                               # Raised from 0.35 → 0.55 after the 6h analysis:
+                               # sub-0.55 matches were dominated by spurious
+                               # keyword overlaps (Rick Rieder → Rick Devens,
+                               # OPEC cuts demand → OPEC dissolves, etc.).
+                               # Mirrors impact_tracker's MIN_SIMILARITY.
+  top_k: 15                    # max markets to evaluate per headline (AI batch size)
+                               # Don't raise without first fixing ai/classify_batch p95.
+  max_tracked_markets: 20000   # cap index at top-N markets by volume (0 = no cap)
+                               # 20k × ~1.5KB embedding ≈ 30MB; matching is numpy
+                               # cosine over a (N, 384) matrix — sub-10ms at N=20k.
+                               # A wider universe means each headline's top-15 is
+                               # drawn from a much broader pool — better matches
+                               # without raising per-headline LLM cost.
 
 # ── AI direction classifier (via OpenRouter) ─────────────────────────────────
 # OpenRouter model IDs: https://openrouter.ai/models
@@ -133,6 +144,16 @@ trading:
   # cold-cull / timeout / WIN / LOSS) still apply.
   infinite_balance: true
   mode: "paper"
+  # Soft rail-skip: reject trades when the entry-side mid is within this
+  # distance of 0/1. 6h backtest: 99% of p≥0.95 entries were no_signal — the
+  # market is pinned and the headline can't move it. Per-engine override
+  # allowed (aggressive opts out to keep its TP harvesters running).
+  rail_skip_threshold: 0.05
+  # Hard rail floor — applies on top of the soft rail, default-on for every
+  # engine. At p ≥ 0.98 (or ≤ 0.02) the bid-ask spread alone routinely
+  # exceeds aggressive's SL=0.015, so SL fires on spread movement before
+  # any signal arrives. Keep this small.
+  entry_rail_skip_threshold: 0.02
 
 # ── Trading engines ──────────────────────────────────────────────────────────
 # Each engine runs the same headlines with its own rule set.
@@ -146,6 +167,15 @@ engines:
     max_position_usdc: 150.0
     min_confidence: 0.25      # fires at conf ≥ 0.51 (edge = 0.20 × 0.02 > 0.005)
     max_open_positions: 30
+    # Technical exits — micro-wins, recycle slots fast.
+    take_profit:      0.005   # close at +0.5¢ MTM
+    stop_loss:        0.015   # cut at -1.5¢ MTM
+    trailing_stop:    0.003   # after being in profit, lock in if 0.3¢ off the peak
+    min_hold_seconds: 60
+    # Aggressive harvests noise via TP=0.5¢ and was profitable in the 6h run
+    # despite IC<0; preserve its behaviour as a regression check by opting
+    # out of the rail-skip filter.
+    rail_skip_threshold: 0.0
 
   - name: "balanced"
     min_edge: 0.03
@@ -153,6 +183,10 @@ engines:
     max_position_usdc: 100.0
     min_confidence: 0.40
     max_open_positions: 20
+    take_profit:      0.020
+    stop_loss:        0.030
+    trailing_stop:    0.010
+    min_hold_seconds: 300
 
   - name: "conservative"
     min_edge: 0.06
@@ -160,6 +194,32 @@ engines:
     max_position_usdc: 50.0
     min_confidence: 0.55
     max_open_positions: 10
+    take_profit:      0.040
+    stop_loss:        0.040
+    trailing_stop:    0.020
+    min_hold_seconds: 600
+
+  # Shadow strategy: same rules as balanced, but flips direction when the AI
+  # is highly confident (conf ≥ 0.85) AND the mid is off the rails. Tests the
+  # 6h finding that high-confidence calls have IC<0 (anti-informative).
+  # If this engine outperforms balanced over the next 24h, the LLM signal is
+  # the failure mode rather than the rule set, and we should ship the
+  # inversion as a global gate.
+  - name: "inverted_highconf"
+    min_edge: 0.03
+    edge_increment: 0.12
+    max_position_usdc: 100.0
+    min_confidence: 0.40
+    max_open_positions: 20
+    take_profit:      0.020
+    stop_loss:        0.030
+    trailing_stop:    0.010
+    min_hold_seconds: 300
+    invert_high_conf: true
+    # Lowered from 0.85 → 0.75: the 0.75-0.85 bucket was also flat/anti-
+    # informative in the 6h analysis (n=21, 100% no_signal). Catching it too
+    # gives the shadow engine enough signal to actually execute trades.
+    invert_conf_threshold: 0.75
 
 # ── Database ─────────────────────────────────────────────────────────────────
 db:

@@ -97,6 +97,7 @@ class EngineRunner:
         dashboard=None,       # Optional[Dashboard] — avoids circular import
         news_memory=None,     # Optional[NewsMemory] — avoids circular import
         impact_tracker=None,  # Optional[PriceImpactTracker] — avoids circular import
+        article_fetcher=None, # Optional[ArticleFetcher] — fire-and-forget body capture
     ) -> None:
         self._engines = engines
         self._index = index
@@ -105,6 +106,7 @@ class EngineRunner:
         self._dashboard = dashboard
         self._news_memory = news_memory
         self._impact_tracker = impact_tracker
+        self._article_fetcher = article_fetcher
         # Single shared aiohttp session for parallel price prefetches
         self._price_session: Optional[aiohttp.ClientSession] = None
         # Mid-price TTL cache shared across headlines — cuts CLOB API traffic
@@ -128,6 +130,18 @@ class EngineRunner:
         """
         _t0 = time.monotonic()
         hid = getattr(headline, "headline_id", "")
+        # Fire-and-forget article body capture — runs in parallel with the rest
+        # of the pipeline; never blocks the trade decision. Data collection
+        # only (lands in headline_articles for later analysis / re-classification).
+        if self._article_fetcher is not None and getattr(headline, "article_url", None):
+            asyncio.create_task(
+                self._article_fetcher.fetch_and_store(
+                    headline_id=hid,
+                    article_url=headline.article_url,
+                    site_url=headline.site_url,
+                ),
+                name=f"article_fetch:{hid}",
+            )
         loop = asyncio.get_event_loop()
         try:
             embedding = await loop.run_in_executor(
@@ -409,6 +423,7 @@ def build_engines(
     cfg,                       # Config
     db: SeulgiDB,
     classifier: DirectionClassifier,
+    rule_engine=None,          # Optional[RuleEngine] — shared across engines
 ) -> list[Engine]:
     """
     Build the list of engines from config.
@@ -416,6 +431,10 @@ def build_engines(
     If cfg.engines is populated, one engine per entry is created, each
     overriding the global trading defaults. Otherwise a single "default"
     engine is created from cfg.trading.
+
+    All engines share the same `rule_engine` — rules are user-curated trade
+    gates that apply uniformly. Per-engine rule overrides can be added later
+    if needed.
     """
     engine_cfgs = getattr(cfg, "engines", [])
 
@@ -424,7 +443,7 @@ def build_engines(
             name="default",
             trader=PaperTrader(
                 db=db, classifier=classifier, cfg=cfg.trading, ai_cfg=cfg.ai,
-                engine_name="default",
+                engine_name="default", rule_engine=rule_engine,
             ),
         )]
 
@@ -436,7 +455,7 @@ def build_engines(
             name=ec.name,
             trader=PaperTrader(
                 db=db, classifier=classifier, cfg=trading_cfg, ai_cfg=ai_cfg,
-                engine_name=ec.name,
+                engine_name=ec.name, rule_engine=rule_engine,
             ),
         ))
 
@@ -462,8 +481,16 @@ def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
         max_open_positions=_pick("max_open_positions", base.max_open_positions),
         max_unique_markets=base.max_unique_markets,
         cold_position_hours=base.cold_position_hours,
+        take_profit=_pick("take_profit", base.take_profit),
+        stop_loss=_pick("stop_loss", base.stop_loss),
+        trailing_stop=_pick("trailing_stop", base.trailing_stop),
+        min_hold_seconds=_pick("min_hold_seconds", base.min_hold_seconds),
         infinite_balance=base.infinite_balance,   # propagate global flag to every engine
         mode=base.mode,
+        rail_skip_threshold=_pick("rail_skip_threshold", base.rail_skip_threshold),
+        entry_rail_skip_threshold=_pick("entry_rail_skip_threshold", base.entry_rail_skip_threshold),
+        invert_high_conf=_pick("invert_high_conf", base.invert_high_conf),
+        invert_conf_threshold=_pick("invert_conf_threshold", base.invert_conf_threshold),
     )
 
 

@@ -11,6 +11,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ /app/
 
+# Manual-planning rules — user-curated trade gates consulted by PaperTrader.
+# Baked into the image so a `docker compose restart seulgi` picks up edits.
+COPY rules/ /app/rules/
+
 # Data directory for SQLite DB
 RUN mkdir -p /data
 

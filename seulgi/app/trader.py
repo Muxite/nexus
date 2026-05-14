@@ -142,12 +142,16 @@ class PaperTrader:
         cfg,    # TradingConfig
         ai_cfg, # AIConfig
         engine_name: str = "default",
+        rule_engine=None,   # Optional[RuleEngine] — None disables rule gating
     ) -> None:
         self._db = db
         self._classifier = classifier
         self._cfg = cfg
         self._ai_cfg = ai_cfg
         self._engine_name = engine_name
+        # Manual-planning rules engine — shared across engines, evaluated
+        # pre-AI (to save tokens) and post-AI (to skip on AI confidence).
+        self._rules = rule_engine
         # In infinite-balance mode, `_balance` represents cumulative *realized*
         # PnL (the "gain"), starting at 0. There's no capital constraint —
         # position-side caps (max_open / max_unique / cold-cull) gate trades.
@@ -233,12 +237,50 @@ class PaperTrader:
             headline_id=getattr(headline, "headline_id", None),
         )
 
-        # Classify all matches in ONE batched API call (10-15× cheaper)
+        # ── Pre-AI rule gate ─────────────────────────────────────────
+        # Skip matches that fail a pre_ai rule BEFORE we burn AI tokens on
+        # them. The skipped decisions are still recorded so the post-mortem
+        # can attribute exactly which rule killed each match.
+        decisions: list[TradeDecision] = []
+        survivors: list[MarketMatch] = []
+        if self._rules is not None:
+            for match in matches:
+                reason = self._rules.gate_pre_ai(
+                    market_type=match.market_type,
+                    mid_price=match.mid_yes,
+                )
+                if reason is None:
+                    survivors.append(match)
+                    continue
+                decision = TradeDecision(
+                    condition_id=match.condition_id,
+                    question=match.question,
+                    direction=Direction.NEUTRAL,
+                    confidence=0.0,
+                    similarity=match.similarity,
+                    p_hat=0.0,
+                    mid_price=match.mid_yes,
+                    edge=0.0,
+                    size_usdc=0.0,
+                    executed=False,
+                    skip_reason=reason,
+                )
+                await self._record(signal_id, decision, token_id=None)
+                decisions.append(decision)
+        else:
+            survivors = list(matches)
+
+        # Nothing left to classify — return the skip decisions only.
+        if not survivors:
+            self._last_tokens_used = 0
+            return decisions
+
+        # Classify the survivors in ONE batched API call (10-15× cheaper)
         is_republish = getattr(headline, "_is_republish", False)
         similar_to   = getattr(headline, "_similar_to",   None)
         classify_results: list[ClassifyResult] = await self._classifier.classify_batch(
             headline=headline.headline,
-            matches=matches,
+            matches=survivors,
             is_republish=is_republish,
             similar_to=similar_to,
         )
@@ -246,9 +288,7 @@ class PaperTrader:
         self._last_tokens_used = sum(r.tokens_used for r in classify_results)
 
         session = self._get_session()
-        decisions: list[TradeDecision] = []
-
-        for match, result in zip(matches, classify_results):
+        for match, result in zip(survivors, classify_results):
             decision = await self._evaluate_market(
                 session, signal_id, headline, match, result
             )
@@ -296,6 +336,39 @@ class PaperTrader:
             await self._record(signal_id, decision, token_id=None)
             return decision
 
+        # ── Post-AI rule gate ─────────────────────────────────────────
+        # Use the YES-side mid as the canonical reference price (matches the
+        # pre-AI gate). Direction here is the AI's call BEFORE the optional
+        # inversion below — intentional: we want to catch high-conf calls
+        # regardless of whether the shadow engine later flips them.
+        if self._rules is not None:
+            reason = self._rules.gate_post_ai(
+                market_type=match.market_type,
+                mid_price=match.mid_yes,
+                direction=result.direction.value,
+                confidence=result.confidence,
+            )
+            if reason is not None:
+                decision = _skip(reason)
+                await self._record(signal_id, decision, token_id=None)
+                return decision
+
+        # ── Optional: invert direction on high-confidence calls ───────
+        # Shadow strategy: empirically conf ≥ invert_conf_threshold has IC<0
+        # against the next 5m. Flip only when the *original* side's mid is
+        # not at a rail (so the flip lands on a tradeable price too).
+        if (
+            self._cfg.invert_high_conf
+            and result.confidence >= self._cfg.invert_conf_threshold
+        ):
+            original_mid = (
+                match.mid_yes if result.direction == Direction.YES else match.mid_no
+            )
+            if original_mid is not None and 0.05 < original_mid < 0.95:
+                from dataclasses import replace as _dc_replace
+                flipped = Direction.NO if result.direction == Direction.YES else Direction.YES
+                result = _dc_replace(result, direction=flipped)
+
         # ── Token + price selection ───────────────────────────────────
         # Prefer the price that was prefetched in EngineRunner.process()
         # (one parallel gather instead of N serial HTTP calls per engine).
@@ -316,6 +389,27 @@ class PaperTrader:
             mid_price = await _fetch_mid_price(session, token_id)
         if mid_price is None:
             decision = _skip("no_price")
+            await self._record(signal_id, decision, token_id=token_id)
+            return decision
+
+        # ── Hard rail floor (applies to every engine; aggressive too) ─
+        # At extreme prices the bid-ask spread alone routinely exceeds a
+        # tight stop-loss, so SL fires on spread before any signal arrives.
+        # Reject entries inside [0, hard_thr] ∪ [1-hard_thr, 1] regardless
+        # of whether the engine opted out of the softer rail filter below.
+        hard_thr = self._cfg.entry_rail_skip_threshold
+        if hard_thr > 0 and (mid_price <= hard_thr or mid_price >= 1.0 - hard_thr):
+            decision = _skip(f"hard_rail:{mid_price:.3f}", mid=mid_price)
+            await self._record(signal_id, decision, token_id=token_id)
+            return decision
+
+        # ── Soft rail-skip: refuse trades on saturated markets ────────
+        # In the 6h backtest, p_t0 ≥ 0.95 was 99% no_signal — the headline
+        # cannot move a market already pinned at the rail. Aggressive opts
+        # out (rail_skip_threshold=0) to keep its TP harvesters running.
+        rail_thr = self._cfg.rail_skip_threshold
+        if rail_thr > 0 and (mid_price <= rail_thr or mid_price >= 1.0 - rail_thr):
+            decision = _skip(f"rail_price:{mid_price:.3f}", mid=mid_price)
             await self._record(signal_id, decision, token_id=token_id)
             return decision
 
@@ -475,7 +569,7 @@ class PaperTrader:
                 else:
                     self._balance += pos["size_usdc"] + pnl
                 await self._db.close_position(pos["trade_id"])
-                await self._db.close_trade(pos["trade_id"], pnl)
+                await self._db.close_trade(pos["trade_id"], pnl, close_reason="COLD_CULL")
             logger.info(
                 "[trader] COLD_CULL %s %s  exit=%.3f  pnl=%.2f",
                 pos["direction"], pos["condition_id"][:12], price, pnl,
@@ -503,6 +597,7 @@ class PaperTrader:
             entry_price = pos["entry_price"]
             direction   = pos["direction"]
             condition_id = pos["condition_id"]
+            prev_hwm    = pos.get("high_water_price")
 
             opened_at = datetime.fromisoformat(pos["opened_at"])
             # Ensure timezone-aware for comparison
@@ -512,16 +607,49 @@ class PaperTrader:
 
             shares = size_usdc / entry_price
             unrealized_pnl = (current_price - entry_price) * shares
-            await self._db.update_position_price(trade_id, current_price, unrealized_pnl)
 
-            # Determine close trigger
+            # Update price + high-water mark in DB. The DB MAX() guarantees
+            # monotonically-rising HWM even if multiple ticks race.
+            await self._db.update_position_price(
+                trade_id, current_price, unrealized_pnl,
+                high_water_price=current_price,
+            )
+            # Local copy of the updated HWM for the trailing-stop check.
+            local_hwm = max(current_price, prev_hwm if prev_hwm is not None else current_price)
+
+            # MTM in probability points. current_price is the mid of the side
+            # we entered (token_id is per-side), so (current - entry) is positive
+            # when the position is in profit regardless of YES/NO direction.
+            mtm     = current_price - entry_price
+            hwm_mtm = local_hwm     - entry_price
+
+            tp = self._cfg.take_profit
+            sl = self._cfg.stop_loss
+            ts = self._cfg.trailing_stop
+            min_hold = self._cfg.min_hold_seconds
+
+            # Determine close trigger. Order: hard WIN/LOSS first, then
+            # technical exits once min_hold has elapsed (trailing > TP > SL),
+            # then absolute timeout as backstop.
+            close_reason: Optional[str] = None
+            min_hold_met = (min_hold <= 0) or (age_secs >= min_hold)
             if current_price >= _WIN_PRICE:
                 close_reason = "WIN"
             elif current_price <= _LOSS_PRICE:
                 close_reason = "LOSS"
+            elif min_hold_met and ts > 0 and hwm_mtm >= ts and (hwm_mtm - mtm) >= ts:
+                close_reason = "TRAIL"
+            elif min_hold_met and tp > 0 and mtm >= tp:
+                close_reason = "TP"
+            elif min_hold_met and sl > 0 and mtm <= -sl:
+                # Note: SL is gated by min_hold_met (same as TP/TRAIL) to
+                # prevent the first post-entry spread tick from instantly
+                # triggering a loss before any headline has had a chance to
+                # move the market.
+                close_reason = "SL"
             elif age_secs >= timeout_secs:
                 close_reason = "TIMEOUT"
-            else:
+            if close_reason is None:
                 continue
 
             realized_pnl = (current_price - entry_price) * shares
@@ -532,7 +660,7 @@ class PaperTrader:
                 else:
                     self._balance += size_usdc + realized_pnl
                 await self._db.close_position(trade_id)
-                await self._db.close_trade(trade_id, realized_pnl)
+                await self._db.close_trade(trade_id, realized_pnl, close_reason=close_reason)
 
             sign = "+" if realized_pnl >= 0 else ""
             logger.info(
