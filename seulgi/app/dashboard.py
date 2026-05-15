@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
 import os
 import time
@@ -152,9 +153,11 @@ class Dashboard:
     Collects pipeline events and writes them to text files in data_dir.
     """
 
-    def __init__(self, data_dir: str, interval_secs: float = 30.0) -> None:
+    def __init__(self, data_dir: str, interval_secs: float = 30.0, db=None) -> None:
         self._dir = data_dir
         self._interval = interval_secs
+        self._db = db                         # Optional[SeulgiDB] for new views
+        self._last_trade_log_id: int = 0      # cursor into closed trades for trade_log.jsonl
         self._started_at = datetime.now(timezone.utc)
 
         # Ring buffers
@@ -440,6 +443,11 @@ class Dashboard:
             self._write_signal_journal(),
             self._write_quant_stats(),
             self._write_usage(),
+            self._write_trade_log(),
+            self._write_variant_compare(),
+            self._write_wins_losses(),
+            self._write_headline_journal(),
+            self._write_headline_winners(),
         )
 
     # ------------------------------------------------------------------
@@ -522,14 +530,22 @@ class Dashboard:
                 lines.append(
                     f"  {eng_name:<{name_w}}  {eng_bal:>+10.2f}  {eng_open:>5d}  {unreal:>+11.2f}"
                 )
+        # Process-local counters since the container started. The per-engine
+        # GAIN/ROI block above shows the *lifetime* numbers restored from
+        # DB; the lines below show "what's happened since this run booted".
+        # We label them explicitly so the operator stops being confused
+        # when the top says +$61 lifetime and the bottom says +$0 session.
+        n_closed_session = len(self._closed)
+        session_realized = self._total_realized_pnl
+        sess_sign = "+" if session_realized >= 0 else ""
         lines += [
             "",
-            f"  Open positions  : {n_open_total}",
-            f"  Unrealized PnL  : {unreal_sign}${abs(unrealized):.2f}",
-            f"  Realized PnL    : {'+' if self._total_realized_pnl >= 0 else ''}${self._total_realized_pnl:.2f}",
-            f"  Trades executed : {len(self._executed)}",
-            f"  Trades declined : {len(self._declined)}",
-            f"  Near misses     : {len(self._near_miss)}",
+            f"  Open positions      : {n_open_total}",
+            f"  Unrealized PnL      : {unreal_sign}${abs(unrealized):.2f}    (mark-to-market on open positions)",
+            f"  Closes this session : {n_closed_session} / {sess_sign}${session_realized:.2f}   (since container start; lifetime gain shown above)",
+            f"  Recent trades buf   : {len(self._executed)} / {self._executed.maxlen}    (in-memory ring)",
+            f"  Trades declined     : {len(self._declined)}",
+            f"  Near misses         : {len(self._near_miss)}",
             "",
             "── MARKET INDEX ────────────────────────────────────────────────",
             f"  Markets tracked : {self._market_count}",
@@ -974,6 +990,154 @@ class Dashboard:
         if not self._traces:
             lines.append("  (no traces yet)")
         _write(self._path("trace_log.txt"), "\n".join(lines) + "\n")
+
+    # ------------------------------------------------------------------
+    # Phase C: rich per-trade reasoning views
+    # ------------------------------------------------------------------
+
+    async def _write_trade_log(self) -> None:
+        """
+        Append-only JSONL of every closed trade with full reasoning context.
+        One row per close, in id order so `tail -f` shows new closes live.
+        """
+        if self._db is None:
+            return
+        try:
+            rows = await self._db.get_closed_trades_since(self._last_trade_log_id)
+        except Exception as exc:
+            logger.warning("[dash] trade_log query failed: %s", exc)
+            return
+        if not rows:
+            return
+        path = self._path("trade_log.jsonl")
+        try:
+            # Append-only; never rewritten. Atomic line-by-line under POSIX
+            # writes since each line is < PIPE_BUF.
+            with open(path, "a", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, default=str, separators=(",", ":")) + "\n")
+            self._last_trade_log_id = max(r["id"] for r in rows)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[dash] trade_log append failed: %s", exc)
+
+    async def _write_variant_compare(self) -> None:
+        """Per-variant pivot: trades, wins, losses, hit-rate, sum PnL."""
+        if self._db is None:
+            return
+        try:
+            stats = await self._db.get_variant_stats()
+        except Exception as exc:
+            logger.warning("[dash] variant_stats query failed: %s", exc)
+            return
+        lines = [
+            _header("VARIANT COMPARISON  (all engines × variants, sorted by sum PnL)"),
+            "  Each row is one strategy variant. Variants of the same engine share the AI",
+            "  call but differ in entry/exit rules — compare to find which rule set wins.",
+            "",
+        ]
+        if not stats:
+            lines.append("  (no executed trades yet)")
+        else:
+            lines.append(
+                f"  {'VARIANT':<28}  {'TRADES':>6} {'OPEN':>5} {'WINS':>5} {'LOSS':>5}  "
+                f"{'HIT%':>6}  {'SUM PnL':>9}  {'AVG PnL':>8}  {'AVG CONF':>8}  "
+                f"{'AVG EDGE':>9}  {'STAKED':>9}  {'INV':>4}"
+            )
+            lines.append("  " + "─" * 130)
+            for r in stats:
+                closed = (r["n_wins"] or 0) + (r["n_losses"] or 0)
+                hit = (r["n_wins"] / closed * 100.0) if closed else 0.0
+                lines.append(
+                    f"  {r['variant']:<28}  {r['n_trades']:>6} {r['n_open']:>5} "
+                    f"{r['n_wins']:>5} {r['n_losses']:>5}  "
+                    f"{hit:>5.1f}%  {r['sum_pnl']:>+9.2f}  {r['avg_pnl']:>+8.3f}  "
+                    f"{r['avg_conf']:>7.1%}  {r['avg_edge']:>+9.4f}  "
+                    f"{r['total_staked']:>9.2f}  {r['n_inverted']:>4}"
+                )
+        _write(self._path("variant_compare.txt"), "\n".join(lines) + "\n")
+
+    async def _write_wins_losses(self) -> None:
+        """Top winners and losers with full reasoning context."""
+        if self._db is None:
+            return
+        try:
+            wins, losses = await self._db.get_top_wins_losses(limit=50)
+        except Exception as exc:
+            logger.warning("[dash] wins/losses query failed: %s", exc)
+            return
+        for path, label, rows in (
+            ("wins.txt",   "TOP WINS",   wins),
+            ("losses.txt", "TOP LOSSES", losses),
+        ):
+            lines = [_header(f"{label}  (top 50 by realized PnL)"), ""]
+            if not rows:
+                lines.append("  (none yet)")
+            else:
+                for r in rows:
+                    inv = " [INV]" if (r.get("inverted") or 0) else ""
+                    mid_y = r.get("mid_yes")
+                    mid_n = r.get("mid_no")
+                    mid_y_s = f"{mid_y:.3f}" if mid_y is not None else "  —  "
+                    mid_n_s = f"{mid_n:.3f}" if mid_n is not None else "  —  "
+                    lines.append(
+                        f"  PnL={r['realized_pnl']:>+8.3f}  [{r['variant']}]{inv}  "
+                        f"{r['direction']} ${r['size_usdc']:.0f} "
+                        f"@ {r['entry_price']:.3f}  edge={r['signed_edge']:+.4f}  "
+                        f"conf={r['confidence']:.0%}  agree={(r.get('agreement') or 0):.2f}  "
+                        f"close={r.get('close_reason') or '?'}"
+                    )
+                    lines.append(f"    yes/no rails  : {mid_y_s} / {mid_n_s}")
+                    lines.append(f"    Market   : {(r.get('question') or '')[:95]}")
+                    if r.get("ai_reason"):
+                        lines.append(f"    AI says  : {r['ai_reason'][:120]}")
+                    lines.append("")
+            _write(self._path(path), "\n".join(lines) + "\n")
+
+    async def _write_headline_journal(self) -> None:
+        """One JSONL line per headline + linked trades + price context."""
+        if self._db is None:
+            return
+        try:
+            rows = await self._db.get_headline_summary(limit=500)
+        except Exception as exc:
+            logger.warning("[dash] headline_summary query failed: %s", exc)
+            return
+        path = self._path("headline_journal.jsonl")
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, default=str, separators=(",", ":")) + "\n")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[dash] headline_journal write failed: %s", exc)
+
+    async def _write_headline_winners(self) -> None:
+        """Group by headline; show headlines where ≥2 variants traded, ranked by sum PnL."""
+        if self._db is None:
+            return
+        try:
+            rows = await self._db.get_headline_winners(limit=40, min_variants=2)
+        except Exception as exc:
+            logger.warning("[dash] headline_winners query failed: %s", exc)
+            return
+        lines = [
+            _header("HEADLINE WINNERS  (≥2 variants traded; sum PnL desc)"),
+            "  Headlines where the signal was robust across multiple strategy variants.",
+            "  Single-variant flukes are filtered out.",
+            "",
+        ]
+        if not rows:
+            lines.append("  (no multi-variant trades yet — give it more time)")
+        else:
+            for r in rows:
+                lines.append(
+                    f"  Σ PnL={r['sum_pnl']:>+8.3f}  variants={r['n_variants']}  "
+                    f"wins={r['n_wins']}  losses={r['n_losses']}  "
+                    f"at {(r['detected_at'] or '')[:19]}"
+                )
+                lines.append(f"    {(r.get('headline') or '')[:110]}")
+                lines.append(f"    {_short(r.get('site_url') or '')}  hid={(r.get('headline_id') or '')[:8]}")
+                lines.append("")
+        _write(self._path("headline_winners.txt"), "\n".join(lines) + "\n")
 
     # ------------------------------------------------------------------
     # Helpers

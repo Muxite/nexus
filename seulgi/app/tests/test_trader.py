@@ -57,12 +57,24 @@ def _make_cfg(
     cfg.max_unique_markets = max_unique_markets
     cfg.cold_position_hours = cold_position_hours
     cfg.infinite_balance = False
+    # Explicit defaults — without these MagicMock returns truthy child mocks
+    # and `>=` against a Mock raises TypeError.
+    cfg.invert_high_conf = False
+    cfg.invert_conf_threshold = 0.85
+    cfg.rail_skip_threshold = 0.0
+    cfg.entry_rail_skip_threshold = 0.0
+    cfg.take_profit = 0.0
+    cfg.stop_loss = 0.0
+    cfg.trailing_stop = 0.0
+    cfg.min_hold_seconds = 0.0
+    cfg.spread_cost_bps = 0.0
     return cfg
 
 
 def _make_ai_cfg(min_confidence=0.45):
     ai_cfg = MagicMock()
     ai_cfg.min_confidence = min_confidence
+    ai_cfg.min_agreement = 0.0  # disable ensemble gate in unit tests
     return ai_cfg
 
 
@@ -459,7 +471,7 @@ class TestMonitorPositions:
         expected_pnl = (exit_price - entry_price) * (size / entry_price)
 
         pnl_recorded = []
-        db.close_trade = AsyncMock(side_effect=lambda tid, pnl: pnl_recorded.append(pnl))
+        db.close_trade = AsyncMock(side_effect=lambda tid, pnl, **_kw: pnl_recorded.append(pnl))
 
         with patch("trader._fetch_mid_price", AsyncMock(return_value=exit_price)):
             await trader.monitor_positions()

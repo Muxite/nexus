@@ -86,9 +86,19 @@ def _make_trader(balance: float = 1000.0):
     cfg.max_unique_markets = 15
     cfg.cold_position_hours = 12.0
     cfg.infinite_balance = False
+    cfg.invert_high_conf = False
+    cfg.invert_conf_threshold = 0.85
+    cfg.rail_skip_threshold = 0.0
+    cfg.entry_rail_skip_threshold = 0.0
+    cfg.take_profit = 0.0
+    cfg.stop_loss = 0.0
+    cfg.trailing_stop = 0.0
+    cfg.min_hold_seconds = 0.0
+    cfg.spread_cost_bps = 0.0
 
     ai_cfg = MagicMock()
     ai_cfg.min_confidence = 0.45
+    ai_cfg.min_agreement = 0.0
 
     trader = PaperTrader(db=db, classifier=MagicMock(), cfg=cfg, ai_cfg=ai_cfg)
     trader._balance = balance

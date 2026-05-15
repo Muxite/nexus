@@ -39,14 +39,16 @@ created from the global `trading:` config.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
-from ai import DirectionClassifier
+from ai import DirectionClassifier, ClassifyResult
 from config import TradingConfig, AIConfig
 from db import SeulgiDB
 from markets import MarketIndex, Embedder, MarketMatch
@@ -94,6 +96,8 @@ class EngineRunner:
         index: MarketIndex,
         embedder: Embedder,
         db: SeulgiDB,
+        classifier: DirectionClassifier,
+        rule_engine=None,     # Optional[RuleEngine] — shared across all variants
         dashboard=None,       # Optional[Dashboard] — avoids circular import
         news_memory=None,     # Optional[NewsMemory] — avoids circular import
         impact_tracker=None,  # Optional[PriceImpactTracker] — avoids circular import
@@ -103,6 +107,8 @@ class EngineRunner:
         self._index = index
         self._embedder = embedder
         self._db = db
+        self._classifier = classifier
+        self._rules = rule_engine
         self._dashboard = dashboard
         self._news_memory = news_memory
         self._impact_tracker = impact_tracker
@@ -114,6 +120,23 @@ class EngineRunner:
         # token_id → (price_or_None, monotonic_expiry_secs)
         self._price_cache: dict[str, tuple[Optional[float], float]] = {}
         self._price_cache_ttl: float = 10.0   # seconds
+        # Lessons cache (hoisted from PaperTrader): one fetch per ~60s shared
+        # across all engines/variants. The aggregator only runs every ~10m.
+        self._lesson_notes: list[str] = []
+        self._lesson_cache_until: float = 0.0
+
+    async def _get_lesson_notes_cached(self) -> list[str]:
+        from time import monotonic
+        if monotonic() < self._lesson_cache_until:
+            return self._lesson_notes
+        try:
+            import lessons as _lessons
+            notes = await _lessons.load_active_notes(self._db, limit=8)
+        except Exception:  # noqa: BLE001
+            notes = []
+        self._lesson_notes = notes
+        self._lesson_cache_until = monotonic() + 60.0
+        return notes
 
     def _get_price_session(self) -> aiohttp.ClientSession:
         if self._price_session is None or self._price_session.closed:
@@ -200,13 +223,78 @@ class EngineRunner:
             hid, headline.headline[:60], len(matches), is_republish, len(self._engines),
         )
 
+        # ── Signal insert + pre-AI gate (shared across all variants) ────────
+        # One signal row per headline (was: one per engine in trader.process).
+        signal_id = await self._db.insert_signal(
+            site_url=headline.site_url,
+            headline=headline.headline,
+            headline_id=getattr(headline, "headline_id", None),
+        )
+
+        pre_skips: list[tuple[MarketMatch, str]] = []
+        survivors: list[MarketMatch] = []
+        if self._rules is not None:
+            for m in matches:
+                reason = self._rules.gate_pre_ai(
+                    market_type=m.market_type, mid_price=m.mid_yes,
+                )
+                if reason is None:
+                    survivors.append(m)
+                else:
+                    pre_skips.append((m, reason))
+        else:
+            survivors = list(matches)
+
+        # ── Single batched AI call (shared by every variant) ───────────────
+        source_host: Optional[str] = None
+        if headline.site_url:
+            try:
+                source_host = urlparse(headline.site_url).netloc or None
+            except Exception:  # noqa: BLE001
+                source_host = None
+        try:
+            lesson_notes = await self._get_lesson_notes_cached()
+        except Exception:  # noqa: BLE001
+            lesson_notes = []
+
+        classify_results: list[ClassifyResult] = []
+        prompt_meta: dict = {}
+        if survivors:
+            classify_results, prompt_meta = await self._classifier.classify_batch(
+                headline=headline.headline,
+                matches=survivors,
+                is_republish=is_republish,
+                similar_to=similar_to,
+                source=source_host,
+                lesson_notes=lesson_notes,
+            )
+            # ONE usage_events row per headline — tokens are shared across all
+            # variants by construction.
+            tokens_used = sum(r.tokens_used for r in classify_results)
+            if tokens_used:
+                asyncio.create_task(self._db.log_usage(
+                    kind="ai_tokens",
+                    count=float(tokens_used),
+                    provider=prompt_meta.get("model"),
+                    meta=json.dumps({"hid": hid, "n_markets": len(survivors)}),
+                ))
+
+        prompt_meta_json = (
+            json.dumps(prompt_meta, separators=(",", ":")) if prompt_meta else None
+        )
+
         # Embed + dedup + match time — passed in; AI call time is measured per-engine
         pre_ms = (time.monotonic() - _t0) * 1000.0
 
-        # Fan out to all engines concurrently
+        # Fan out to all engines/variants concurrently. Every engine sees the
+        # same signal_id, same classify_results, same prompt_meta.
         results: list[list[TradeDecision]] = await asyncio.gather(
             *[
-                self._run_engine(engine, headline, matches, pre_ms)
+                self._run_engine(
+                    engine, headline, signal_id,
+                    survivors, classify_results, prompt_meta_json,
+                    pre_skips, pre_ms,
+                )
                 for engine in self._engines
             ],
             return_exceptions=True,
@@ -293,32 +381,32 @@ class EngineRunner:
         self,
         engine: Engine,
         headline: RawHeadline,
-        matches: list[MarketMatch],
+        signal_id: int,
+        survivors: list[MarketMatch],
+        classify_results: list[ClassifyResult],
+        prompt_meta_json: Optional[str],
+        pre_skips: list[tuple[MarketMatch, str]],
         pre_ms: float = 0.0,
     ) -> list[TradeDecision]:
         """
-        Run one engine on the matches. Total signal latency = pre_ms (embed +
-        dedup + similarity) + the AI classification call inside trader.process().
-        This captures end-to-end headline-to-decision time.
+        Run one engine/variant on the pre-classified matches.
+
+        Total signal latency = pre_ms (embed + dedup + similarity + shared AI
+        call) + the variant's own per-match guard evaluation time.
         """
         hid = getattr(headline, "headline_id", "")
         _t_engine = time.monotonic()
-        decisions = await engine.trader.process(headline, matches)
+        decisions = await engine.trader.evaluate(
+            signal_id, headline, survivors, classify_results,
+            prompt_meta_json, pre_ai_skips=pre_skips,
+        )
         total_latency_ms = pre_ms + (time.monotonic() - _t_engine) * 1000.0
         await self._db.record_engine_decisions(
             engine.name, decisions, headline_id=hid, signal_latency_ms=total_latency_ms
         )
 
-        # Log AI tokens consumed by this engine's batch call for this headline.
-        # PaperTrader.process stashes the batch's total on _last_tokens_used.
-        tokens_used = getattr(engine.trader, "_last_tokens_used", 0) or 0
-        if tokens_used:
-            asyncio.create_task(self._db.log_usage(
-                kind="ai_tokens", count=float(tokens_used),
-                provider=getattr(engine.trader._ai_cfg, "model", None),
-                meta=f'{{"engine":"{engine.name}","hid":"{hid}"}}',
-            ))
-
+        # Reconstruct the matches set for impact tracking (survivors only —
+        # pre-AI skips never get a token assignment for the impact row).
         # Price-impact tracking — only from first engine to avoid duplicate rows
         if self._impact_tracker is not None and engine == self._engines[0]:
             is_republish = getattr(headline, "_is_republish", False)
@@ -327,7 +415,7 @@ class EngineRunner:
                 for d in decisions:
                     # Pick the token for the AI's predicted direction
                     match_for_d = next(
-                        (m for m in matches if m.condition_id == d.condition_id), None
+                        (m for m in survivors if m.condition_id == d.condition_id), None
                     )
                     token_id = None
                     if match_for_d:
@@ -426,15 +514,20 @@ def build_engines(
     rule_engine=None,          # Optional[RuleEngine] — shared across engines
 ) -> list[Engine]:
     """
-    Build the list of engines from config.
+    Build the list of engines (and variants) from config.
 
-    If cfg.engines is populated, one engine per entry is created, each
-    overriding the global trading defaults. Otherwise a single "default"
-    engine is created from cfg.trading.
+    Each engine entry in cfg.engines may declare a list of `variants` that
+    inherit the engine's overrides and add further overrides. Each variant
+    materialises as its own Engine row with a composite name
+    `<engine>/<variant>`; trades land under that name and a separate
+    `variant_name` column on `trades` mirrors it. All variants of one engine
+    share the same batched AI call (made once at the runner level).
+
+    If cfg.engines is empty, a single "default" engine is created from
+    cfg.trading.
 
     All engines share the same `rule_engine` — rules are user-curated trade
-    gates that apply uniformly. Per-engine rule overrides can be added later
-    if needed.
+    gates that apply uniformly.
     """
     engine_cfgs = getattr(cfg, "engines", [])
 
@@ -444,20 +537,33 @@ def build_engines(
             trader=PaperTrader(
                 db=db, classifier=classifier, cfg=cfg.trading, ai_cfg=cfg.ai,
                 engine_name="default", rule_engine=rule_engine,
+                variant_name="default", parent_engine="default",
             ),
         )]
 
-    engines = []
+    engines: list[Engine] = []
     for ec in engine_cfgs:
-        trading_cfg = _merge_trading_cfg(cfg.trading, ec)
-        ai_cfg = _merge_ai_cfg(cfg.ai, ec)
-        engines.append(Engine(
-            name=ec.name,
-            trader=PaperTrader(
-                db=db, classifier=classifier, cfg=trading_cfg, ai_cfg=ai_cfg,
-                engine_name=ec.name, rule_engine=rule_engine,
-            ),
-        ))
+        base_trading = _merge_trading_cfg(cfg.trading, ec)
+        base_ai = _merge_ai_cfg(cfg.ai, ec)
+
+        variants = getattr(ec, "variants", None) or [None]
+        for variant in variants:
+            if variant is None:
+                v_trading = base_trading
+                v_ai = base_ai
+                v_name = ec.name
+            else:
+                v_trading = _merge_trading_cfg(base_trading, variant)
+                v_ai = _merge_ai_cfg(base_ai, variant)
+                v_name = f"{ec.name}/{variant.name}"
+            engines.append(Engine(
+                name=v_name,
+                trader=PaperTrader(
+                    db=db, classifier=classifier, cfg=v_trading, ai_cfg=v_ai,
+                    engine_name=v_name, rule_engine=rule_engine,
+                    variant_name=v_name, parent_engine=ec.name,
+                ),
+            ))
 
     logger.info("[engine] built %d engines: %s", len(engines), [e.name for e in engines])
     return engines
@@ -491,6 +597,7 @@ def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
         entry_rail_skip_threshold=_pick("entry_rail_skip_threshold", base.entry_rail_skip_threshold),
         invert_high_conf=_pick("invert_high_conf", base.invert_high_conf),
         invert_conf_threshold=_pick("invert_conf_threshold", base.invert_conf_threshold),
+        spread_cost_bps=_pick("spread_cost_bps", base.spread_cost_bps),
     )
 
 

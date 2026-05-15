@@ -35,7 +35,7 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
@@ -83,20 +83,29 @@ in the same order as the input list. No prose, no markdown.
 
 _BATCH_PROMPT_TEMPLATE = """\
 Headline: {headline}
-{republish_block}
+{source_block}{lessons_block}{republish_block}
 Evaluate the headline against each of the following Polymarket questions:
 
 {questions_block}
 
 For each question output exactly:
-{{"idx": <0-based index>, "direction": "YES"|"NO"|"NEUTRAL", "confidence": 0.0-1.0, "reason": "<one sentence>"}}
+{{"idx": <0-based index>, "p_yes": <0.0-1.0>, "p_no": <0.0-1.0>, "p_neutral": <0.0-1.0>, "p_alpha": <0.0-1.0>, "risk": <0.0-1.0>, "reason": "<one sentence>"}}
 
 Rules:
-- YES  = headline increases likelihood of YES outcome
-- NO   = headline decreases likelihood of YES outcome
-- NEUTRAL = not clearly related, ambiguous, or already priced in
-- confidence = how certain you are (0.5 = barely, 1.0 = certain)
-- If current mid price already reflects the news (≥0.85 or ≤0.15), return NEUTRAL
+- p_yes  = probability the headline increases YES outcome likelihood
+- p_no   = probability the headline decreases YES outcome likelihood
+- p_neutral = probability the headline is not clearly related, ambiguous, or already priced in
+- The three probabilities MUST sum to 1.0. Express genuine uncertainty here, do not collapse to one bucket.
+- If current mid price already reflects the news (≥0.85 or ≤0.15), shift mass to p_neutral.
+- Trust: state-media (Xinhua, TASS, RT, People's Daily) and partisan/tabloid sources move markets less — shift mass to p_neutral on contested claims.
+
+- p_alpha = probability that a trade in the argmax direction (the highest of p_yes/p_no/p_neutral, ignoring NEUTRAL) makes money inside 5–30 minutes after this headline.
+    Lower it when mid is already pinned near 0/1, the headline is a restatement, or the source is low-trust.
+    Raise it when the headline introduces a hard fact (numbers, names, decisions) and the market is mid-range and reactive.
+    p_alpha ≤ 0.5 means "do not bet, even though I have a directional guess".
+- risk = expected magnitude of the realized 5-minute |Δprice| on a 0–1 scale.
+    0 ≈ ±0.5¢ noise; 0.5 ≈ ±2–3¢ typical; 1 ≈ bimodal ±10¢, hard to predict direction.
+
 - Respond with EXACTLY this JSON shape: {{"results": [<array of {n} objects, ordered by idx>]}}
 """
 
@@ -116,9 +125,34 @@ class Direction(str, Enum):
 @dataclass
 class ClassifyResult:
     direction: Direction
-    confidence: float      # 0.0–1.0
+    confidence: float      # 0.0–1.0  — production-facing (alias of p_alpha in cycle 7+)
     reason: str
     tokens_used: int = 0
+    # Ensemble-aware fields (filled by classify_batch when ensemble_samples > 1;
+    # a single-sample call leaves these defaulted). The dataclass carries them
+    # so callers can downsample what they log without parsing JSON twice.
+    #
+    # p_yes / p_no / p_neutral: average of per-sample model-emitted distributions
+    # agreement: fraction of ensemble samples that voted for the winning direction
+    #            (1.0 = unanimous, 1/N = no signal — model can't decide)
+    # p_alpha: probability the argmax-direction trade is +EV in 5–30 min
+    # risk_score: expected |Δ5m| magnitude on a [0,1] scale (0=tiny, 1=bimodal big)
+    p_yes: float = 0.0
+    p_no: float = 0.0
+    p_neutral: float = 0.0
+    agreement: float = 0.0
+    p_alpha: float = 0.0
+    risk_score: float = 0.0
+    # Per-market raw JSON object the model emitted (one entry of the batch
+    # "results" array, dumped back to text and truncated to ~2KB). Persisted
+    # on the trade row so post-hoc analysis can re-parse the full distribution
+    # without a separate log file. Populated for ensembled batch calls; left
+    # empty on the legacy single-market path.
+    raw_response: str = ""
+    # Per-market ensemble vote counts {"YES":n, "NO":n, "NEUTRAL":n}. Carries
+    # the same information as `agreement` but lets the dashboard show 2/3 vs
+    # 3/3 separately, and `agreement` discards which directions lost.
+    votes: dict = field(default_factory=dict)
 
 
 class DirectionClassifier:
@@ -144,14 +178,23 @@ class DirectionClassifier:
         max_concurrent: int = 5,
         premium_model: Optional[str] = None,
         premium_sim_threshold: float = 0.70,
+        ensemble_samples: int = 3,
+        ensemble_temperature: float = 0.5,
     ) -> None:
         self._api_key = api_key
         self._model = model
         self._premium_model = premium_model
         self._premium_sim_threshold = premium_sim_threshold
         self._url = api_base.rstrip("/") + _CHAT_PATH
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+        # Semaphore caps API concurrency. Multiply by ensemble_samples so a
+        # single ensembled call doesn't monopolise the budget on its peers.
+        self._semaphore = asyncio.Semaphore(max(max_concurrent, ensemble_samples * 2))
         self._session: Optional[aiohttp.ClientSession] = None
+        # Ensemble config: N parallel calls at ensemble_temperature, then
+        # average the per-sample distributions and majority-vote the
+        # direction. ensemble_samples=1 falls back to legacy behaviour.
+        self._ensemble_samples = max(1, ensemble_samples)
+        self._ensemble_temperature = ensemble_temperature
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -174,21 +217,32 @@ class DirectionClassifier:
         matches: list,           # list[MarketMatch] — avoids circular import
         is_republish: bool = False,
         similar_to: Optional[str] = None,
-    ) -> list[ClassifyResult]:
+        source: Optional[str] = None,
+        lesson_notes: Optional[list[str]] = None,
+    ) -> tuple[list[ClassifyResult], dict]:
         """
         Classify a headline against ALL matching markets in a single API call.
 
         Up to 15× cheaper than calling classify() per market.
-        Returns one ClassifyResult per match, in the same order as `matches`.
+        Returns `(results, prompt_meta)` where results has one entry per
+        match in input order, and `prompt_meta` captures the runtime context
+        (model, samples, republish flag, source, lessons) so the trader can
+        persist it on every trade row.
         Falls back to per-market classify() if the batch parse fails.
         """
         if not matches:
-            return []
+            return [], {}
 
         republish_block = (
             _REPUBLISH_BLOCK.format(similar_to=similar_to[:200])
             if is_republish and similar_to else ""
         )
+        source_block = f"Source: {source}\n" if source else ""
+        if lesson_notes:
+            lesson_lines = "\n".join(f"  - {n}" for n in lesson_notes[:8])
+            lessons_block = f"Recent lessons (apply to confidence + direction):\n{lesson_lines}\n"
+        else:
+            lessons_block = ""
 
         # Build the numbered question block. mid_yes is the YES-token mid,
         # which is what "current likelihood of YES" maps to in [0,1].
@@ -203,6 +257,8 @@ class DirectionClassifier:
 
         prompt = _BATCH_PROMPT_TEMPLATE.format(
             headline=headline,
+            source_block=source_block,
+            lessons_block=lessons_block,
             republish_block=republish_block,
             questions_block=questions_block,
             n=len(matches),
@@ -218,50 +274,77 @@ class DirectionClassifier:
         if model != self._model:
             logger.info("[ai] routing batch to premium model=%s (max_sim=%.2f)", model, max_sim)
 
-        body = {
+        # Ensemble: N parallel calls at higher temperature, then aggregate
+        # per-market across samples. N=1 reproduces the single-call path.
+        N = self._ensemble_samples
+        temp = self._ensemble_temperature if N > 1 else 0.1
+
+        def _build_body() -> dict:
+            return {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": _BATCH_SYSTEM_MESSAGE},
+                    {"role": "user",   "content": prompt},
+                ],
+                "max_tokens": 80 * len(matches) + 50,
+                "temperature": temp,
+                "response_format": {"type": "json_object"},
+            }
+
+        sample_responses = await asyncio.gather(
+            *[self._call_api(_build_body()) for _ in range(N)],
+            return_exceptions=False,
+        )
+
+        # Parse each sample. Drop ones that errored or failed to parse — if
+        # we're left with zero, fall back to per-market on a single sample.
+        per_sample_results: list[list[ClassifyResult]] = []
+        per_sample_raws: list[list[str]] = []
+        total_tokens = 0
+        for data in sample_responses:
+            if data is None:
+                continue
+            parsed = _parse_batch_response(data, len(matches))
+            if parsed is None:
+                continue
+            per_sample_results.append(parsed[0])
+            per_sample_raws.append(parsed[1])
+            total_tokens += int(data.get("usage", {}).get("total_tokens", 0))
+
+        prompt_meta = {
             "model": model,
-            "messages": [
-                {"role": "system", "content": _BATCH_SYSTEM_MESSAGE},
-                {"role": "user",   "content": prompt},
-            ],
-            "max_tokens": 80 * len(matches) + 50,
-            "temperature": 0.1,
-            "response_format": {"type": "json_object"},
+            "n_samples": N,
+            "samples_ok": len(per_sample_results),
+            "temperature": temp,
+            "is_republish": bool(is_republish),
+            "similar_to": (similar_to or "")[:200] if similar_to else None,
+            "source": source,
+            "lessons_used": list(lesson_notes)[:8] if lesson_notes else [],
         }
 
-        data = await self._call_api(body)
-        if data is None:
-            # Fall back to per-market
-            return await asyncio.gather(*[
+        if not per_sample_results:
+            logger.warning("[ai] all %d ensemble samples failed — per-market fallback", N)
+            fallback = await asyncio.gather(*[
                 self.classify(headline, m.question,
                               mid_price=getattr(m, "mid_price", None),
                               similarity=m.similarity,
                               is_republish=is_republish, similar_to=similar_to)
                 for m in matches
             ])
+            return fallback, prompt_meta
 
-        results = _parse_batch_response(data, len(matches))
-        if results is None:
-            logger.warning("[ai] batch parse failed — falling back to per-market classify")
-            return await asyncio.gather(*[
-                self.classify(headline, m.question,
-                              mid_price=getattr(m, "mid_price", None),
-                              similarity=m.similarity,
-                              is_republish=is_republish, similar_to=similar_to)
-                for m in matches
-            ])
-
-        usage = data.get("usage", {})
-        tokens = int(usage.get("total_tokens", 0))
-        logger.info(
-            "[ai] batch classify: %d markets, model=%s, tokens=%d",
-            len(matches), model, tokens,
+        aggregated = _aggregate_ensemble(
+            per_sample_results, n_markets=len(matches), raw_samples=per_sample_raws,
         )
-        # Distribute token cost evenly across results
-        per_market = max(1, tokens // len(results))
-        for r in results:
-            r.tokens_used = per_market
-        return results
+        per_market_tokens = max(1, total_tokens // max(1, len(aggregated)))
+        for r in aggregated:
+            r.tokens_used = per_market_tokens
+
+        logger.info(
+            "[ai] ensemble classify: %d markets × %d/%d samples, model=%s, tokens=%d",
+            len(matches), len(per_sample_results), N, model, total_tokens,
+        )
+        return aggregated, prompt_meta
 
     # ------------------------------------------------------------------
     # Single-market path (legacy / fallback)
@@ -368,7 +451,55 @@ def _extract_text(data: dict) -> str:
 
 
 def _parse_one(obj: dict) -> ClassifyResult:
-    """Parse a single {direction, confidence, reason} dict into a ClassifyResult."""
+    """
+    Parse one classification object. Accepts either the new distribution form
+    (`p_yes`, `p_no`, `p_neutral`) or the legacy form (`direction`,
+    `confidence`). Models occasionally regress to the legacy form; we accept
+    both rather than throwing the row away.
+
+    The distribution is normalized to sum 1 (defensive against models that
+    don't quite hit unity), then we pick the argmax as the direction and use
+    its probability as the confidence. argmax ties resolve to NEUTRAL.
+    """
+    reason = str(obj.get("reason", ""))[:200]
+    # Cycle-7 fields: optional in the response. Defaulted to "no signal"
+    # values so a model that regresses to the old schema doesn't poison the
+    # downstream edge model with a bogus high p_alpha.
+    p_alpha = max(0.0, min(1.0, float(obj.get("p_alpha", 0.0) or 0.0)))
+    risk_score = max(0.0, min(1.0, float(obj.get("risk", 0.0) or 0.0)))
+
+    # New distribution form (preferred)
+    p_yes_raw = obj.get("p_yes")
+    p_no_raw = obj.get("p_no")
+    p_neu_raw = obj.get("p_neutral")
+    if p_yes_raw is not None or p_no_raw is not None or p_neu_raw is not None:
+        p_yes = max(0.0, float(p_yes_raw or 0.0))
+        p_no = max(0.0, float(p_no_raw or 0.0))
+        p_neu = max(0.0, float(p_neu_raw or 0.0))
+        total = p_yes + p_no + p_neu
+        if total <= 0:
+            return ClassifyResult(Direction.NEUTRAL, 0.0, reason,
+                                  p_yes=0.0, p_no=0.0, p_neutral=1.0,
+                                  p_alpha=p_alpha, risk_score=risk_score)
+        p_yes /= total; p_no /= total; p_neu /= total
+        # Pick argmax; tie → NEUTRAL.
+        if p_yes > p_no and p_yes > p_neu:
+            direction, conf = Direction.YES, p_yes
+        elif p_no > p_yes and p_no > p_neu:
+            direction, conf = Direction.NO, p_no
+        else:
+            direction, conf = Direction.NEUTRAL, p_neu
+        # Cycle-7 contract: `confidence` becomes the model's stated p_alpha
+        # (probability the chosen-direction trade is +EV). If the model
+        # forgot to emit p_alpha, fall back to argmax-mass so we don't fire
+        # on an implicit zero. The legacy edge formula `2·conf − 1` is
+        # exactly right under this interpretation (≤0.5 → zero edge → skip).
+        prod_conf = p_alpha if p_alpha > 0.0 else conf
+        return ClassifyResult(direction, prod_conf, reason,
+                              p_yes=p_yes, p_no=p_no, p_neutral=p_neu,
+                              p_alpha=p_alpha, risk_score=risk_score)
+
+    # Legacy form
     direction_str = str(obj.get("direction", "NEUTRAL")).upper()
     try:
         direction = Direction(direction_str)
@@ -376,8 +507,18 @@ def _parse_one(obj: dict) -> ClassifyResult:
         direction = Direction.NEUTRAL
     confidence = float(obj.get("confidence", 0.0))
     confidence = max(0.0, min(1.0, confidence))
-    reason = str(obj.get("reason", ""))[:200]
-    return ClassifyResult(direction, confidence, reason)
+    # Synthesise a plausible distribution from (direction, confidence) so the
+    # ensemble aggregator can still work with legacy responses.
+    rest = (1.0 - confidence) / 2.0
+    if direction == Direction.YES:
+        p_yes, p_no, p_neu = confidence, rest, rest
+    elif direction == Direction.NO:
+        p_yes, p_no, p_neu = rest, confidence, rest
+    else:
+        p_yes, p_no, p_neu = rest, rest, confidence
+    return ClassifyResult(direction, confidence, reason,
+                          p_yes=p_yes, p_no=p_no, p_neutral=p_neu,
+                          p_alpha=p_alpha, risk_score=risk_score)
 
 
 def _parse_response(data: dict) -> ClassifyResult:
@@ -395,7 +536,108 @@ def _parse_response(data: dict) -> ClassifyResult:
         return ClassifyResult(Direction.NEUTRAL, 0.0, "parse_error")
 
 
-def _parse_batch_response(data: dict, n: int) -> Optional[list[ClassifyResult]]:
+def _aggregate_ensemble(
+    samples: list[list[ClassifyResult]],
+    n_markets: int,
+    raw_samples: Optional[list[list[str]]] = None,
+) -> list[ClassifyResult]:
+    """
+    Collapse N ensemble samples into one per-market ClassifyResult.
+
+    Inputs: `samples` is a list of N lists, each of length `n_markets`,
+    holding one ClassifyResult per market per sample.
+
+    Aggregation:
+      * Distribution = mean of the per-sample (p_yes, p_no, p_neutral) tuples.
+      * Direction = majority vote of per-sample argmaxes; tie → NEUTRAL.
+        (Picking direction from the *averaged* distribution would silently
+        prefer the largest-mean even when 2/3 samples disagreed; we want
+        agreement to gate execution, so the vote count matters here.)
+      * confidence = mean(P[winning_direction]) × agreement_fraction.
+        This composes "how strongly does the model believe in its pick" with
+        "how often does the model reach the same pick under resampling".
+      * agreement = max(vote_count_yes, vote_count_no, vote_count_neutral) / N.
+        1/N = no signal; 1.0 = unanimous.
+    """
+    if not samples:
+        return [ClassifyResult(Direction.NEUTRAL, 0.0, "empty_ensemble") for _ in range(n_markets)]
+
+    N = len(samples)
+    out: list[ClassifyResult] = []
+    for i in range(n_markets):
+        votes = {Direction.YES: 0, Direction.NO: 0, Direction.NEUTRAL: 0}
+        sum_yes = sum_no = sum_neu = 0.0
+        sum_alpha = sum_risk = 0.0
+        reasons: list[str] = []
+        for s in samples:
+            if i >= len(s):
+                votes[Direction.NEUTRAL] += 1
+                sum_neu += 1.0
+                continue
+            r = s[i]
+            votes[r.direction] = votes.get(r.direction, 0) + 1
+            sum_yes += r.p_yes
+            sum_no += r.p_no
+            sum_neu += r.p_neutral
+            sum_alpha += r.p_alpha
+            sum_risk += r.risk_score
+            if r.reason:
+                reasons.append(r.reason)
+        p_yes = sum_yes / N
+        p_no = sum_no / N
+        p_neu = sum_neu / N
+        p_alpha = sum_alpha / N
+        risk_score = sum_risk / N
+
+        # Majority vote; ties resolve to NEUTRAL (most conservative).
+        top_count = max(votes.values())
+        winners = [d for d, c in votes.items() if c == top_count]
+        if len(winners) != 1:
+            direction = Direction.NEUTRAL
+        else:
+            direction = winners[0]
+        agreement = top_count / N
+
+        # Cycle-7: production confidence = mean p_alpha across samples.
+        # Falls back to argmax-mass when the model didn't emit p_alpha (it
+        # can sometimes regress to the old schema mid-run). The legacy edge
+        # formula `2·conf − 1` is exactly the right interpretation under
+        # p_alpha — break-even at 0.5, zero edge below.
+        if direction == Direction.YES:
+            mean_p = p_yes
+        elif direction == Direction.NO:
+            mean_p = p_no
+        else:
+            mean_p = p_neu
+        confidence = p_alpha if p_alpha > 0.0 else mean_p
+
+        # Pick one representative raw response (the first sample's text for
+        # this market). Keeping all N would balloon DB rows; one is enough to
+        # recover the model's stated distribution + reason verbatim.
+        raw_for_market = ""
+        if raw_samples:
+            for rs in raw_samples:
+                if i < len(rs) and rs[i]:
+                    raw_for_market = rs[i]
+                    break
+
+        out.append(ClassifyResult(
+            direction=direction,
+            confidence=confidence,
+            reason=reasons[0] if reasons else "",
+            p_yes=p_yes, p_no=p_no, p_neutral=p_neu,
+            agreement=agreement,
+            p_alpha=p_alpha,
+            risk_score=risk_score,
+            raw_response=raw_for_market,
+            votes={d.value: c for d, c in votes.items()},
+        ))
+    return out
+
+
+def _parse_batch_response(
+    data: dict, n: int
+) -> Optional[tuple[list[ClassifyResult], list[str]]]:
     """
     Parse a batched response that should contain a JSON array of n objects.
 
@@ -437,12 +679,23 @@ def _parse_batch_response(data: dict, n: int) -> Optional[list[ClassifyResult]]:
             pass
 
         results = [_parse_one(obj) for obj in parsed]
+        # Preserve the per-object JSON text (truncated) so downstream code can
+        # persist what the model actually said per market, not just the parsed
+        # ClassifyResult. Keys outside the schema (the model's own scratch)
+        # round-trip naturally because we dump the dict back to text.
+        raws: list[str] = []
+        for obj in parsed:
+            try:
+                raws.append(json.dumps(obj, separators=(",", ":"))[:2000])
+            except Exception:  # noqa: BLE001
+                raws.append("")
 
         # Pad with NEUTRAL if model returned fewer items than expected
         while len(results) < n:
             results.append(ClassifyResult(Direction.NEUTRAL, 0.0, "missing"))
+            raws.append("")
 
-        return results[:n]
+        return results[:n], raws[:n]
 
     except Exception as exc:
         logger.warning("[ai] batch parse error: %s | text=%s", exc,

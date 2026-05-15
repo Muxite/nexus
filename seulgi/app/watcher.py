@@ -195,11 +195,20 @@ class SiteWatcher:
         reload_seconds: int = 300,   # kept for API compatibility, unused
         max_failures: int = 5,
         scraper_url: str = _SCRAPER_URL,
+        db=None,
     ) -> None:
         self._url          = url
         self._change_wait  = change_wait_seconds
         self._max_failures = max_failures
         self._scraper_url  = scraper_url.rstrip("/")
+        # Cycle-8: optional DB ref so we can persist per-site health (the
+        # `watcher_health` schema was added in cycle 4 but nothing wrote to
+        # it until now). Persistence lets the dashboard surface stability
+        # scores across container restarts and lets postmortems answer "did
+        # outlet X actually deliver?" without grepping logs.
+        self._db = db
+        self._last_content_hash: Optional[str] = None
+        self._short_circuit_hits: int = 0
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._seen:    set[str] = set()
@@ -213,6 +222,18 @@ class SiteWatcher:
         self._last_headline_at: Optional[datetime] = None
         self._last_headline:    str  = ""
         self._total_headlines:  int  = 0
+        # Adaptive interval: scale base wait by `interval_multiplier` based on
+        # recent churn. Three successful polls with zero new headlines doubles
+        # the multiplier (up to 5x); any poll with new headlines resets to 1.0.
+        # This keeps fast sites fast and stops us hammering quiet sites.
+        self._idle_streak: int = 0
+        self._interval_multiplier: float = 1.0
+        self._max_interval_multiplier: float = 5.0
+        # EMA of fetch latency in ms (for health surface)
+        self._ema_latency_ms: Optional[float] = None
+        # Per-fetch counters
+        self._total_fetches: int = 0
+        self._total_successes: int = 0
 
     # ------------------------------------------------------------------
     # Public properties
@@ -240,6 +261,15 @@ class SiteWatcher:
             "total_headlines":  self._total_headlines,
             "is_unreachable":   self.is_unreachable,
             "last_error":       self._last_error,
+            # Adaptive scheduling + reliability surface (cycle-5 additions).
+            "interval_multiplier": self._interval_multiplier,
+            "current_interval_s":  self._change_wait * self._interval_multiplier,
+            "ema_latency_ms":      self._ema_latency_ms,
+            "total_fetches":       self._total_fetches,
+            "total_successes":     self._total_successes,
+            "success_rate":        (self._total_successes / self._total_fetches) if self._total_fetches else None,
+            "short_circuit_hits":  self._short_circuit_hits,
+            "content_hash":        self._last_content_hash,
         }
 
     # ------------------------------------------------------------------
@@ -263,9 +293,55 @@ class SiteWatcher:
 
         while True:
             await asyncio.sleep(self._next_wait())
+            self._total_fetches += 1
+            t0 = time.monotonic()
+            content_hash_now: Optional[str] = None
             try:
                 with prof.span("watcher/fetch"):
-                    headlines = await self._fetch_headlines()
+                    headlines, content_hash_now = await self._fetch_headlines_with_hash()
+                # Update latency EMA (alpha=0.2)
+                dt_ms = (time.monotonic() - t0) * 1000.0
+                self._ema_latency_ms = (
+                    dt_ms if self._ema_latency_ms is None
+                    else 0.8 * self._ema_latency_ms + 0.2 * dt_ms
+                )
+                self._total_successes += 1
+
+                # Content-hash short-circuit: if the response's deduped link
+                # set hashes to the same value as the previous successful
+                # fetch, the page hasn't changed. We still bump the idle
+                # streak (so adaptive interval extends) but skip ALL
+                # downstream work — engine dispatch, AI tokens, the lot.
+                if (
+                    content_hash_now is not None
+                    and content_hash_now == self._last_content_hash
+                    and not headlines
+                ):
+                    self._short_circuit_hits += 1
+                    self._idle_streak += 1
+                    if self._idle_streak >= 3 and self._interval_multiplier < self._max_interval_multiplier:
+                        self._interval_multiplier = min(
+                            self._interval_multiplier * 2.0,
+                            self._max_interval_multiplier,
+                        )
+                        self._idle_streak = 0
+                    self._consecutive_failures = 0
+                    self._backoff_level = 0
+                    if self._db is not None:
+                        try:
+                            await self._db.upsert_watcher_health(
+                                self._url, success=True,
+                                ema_latency_ms=self._ema_latency_ms,
+                                current_interval_s=self._change_wait * self._interval_multiplier,
+                                new_headlines=0,
+                                content_hash=content_hash_now,
+                            )
+                        except Exception:  # noqa: BLE001
+                            pass
+                    continue
+
+                self._last_content_hash = content_hash_now
+
                 for h in headlines:
                     await queue.put(h)
                 if headlines:
@@ -277,6 +353,28 @@ class SiteWatcher:
                     self._last_headline_at = headlines[-1].detected_at
                     self._last_headline    = headlines[-1].headline
                     self._total_headlines += len(headlines)
+                    # Active site — slot back to base interval
+                    self._idle_streak = 0
+                    if self._interval_multiplier > 1.0:
+                        logger.info(
+                            "[watcher] %s: churn detected, restoring base interval (was ×%.1f)",
+                            self._url, self._interval_multiplier,
+                        )
+                    self._interval_multiplier = 1.0
+                else:
+                    # Quiet poll — back off the polling interval gradually so we
+                    # stop hammering sites that aren't producing.
+                    self._idle_streak += 1
+                    if self._idle_streak >= 3 and self._interval_multiplier < self._max_interval_multiplier:
+                        self._interval_multiplier = min(
+                            self._interval_multiplier * 2.0,
+                            self._max_interval_multiplier,
+                        )
+                        self._idle_streak = 0
+                        logger.debug(
+                            "[watcher] %s: idle, extending interval ×%.1f",
+                            self._url, self._interval_multiplier,
+                        )
                 # Reset backoff on any successful poll
                 if self._backoff_level > 0:
                     logger.info(
@@ -286,6 +384,21 @@ class SiteWatcher:
                 self._consecutive_failures = 0
                 self._backoff_level        = 0
                 self._last_error           = ""
+
+                # Persist watcher health on every successful fetch so the
+                # dashboard can render lifetime success rate and the
+                # postmortem can identify silently-degraded sources.
+                if self._db is not None:
+                    try:
+                        await self._db.upsert_watcher_health(
+                            self._url, success=True,
+                            ema_latency_ms=self._ema_latency_ms,
+                            current_interval_s=self._change_wait * self._interval_multiplier,
+                            new_headlines=len(headlines),
+                            content_hash=content_hash_now,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
 
             except asyncio.CancelledError:
                 logger.info("[watcher] %s: cancelled", self._url)
@@ -308,6 +421,16 @@ class SiteWatcher:
                         self._url, self._backoff_level,
                         _BACKOFF_LEVELS[self._backoff_level],
                     )
+                if self._db is not None:
+                    try:
+                        await self._db.upsert_watcher_health(
+                            self._url, success=False,
+                            ema_latency_ms=self._ema_latency_ms,
+                            current_interval_s=self._change_wait * self._interval_multiplier,
+                            new_headlines=0,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
 
     async def close(self) -> None:
         if self._session is not None:
@@ -328,11 +451,23 @@ class SiteWatcher:
         if self._backoff_level > 0:
             base = float(_BACKOFF_LEVELS[self._backoff_level])
         else:
-            base = float(self._change_wait)
+            base = float(self._change_wait) * self._interval_multiplier
         return max(5.0, random.gauss(base, base * 0.2))
 
     async def _fetch_headlines(self) -> list[RawHeadline]:
-        """Call the scraper and return new, unseen headlines."""
+        """Backward-compat shim — discards the content hash."""
+        results, _ = await self._fetch_headlines_with_hash()
+        return results
+
+    async def _fetch_headlines_with_hash(self) -> tuple[list[RawHeadline], Optional[str]]:
+        """Call the scraper and return (new headlines, content fingerprint).
+
+        The fingerprint is a SHA-1 over the sorted, deduped link URLs in the
+        response. Stable across calls when the page hasn't changed; lets the
+        outer loop short-circuit identical responses before any downstream
+        work happens.
+        """
+        import hashlib
         payload = {
             "url":           self._url,
             "extract_links": True,
@@ -360,8 +495,21 @@ class SiteWatcher:
         except Exception:
             pass
 
+        # Fingerprint the sorted URL set so identical responses → identical
+        # hashes regardless of link order. Skips entirely if no links.
+        clean_urls = sorted({
+            _clean_url((l.get("url") or "").strip())
+            for l in links
+            if isinstance(l, dict)
+        })
+        clean_urls = [u for u in clean_urls if u.startswith("http")]
+        content_hash = (
+            hashlib.sha1("\n".join(clean_urls).encode()).hexdigest()[:16]
+            if clean_urls else None
+        )
+
         if not links:
-            return []
+            return [], content_hash
 
         now = datetime.now(timezone.utc)
         results = []
@@ -381,7 +529,7 @@ class SiteWatcher:
                 article_url = url,
                 detected_at = now,
             ))
-        return results
+        return results, content_hash
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +806,180 @@ class TruthSocialWatcher:
                 source="truth_social",
             )
             results.append(post)
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Generic RSS / Atom FeedWatcher (cycle 8)
+# ---------------------------------------------------------------------------
+
+
+class FeedWatcher:
+    """
+    Subscribes to a site's RSS/Atom feed via the scraper's /feed endpoint.
+
+    Why exists: cycle 4's preflight identified 26 outlets that publish proper
+    RSS — Times of Israel, The Hindu, Al Jazeera, Le Monde, SCMP, etc. — and
+    we were rendering every page with Playwright (~3–10s per fetch) when a
+    feed fetch is ~50ms. This watcher polls the feed instead, leaving the
+    Playwright budget for sites that don't expose feeds.
+
+    Behaviour mirrors SiteWatcher's API surface (status dict, run/close, db
+    persistence) so the dashboard and watcher_status loop don't need to
+    special-case it.
+    """
+
+    def __init__(
+        self,
+        site_url: str,
+        feed_url: str,
+        *,
+        interval_seconds: int = 60,
+        scraper_url: str = _SCRAPER_URL,
+        max_failures: int = 5,
+        db=None,
+    ) -> None:
+        self._url      = site_url      # canonical display URL (e.g. https://www.aljazeera.com/news/)
+        self._feed_url = feed_url
+        self._interval = interval_seconds
+        self._max_failures = max_failures
+        self._scraper_url = scraper_url.rstrip("/")
+        self._db = db
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._seen: set[str] = set()
+        self._consecutive_failures = 0
+        self._backoff_level = 0
+        self._last_error: str = ""
+        self._last_headline_at: Optional[datetime] = None
+        self._last_headline = ""
+        self._total_headlines = 0
+        self._total_fetches = 0
+        self._total_successes = 0
+        self._ema_latency_ms: Optional[float] = None
+
+    @property
+    def is_unreachable(self) -> bool:
+        return self._backoff_level >= len(_BACKOFF_LEVELS) - 1
+
+    @property
+    def backoff_level(self) -> int:
+        return self._backoff_level
+
+    @property
+    def status(self) -> dict:
+        return {
+            "url":              self._url,
+            "feed_url":         self._feed_url,
+            "type":             "feed",
+            "reachable":        self._backoff_level == 0,
+            "failures":         self._consecutive_failures,
+            "backoff_level":    self._backoff_level,
+            "last_headline_at": self._last_headline_at,
+            "last_headline":    self._last_headline,
+            "total_headlines":  self._total_headlines,
+            "is_unreachable":   self.is_unreachable,
+            "last_error":       self._last_error,
+            "ema_latency_ms":   self._ema_latency_ms,
+            "total_fetches":    self._total_fetches,
+            "total_successes":  self._total_successes,
+            "success_rate":     (self._total_successes / self._total_fetches) if self._total_fetches else None,
+        }
+
+    async def run(self, queue: asyncio.Queue) -> None:
+        self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+        logger.info(
+            "[feed] %s ← %s starting (interval=%ds)",
+            self._url, self._feed_url, self._interval,
+        )
+        while True:
+            await asyncio.sleep(max(5, random.gauss(self._interval, self._interval * 0.15)))
+            self._total_fetches += 1
+            t0 = time.monotonic()
+            try:
+                items = await self._fetch_feed()
+                self._ema_latency_ms = (time.monotonic() - t0) * 1000.0 if self._ema_latency_ms is None \
+                    else 0.8 * self._ema_latency_ms + 0.2 * (time.monotonic() - t0) * 1000.0
+                self._total_successes += 1
+                new_count = 0
+                for h in items:
+                    await queue.put(h)
+                    new_count += 1
+                    logger.info(
+                        "[feed] [hid=%s] new headline site=%s url=%s title=%s",
+                        h.headline_id, self._url, h.article_url, h.headline[:80],
+                    )
+                    self._last_headline_at = h.detected_at
+                    self._last_headline    = h.headline
+                self._total_headlines += new_count
+                if self._backoff_level > 0:
+                    logger.info("[feed] %s: recovered (was backoff %d)", self._url, self._backoff_level)
+                self._consecutive_failures = 0
+                self._backoff_level = 0
+                self._last_error = ""
+                if self._db is not None:
+                    try:
+                        await self._db.upsert_watcher_health(
+                            self._url, success=True,
+                            ema_latency_ms=self._ema_latency_ms,
+                            current_interval_s=float(self._interval),
+                            new_headlines=new_count,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            except asyncio.CancelledError:
+                logger.info("[feed] %s: cancelled", self._url)
+                break
+
+            except Exception as exc:
+                self._consecutive_failures += 1
+                self._last_error = str(exc)[:80]
+                logger.warning("[feed] %s: failure #%d: %s",
+                               self._url, self._consecutive_failures, exc)
+                if self._consecutive_failures >= self._max_failures:
+                    self._backoff_level = min(self._backoff_level + 1, len(_BACKOFF_LEVELS) - 1)
+                    self._consecutive_failures = 0
+                if self._db is not None:
+                    try:
+                        await self._db.upsert_watcher_health(
+                            self._url, success=False,
+                            ema_latency_ms=self._ema_latency_ms,
+                            current_interval_s=float(self._interval),
+                            new_headlines=0,
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+
+    async def _fetch_feed(self) -> list[RawHeadline]:
+        url = f"{self._scraper_url}/feed"
+        payload = {"url": self._feed_url}
+        async with self._session.post(url, json=payload) as resp:
+            if resp.status != 200:
+                raise _FetchError(f"scraper /feed {resp.status}")
+            data = await resp.json()
+
+        items = data.get("items") or []
+        now = datetime.now(timezone.utc)
+        results: list[RawHeadline] = []
+        for item in items:
+            item_url = (item.get("url") or item.get("link") or "").strip()
+            title = _clean_title((item.get("title") or "").strip())
+            if not item_url or item_url in self._seen:
+                continue
+            if len(title) < 10 or _is_junk(title):
+                continue
+            self._seen.add(item_url)
+            results.append(RawHeadline(
+                site_url=self._url,
+                headline=title,
+                article_url=item_url,
+                detected_at=now,
+                source="news_rss",
+            ))
         return results
 
 

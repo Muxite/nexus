@@ -224,6 +224,108 @@ _MIGRATIONS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_usage_ts   ON usage_events(ts)",
     "CREATE INDEX IF NOT EXISTS idx_usage_kind ON usage_events(kind)",
+    # Continuous-reinforcement lessons table. Filled by the lessons aggregator
+    # (app/lessons.py) every N minutes from classified price_impacts. Active
+    # rows are injected into the AI batch prompt and (optionally) consulted by
+    # the trader for soft gates. rule_key is the canonical (source × market_type
+    # × conf_bucket) tuple as a string so we can UPSERT cheaply.
+    """CREATE TABLE IF NOT EXISTS lessons (
+        rule_key      TEXT PRIMARY KEY,
+        source        TEXT,
+        market_type   TEXT,
+        conf_bucket   TEXT,
+        support_n     INTEGER NOT NULL DEFAULT 0,
+        captured_n    INTEGER NOT NULL DEFAULT 0,
+        no_signal_n   INTEGER NOT NULL DEFAULT 0,
+        wrong_dir_n   INTEGER NOT NULL DEFAULT 0,
+        ic            REAL,
+        capture_rate  REAL,
+        action        TEXT,            -- 'note' | 'downweight' | 'skip' | 'invert'
+        note          TEXT,            -- one-line lesson for the AI prompt
+        seeded        INTEGER DEFAULT 0,  -- 1 if seeded from postmortem (no empirical support)
+        active        INTEGER NOT NULL DEFAULT 0,
+        updated_at    TEXT NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_lessons_active ON lessons(active)",
+    "CREATE INDEX IF NOT EXISTS idx_lessons_action ON lessons(action)",
+    # Per-watcher health: persist content hash + churn so the watcher can
+    # short-circuit identical fetches and adapt its polling interval across
+    # restarts. Filled by SiteWatcher; read by the dashboard.
+    """CREATE TABLE IF NOT EXISTS watcher_health (
+        url                  TEXT PRIMARY KEY,
+        last_fetch_at        TEXT,
+        last_success_at      TEXT,
+        last_failure_at      TEXT,
+        last_content_hash    TEXT,
+        last_headline_count  INTEGER DEFAULT 0,
+        total_fetches        INTEGER NOT NULL DEFAULT 0,
+        total_successes      INTEGER NOT NULL DEFAULT 0,
+        total_new_headlines  INTEGER NOT NULL DEFAULT 0,
+        ema_latency_ms       REAL,
+        current_interval_s   REAL,
+        stability_score      REAL
+    )""",
+    # Cycle-4 analytics shadow fields: log the AI's raw confidence alongside
+    # the production p_hat/edge so the next postmortem can build a real
+    # calibration curve. NULL on legacy rows; new rows always populate.
+    "ALTER TABLE trades ADD COLUMN confidence_raw REAL",
+    "ALTER TABLE trades ADD COLUMN p_hat_if_raw REAL",
+    "ALTER TABLE trades ADD COLUMN signed_edge REAL",
+    "ALTER TABLE trades ADD COLUMN signed_edge_if_raw REAL",
+    # Cycle-5 fix: tag each trade with the engine that made it. Without this
+    # column the per-engine PnL restore on startup uses a broken JOIN
+    # (engine_results.headline_id = trades.headline_id) and silently returns
+    # zero for every engine, so the dashboard says ROI=0% after every
+    # container restart even when the bot has been profitable. Backfilled on
+    # startup via (condition_id, decided_at) proximity to engine_results.
+    "ALTER TABLE trades ADD COLUMN engine_name TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_trades_engine_name ON trades(engine_name)",
+    # Cycle-6 ensemble: fraction of N parallel classifier samples that voted
+    # for the winning direction (1.0 = unanimous, 1/N = no signal). Lets the
+    # postmortem isolate "high-agreement-but-still-wrong" pockets — exactly
+    # the slice where a hard skip lesson is justified.
+    "ALTER TABLE trades ADD COLUMN agreement REAL",
+    # Cycle-7 (2D measurement): model emits a probability the chosen-direction
+    # trade is +EV (`p_alpha`) and an expected variance magnitude (`risk_score`,
+    # on a 0..1 scale). p_alpha replaces `confidence` as the input to the edge
+    # formula. Both columns logged on every executed trade so the postmortem
+    # can plot realized hit-rate vs predicted p_alpha (calibration check) and
+    # realized |Δ| vs predicted risk (risk calibration).
+    "ALTER TABLE trades ADD COLUMN p_alpha REAL",
+    "ALTER TABLE trades ADD COLUMN risk_score REAL",
+    # Cycle-8 (cycle scoping): persistent record of every cycle the bot has
+    # ever run. `started_at` is the moment cycle.py cycle <name> was invoked;
+    # `ended_at` is when the *next* cycle started (so the active cycle has
+    # ended_at IS NULL). All "current cycle" reads filter by
+    # `decided_at >= started_at`. NO data is deleted across cycles — only
+    # the dashboard / plots / engine-PnL restore narrows its window.
+    """CREATE TABLE IF NOT EXISTS cycles (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        name        TEXT NOT NULL,
+        started_at  TEXT NOT NULL,
+        ended_at    TEXT,
+        notes       TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_cycles_started_at ON cycles(started_at)",
+    # Per-trade reasoning capture. The AI's one-line `reason`, the truncated
+    # raw JSON it emitted, and the runtime context that produced the call
+    # (source, republish flag, lessons injected, model+samples+votes). The
+    # trader's step-by-step guard trace is JSON in `trader_trace`. Both mids
+    # at decision time so post-hoc analysis can re-derive edge against the
+    # *other* side. `inverted` records whether invert_high_conf flipped the
+    # direction. `variant_name` is per-variant strategy tag — falls back to
+    # engine_name when no variants are defined.
+    "ALTER TABLE trades ADD COLUMN ai_reason       TEXT",
+    "ALTER TABLE trades ADD COLUMN ai_raw_response TEXT",
+    "ALTER TABLE trades ADD COLUMN ai_prompt_meta  TEXT",
+    "ALTER TABLE trades ADD COLUMN trader_trace    TEXT",
+    "ALTER TABLE trades ADD COLUMN mid_yes         REAL",
+    "ALTER TABLE trades ADD COLUMN mid_no          REAL",
+    "ALTER TABLE trades ADD COLUMN inverted        INTEGER",
+    "ALTER TABLE trades ADD COLUMN variant_name    TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_trades_variant_name ON trades(variant_name)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_closed_at    ON trades(closed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_headline_id  ON trades(headline_id)",
 ]
 
 
@@ -251,6 +353,17 @@ class SeulgiDB:
         await self._conn.executescript(_PRICE_IMPACT_SCHEMA)
         await self._conn.commit()
         await self._migrate()
+        # One-time backfill: tag any historical NULL-engine trades using the
+        # closest engine_results match. Cheap (one UPDATE), idempotent, and
+        # essential — without it `get_engine_gain_and_staked` returns 0 for
+        # every engine after a container restart even when realized PnL is
+        # non-zero in DB. See `backfill_trades_engine_name` for the why.
+        try:
+            n = await self.backfill_trades_engine_name()
+            if n:
+                logger.info("[db] backfilled engine_name on %d historical trades", n)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[db] engine_name backfill failed: %s", exc)
         logger.info("SeulgiDB connected: %s", self._path)
 
     async def connect_ro(self) -> None:
@@ -278,6 +391,16 @@ class SeulgiDB:
 
     async def close(self) -> None:
         if self._conn:
+            # WAL checkpoint before close so the next start opens a clean
+            # main DB file. Without TRUNCATE the -wal file can keep growing
+            # across container restarts; with it, the wal is rolled into
+            # the main DB and reset. Best-effort: if the checkpoint fails
+            # (locked, busy, etc.) we still close.
+            try:
+                await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                await self._conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[db] wal_checkpoint on close failed: %s", exc)
             await self._conn.close()
             self._conn = None
 
@@ -310,7 +433,11 @@ class SeulgiDB:
               end_date    = excluded.end_date,
               volume_usdc = excluded.volume_usdc,
               embedding   = excluded.embedding,
-              fetched_at  = excluded.fetched_at
+              fetched_at  = excluded.fetched_at,
+              -- Reopen any market that Gamma is showing again. Without this
+              -- a market mistakenly closed by an earlier short-pagination
+              -- refresh would stay closed forever (until 30-day prune).
+              closed_at   = NULL
             """,
             (condition_id, question, token_yes, token_no, end_date,
              volume_usdc, emb_bytes, _now_iso()),
@@ -450,19 +577,100 @@ class SeulgiDB:
         size_usdc: float,
         skip_reason: Optional[str],
         headline_id: Optional[str] = None,
+        confidence_raw: Optional[float] = None,
+        p_hat_if_raw: Optional[float] = None,
+        signed_edge: Optional[float] = None,
+        signed_edge_if_raw: Optional[float] = None,
+        engine_name: Optional[str] = None,
+        agreement: Optional[float] = None,
+        p_alpha: Optional[float] = None,
+        risk_score: Optional[float] = None,
+        ai_reason: Optional[str] = None,
+        ai_raw_response: Optional[str] = None,
+        ai_prompt_meta: Optional[str] = None,
+        trader_trace: Optional[str] = None,
+        mid_yes: Optional[float] = None,
+        mid_no: Optional[float] = None,
+        inverted: Optional[int] = None,
+        variant_name: Optional[str] = None,
     ) -> int:
         cur = await self._conn.execute(
             """
             INSERT INTO trades
               (signal_id, condition_id, question, token_id, direction, similarity,
-               p_hat, mid_price, size_usdc, skip_reason, decided_at, headline_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               p_hat, mid_price, size_usdc, skip_reason, decided_at, headline_id,
+               confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
+               engine_name, agreement, p_alpha, risk_score,
+               ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
+               mid_yes, mid_no, inverted, variant_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (signal_id, condition_id, question, token_id, direction, similarity,
-             p_hat, mid_price, size_usdc, skip_reason, _now_iso(), headline_id),
+             p_hat, mid_price, size_usdc, skip_reason, _now_iso(), headline_id,
+             confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
+             engine_name, agreement, p_alpha, risk_score,
+             ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
+             mid_yes, mid_no, inverted, variant_name),
         )
         await self._conn.commit()
         return cur.lastrowid
+
+    async def backfill_trades_engine_name(self) -> int:
+        """
+        One-time backfill: tag historical `trades` rows with the engine that
+        made them. Matches each NULL-engine trade to the engine_results row
+        with the same `condition_id` whose `decided_at` is closest in time
+        (engines decide on the same headline within seconds of each other,
+        so the nearest timestamp wins). Idempotent. Returns rows updated.
+
+        Implemented in Python rather than a correlated SQL UPDATE because the
+        SQLite shipped with our base image can't reference the outer table
+        name from inside the SET subquery (the correlated form raised
+        "no such column: trades.decided_at"). The Python loop is fine: this
+        runs at most once per DB, on at most a few thousand legacy rows.
+        """
+        cur = await self._conn.execute(
+            """SELECT id, condition_id, decided_at FROM trades
+               WHERE engine_name IS NULL AND skip_reason IS NULL"""
+        )
+        nulls = await cur.fetchall()
+        if not nulls:
+            return 0
+
+        # Pull every executed engine_results row keyed by condition_id.
+        cur = await self._conn.execute(
+            """SELECT condition_id, engine_name, decided_at
+               FROM engine_results WHERE executed = 1"""
+        )
+        er_rows = await cur.fetchall()
+        from collections import defaultdict
+        from datetime import datetime as _dt
+        er_by_cond: dict[str, list[tuple[str, float]]] = defaultdict(list)
+        for er in er_rows:
+            try:
+                ts = _dt.fromisoformat(er[2]).timestamp()
+            except Exception:  # noqa: BLE001
+                continue
+            er_by_cond[er[0]].append((er[1], ts))
+
+        updated = 0
+        for tid, cond_id, t_at in nulls:
+            try:
+                tts = _dt.fromisoformat(t_at).timestamp()
+            except Exception:  # noqa: BLE001
+                continue
+            candidates = er_by_cond.get(cond_id)
+            if not candidates:
+                continue
+            best = min(candidates, key=lambda p: abs(p[1] - tts))
+            await self._conn.execute(
+                "UPDATE trades SET engine_name = ? WHERE id = ?",
+                (best[0], tid),
+            )
+            updated += 1
+        await self._conn.commit()
+        return updated
 
     async def close_trade(
         self,
@@ -620,8 +828,110 @@ class SeulgiDB:
             row = await cur.fetchone()
             return float(row[0]) if row else 0.0
 
+    # ──────────────────────────────────────────────────────────────────
+    # Cycle bookkeeping (cycle 8+)
+    # ──────────────────────────────────────────────────────────────────
+
+    async def get_current_cycle(self) -> Optional[dict]:
+        """Return the open cycle (the row with ended_at IS NULL), or None."""
+        cur = await self._conn.execute(
+            "SELECT id, name, started_at FROM cycles "
+            "WHERE ended_at IS NULL ORDER BY id DESC LIMIT 1"
+        )
+        row = await cur.fetchone()
+        if not row:
+            return None
+        return {"id": row[0], "name": row[1], "started_at": row[2]}
+
+    async def ensure_current_cycle(self, default_name: str = "cycle_auto") -> dict:
+        """Return the open cycle, creating one if none exists yet."""
+        existing = await self.get_current_cycle()
+        if existing:
+            return existing
+        await self._conn.execute(
+            "INSERT INTO cycles (name, started_at) VALUES (?, ?)",
+            (default_name, _now_iso()),
+        )
+        await self._conn.commit()
+        result = await self.get_current_cycle()
+        assert result is not None
+        return result
+
+    # ──────────────────────────────────────────────────────────────────
+    # Watcher health (cycle 8+) — persisted per-site stability
+    # ──────────────────────────────────────────────────────────────────
+
+    async def upsert_watcher_health(
+        self,
+        url: str,
+        *,
+        success: bool,
+        ema_latency_ms: Optional[float],
+        current_interval_s: Optional[float],
+        new_headlines: int = 0,
+        content_hash: Optional[str] = None,
+    ) -> None:
+        """Persist one watcher-tick worth of health stats.
+
+        Idempotent UPSERT keyed on url. `stability_score` is a recency-weighted
+        EWMA of success rate − idle penalty, computed downstream from the
+        accumulated counters (we just keep the raw numbers honest here).
+        """
+        now = _now_iso()
+        s_field = "last_success_at" if success else "last_failure_at"
+        # The UPSERT is verbose because we need to increment specific counters
+        # only on success — and SQLite's ON CONFLICT requires fully-formed SETs.
+        await self._conn.execute(
+            f"""
+            INSERT INTO watcher_health (url, last_fetch_at, {s_field},
+                                        last_content_hash, last_headline_count,
+                                        total_fetches, total_successes,
+                                        total_new_headlines,
+                                        ema_latency_ms, current_interval_s)
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(url) DO UPDATE SET
+              last_fetch_at        = excluded.last_fetch_at,
+              {s_field}            = excluded.{s_field},
+              last_content_hash    = COALESCE(excluded.last_content_hash, watcher_health.last_content_hash),
+              last_headline_count  = excluded.last_headline_count,
+              total_fetches        = watcher_health.total_fetches + 1,
+              total_successes      = watcher_health.total_successes + ?,
+              total_new_headlines  = watcher_health.total_new_headlines + excluded.total_new_headlines,
+              ema_latency_ms       = excluded.ema_latency_ms,
+              current_interval_s   = excluded.current_interval_s
+            """,
+            (url, now, now, content_hash, new_headlines,
+             1 if success else 0, new_headlines,
+             ema_latency_ms, current_interval_s,
+             1 if success else 0),
+        )
+        await self._conn.commit()
+
+    async def start_new_cycle(self, name: str, notes: Optional[str] = None) -> dict:
+        """Close the current cycle and open a new one. No data deletion.
+
+        After this returns, `get_engine_gain_and_staked(since_ts=...)` and the
+        plotter / dashboard / trade-examples sampler all narrow to the new
+        cycle's window. Historical trades stay in the DB for tracing.
+        """
+        now = _now_iso()
+        await self._conn.execute(
+            "UPDATE cycles SET ended_at = ? WHERE ended_at IS NULL",
+            (now,),
+        )
+        await self._conn.execute(
+            "INSERT INTO cycles (name, started_at, notes) VALUES (?, ?, ?)",
+            (name, now, notes),
+        )
+        await self._conn.commit()
+        result = await self.get_current_cycle()
+        assert result is not None
+        logger.info("[db] new cycle started: %s (id=%d, ts=%s)",
+                    result["name"], result["id"], result["started_at"])
+        return result
+
     async def get_engine_gain_and_staked(
-        self, engine_name: str
+        self, engine_name: str, since_ts: Optional[str] = None,
     ) -> tuple[float, float]:
         """
         Return (realized_gain, total_staked) for ONE engine, restoring from DB.
@@ -631,31 +941,32 @@ class SeulgiDB:
 
         Used by infinite-balance mode to restart with the cumulative gain
         already credited and the staked total visible.
+
+        Cycle-8: optional `since_ts` (ISO8601) scopes the restore to only the
+        current cycle's data so cycle boundaries reset the dashboard to $0
+        without deleting any history. Pass `None` to get lifetime totals.
         """
-        async with self._conn.execute(
-            """
-            SELECT COALESCE(SUM(t.realized_pnl), 0.0) AS gain
-            FROM trades t
-            JOIN engine_results er
-              ON er.headline_id = t.headline_id
-             AND er.condition_id = t.condition_id
-             AND er.executed = 1
-            WHERE er.engine_name = ?
-              AND t.realized_pnl IS NOT NULL
-            """,
-            (engine_name,),
-        ) as cur:
+        gain_sql = (
+            "SELECT COALESCE(SUM(realized_pnl), 0.0) FROM trades "
+            "WHERE engine_name = ? AND realized_pnl IS NOT NULL"
+        )
+        gain_args: list = [engine_name]
+        if since_ts:
+            gain_sql += " AND decided_at >= ?"
+            gain_args.append(since_ts)
+        async with self._conn.execute(gain_sql, tuple(gain_args)) as cur:
             row = await cur.fetchone()
             gain = float(row[0]) if row else 0.0
 
-        async with self._conn.execute(
-            """
-            SELECT COALESCE(SUM(size_usdc), 0.0)
-            FROM engine_results
-            WHERE engine_name = ? AND executed = 1
-            """,
-            (engine_name,),
-        ) as cur:
+        staked_sql = (
+            "SELECT COALESCE(SUM(size_usdc), 0.0) FROM engine_results "
+            "WHERE engine_name = ? AND executed = 1"
+        )
+        staked_args: list = [engine_name]
+        if since_ts:
+            staked_sql += " AND decided_at >= ?"
+            staked_args.append(since_ts)
+        async with self._conn.execute(staked_sql, tuple(staked_args)) as cur:
             row = await cur.fetchone()
             staked = float(row[0]) if row else 0.0
 
@@ -731,6 +1042,177 @@ class SeulgiDB:
         ) as cur:
             rows = await cur.fetchall()
         return [dict(row) for row in rows]
+
+    async def get_variant_stats(self, since_ts: Optional[str] = None) -> list[dict]:
+        """
+        Per-variant rollup for variant_compare.txt.
+
+        Rows include only executed trades; wins/losses come from realized_pnl
+        on closed rows. `variant_name` falls back to `engine_name` for legacy
+        rows written before the variant column existed.
+        """
+        where = "WHERE size_usdc > 0 AND skip_reason IS NULL"
+        params: tuple = ()
+        if since_ts:
+            where += " AND decided_at >= ?"
+            params = (since_ts,)
+        async with self._conn.execute(
+            f"""
+            SELECT
+                COALESCE(variant_name, engine_name, 'default')  AS variant,
+                COUNT(*)                                        AS n_trades,
+                SUM(CASE WHEN realized_pnl IS NULL THEN 1 ELSE 0 END)   AS n_open,
+                SUM(CASE WHEN realized_pnl > 0  THEN 1 ELSE 0 END)      AS n_wins,
+                SUM(CASE WHEN realized_pnl <= 0 AND realized_pnl IS NOT NULL THEN 1 ELSE 0 END)
+                                                                  AS n_losses,
+                COALESCE(SUM(realized_pnl), 0)                  AS sum_pnl,
+                COALESCE(AVG(realized_pnl), 0)                  AS avg_pnl,
+                COALESCE(AVG(confidence_raw), 0)                AS avg_conf,
+                COALESCE(AVG(signed_edge), 0)                   AS avg_edge,
+                COALESCE(SUM(size_usdc), 0)                     AS total_staked,
+                SUM(CASE WHEN inverted = 1 THEN 1 ELSE 0 END)   AS n_inverted
+            FROM trades
+            {where}
+            GROUP BY variant
+            ORDER BY sum_pnl DESC
+            """,
+            params,
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_top_wins_losses(
+        self, limit: int = 50, since_ts: Optional[str] = None,
+    ) -> tuple[list[dict], list[dict]]:
+        """Return (wins, losses) sorted by realized_pnl magnitude."""
+        cols = (
+            "id, signal_id, headline_id, "
+            "COALESCE(variant_name, engine_name, 'default') AS variant, "
+            "engine_name, question, direction, similarity, confidence_raw AS confidence, "
+            "p_alpha, agreement, signed_edge, mid_yes, mid_no, mid_price AS entry_price, "
+            "size_usdc, realized_pnl, close_reason, inverted, ai_reason, "
+            "decided_at, closed_at"
+        )
+        where_extra = ""
+        params: list = []
+        if since_ts:
+            where_extra = " AND decided_at >= ?"
+            params.append(since_ts)
+        async with self._conn.execute(
+            f"""SELECT {cols} FROM trades
+               WHERE realized_pnl IS NOT NULL AND realized_pnl > 0{where_extra}
+               ORDER BY realized_pnl DESC LIMIT ?""",
+            (*params, limit),
+        ) as cur:
+            wins = [dict(r) for r in await cur.fetchall()]
+        async with self._conn.execute(
+            f"""SELECT {cols} FROM trades
+               WHERE realized_pnl IS NOT NULL AND realized_pnl <= 0{where_extra}
+               ORDER BY realized_pnl ASC LIMIT ?""",
+            (*params, limit),
+        ) as cur:
+            losses = [dict(r) for r in await cur.fetchall()]
+        return wins, losses
+
+    async def get_closed_trades_since(self, last_id: int) -> list[dict]:
+        """
+        Append-only feed for trade_log.jsonl. Returns all closed-trade rows
+        with id > last_id, joined with the headline text from `signals`.
+        """
+        async with self._conn.execute(
+            """
+            SELECT
+                t.id, t.signal_id, t.headline_id,
+                COALESCE(t.variant_name, t.engine_name, 'default') AS variant_name,
+                t.engine_name,
+                s.site_url, s.headline,
+                t.question, t.direction, t.similarity,
+                t.confidence_raw, t.p_alpha, t.agreement, t.signed_edge,
+                t.mid_yes, t.mid_no, t.mid_price AS entry_price,
+                t.size_usdc, t.realized_pnl, t.close_reason, t.inverted,
+                t.ai_reason, t.ai_prompt_meta, t.trader_trace,
+                t.decided_at, t.closed_at
+            FROM trades t
+            LEFT JOIN signals s ON s.id = t.signal_id
+            WHERE t.realized_pnl IS NOT NULL AND t.id > ?
+            ORDER BY t.id ASC
+            LIMIT 500
+            """,
+            (last_id,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_headline_summary(
+        self, limit: int = 100, since_ts: Optional[str] = None,
+    ) -> list[dict]:
+        """
+        One row per headline that produced at least one trade. Joins price
+        impact context (t0/t5m/t60m for the first impact row of that headline)
+        so the journal shows the news + the market reaction in one line.
+        """
+        where_extra = ""
+        params: list = []
+        if since_ts:
+            where_extra = "WHERE s.detected_at >= ?"
+            params.append(since_ts)
+        async with self._conn.execute(
+            f"""
+            SELECT
+                s.id              AS signal_id,
+                s.headline_id,
+                s.headline,
+                s.site_url,
+                s.detected_at,
+                COUNT(t.id)                                                  AS n_trades,
+                SUM(CASE WHEN t.size_usdc > 0 AND t.skip_reason IS NULL THEN 1 ELSE 0 END)
+                                                                              AS n_executed,
+                COUNT(DISTINCT COALESCE(t.variant_name, t.engine_name))      AS n_variants,
+                COALESCE(SUM(t.realized_pnl), 0)                             AS sum_pnl,
+                (SELECT price_t0  FROM price_impacts pi WHERE pi.headline_id = s.headline_id LIMIT 1)
+                                                                              AS price_t0,
+                (SELECT price_t5m FROM price_impacts pi WHERE pi.headline_id = s.headline_id LIMIT 1)
+                                                                              AS price_t5m,
+                (SELECT price_t60m FROM price_impacts pi WHERE pi.headline_id = s.headline_id LIMIT 1)
+                                                                              AS price_t60m
+            FROM signals s
+            LEFT JOIN trades t ON t.signal_id = s.id
+            {where_extra}
+            GROUP BY s.id
+            HAVING n_trades > 0
+            ORDER BY s.detected_at DESC
+            LIMIT ?
+            """,
+            (*params, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_headline_winners(
+        self, limit: int = 30, min_variants: int = 2,
+    ) -> list[dict]:
+        """Headlines where ≥min_variants traded, ranked by sum_pnl."""
+        async with self._conn.execute(
+            """
+            SELECT
+                s.headline_id,
+                s.headline,
+                s.site_url,
+                s.detected_at,
+                COUNT(DISTINCT COALESCE(t.variant_name, t.engine_name)) AS n_variants,
+                SUM(CASE WHEN t.size_usdc > 0 AND t.skip_reason IS NULL THEN 1 ELSE 0 END)
+                                                                         AS n_executed,
+                COALESCE(SUM(t.realized_pnl), 0)                        AS sum_pnl,
+                SUM(CASE WHEN t.realized_pnl > 0 THEN 1 ELSE 0 END)     AS n_wins,
+                SUM(CASE WHEN t.realized_pnl < 0 THEN 1 ELSE 0 END)     AS n_losses
+            FROM signals s
+            JOIN trades t ON t.signal_id = s.id
+            GROUP BY s.id
+            HAVING n_variants >= ? AND n_executed > 0
+            ORDER BY sum_pnl DESC
+            LIMIT ?
+            """,
+            (min_variants, limit),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
 
     async def get_recent_neutral_rate(self, hours: float = 1.0) -> tuple[Optional[float], int]:
         """

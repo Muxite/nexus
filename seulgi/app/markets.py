@@ -80,13 +80,23 @@ async def _fetch_gamma_markets(session: aiohttp.ClientSession) -> list[dict]:
     """
     Fetch all open markets from the Gamma API, paginating automatically.
 
-    Returns raw dicts straight from the API. Stops early if a page is empty.
+    Page size of 100 — Gamma silently caps every response at 100 items
+    regardless of the `limit` we ask for (verified 2026-05-14; previously the
+    cap appeared higher). The loop terminates only when a page returns *zero*
+    items; using `len(page) < page_size` as the exit condition (which we used
+    to, with page_size=200) caused the very first page to short-circuit and
+    return only 100 markets total, which made nearly every market in our DB
+    get marked closed and the index collapse to ~93 rows.
+
+    A hard safety cap of `max_pages` rounds prevents an unbounded loop if
+    Gamma's pagination ever misbehaves.
     """
     markets = []
     offset = 0
-    page_size = 200
+    page_size = 100
+    max_pages = 1000  # 100k markets — generous; current universe is ~50k
 
-    while True:
+    for _ in range(max_pages):
         params = {
             "active": "true",
             "closed": "false",
@@ -106,10 +116,7 @@ async def _fetch_gamma_markets(session: aiohttp.ClientSession) -> list[dict]:
 
         markets.extend(page)
         logger.debug("Fetched %d markets (offset=%d)", len(page), offset)
-
-        if len(page) < page_size:
-            break
-        offset += page_size
+        offset += len(page)
 
     logger.info("Gamma API: fetched %d total open markets", len(markets))
     return markets

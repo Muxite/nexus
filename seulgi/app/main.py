@@ -35,10 +35,11 @@ from engine import EngineRunner, build_engines
 from rules import RuleEngine
 from markets import Embedder, MarketIndex
 from impact_tracker import PriceImpactTracker
+import lessons
 from news_memory import NewsMemory
 from plotter import QuantPlotter
 from watcher import (
-    RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher,
+    RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher, FeedWatcher,
     SearchBudget, ScraperHealthPoller,
 )
 
@@ -233,11 +234,26 @@ async def main() -> None:
     logger.info("Seulgi starting up")
 
     # Dashboard
-    dash = Dashboard(data_dir=cfg.dashboard.data_dir, interval_secs=cfg.dashboard.interval_secs)
+    dash = Dashboard(
+        data_dir=cfg.dashboard.data_dir,
+        interval_secs=cfg.dashboard.interval_secs,
+        db=db,
+    )
 
     # DB
     db = SeulgiDB(cfg.db.path)
     await db.connect()
+
+    # Cycle-8 scoping: ensure the cycles table has an open row before any
+    # restore queries run. The SEULGI__CYCLE_NAME env var lets cycle.py name
+    # the cycle explicitly; falls back to a timestamped name otherwise.
+    _default_cycle_name = os.getenv(
+        "SEULGI__CYCLE_NAME",
+        f"cycle_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}",
+    )
+    _current_cycle = await db.ensure_current_cycle(default_name=_default_cycle_name)
+    logger.info("[main] current cycle: %s (id=%d, started=%s)",
+                _current_cycle["name"], _current_cycle["id"], _current_cycle["started_at"])
 
     # Embedder + Market index
     embedder = Embedder()
@@ -268,6 +284,8 @@ async def main() -> None:
         api_base=cfg.ai.api_base,
         premium_model=cfg.ai.premium_model or None,
         premium_sim_threshold=cfg.ai.premium_sim_threshold,
+        ensemble_samples=cfg.ai.ensemble_samples,
+        ensemble_temperature=cfg.ai.ensemble_temperature,
     )
 
     # Manual-planning rules engine — shared across trading engines.
@@ -311,21 +329,37 @@ async def main() -> None:
     # Engine runner (fans out headlines to all engines)
     runner = EngineRunner(
         engines=engines, index=index, embedder=embedder,
-        db=db, dashboard=dash, news_memory=news_memory,
+        db=db, classifier=classifier, rule_engine=rule_engine,
+        dashboard=dash, news_memory=news_memory,
         impact_tracker=impact_tracker,
         article_fetcher=article_fetcher,
     )
 
     # Watchers
     queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
-    watchers = [
+    watchers: list = [
         SiteWatcher(
             url=site.url,
             change_wait_seconds=site.change_wait_seconds,
             reload_seconds=site.reload_seconds,
             max_failures=site.max_failures,
+            db=db,
         )
         for site in cfg.watched_sites
+    ]
+    # Cycle-8: RSS/Atom subscribers for outlets identified as feed-capable
+    # in cycle 4's preflight. Vastly cheaper per fetch than Playwright; runs
+    # alongside the html watchers (the html version is dropped from
+    # watched_sites for any URL we cover here, so we don't duplicate work).
+    watchers += [
+        FeedWatcher(
+            site_url=f.site_url,
+            feed_url=f.feed_url,
+            interval_seconds=f.interval_seconds,
+            max_failures=f.max_failures,
+            db=db,
+        )
+        for f in cfg.feeds
     ]
     for w in watchers:
         s = w.status
@@ -393,6 +427,7 @@ async def main() -> None:
         ),
         asyncio.create_task(_headline_drain_loop(queue, runner, dash), name="drain"),
         asyncio.create_task(plotter.run(), name="quant-plotter"),
+        asyncio.create_task(lessons.runner(db, interval_secs=600.0), name="lessons"),
     ]
 
     all_tasks = watcher_tasks + bg_tasks
@@ -414,23 +449,47 @@ async def main() -> None:
 
     await stop_event.wait()
 
-    logger.info("[main] cancelling tasks …")
-    for task in all_tasks:
-        task.cancel()
-    await asyncio.gather(*all_tasks, return_exceptions=True)
+    # ── Safe shutdown ──────────────────────────────────────────────────
+    # Order matters:
+    #   1. Stop accepting NEW headlines — close watchers so no new items hit
+    #      the queue. In-flight runner.process() calls are allowed to finish
+    #      so we don't lose trades that already debited balance / inserted
+    #      signal rows.
+    #   2. Cancel long-running background loops (dashboard, monitors, drain).
+    #   3. Close HTTP clients + DB. db.close() runs a WAL checkpoint so the
+    #      next start reads a clean main DB file.
+    # The whole drain is bounded by a timeout — if anything refuses to die
+    # we log it and force-exit rather than hang the host shutdown.
+    async def _drain() -> None:
+        logger.info("[main] stopping watchers …")
+        for w in all_watchers:
+            try:
+                await asyncio.wait_for(w.close(), timeout=3.0)
+            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                logger.warning("[main] watcher close timeout/err: %s", exc)
+        for task in watcher_tasks:
+            task.cancel()
 
-    for w in all_watchers:
-        await w.close()
+        logger.info("[main] cancelling background loops …")
+        for task in bg_tasks:
+            task.cancel()
+        await asyncio.gather(*all_tasks, return_exceptions=True)
 
-    await classifier.close()
-    await news_memory.close()
-    await impact_tracker.close()
-    await article_fetcher.close()
-    await runner.close()
-    for engine in engines:
-        await engine.trader.close()
-    await db.close()
-    logger.info("[main] Seulgi stopped cleanly")
+        logger.info("[main] closing subsystems …")
+        await classifier.close()
+        await news_memory.close()
+        await impact_tracker.close()
+        await article_fetcher.close()
+        await runner.close()
+        for engine in engines:
+            await engine.trader.close()
+        await db.close()    # PRAGMA wal_checkpoint(TRUNCATE) runs inside
+
+    try:
+        await asyncio.wait_for(_drain(), timeout=20.0)
+        logger.info("[main] Seulgi stopped cleanly")
+    except asyncio.TimeoutError:
+        logger.warning("[main] shutdown timed out after 20s — forcing exit")
 
 
 if __name__ == "__main__":

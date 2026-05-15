@@ -159,42 +159,61 @@ def cmd_restore(args: argparse.Namespace) -> int:
 
 def cmd_cycle(args: argparse.Namespace) -> int:
     """
-    Save current state, swap in a fresh trading slate, restart the bot.
-    Keeps the market universe and news memory by default (the slow-to-rebuild
-    bits). Pass --fresh-markets when the market-finding code itself changed.
+    Snapshot current state, open a new cycle row, restart the bot.
+
+    Cycle-8 change: this no longer DELETES trading data. Instead it inserts a
+    new row into the `cycles` table whose `started_at` becomes the live
+    dashboard's window — all PnL/staked counters narrow to "since this cycle
+    started". Historical trades stay in the DB so you can SQL-trace any
+    prior cycle directly without rehydrating a snapshot.
+
+    `--fresh-markets` still wipes the market index + news_chroma (for cycles
+    that re-discover the market universe).
     """
-    # 1. Save baseline so the user can roll back
-    print(f"[cycle] 1/4 saving current state as {args.name!r}…")
+    # 1. Snapshot the state at cycle boundary so the byte-identical copy is
+    #    always available even if someone manually mutates the live DB later.
+    print(f"[cycle] 1/4 snapshotting state as {args.name!r}…")
     save_args = [args.name]
     if args.minimal:
         save_args.append("--minimal")
+    save_args.append("--overwrite")
     _sudo_py("scripts.snapshot.snapshot", "save", *save_args)
 
-    # 2. Stop the bot before mutating the DB
+    # 2. Stop the bot so the cycle row update happens against a quiet DB.
     if _bot_is_running():
         print("[cycle] 2/4 stopping seulgi…")
         _docker("stop", "seulgi")
     else:
         print("[cycle] 2/4 seulgi already stopped")
 
-    # 3. Mutate state — restore from the same snapshot with --reset-trading.
-    # This guarantees a clean per-model slate while keeping markets+news.
-    # If --fresh-markets is set, also blow away the market universe.
-    print(f"[cycle] 3/4 resetting trading state (preserving "
-          + ("nothing" if args.fresh_markets else "markets + news memory")
-          + ")…")
-    _sudo_py("scripts.snapshot.snapshot", "restore", args.name, "--reset-trading")
+    # 3. Close the current cycle row and open a new one. Inline SQL keeps the
+    #    cycle.py script standalone — no need to import the SeulgiDB module.
+    db_path = REPO / "data" / "seulgi.db"
+    print(f"[cycle] 3/4 opening cycle row {args.name!r} (no data deleted)…")
+    _run([
+        "sudo", sys.executable, "-c",
+        "import sqlite3, datetime as dt; "
+        f"c=sqlite3.connect(r{str(db_path)!r}); "
+        "now=dt.datetime.now(dt.timezone.utc).isoformat(); "
+        "c.execute(\"CREATE TABLE IF NOT EXISTS cycles ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  name TEXT NOT NULL, started_at TEXT NOT NULL,"
+        "  ended_at TEXT, notes TEXT)\"); "
+        "c.execute('UPDATE cycles SET ended_at = ? WHERE ended_at IS NULL', (now,)); "
+        f"c.execute('INSERT INTO cycles (name, started_at) VALUES (?, ?)', ({args.name!r}, now)); "
+        "c.commit(); "
+        "row=c.execute('SELECT id, name, started_at FROM cycles WHERE ended_at IS NULL').fetchone(); "
+        "print(f'  new cycle id={row[0]} name={row[1]} started_at={row[2]}'); "
+        "c.close()",
+    ])
+
     if args.fresh_markets:
-        # Wipe the market index AND news_chroma so the new cycle re-fetches
-        # markets and re-builds dedup memory from scratch. Both paths require
-        # sudo because the bot wrote them as root via the bind mount.
-        db_path = REPO / "data" / "seulgi.db"
         chroma_path = REPO / "data" / "news_chroma"
         print("[cycle]   --fresh-markets: clearing markets table + news_chroma…")
         _run(["sudo", "rm", "-rf", str(chroma_path)])
         _run([
             "sudo", sys.executable, "-c",
-            "import sqlite3, sys; "
+            "import sqlite3; "
             f"c=sqlite3.connect(r{str(db_path)!r}); "
             "c.execute('DELETE FROM markets'); c.commit(); c.close(); "
             "print('  markets table cleared')",
@@ -210,9 +229,9 @@ def cmd_cycle(args: argparse.Namespace) -> int:
               "check `docker compose logs seulgi`")
 
     print()
-    print(f"[cycle] done. snapshot {args.name!r} is saved; live data/ is now "
-          "a fresh slate" + (" with empty market index" if args.fresh_markets else
-                             " with markets + news memory preserved") + ".")
+    print(f"[cycle] done. snapshot {args.name!r} saved; cycle row inserted. "
+          f"Dashboard now shows 'since {args.name}' totals. "
+          "Past trades remain in DB for SQL trace.")
     print("[cycle] suggested next steps:")
     print("[cycle]   python3 cycle.py status         # confirm rules + scraper")
     print("[cycle]   python3 cycle.py postmortem     # after ~30 min of new data")

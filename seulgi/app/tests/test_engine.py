@@ -45,7 +45,6 @@ def _make_headline():
 def _make_trader_mock(name="eng", balance=1000.0):
     trader = MagicMock(spec=PaperTrader)
     trader.balance = balance
-    match = MarketMatch("cid1", "Will X?", "ty1", "tn1", 0.8)
     decision = TradeDecision(
         condition_id="cid1",
         question="Will X?",
@@ -59,6 +58,11 @@ def _make_trader_mock(name="eng", balance=1000.0):
         executed=True,
         skip_reason=None,
     )
+    # Runner now calls evaluate(signal_id, headline, survivors,
+    # classify_results, prompt_meta_json, pre_ai_skips=...). Keep `.process`
+    # as a no-op so tests asserting "was not called" still pass for the
+    # legacy entry point.
+    trader.evaluate = AsyncMock(return_value=[decision])
     trader.process = AsyncMock(return_value=[decision])
     trader.monitor_positions = AsyncMock()
     return trader
@@ -72,6 +76,8 @@ def _make_runner(engines=None, n_matches=1):
     db = MagicMock()
     db.record_engine_decisions = AsyncMock()
     db.bump_market_heat = AsyncMock()
+    db.insert_signal = AsyncMock(return_value=1)
+    db.log_usage = AsyncMock()
     embedder = MagicMock()
     vec = np.ones(384, dtype=np.float32)
     vec /= np.linalg.norm(vec)
@@ -89,7 +95,22 @@ def _make_runner(engines=None, n_matches=1):
     if engines is None:
         engines = [_make_engine("default")]
 
-    runner = EngineRunner(engines=engines, index=index, embedder=embedder, db=db)
+    # The refactored runner does the AI call itself, so it needs a
+    # classifier. Return one ClassifyResult per match — same shape every
+    # variant receives.
+    classifier = MagicMock()
+    classifier.classify_batch = AsyncMock(return_value=(
+        [
+            ClassifyResult(Direction.YES, 0.85, "bullish")
+            for _ in range(n_matches)
+        ],
+        {"model": "test", "n_samples": 1},
+    ))
+
+    runner = EngineRunner(
+        engines=engines, index=index, embedder=embedder, db=db,
+        classifier=classifier, rule_engine=None,
+    )
     return runner
 
 
@@ -171,11 +192,11 @@ class TestEngineRunnerProcess:
         runner._index._matrix = None
 
         await runner.process(_make_headline())
-        eng.trader.process.assert_not_called()
+        eng.trader.evaluate.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_all_engines_receive_same_matches(self):
-        """Each engine's process() should be called with the same matches."""
+        """Each engine's evaluate() should be called with the same survivors."""
         e1 = _make_engine("e1")
         e2 = _make_engine("e2")
         e3 = _make_engine("e3")
@@ -184,26 +205,24 @@ class TestEngineRunnerProcess:
         await runner.process(_make_headline())
 
         for eng in [e1, e2, e3]:
-            eng.trader.process.assert_called_once()
-            args = eng.trader.process.call_args
-            # Second arg is matches list
-            matches = args[0][1]
-            assert len(matches) == 2
+            eng.trader.evaluate.assert_called_once()
+            args = eng.trader.evaluate.call_args
+            # evaluate(signal_id, headline, survivors, classify_results, ...)
+            survivors = args[0][2]
+            assert len(survivors) == 2
 
     @pytest.mark.asyncio
     async def test_engines_run_concurrently(self):
         """Fan-out should be parallel, not sequential."""
-        call_times = {}
 
-        async def _slow_process(headline, matches):
-            call_times[asyncio.current_task().get_name()] = asyncio.get_event_loop().time()
+        async def _slow_evaluate(*_a, **_kw):
             await asyncio.sleep(0.02)
             return []
 
         engines = []
         for i in range(4):
             eng = _make_engine(f"eng{i}")
-            eng.trader.process = _slow_process
+            eng.trader.evaluate = _slow_evaluate
             engines.append(eng)
 
         runner = _make_runner(engines=engines, n_matches=1)
@@ -221,13 +240,13 @@ class TestEngineRunnerProcess:
         """An exception in one engine should not abort the others."""
         good_engine = _make_engine("good")
         bad_engine = _make_engine("bad")
-        bad_engine.trader.process = AsyncMock(side_effect=RuntimeError("boom"))
+        bad_engine.trader.evaluate = AsyncMock(side_effect=RuntimeError("boom"))
 
         runner = _make_runner(engines=[good_engine, bad_engine], n_matches=1)
         # Should not raise
         await runner.process(_make_headline())
 
-        good_engine.trader.process.assert_called_once()
+        good_engine.trader.evaluate.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_decisions_recorded_to_db(self):
@@ -255,7 +274,7 @@ class TestEngineRunnerProcess:
         runner._engines = [eng]
 
         await runner.process(_make_headline())
-        eng.trader.process.assert_not_called()
+        eng.trader.evaluate.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

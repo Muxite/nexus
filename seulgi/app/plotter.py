@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -83,11 +84,21 @@ class QuantPlotter:
         # Variable file set, written into plots/trade_examples/. Independent
         # of the 13 fixed dashboards.
         try:
+            # Cycle-8: clean stale PNGs each render so we don't accumulate
+            # cross-cycle bloat. The cap is 8 fresh examples per render now,
+            # so the dir size stays bounded.
+            out_dir = self._plots_dir / "trade_examples"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            for p in out_dir.glob("*.png"):
+                try:
+                    p.unlink()
+                except Exception:  # noqa: BLE001
+                    pass
+
             examples = await self._collect_trade_examples()
             if examples:
-                out_dir = str(self._plots_dir / "trade_examples")
                 await loop.run_in_executor(
-                    None, _render_trade_examples, examples, out_dir,
+                    None, _render_trade_examples, examples, str(out_dir),
                 )
                 logger.info(
                     "[plotter] rendered %d trade-example charts to %s",
@@ -98,14 +109,22 @@ class QuantPlotter:
 
     async def _collect_trade_examples(self) -> list[dict]:
         """
-        Sample 1/4 of plot-eligible price_impacts (those with full timeseries
-        backfill) across all four missed-alpha buckets so the user sees a mix
-        of too_slow / captured / no_signal / wrong_dir. Each returned dict has
-        the impact metadata, trade timing, and the full price series.
+        Sample plot-eligible price_impacts (full timeseries backfill) across
+        the four missed-alpha buckets so the user sees a mix of too_slow /
+        captured / no_signal / wrong_dir.
+
+        Cycle-8: scope to the current cycle only — historical examples stay
+        in DB for SQL trace but shouldn't clutter the live plots.
         """
         from impact_tracker import classify_missed_alpha  # local import to avoid cycle
 
+        cycle = await self._db.get_current_cycle()
+        cycle_start = cycle["started_at"] if cycle else None
+
         candidates = await self._db.get_plot_candidate_impacts(limit=400, min_samples=30)
+        if cycle_start:
+            candidates = [r for r in candidates
+                          if (r.get("detected_at") or "") >= cycle_start]
         # Group by bucket so we sample evenly. Avoids one big bucket dominating.
         by_bucket: dict[str, list[dict]] = {
             "too_slow": [], "captured": [], "no_signal": [], "wrong_dir": [],
@@ -127,10 +146,12 @@ class QuantPlotter:
         for bucket_rows in by_bucket.values():
             sampled.extend(bucket_rows[::4])
 
-        # Attach timeseries + cap total examples per render to avoid
-        # IO spikes. Newest first.
+        # Cycle-8: lowered cap from 24 → 8 plus the plotter now clears the
+        # trade_examples/ dir each render to avoid the 64 MB / 892-file
+        # accumulation we saw in cycle 7. Snapshots therefore archive ~8
+        # current-cycle examples instead of every render's worth.
         sampled.sort(key=lambda r: r.get("detected_at") or "", reverse=True)
-        sampled = sampled[:24]
+        sampled = sampled[:8]
         result = []
         for row in sampled:
             series = await self._db.get_timeseries_for_impact(row["id"])
@@ -158,20 +179,22 @@ class QuantPlotter:
     async def _collect_data(self) -> dict:
         """Pull every DB query needed by the renderer."""
         return {
-            "calibration":     await self._db.get_calibration_curve(),
-            "alpha_decay":     await self._db.get_alpha_decay(),
-            "source_stats":    await self._db.get_source_stats(),
-            "ic_pairs":        await self._db.get_ic_pairs(),
-            "latencies":       await _fetch_all_latencies(self._db),
-            "precision_ts":    await _fetch_precision_timeseries(self._db),
-            "similarity_buckets": await _fetch_similarity_buckets(self._db),
-            "delta_5m_dist":   await _fetch_delta_5m_distribution(self._db),
-            "edge_vs_pnl":     await _fetch_edge_vs_pnl(self._db),
-            "close_reasons":   await _fetch_close_reasons(self._db),
-            "confidence_dist": await _fetch_confidence_distribution(self._db),
-            "pnl_over_time":   await _fetch_pnl_over_time(self._db),
-            "tokens_over_time": await _fetch_tokens_over_time(self._db),
-            "generated_at":    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "calibration":         await self._db.get_calibration_curve(),
+            "alpha_decay":         await self._db.get_alpha_decay(),
+            "source_stats":        await self._db.get_source_stats(),
+            "source_stats_sites":  await _fetch_source_stats_per_site(self._db),
+            "ic_pairs":            await self._db.get_ic_pairs(),
+            "latencies":           await _fetch_all_latencies(self._db),
+            "precision_ts":        await _fetch_precision_timeseries(self._db),
+            "similarity_buckets":  await _fetch_similarity_buckets(self._db),
+            "delta_5m_dist":       await _fetch_delta_5m_distribution(self._db),
+            "edge_vs_pnl":         await _fetch_edge_vs_pnl(self._db),
+            "close_reasons":       await _fetch_close_reasons(self._db),
+            "confidence_dist":     await _fetch_confidence_distribution(self._db),
+            "pnl_over_time":       await _fetch_pnl_over_time(self._db),
+            "tokens_over_time":    await _fetch_tokens_over_time(self._db),
+            "trade_pnl_stats":     await _fetch_trade_pnl_stats(self._db),
+            "generated_at":        datetime.now(timezone.utc).isoformat(timespec="seconds"),
         }
 
 
@@ -253,6 +276,76 @@ async def _fetch_edge_vs_pnl(db: SeulgiDB) -> list[dict]:
         return [dict(r) for r in await cur.fetchall()]
 
 
+async def _fetch_source_stats_per_site(db: SeulgiDB, top_n: int = 30) -> list[dict]:
+    """
+    Per-site (site_url, not just the 'news'/'twitter' source bucket) precision.
+    The original get_source_stats() collapses to 3-4 categories which throws
+    away the per-outlet variation we actually want to act on. This query
+    surfaces it.
+    """
+    async with db._conn.execute(
+        """
+        SELECT site_url,
+               COUNT(*) AS n,
+               SUM(CASE WHEN (direction='YES' AND delta_t5m > 0)
+                             OR (direction='NO' AND delta_t5m < 0)
+                        THEN 1 ELSE 0 END) AS hits,
+               AVG(ABS(delta_t5m)) AS avg_abs_delta,
+               AVG(ai_confidence) AS avg_confidence
+        FROM price_impacts
+        WHERE delta_t5m IS NOT NULL AND direction IN ('YES','NO')
+              AND site_url IS NOT NULL
+        GROUP BY site_url
+        ORDER BY n DESC
+        LIMIT ?
+        """,
+        (top_n,),
+    ) as cur:
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def _fetch_trade_pnl_stats(db: SeulgiDB) -> dict:
+    """
+    Returns the sample mean / std of per-trade *normalized* PnL (realized_pnl
+    / size_usdc) and the trade rate over the most recent activity window.
+    Used by the sample-size plot to drive a Central-Limit-Theorem-based "how
+    many more trades do we need?" calculation.
+    """
+    async with db._conn.execute(
+        """
+        SELECT realized_pnl, size_usdc, closed_at
+        FROM trades
+        WHERE realized_pnl IS NOT NULL AND size_usdc > 0 AND closed_at IS NOT NULL
+        ORDER BY closed_at ASC
+        """
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return {"n": 0, "mean": 0.0, "std": 0.0, "trades_per_hour": 0.0, "ts": []}
+
+    norm = [float(r[0]) / float(r[1]) for r in rows]
+    n = len(norm)
+    mean = sum(norm) / n
+    var = sum((x - mean) ** 2 for x in norm) / max(1, n - 1)  # unbiased
+    std = var ** 0.5
+
+    # Trade rate over the realized window
+    try:
+        from datetime import datetime as _dt
+        first = _dt.fromisoformat(rows[0][2])
+        last = _dt.fromisoformat(rows[-1][2])
+        hours = max(1e-6, (last - first).total_seconds() / 3600.0)
+        rate = n / hours
+    except Exception:  # noqa: BLE001
+        rate = 0.0
+
+    return {
+        "n": n, "mean": mean, "std": std,
+        "trades_per_hour": rate,
+        "norm_pnl_series": norm,
+    }
+
+
 async def _fetch_close_reasons(db: SeulgiDB) -> dict[str, int]:
     """
     Bucket closed trades by why they closed, using the close_reason persisted
@@ -325,6 +418,7 @@ _CHARTS = (
     "calibration.png",
     "alpha_decay.png",
     "source_breakdown.png",
+    "source_breakdown_sites.png",
     "scatter_ic.png",
     "latency_hist.png",
     "precision_over_time.png",
@@ -335,7 +429,40 @@ _CHARTS = (
     "confidence_dist.png",
     "pnl_over_time.png",
     "tokens_over_time.png",
+    "sample_size.png",
 )
+
+
+"""
+Palette: Okabe-Ito-inspired colourblind-safe set, plus a few semantic accents
+the trader-style charts need (WIN/LOSS/TP/SL). Use these everywhere instead
+of ad-hoc colour names so every chart in the dashboard reads as one set.
+"""
+PALETTE = {
+    # Primary categorical colours (Okabe-Ito) — for engines, sources, buckets
+    "primary":     "#0072B2",  # strong blue
+    "secondary":   "#E69F00",  # orange
+    "tertiary":    "#009E73",  # green
+    "quaternary":  "#CC79A7",  # rose
+    "quinary":     "#56B4E9",  # sky
+    "senary":      "#D55E00",  # vermillion
+    "septenary":   "#F0E442",  # yellow
+    "octonary":    "#000000",  # black
+    # Semantic
+    "gain":        "#1B7F4D",  # deep emerald — realized profit
+    "loss":        "#B5142E",  # deep crimson — realized loss
+    "neutral":     "#5C6770",  # slate — neutral / unknown
+    "baseline":    "#A0A4AB",  # light grey — reference lines
+    "ci_band":     "#C7D8EC",  # pale blue — confidence-interval fill
+    "highlight":   "#FFB000",  # amber — call-out
+}
+CAT_ORDER = ["primary", "secondary", "tertiary", "quaternary",
+             "quinary", "senary", "septenary"]
+
+
+def _cat_colors(n: int) -> list[str]:
+    """Return n categorical colours in canonical order (wraps if n > len)."""
+    return [PALETTE[CAT_ORDER[i % len(CAT_ORDER)]] for i in range(n)]
 
 
 def _render_all(data: dict, out_dir: str) -> None:
@@ -347,27 +474,43 @@ def _render_all(data: dict, out_dir: str) -> None:
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: E402
 
-    plt.rcParams["figure.dpi"] = 110
+    plt.rcParams["figure.dpi"] = 120
     plt.rcParams["savefig.bbox"] = "tight"
     plt.rcParams["axes.grid"] = True
-    plt.rcParams["grid.alpha"] = 0.3
+    plt.rcParams["grid.alpha"] = 0.22
+    plt.rcParams["grid.linestyle"] = "--"
+    plt.rcParams["axes.spines.top"] = False
+    plt.rcParams["axes.spines.right"] = False
+    plt.rcParams["axes.edgecolor"] = "#333740"
+    plt.rcParams["axes.labelcolor"] = "#22262C"
+    plt.rcParams["axes.titleweight"] = "semibold"
+    plt.rcParams["axes.titlesize"] = 12
+    plt.rcParams["axes.labelsize"] = 10
+    plt.rcParams["xtick.color"] = "#444851"
+    plt.rcParams["ytick.color"] = "#444851"
+    plt.rcParams["font.family"] = ["DejaVu Sans"]
+    plt.rcParams["axes.prop_cycle"] = matplotlib.cycler(
+        color=[PALETTE[k] for k in CAT_ORDER]
+    )
 
     ts = data.get("generated_at", "")
 
     for name, fn in (
-        ("calibration",         _plot_calibration),
-        ("alpha_decay",         _plot_alpha_decay),
-        ("source_breakdown",    _plot_source_breakdown),
-        ("scatter_ic",          _plot_scatter_ic),
-        ("latency_hist",        _plot_latency_hist),
-        ("precision_over_time", _plot_precision_timeseries),
-        ("similarity_buckets",  _plot_similarity_buckets),
-        ("delta_5m_dist",       _plot_delta_5m_dist),
-        ("edge_vs_pnl",         _plot_edge_vs_pnl),
-        ("close_reasons",       _plot_close_reasons),
-        ("confidence_dist",     _plot_confidence_dist),
-        ("pnl_over_time",       _plot_pnl_over_time),
-        ("tokens_over_time",    _plot_tokens_over_time),
+        ("calibration",            _plot_calibration),
+        ("alpha_decay",            _plot_alpha_decay),
+        ("source_breakdown",       _plot_source_breakdown),
+        ("source_breakdown_sites", _plot_source_breakdown_per_site),
+        ("scatter_ic",             _plot_scatter_ic),
+        ("latency_hist",           _plot_latency_hist),
+        ("precision_over_time",    _plot_precision_timeseries),
+        ("similarity_buckets",     _plot_similarity_buckets),
+        ("delta_5m_dist",          _plot_delta_5m_dist),
+        ("edge_vs_pnl",            _plot_edge_vs_pnl),
+        ("close_reasons",          _plot_close_reasons),
+        ("confidence_dist",        _plot_confidence_dist),
+        ("pnl_over_time",          _plot_pnl_over_time),
+        ("tokens_over_time",       _plot_tokens_over_time),
+        ("sample_size",            _plot_sample_size),
     ):
         path = os.path.join(out_dir, f"{name}.png")
         try:
@@ -395,12 +538,13 @@ def _plot_calibration(plt, data: dict, path: str, ts: str) -> None:
             his.append(hi - rate)
         sizes = [max(20, min(400, (r["n"] or 0) * 4)) for r in rows]
         ax.plot([0, 1], [0, 1], "k--", linewidth=1, alpha=0.4, label="perfect calibration")
-        ax.axhline(0.5, color="red", linestyle=":", linewidth=0.8, alpha=0.5,
+        ax.axhline(0.5, color=PALETTE["loss"], linestyle=":", linewidth=0.8, alpha=0.6,
                    label="random (0.5)")
         ax.errorbar(confs, rates, yerr=[los, his], fmt="none",
-                    ecolor="gray", elinewidth=1, capsize=4, alpha=0.7,
+                    ecolor=PALETTE["neutral"], elinewidth=1, capsize=4, alpha=0.75,
                     label="95% Wilson CI")
-        ax.scatter(confs, rates, s=sizes, alpha=0.8, c="steelblue", edgecolors="black")
+        ax.scatter(confs, rates, s=sizes, alpha=0.85, c=PALETTE["primary"],
+                   edgecolors=PALETTE["octonary"], linewidths=0.5)
         ax.set_xlim(0, 1)
         ax.set_ylim(0, 1)
         for r, c, rate in zip(rows, confs, rates):
@@ -429,10 +573,10 @@ def _plot_similarity_buckets(plt, data: dict, path: str, ts: str) -> None:
             los.append(rate - lo)
             his.append(hi - rate)
         sizes = [max(20, min(400, (r["n"] or 0) * 4)) for r in rows]
-        ax.axhline(0.5, color="red", linestyle=":", linewidth=0.8,
+        ax.axhline(0.5, color=PALETTE["loss"], linestyle=":", linewidth=0.8,
                    alpha=0.6, label="random (0.5)")
         ax.errorbar(sims, rates, yerr=[los, his], fmt="none",
-                    ecolor="gray", elinewidth=1, capsize=4, alpha=0.7)
+                    ecolor=PALETTE["neutral"], elinewidth=1, capsize=4, alpha=0.7)
         ax.scatter(sims, rates, s=sizes, alpha=0.8, c="seagreen", edgecolors="black")
         for r, s, rate in zip(rows, sims, rates):
             ax.annotate(f"n={r['n']}", (s, rate),
@@ -455,12 +599,12 @@ def _plot_delta_5m_dist(plt, data: dict, path: str, ts: str) -> None:
     else:
         # Clip outliers at ±0.20 for a readable histogram
         clipped = [max(-0.20, min(0.20, d)) for d in deltas]
-        ax.hist(clipped, bins=40, color="steelblue", edgecolor="black", alpha=0.85)
+        ax.hist(clipped, bins=40, color=PALETTE["primary"], edgecolor=PALETTE["octonary"], alpha=0.85)
         mean_abs = sum(abs(d) for d in deltas) / len(deltas)
-        ax.axvline(0, color="black", linewidth=0.7)
-        ax.axvline(0.01, color="green", linestyle=":", linewidth=1,
+        ax.axvline(0, color=PALETTE["octonary"], linewidth=0.7)
+        ax.axvline(0.01, color=PALETTE["gain"], linestyle=":", linewidth=1,
                    label="|Δ| = 0.01 (meaningful move)")
-        ax.axvline(-0.01, color="green", linestyle=":", linewidth=1)
+        ax.axvline(-0.01, color=PALETTE["gain"], linestyle=":", linewidth=1)
         ax.set_title(f"Δ5m distribution  N={len(deltas)}  mean|Δ|={mean_abs:.4f}  ({ts})")
     ax.set_xlabel("Δ5m (price change 5 minutes after headline, clipped at ±0.20)")
     ax.set_ylabel("Count")
@@ -470,36 +614,309 @@ def _plot_delta_5m_dist(plt, data: dict, path: str, ts: str) -> None:
 
 
 def _plot_edge_vs_pnl(plt, data: dict, path: str, ts: str) -> None:
-    """Does predicted edge predict realized PnL? OLS fit line."""
+    """
+    Predicted edge vs realized PnL — but the raw scatter from cycle 4 was
+    illegible because executed edges cluster at edge_increment × small
+    multipliers (every dot landed on the same vertical strip). Re-render as:
+      * quantile-binned mean PnL ± 95% CI per bin (heavy line)
+      * raw scatter underneath (very faint, for context)
+      * OLS fit + Pearson r (since IC is the value we actually want)
+      * mean line and zero baselines
+    Reads vastly better and surfaces the real question: does *predicted* edge
+    monotonically buy us *realized* PnL?
+    """
     rows = data["edge_vs_pnl"]
-    fig, ax = plt.subplots(figsize=(7, 5.5))
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
     if len(rows) < 3:
         ax.text(0.5, 0.5, "need ≥3 closed trades", ha="center", va="center",
-                transform=ax.transAxes)
-    else:
-        xs = [r["edge"] for r in rows]
-        ys = [r["norm_pnl"] for r in rows]
-        ic = _pearson(xs, ys)
-        ax.scatter(xs, ys, c="steelblue", alpha=0.6, edgecolors="none", s=30)
-        ax.axhline(0, color="black", linewidth=0.5)
-        ax.axvline(0, color="black", linewidth=0.5)
-        # OLS fit line
-        n = len(xs)
-        mx, my = sum(xs)/n, sum(ys)/n
-        denom = sum((x-mx)**2 for x in xs)
-        if denom > 0:
-            slope = sum((x-mx)*(y-my) for x,y in zip(xs,ys)) / denom
-            intercept = my - slope*mx
-            xfit = sorted(xs)
-            yfit = [slope*x + intercept for x in xfit]
-            ax.plot(xfit, yfit, "r-", linewidth=1.5, alpha=0.7,
-                    label=f"OLS: y = {slope:+.2f}x + {intercept:+.3f}")
-        ax.set_title(f"Predicted edge vs realized PnL  IC={ic:+.3f}  N={n}  ({ts})")
-        ax.legend(loc="upper left")
-    ax.set_xlabel("Predicted edge (p_hat − mid_price)")
+                transform=ax.transAxes, color=PALETTE["neutral"])
+        ax.set_title(f"Predicted edge vs realized PnL  ({ts})")
+        fig.savefig(path)
+        plt.close(fig)
+        return
+
+    xs = [float(r["edge"]) for r in rows]
+    ys = [float(r["norm_pnl"]) for r in rows]
+    n = len(xs)
+    ic = _pearson(xs, ys)
+
+    # Raw scatter — faint, for context only.
+    ax.scatter(xs, ys, c=PALETTE["primary"], alpha=0.18,
+               edgecolors="none", s=20, label="trades")
+
+    # Quantile bins (5 if enough data, 3 if very sparse). Empty bins are
+    # silently dropped so a 6-trade chart still renders something useful.
+    nbins = 5 if n >= 25 else (4 if n >= 12 else 3)
+    sorted_pairs = sorted(zip(xs, ys), key=lambda p: p[0])
+    bin_size = max(1, n // nbins)
+    bins = [sorted_pairs[i:i + bin_size] for i in range(0, n, bin_size)]
+    # Merge a tiny trailing bin into the previous one
+    if len(bins) > nbins and len(bins[-1]) < bin_size * 0.6:
+        bins[-2].extend(bins[-1]); bins.pop()
+
+    bin_x_mid = []
+    bin_y_mean = []
+    bin_y_ci_half = []
+    bin_n = []
+    for b in bins:
+        if not b:
+            continue
+        bxs = [p[0] for p in b]; bys = [p[1] for p in b]
+        bn = len(b)
+        bmean = sum(bys) / bn
+        if bn > 1:
+            bvar = sum((y - bmean) ** 2 for y in bys) / (bn - 1)
+            bstd = bvar ** 0.5
+            ci_half = 1.96 * bstd / (bn ** 0.5)
+        else:
+            ci_half = 0.0
+        bin_x_mid.append(sum(bxs) / bn)
+        bin_y_mean.append(bmean)
+        bin_y_ci_half.append(ci_half)
+        bin_n.append(bn)
+
+    if bin_x_mid:
+        ax.errorbar(
+            bin_x_mid, bin_y_mean, yerr=bin_y_ci_half,
+            fmt="o-", color=PALETTE["secondary"], ecolor=PALETTE["secondary"],
+            elinewidth=1.6, capsize=4, markersize=8, linewidth=2.0,
+            label=f"binned mean ± 95% CI ({len(bin_x_mid)} bins)", zorder=3,
+        )
+        for x, y, bn_ in zip(bin_x_mid, bin_y_mean, bin_n):
+            ax.annotate(f"n={bn_}", (x, y), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=8,
+                        color=PALETTE["neutral"])
+
+    # OLS line over the full range
+    mx, my = sum(xs) / n, sum(ys) / n
+    denom = sum((x - mx) ** 2 for x in xs)
+    if denom > 0:
+        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / denom
+        intercept = my - slope * mx
+        xfit = [min(xs), max(xs)]
+        yfit = [slope * x + intercept for x in xfit]
+        ax.plot(xfit, yfit, "-", linewidth=1.4, alpha=0.7,
+                color=PALETTE["loss"],
+                label=f"OLS: y = {slope:+.2f}x + {intercept:+.3f}")
+
+    ax.axhline(0, color=PALETTE["baseline"], linewidth=0.7)
+    ax.axvline(0, color=PALETTE["baseline"], linewidth=0.7)
+    mean_y = sum(ys) / n
+    ax.axhline(mean_y, color=PALETTE["tertiary"], linewidth=0.8,
+               linestyle=":", label=f"mean PnL/stake = {mean_y:+.3f}")
+
+    ax.set_title(f"Predicted edge vs realized PnL  ·  IC={ic:+.3f}  N={n}  ({ts})")
+    ax.set_xlabel("Predicted edge  (p_hat − mid_price)")
     ax.set_ylabel("Realized PnL / stake")
+    ax.legend(loc="best", framealpha=0.9, fontsize=9)
     fig.savefig(path)
     plt.close(fig)
+
+
+def _plot_source_breakdown_per_site(plt, data: dict, path: str, ts: str) -> None:
+    """
+    Per-site (site_url) hit rate with Wilson 95% CIs. Horizontal bar chart so
+    long lists of outlets fit on one image without rotated x-labels. Bars are
+    coloured by sample size (darker = more samples = trust this rate more).
+    """
+    rows = data["source_stats_sites"]
+    fig, ax = plt.subplots(figsize=(9, max(4, 0.32 * len(rows) + 1.6)))
+    if not rows:
+        ax.text(0.5, 0.5, "no per-site data yet",
+                ha="center", va="center", transform=ax.transAxes,
+                color=PALETTE["neutral"])
+        ax.set_title(f"Hit rate by site  ({ts})")
+        ax.set_xticks([]); ax.set_yticks([])
+        fig.savefig(path)
+        plt.close(fig)
+        return
+
+    # Sort ascending by rate so the worst is at the bottom and best at top —
+    # which matches reading order on a horizontal bar chart.
+    rows = sorted(rows, key=lambda r: (r["hits"] / r["n"]) if r["n"] else 0)
+    sites = [(_short_site(r["site_url"]) or "?") for r in rows]
+    rates = [(r["hits"] / r["n"]) if r["n"] else 0.0 for r in rows]
+    ns = [r["n"] or 0 for r in rows]
+    cis = [_wilson_ci(int(r["hits"] or 0), int(r["n"] or 0)) for r in rows]
+    lower_err = [max(0.0, rate - lo) for rate, (lo, _) in zip(rates, cis)]
+    upper_err = [max(0.0, hi - rate) for rate, (_, hi) in zip(rates, cis)]
+
+    # Colour-grade by sample size (light → dark)
+    max_n = max(ns) or 1
+    bar_colors = [_grade_color(n / max_n) for n in ns]
+
+    bars = ax.barh(sites, rates, color=bar_colors, edgecolor="#202428", linewidth=0.5)
+    ax.errorbar(
+        rates, sites, xerr=[lower_err, upper_err], fmt="none",
+        ecolor=PALETTE["neutral"], elinewidth=1.0, capsize=3, alpha=0.8,
+    )
+
+    ax.axvline(0.5, color=PALETTE["loss"], linestyle=":", linewidth=0.9,
+               alpha=0.7, label="random baseline (0.5)")
+    for bar, n_, rate in zip(bars, ns, rates):
+        ax.text(min(rate + 0.015, 0.98), bar.get_y() + bar.get_height() / 2,
+                f"{rate:.0%}  n={n_}", va="center", fontsize=8,
+                color=PALETTE["octonary"])
+
+    ax.set_xlim(0, 1.05)
+    ax.set_xlabel("Hit rate (Δ5m in predicted direction)  ±  95% Wilson CI")
+    ax.set_title(f"Precision by site — top {len(rows)} by sample size  ({ts})")
+    ax.legend(loc="lower right", framealpha=0.9, fontsize=9)
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _short_site(url) -> str:
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        host = (p.netloc or url).replace("www.", "")
+        path = (p.path or "").rstrip("/")
+        return f"{host}{path}" if path and len(path) < 20 else host
+    except Exception:  # noqa: BLE001
+        return str(url)[:32]
+
+
+def _grade_color(intensity: float) -> str:
+    """Map intensity [0..1] to a blue→primary gradient hex."""
+    intensity = max(0.0, min(1.0, intensity))
+    # Linear interp from pale blue to primary blue
+    c0 = (0.78, 0.85, 0.92)  # pale
+    c1 = (0.00, 0.45, 0.70)  # primary
+    rgb = tuple(c0[i] + (c1[i] - c0[i]) * intensity for i in range(3))
+    return "#%02x%02x%02x" % tuple(int(255 * x) for x in rgb)
+
+
+def _plot_sample_size(plt, data: dict, path: str, ts: str) -> None:
+    """
+    How many closed trades do we need before the sample-mean ROI is "reasonably
+    accurate"? Apply the CLT: for an iid sample with std σ, the sample mean
+    has std σ/√n, and a normal-approximation 95% CI half-width is 1.96·σ/√n.
+    Solving for n at a target margin-of-error gives:
+
+        n_required = (1.96 · σ / MoE)²
+
+    We compute σ from the realized per-trade normalized-PnL series and report:
+      * current n, mean ROI ± 95% CI, σ
+      * n required for MoE of {0.5%, 1.0%, 2.0%} of stake
+      * estimated wall-clock time at the current trade rate
+
+    Left panel: text panel with the numbers (easier than reading a number off
+    a chart). Right panel: CI half-width as a function of n on log-x, with
+    the current n highlighted.
+    """
+    stats = data.get("trade_pnl_stats", {})
+    n = int(stats.get("n", 0) or 0)
+    mean = float(stats.get("mean", 0.0) or 0.0)
+    std = float(stats.get("std", 0.0) or 0.0)
+    rate = float(stats.get("trades_per_hour", 0.0) or 0.0)
+
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(12, 5.2),
+                                   gridspec_kw={"width_ratios": [1.0, 1.4]})
+
+    # ── Left: numbers panel ────────────────────────────────────────────
+    axL.axis("off")
+    if n < 2:
+        lines = [
+            "Sample size analysis",
+            "",
+            f"Closed trades observed: n = {n}",
+            "",
+            "Need n ≥ 2 before we can estimate σ.",
+            "Come back once 5–10 trades have closed.",
+        ]
+    else:
+        z = 1.96
+        ci_half = z * std / (n ** 0.5)
+
+        def n_req(moe: float) -> int:
+            if moe <= 0 or std == 0:
+                return 0
+            return int(math.ceil((z * std / moe) ** 2))
+
+        def hours_for(target_n: int) -> float:
+            return target_n / rate if rate > 0 else float("inf")
+
+        targets = [0.005, 0.01, 0.02]
+        rows_lines = ["Required n for 95% CI half-width =", ""]
+        for t in targets:
+            nr = n_req(t)
+            extra = max(0, nr - n)
+            h = hours_for(extra)
+            if h == float("inf"):
+                eta = "—"
+            elif h < 1:
+                eta = f"{h*60:.0f} min"
+            elif h < 48:
+                eta = f"{h:.1f} h"
+            else:
+                eta = f"{h/24:.1f} d"
+            rows_lines.append(
+                f"   ±{t*100:.1f}% of stake → n ≥ {nr:>5}   (need +{extra}, ETA {eta})"
+            )
+
+        lines = [
+            "Sample size analysis (CLT, 95% CI)",
+            "",
+            f"Closed trades observed:  n = {n}",
+            f"Sample mean ROI:         μ̂ = {mean*100:+.2f}%",
+            f"Sample std dev:          σ = {std*100:.2f}%",
+            f"Current 95% CI half-width: ±{ci_half*100:.2f}%",
+            f"Trade rate:              {rate:.2f} / hour",
+            "",
+            *rows_lines,
+        ]
+
+    axL.text(0.0, 1.0, "\n".join(lines), family="DejaVu Sans Mono",
+             fontsize=10, va="top", ha="left", color=PALETTE["octonary"])
+
+    # ── Right: CI half-width vs n curve ────────────────────────────────
+    if n >= 2 and std > 0:
+        z = 1.96
+        ns = [int(round(x)) for x in _logspace(1, max(5000, n * 5), 80)]
+        moes = [z * std / (k ** 0.5) for k in ns]
+        axR.plot(ns, [m * 100 for m in moes], color=PALETTE["primary"],
+                 linewidth=2.0, label="95% CI half-width")
+        axR.fill_between(ns, 0, [m * 100 for m in moes], alpha=0.15,
+                         color=PALETTE["primary"])
+        # Mark current n
+        axR.axvline(n, color=PALETTE["secondary"], linestyle="--",
+                    linewidth=1.2, label=f"current n = {n}")
+        # Target lines
+        for t, col in zip([0.005, 0.01, 0.02],
+                          [PALETTE["tertiary"], PALETTE["highlight"], PALETTE["loss"]]):
+            axR.axhline(t * 100, color=col, linestyle=":",
+                        linewidth=1.0, alpha=0.75,
+                        label=f"target ±{t*100:.1f}%")
+        axR.set_xscale("log")
+        axR.set_xlabel("Sample size n (log scale)")
+        axR.set_ylabel("95% CI half-width  (% of stake)")
+        axR.set_title("Estimator precision vs sample size")
+        axR.legend(loc="upper right", framealpha=0.9, fontsize=9)
+    else:
+        axR.text(0.5, 0.5, "need ≥2 closed trades for σ",
+                 ha="center", va="center", transform=axR.transAxes,
+                 color=PALETTE["neutral"])
+        axR.set_xticks([]); axR.set_yticks([])
+
+    fig.suptitle(f"How many trades until we trust the mean ROI?  ({ts})",
+                 fontsize=12, fontweight="semibold")
+    fig.savefig(path)
+    plt.close(fig)
+
+
+def _logspace(lo: float, hi: float, n: int) -> list[float]:
+    import math
+    if lo <= 0:
+        lo = 1.0
+    if hi <= lo:
+        hi = lo * 10
+    log_lo = math.log10(lo)
+    log_hi = math.log10(hi)
+    step = (log_hi - log_lo) / max(1, n - 1)
+    return [10 ** (log_lo + i * step) for i in range(n)]
 
 
 def _plot_close_reasons(plt, data: dict, path: str, ts: str) -> None:
@@ -524,13 +941,13 @@ def _plot_close_reasons(plt, data: dict, path: str, ts: str) -> None:
             "TRAIL":     "goldenrod",
             "TIMEOUT":   "steelblue",
             "COLD_CULL": "slategrey",
-            "UNKNOWN":   "lightgrey",
+            "UNKNOWN":   PALETTE["baseline"],
         }
         # Render in descending-count order so the biggest wedge starts at 0deg.
         ordered = sorted(counts.items(), key=lambda kv: -kv[1])
         labels = [f"{k}  ({v}, {100*v/total:.0f}%)" for k, v in ordered]
         values = [v for _, v in ordered]
-        colors = [color_map.get(k, "lightgrey") for k, _ in ordered]
+        colors = [color_map.get(k, PALETTE["baseline"]) for k, _ in ordered]
         ax.pie(values, labels=labels, colors=colors,
                autopct="", startangle=90, wedgeprops={"edgecolor": "white"})
     ax.set_title(f"Close-reason breakdown  N={total}  ({ts})")
@@ -545,12 +962,12 @@ def _plot_confidence_dist(plt, data: dict, path: str, ts: str) -> None:
     if not confs:
         ax.text(0.5, 0.5, "no data yet", ha="center", va="center", transform=ax.transAxes)
     else:
-        ax.hist(confs, bins=20, range=(0.0, 1.0), color="purple",
-                edgecolor="black", alpha=0.8)
+        ax.hist(confs, bins=20, range=(0.0, 1.0), color=PALETTE["quaternary"],
+                edgecolor=PALETTE["octonary"], alpha=0.8)
         avg = sum(confs) / len(confs)
-        ax.axvline(avg, color="red", linestyle="--", linewidth=1.2,
+        ax.axvline(avg, color=PALETTE["loss"], linestyle="--", linewidth=1.2,
                    label=f"mean = {avg:.2f}")
-        ax.axvline(0.5, color="gray", linestyle=":", linewidth=0.8,
+        ax.axvline(0.5, color=PALETTE["neutral"], linestyle=":", linewidth=0.8,
                    label="0.5 floor")
     ax.set_xlabel("AI confidence")
     ax.set_ylabel("Count")
@@ -580,7 +997,7 @@ def _plot_pnl_over_time(plt, data: dict, path: str, ts: str) -> None:
             last = buf["cum"][-1] if buf["cum"] else 0.0
             buf["ts"].append(t)
             buf["cum"].append(last + (r["realized_pnl"] or 0.0))
-        ax.axhline(0, color="black", linewidth=0.5)
+        ax.axhline(0, color=PALETTE["octonary"], linewidth=0.5)
         for eng, buf in sorted(by_engine.items()):
             ax.plot(buf["ts"], buf["cum"], linewidth=1.5,
                     label=f"{eng}  final={buf['cum'][-1]:+.2f}")
@@ -610,7 +1027,7 @@ def _plot_tokens_over_time(plt, data: dict, path: str, ts: str) -> None:
             except (ValueError, TypeError):
                 continue
         if ts_vals:
-            ax.bar(ts_vals, ys, width=0.01, color="darkorange", edgecolor="black",
+            ax.bar(ts_vals, ys, width=0.01, color=PALETTE["secondary"], edgecolor=PALETTE["octonary"],
                    linewidth=0.5)
             total = sum(ys)
             ax.set_title(f"AI token usage per 15-min bucket  total={total:,}  ({ts})")
@@ -647,7 +1064,7 @@ def _plot_alpha_decay(plt, data: dict, path: str, ts: str) -> None:
             ys = [r.get(f"hit_t{b}m") or 0.0 for b in buckets]
             ax.plot(buckets, ys, marker="o", linewidth=2,
                     label=f"{r['direction']} (n={r['n']})")
-        ax.axhline(0.5, color="red", linestyle=":", linewidth=0.8,
+        ax.axhline(0.5, color=PALETTE["loss"], linestyle=":", linewidth=0.8,
                    alpha=0.5, label="random baseline")
     ax.set_xlabel("Time bucket (minutes after headline)")
     ax.set_ylabel("Hit rate")
@@ -669,7 +1086,7 @@ def _plot_source_breakdown(plt, data: dict, path: str, ts: str) -> None:
         rates = [(r["hits"] / r["n"]) if r["n"] else 0.0 for r in rows]
         ns = [r["n"] or 0 for r in rows]
         bars = ax.bar(sources, rates, color=["steelblue", "darkorange", "seagreen", "crimson"][:len(rows)])
-        ax.axhline(0.5, color="red", linestyle=":", linewidth=0.8, alpha=0.6,
+        ax.axhline(0.5, color=PALETTE["loss"], linestyle=":", linewidth=0.8, alpha=0.6,
                    label="random baseline")
         for bar, n, rate in zip(bars, ns, rates):
             ax.text(bar.get_x() + bar.get_width() / 2, rate + 0.01,
@@ -694,8 +1111,8 @@ def _plot_scatter_ic(plt, data: dict, path: str, ts: str) -> None:
         # Colour: green if Δ5m moved in predicted direction, red if not
         colours = ["green" if (x > 0) == (y > 0) else "red" for x, y in pairs]
         ax.scatter(xs, ys, c=colours, alpha=0.5, s=22, edgecolors="none")
-        ax.axhline(0, color="black", linewidth=0.5)
-        ax.axvline(0, color="black", linewidth=0.5)
+        ax.axhline(0, color=PALETTE["octonary"], linewidth=0.5)
+        ax.axvline(0, color=PALETTE["octonary"], linewidth=0.5)
         ax.set_title(f"Signed confidence vs Δ5m   IC = {ic:+.4f}  (n={len(pairs)})  ({ts})")
     ax.set_xlabel("Signed AI confidence  (+conf=YES, -conf=NO)")
     ax.set_ylabel("Δ5m (price change 5 minutes after headline)")
@@ -727,17 +1144,17 @@ def _plot_latency_hist(plt, data: dict, path: str, ts: str) -> None:
         bins = [10 ** x for x in
                 _linspace(math.log10(lo), math.log10(max(clip, lo * 10)), 41)]
         clipped = [min(x, clip) for x in positive]
-        ax.hist(clipped, bins=bins, color="steelblue", edgecolor="black", alpha=0.85)
+        ax.hist(clipped, bins=bins, color=PALETTE["primary"], edgecolor=PALETTE["octonary"], alpha=0.85)
         avg = sum(positive) / len(positive)
         p50 = positive_sorted[len(positive_sorted) // 2]
         p99 = positive_sorted[int(0.99 * len(positive_sorted))]
-        ax.axvline(avg,  color="red",       linestyle="--", linewidth=1.2,
+        ax.axvline(avg,  color=PALETTE["loss"],       linestyle="--", linewidth=1.2,
                    label=f"mean = {avg:.0f} ms")
-        ax.axvline(p50,  color="orange",    linestyle="-",  linewidth=1.0,
+        ax.axvline(p50,  color=PALETTE["secondary"],    linestyle="-",  linewidth=1.0,
                    label=f"p50 = {p50:.0f} ms")
-        ax.axvline(p99,  color="darkred",   linestyle=":",  linewidth=1.0,
+        ax.axvline(p99,  color=PALETTE["loss"],   linestyle=":",  linewidth=1.0,
                    label=f"p99 = {p99:.0f} ms")
-        ax.axvline(5000, color="darkgreen", linestyle=":",  linewidth=1.2,
+        ax.axvline(5000, color=PALETTE["gain"], linestyle=":",  linewidth=1.2,
                    label="5s target")
         ax.set_xscale("log")
     ax.set_xlabel("Signal latency (ms, log scale, clipped at p99)")
@@ -783,8 +1200,8 @@ def _plot_precision_timeseries(plt, data: dict, path: str, ts: str) -> None:
                 times.append(t)
                 rates.append(sum(hits_buf) / len(hits_buf))
         if times:
-            ax.plot(times, rates, color="steelblue", linewidth=1.5)
-            ax.axhline(0.5, color="red", linestyle=":", linewidth=0.8,
+            ax.plot(times, rates, color=PALETTE["primary"], linewidth=1.5)
+            ax.axhline(0.5, color=PALETTE["loss"], linestyle=":", linewidth=0.8,
                        alpha=0.6, label="random baseline")
             ax.set_ylim(0, 1)
             ax.set_title(

@@ -80,16 +80,325 @@ watched_sites:
     reload_seconds: 300
     max_failures: 5
 
+  # ── US / English mainstream additions ────────────────────────────────────
+  - url: "https://www.theatlantic.com/latest/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.economist.com/latest"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.npr.org/sections/news/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://abcnews.go.com/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.nbcnews.com/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.cbsnews.com/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.foxnews.com/"
+    change_wait_seconds: 20
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.usatoday.com/news/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.semafor.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.vox.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.theverge.com/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  # ── Europe ───────────────────────────────────────────────────────────────
+  - url: "https://www.euronews.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.politico.eu/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.telegraph.co.uk/news/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.lemonde.fr/en/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.spiegel.de/international/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.france24.com/en/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.dw.com/en/top-stories/s-9097"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  # ── Asia (English) ───────────────────────────────────────────────────────
+  - url: "https://www.scmp.com/news"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://asia.nikkei.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.japantimes.co.jp/news/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://english.kyodonews.net/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.channelnewsasia.com/latest-news"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.straitstimes.com/global"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.thehindu.com/news/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.koreatimes.co.kr/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://koreajoongangdaily.joins.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.bangkokpost.com/world"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  # ── Chinese-language (Gemini reads Chinese) ──────────────────────────────
+  - url: "http://www.xinhuanet.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "http://cn.people.com.cn/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.zaobao.com.sg/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.hk01.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  # ── Middle East / Israel / conflict-zone ─────────────────────────────────
+  - url: "https://www.timesofisrael.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.haaretz.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.jpost.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.ynetnews.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://english.alarabiya.net/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.middleeasteye.net/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  # ── Africa / Russia state (low-trust, for triangulation) ─────────────────
+  - url: "https://allafrica.com/latest/news/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://tass.com/"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  # ── Sub-page coverage on existing outlets ────────────────────────────────
+  - url: "https://www.bbc.com/news/world"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.bbc.com/news/business"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.bbc.com/news/technology"
+    change_wait_seconds: 30
+    reload_seconds: 600
+    max_failures: 5
+
+  - url: "https://www.reuters.com/world/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.reuters.com/business/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.theguardian.com/us-news"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.theguardian.com/politics"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.nytimes.com/section/politics"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.nytimes.com/section/world"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.washingtonpost.com/politics/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.washingtonpost.com/world/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.aljazeera.com/news/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.cnn.com/politics"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://www.cnn.com/world"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://thehill.com/policy/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+  - url: "https://thehill.com/homenews/"
+    change_wait_seconds: 25
+    reload_seconds: 300
+    max_failures: 5
+
+# ── RSS / Atom feed subscribers (cycle 8) ────────────────────────────────────
+# Outlets identified as feed-capable in cycle 4's preflight, ranked by churn
+# (headlines per 5 min). FeedWatcher fetches the feed via the scraper's
+# /feed endpoint instead of running Playwright on the homepage — typical
+# fetch is ~50 ms instead of 3–10 s. The companion HTML entries above have
+# NOT been removed for these domains, intentionally — the feed often
+# surfaces section headlines while the homepage shows above-the-fold
+# bigger stories. Both have their own dedup so we don't double-emit.
+feeds:
+  - site_url: "https://www.timesofisrael.com/"
+    feed_url: "https://www.timesofisrael.com/feed/"
+    interval_seconds: 60
+
+  - site_url: "https://www.thehindu.com/news/"
+    feed_url: "https://www.thehindu.com/news/feeder/default.rss"
+    interval_seconds: 90
+
+  - site_url: "https://www.aljazeera.com/news/"
+    feed_url: "https://www.aljazeera.com/xml/rss/all.xml"
+    interval_seconds: 90
+
 # ── Social accounts to monitor (Twitter/X and Truth Social) ──────────────────
 # These fire into the same headline pipeline as news sites.
 # Tweets/posts are tagged source="twitter" or "truth_social" in the DB.
 # Requires SEARCH_API_KEY (Brave) set in scraper's .env for Twitter.
 # Truth Social uses public RSS — no key needed.
 social_accounts:
-  - username: "elonmusk"
-    platform: "twitter"
-    interval_seconds: 90
-
+  # Cycle-8: dropped Twitter watchers. Cycle 7 data: 885 twitter signals
+  # produced 7 trades for +$1.43 total (noise) and consumed Brave API budget
+  # continuously. Truth Social stays — it's free public RSS, no Brave cost.
+  # If we re-add Twitter, we should first switch to a nitter mirror so it
+  # doesn't compete with anything else for the Brave hourly cap.
   - username: "realDonaldTrump"
     platform: "truth_social"
     interval_seconds: 60
@@ -103,8 +412,15 @@ markets:
                                # keyword overlaps (Rick Rieder → Rick Devens,
                                # OPEC cuts demand → OPEC dissolves, etc.).
                                # Mirrors impact_tracker's MIN_SIMILARITY.
-  top_k: 15                    # max markets to evaluate per headline (AI batch size)
-                               # Don't raise without first fixing ai/classify_batch p95.
+  top_k: 25                    # max markets to evaluate per headline (AI batch size)
+                               # Cycle-8: raised 15 → 25 to widen the trade
+                               # funnel and produce more closed trades per
+                               # hour (~5/hr → ~8/hr expected). With the
+                               # 0.55 similarity floor still active, the
+                               # extra 10 slots only fire when there really
+                               # are 25 above-threshold matches — typically
+                               # only on big political stories, so the
+                               # marginal token cost is bounded.
   max_tracked_markets: 20000   # cap index at top-N markets by volume (0 = no cap)
                                # 20k × ~1.5KB embedding ≈ 30MB; matching is numpy
                                # cosine over a (N, 384) matrix — sub-10ms at N=20k.
@@ -124,6 +440,16 @@ ai:
   # premium_sim_threshold: 0.70               # similarity floor for premium routing
   api_key: ""                 # leave blank → uses OPENROUTER_API_KEY env var
   api_base: "https://openrouter.ai/api/v1"
+  # Ensemble (cycle 6): N parallel classifier calls at higher temperature,
+  # then average distributions + majority vote. Confidence is reported as
+  # mean_p_winner × agreement_fraction — so a unanimous 0.6 vote scores 0.60,
+  # a 2/3 vote at mean 0.5 scores ~0.33, and a 1/1/1 tie scores 0.
+  ensemble_samples: 3
+  ensemble_temperature: 0.5
+  # Agreement is gated separately (`min_agreement`); confidence stays on the
+  # model's native probability scale so the edge model's `2·conf − 1` rescale
+  # still works (it would floor to 0 if we baked agreement into confidence).
+  min_agreement: 0.66         # 2-of-3 majority required for an ensemble of 3
   min_confidence: 0.35        # below this → treat as NEUTRAL, skip trade
 
 # ── Paper trading ────────────────────────────────────────────────────────────
@@ -188,16 +514,9 @@ engines:
     trailing_stop:    0.010
     min_hold_seconds: 300
 
-  - name: "conservative"
-    min_edge: 0.06
-    edge_increment: 0.10
-    max_position_usdc: 50.0
-    min_confidence: 0.55
-    max_open_positions: 10
-    take_profit:      0.040
-    stop_loss:        0.040
-    trailing_stop:    0.020
-    min_hold_seconds: 600
+  # conservative engine removed in cycle 4 — prior postmortem showed −$88.46 PnL
+  # (lowest of all engines); dropping it gives a cleaner three-engine comparison
+  # (aggressive vs balanced vs inverted_highconf).
 
   # Shadow strategy: same rules as balanced, but flips direction when the AI
   # is highly confident (conf ≥ 0.85) AND the mid is off the rails. Tests the

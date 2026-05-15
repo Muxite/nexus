@@ -37,6 +37,21 @@ class WatchedSite:
 
 
 @dataclass
+class FeedSite:
+    """An RSS/Atom feed to subscribe to instead of polling HTML.
+
+    Cycle 8: for the 26 outlets identified in cycle 4's preflight as
+    feed-capable, a feed fetch costs ~50ms vs ~3–10s for a Playwright render.
+    `site_url` is what the trader records on each headline (display + source
+    bucket); `feed_url` is the actual RSS endpoint.
+    """
+    site_url: str
+    feed_url: str
+    interval_seconds: int = 60
+    max_failures: int = 5
+
+
+@dataclass
 class SocialAccount:
     """A Twitter/X or Truth Social account to monitor for market-moving posts."""
     username: str
@@ -61,6 +76,17 @@ class AIConfig:
     api_key: str = ""                  # blank = use OPENROUTER_API_KEY env var
     api_base: str = "https://openrouter.ai/api/v1"
     min_confidence: float = 0.45
+    # Ensemble sampling: run N parallel calls per batch at higher temperature
+    # and aggregate by majority vote + averaged distribution. Costs N× tokens
+    # but produces an `agreement` signal the trader can gate on, and denoises
+    # the single-shot model's anti-informative high-conf calls. N=1 disables.
+    ensemble_samples: int = 3
+    ensemble_temperature: float = 0.5
+    # Minimum ensemble agreement fraction to fire a trade. With samples=3 a
+    # value of 0.66 demands at least 2-of-3 votes for the chosen direction;
+    # 1.0 demands unanimity. Decoupled from `confidence` so the edge model
+    # keeps using the model's native probability output.
+    min_agreement: float = 0.66
 
 
 @dataclass
@@ -107,6 +133,14 @@ class TradingConfig:
     # opt-in per engine as a shadow strategy.
     invert_high_conf: bool = False
     invert_conf_threshold: float = 0.85
+    # Round-trip trading cost in basis points of stake (1 bp = 0.01%). Default
+    # 20 bps = 0.20% of stake deducted at close. Models the bid-ask spread
+    # (Polymarket has no protocol fees, but you cross the spread on entry AND
+    # exit — a flat buy + immediate sell loses you ~the spread). Without this
+    # a buy-then-sell at the same mid yields zero PnL, which understates real
+    # costs and lets the bot accumulate tiny "edges" that don't exist net.
+    # Per-engine override allowed.
+    spread_cost_bps: float = 20.0
 
 
 @dataclass
@@ -139,6 +173,37 @@ class SearchBudgetConfig:
 
 
 @dataclass
+class VariantConfig:
+    """Shadow-strategy overrides on top of a parent engine.
+
+    Variants share the parent engine's AI classification call (one batch per
+    headline serves all variants) but evaluate their own buy/sell logic and
+    write trades tagged with the variant's name. Use them to A/B different
+    thresholds, exits, or sizing cheaply.
+
+    Unset fields fall back to the parent EngineConfig's value (and from there
+    to the global TradingConfig).
+    """
+    name: str = "variant"
+    max_position_usdc: Optional[float] = None
+    min_trade_usdc: Optional[float] = None
+    min_edge: Optional[float] = None
+    edge_increment: Optional[float] = None
+    position_timeout_hours: Optional[float] = None
+    max_open_positions: Optional[int] = None
+    min_confidence: Optional[float] = None
+    take_profit: Optional[float] = None
+    stop_loss: Optional[float] = None
+    trailing_stop: Optional[float] = None
+    min_hold_seconds: Optional[float] = None
+    rail_skip_threshold: Optional[float] = None
+    entry_rail_skip_threshold: Optional[float] = None
+    invert_high_conf: Optional[bool] = None
+    invert_conf_threshold: Optional[float] = None
+    spread_cost_bps: Optional[float] = None
+
+
+@dataclass
 class EngineConfig:
     """Per-engine trading rule overrides. Unset fields fall back to global trading config."""
     name: str = "default"
@@ -158,11 +223,18 @@ class EngineConfig:
     entry_rail_skip_threshold: Optional[float] = None
     invert_high_conf: Optional[bool] = None
     invert_conf_threshold: Optional[float] = None
+    spread_cost_bps: Optional[float] = None
+    # Optional shadow-strategy variants. When non-empty the engine spawns one
+    # PaperTrader per variant; all variants share the engine's batched AI
+    # call but record trades under their own variant_name. When empty the
+    # engine behaves as a single variant tagged with engine.name.
+    variants: list = field(default_factory=list)   # list[VariantConfig]
 
 
 @dataclass
 class Config:
     watched_sites: list[WatchedSite] = field(default_factory=list)
+    feeds: list[FeedSite] = field(default_factory=list)
     social_accounts: list[SocialAccount] = field(default_factory=list)
     markets: MarketsConfig = field(default_factory=MarketsConfig)
     ai: AIConfig = field(default_factory=AIConfig)
@@ -213,6 +285,15 @@ def _build_config(raw: dict) -> Config:
         )
         for s in raw.get("watched_sites", [])
     ]
+    feeds = [
+        FeedSite(
+            site_url=str(f.get("site_url") or f["url"]),
+            feed_url=str(f["feed_url"]),
+            interval_seconds=int(f.get("interval_seconds", 60)),
+            max_failures=int(f.get("max_failures", 5)),
+        )
+        for f in raw.get("feeds", [])
+    ]
 
     m = raw.get("markets", {})
     a = raw.get("ai", {})
@@ -233,6 +314,27 @@ def _build_config(raw: dict) -> Config:
         if s.get("username")
     ]
 
+    def _build_variant(i: int, v: dict) -> VariantConfig:
+        return VariantConfig(
+            name=str(v.get("name", f"variant_{i}")),
+            max_position_usdc=_opt_float(v.get("max_position_usdc")),
+            min_trade_usdc=_opt_float(v.get("min_trade_usdc")),
+            min_edge=_opt_float(v.get("min_edge")),
+            edge_increment=_opt_float(v.get("edge_increment")),
+            position_timeout_hours=_opt_float(v.get("position_timeout_hours")),
+            max_open_positions=int(v["max_open_positions"]) if "max_open_positions" in v else None,
+            min_confidence=_opt_float(v.get("min_confidence")),
+            take_profit=_opt_float(v.get("take_profit")),
+            stop_loss=_opt_float(v.get("stop_loss")),
+            trailing_stop=_opt_float(v.get("trailing_stop")),
+            min_hold_seconds=_opt_float(v.get("min_hold_seconds")),
+            rail_skip_threshold=_opt_float(v.get("rail_skip_threshold")),
+            entry_rail_skip_threshold=_opt_float(v.get("entry_rail_skip_threshold")),
+            invert_high_conf=v["invert_high_conf"] if "invert_high_conf" in v else None,
+            invert_conf_threshold=_opt_float(v.get("invert_conf_threshold")),
+            spread_cost_bps=_opt_float(v.get("spread_cost_bps")),
+        )
+
     engine_cfgs = [
         EngineConfig(
             name=str(e.get("name", f"engine_{i}")),
@@ -252,12 +354,14 @@ def _build_config(raw: dict) -> Config:
             entry_rail_skip_threshold=_opt_float(e.get("entry_rail_skip_threshold")),
             invert_high_conf=e["invert_high_conf"] if "invert_high_conf" in e else None,
             invert_conf_threshold=_opt_float(e.get("invert_conf_threshold")),
+            variants=[_build_variant(j, v) for j, v in enumerate(e.get("variants", []) or [])],
         )
         for i, e in enumerate(raw.get("engines", []))
     ]
 
     return Config(
         watched_sites=sites,
+        feeds=feeds,
         social_accounts=social_cfgs,
         engines=engine_cfgs,
         markets=MarketsConfig(
@@ -277,6 +381,9 @@ def _build_config(raw: dict) -> Config:
             api_key=str(a.get("api_key", "")),
             api_base=str(a.get("api_base", "https://openrouter.ai/api/v1")),
             min_confidence=float(a.get("min_confidence", 0.45)),
+            ensemble_samples=int(a.get("ensemble_samples", 3)),
+            ensemble_temperature=float(a.get("ensemble_temperature", 0.5)),
+            min_agreement=float(a.get("min_agreement", 0.66)),
         ),
         trading=TradingConfig(
             balance_usdc=float(t.get("balance_usdc", 1000.0)),
