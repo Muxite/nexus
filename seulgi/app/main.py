@@ -27,6 +27,7 @@ import sys
 from datetime import datetime, timezone
 
 from ai import DirectionClassifier
+from relevance import RelevanceFilter
 from config import load_config
 from dashboard import Dashboard, WatcherStatus, PositionEvent, SystemHealth
 from db import SeulgiDB
@@ -233,16 +234,16 @@ async def main() -> None:
     logger = logging.getLogger(__name__)
     logger.info("Seulgi starting up")
 
+    # DB — must be constructed before Dashboard (Dashboard takes db= ref).
+    db = SeulgiDB(cfg.db.path)
+    await db.connect()
+
     # Dashboard
     dash = Dashboard(
         data_dir=cfg.dashboard.data_dir,
         interval_secs=cfg.dashboard.interval_secs,
         db=db,
     )
-
-    # DB
-    db = SeulgiDB(cfg.db.path)
-    await db.connect()
 
     # Cycle-8 scoping: ensure the cycles table has an open row before any
     # restore queries run. The SEULGI__CYCLE_NAME env var lets cycle.py name
@@ -257,6 +258,9 @@ async def main() -> None:
 
     # Embedder + Market index
     embedder = Embedder()
+    # Eager-load on the main thread to avoid a torch meta-tensor race
+    # when sentence-transformers lazy-loads inside the asyncio executor.
+    embedder.load()
     index = MarketIndex(db=db, embedder=embedder, cfg=cfg)
     cached = await index.load_from_db()
     await index.load_heat_from_db()
@@ -288,6 +292,22 @@ async def main() -> None:
         ensemble_temperature=cfg.ai.ensemble_temperature,
     )
 
+    # Stage-2 relevance gate (cycle 9). Shares the OpenRouter API key.
+    relevance_filter = RelevanceFilter(
+        api_key=api_key,
+        model=cfg.relevance.model,
+        api_base=cfg.ai.api_base,
+        temperature=cfg.relevance.temperature,
+        keep_scores=tuple(cfg.relevance.keep_scores),
+        max_tokens_per_market=cfg.relevance.max_tokens_per_market,
+        enabled=cfg.relevance.enabled,
+        min_top_similarity=cfg.relevance.min_top_similarity,
+    )
+    logger.info(
+        "[main] RelevanceFilter ready — enabled=%s model=%s keep=%s",
+        cfg.relevance.enabled, cfg.relevance.model, cfg.relevance.keep_scores,
+    )
+
     # Manual-planning rules engine — shared across trading engines.
     # Rules live in /app/rules/ (baked into the image so reload-on-restart is
     # the source of truth). Loaded once at startup; restart to pick up edits.
@@ -309,11 +329,17 @@ async def main() -> None:
 
     logger.info("[main] engines: %s", [e.name for e in engines])
 
-    # News memory (semantic deduplication)
+    # News memory (semantic deduplication + cycle-9 freshness labels)
     news_memory = NewsMemory(
         path=cfg.news_memory.path,
         embedder=embedder,
         threshold=cfg.news_memory.dedup_distance_threshold,
+        fresh_dist_threshold=cfg.news_memory.fresh_dist_threshold,
+        rehash_age_secs=cfg.news_memory.rehash_age_secs,
+        stale_age_secs=cfg.news_memory.stale_age_secs,
+        recent_context_window_secs=cfg.news_memory.recent_context_window_secs,
+        recent_context_n=cfg.news_memory.recent_context_n,
+        short_circuit_labels=cfg.news_memory.short_circuit_labels,
     )
     logger.info("[main] NewsMemory ready — %d headlines stored", news_memory.size)
 
@@ -333,6 +359,8 @@ async def main() -> None:
         dashboard=dash, news_memory=news_memory,
         impact_tracker=impact_tracker,
         article_fetcher=article_fetcher,
+        relevance_filter=relevance_filter,
+        market_context_cfg=cfg.market_context,
     )
 
     # Watchers

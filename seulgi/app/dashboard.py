@@ -546,6 +546,146 @@ class Dashboard:
             f"  Recent trades buf   : {len(self._executed)} / {self._executed.maxlen}    (in-memory ring)",
             f"  Trades declined     : {len(self._declined)}",
             f"  Near misses         : {len(self._near_miss)}",
+        ]
+
+        # ── Cycle-8 per-decision insight blocks ──────────────────────────
+        # Each block reads from the trades table (variant_name, skip_reason,
+        # confidence_raw). All three queries are cheap (~ms on indexed cols)
+        # and surface what classify_batch already paid for.
+        if self._db is not None:
+            try:
+                v_stats = await self._db.get_variant_stats()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[dash] variant_stats query failed: %s", exc)
+                v_stats = []
+            try:
+                funnel = await self._db.get_decision_funnel(since_secs=3600)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[dash] decision_funnel query failed: %s", exc)
+                funnel = None
+            try:
+                buckets = await self._db.get_confidence_buckets(since_secs=86400)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[dash] confidence_buckets query failed: %s", exc)
+                buckets = []
+            try:
+                fresh_counts = await self._db.get_freshness_counts(since_secs=3600)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[dash] freshness_counts query failed: %s", exc)
+                fresh_counts = []
+            try:
+                fresh_buckets = await self._db.get_freshness_buckets(since_secs=86400)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[dash] freshness_buckets query failed: %s", exc)
+                fresh_buckets = []
+
+            lines += ["", "── VARIANT LEADERBOARD (lifetime, top 5 by sum PnL) ─────────────"]
+            if not v_stats:
+                lines.append("  (no executed trades yet)")
+            else:
+                lines.append(
+                    f"  {'VARIANT':<34}  {'N':>5} {'WINS':>5} {'LOSS':>5}  "
+                    f"{'HIT%':>6}  {'SUM PnL':>9}"
+                )
+                lines.append("  " + "─" * 76)
+                for r in v_stats[:5]:
+                    closed = (r.get("n_wins") or 0) + (r.get("n_losses") or 0)
+                    hit = (r["n_wins"] / closed * 100.0) if closed else 0.0
+                    lines.append(
+                        f"  {(r['variant'] or '?')[:34]:<34}  {r['n_trades']:>5} "
+                        f"{r['n_wins']:>5} {r['n_losses']:>5}  "
+                        f"{hit:>5.1f}%  {r['sum_pnl']:>+9.2f}"
+                    )
+                lines.append("  Full table: variant_compare.txt")
+
+            lines += ["", "── DECISION FUNNEL (last 1h) ────────────────────────────────────"]
+            if funnel is None or funnel["total"] == 0:
+                lines.append("  (no decisions in last hour)")
+            else:
+                total = funnel["total"]
+                def _pct(n: int) -> str:
+                    return f"({n / total * 100.0:>4.1f}%)"
+                lines.append(f"  decisions seen          : {total}")
+                rows = [
+                    ("freshness skip       ", funnel.get("failed_freshness", 0)),
+                    ("low_similarity bypass",funnel.get("failed_low_sim", 0)),
+                    ("relevance gate dropped",funnel.get("failed_relevance", 0)),
+                    ("pre-AI rule dropped",   funnel["pre_ai_dropped"]),
+                    ("AI returned NEUTRAL",   funnel["ai_neutral"]),
+                    ("conf below threshold",  funnel["failed_min_confidence"]),
+                    ("ensemble disagreement", funnel["failed_agreement"]),
+                    ("post-AI rule dropped",  funnel["failed_post_ai_rule"]),
+                    ("rail / price unusable", funnel["failed_rail"]),
+                    ("min-entry-mid blocked", funnel.get("failed_min_entry", 0)),
+                    ("market too noisy",     funnel.get("failed_market_vol", 0)),
+                    ("edge too small",        funnel["failed_edge"]),
+                    ("position-cap blocked",  funnel["failed_position_guard"]),
+                    ("size/balance blocked",  funnel["failed_size"]),
+                    ("other skipped",         funnel["other_skipped"]),
+                    ("executed",              funnel["executed"]),
+                ]
+                # Pin the two new cycle-9 buckets so the operator can see
+                # the freshness + relevance gates are actively engaged even
+                # when they fire 0 times in the window. The other buckets
+                # only show when nonzero — keeps the section scannable.
+                always_show = {"freshness skip       ", "low_similarity bypass",
+                               "relevance gate dropped",
+                               "executed", "AI returned NEUTRAL"}
+                for label, n in rows:
+                    if n == 0 and label not in always_show:
+                        continue
+                    lines.append(f"  → {label:<22}: {n:>4}  {_pct(n)}")
+
+            lines += ["", "── FRESHNESS (last 1h headlines) ────────────────────────────────"]
+            if not fresh_counts:
+                lines.append("  (no labelled signals yet)")
+            else:
+                total_f = sum(r["n"] for r in fresh_counts)
+                for r in fresh_counts:
+                    pct = (r["n"] / total_f * 100.0) if total_f else 0.0
+                    lines.append(f"  {r['label']:<14} : {r['n']:>4}  ({pct:>4.1f}%)")
+
+            lines += ["", "── FRESHNESS BUCKETS (last 24h) ─────────────────────────────────"]
+            if not fresh_buckets:
+                lines.append("  (no decisions in last 24h)")
+            else:
+                lines.append(
+                    f"  {'LABEL':<14} {'EXEC':>5} {'WINS':>5} {'LOSS':>5}  "
+                    f"{'HIT%':>6}  {'AVG PnL':>8}  {'SUM PnL':>9}  {'SKIP':>5}"
+                )
+                lines.append("  " + "─" * 76)
+                for b in fresh_buckets:
+                    closed = (b.get("n_wins") or 0) + (b.get("n_losses") or 0)
+                    hit_s = f"{(b['n_wins']/closed*100.0):>5.1f}%" if closed else "    —"
+                    avg_s = f"{b['avg_pnl']:>+8.3f}" if closed else "       —"
+                    sum_s = f"{b['sum_pnl']:>+9.2f}" if closed else "        —"
+                    lines.append(
+                        f"  {b['label']:<14} {b['n_executed']:>5} "
+                        f"{b['n_wins']:>5} {b['n_losses']:>5}  "
+                        f"{hit_s}  {avg_s}  {sum_s}  {b['n_skipped']:>5}"
+                    )
+
+            lines += ["", "── CONFIDENCE BUCKETS (last 24h) ────────────────────────────────"]
+            if not buckets:
+                lines.append("  (no AI decisions in last 24h)")
+            else:
+                lines.append(
+                    f"  {'CONF':<10} {'EXEC':>5} {'WINS':>5} {'LOSS':>5}  "
+                    f"{'HIT%':>6}  {'AVG PnL':>8}  {'SUM PnL':>9}  {'SKIP':>5}"
+                )
+                lines.append("  " + "─" * 76)
+                for b in buckets:
+                    closed = (b.get("n_wins") or 0) + (b.get("n_losses") or 0)
+                    hit_s = f"{(b['n_wins']/closed*100.0):>5.1f}%" if closed else "    —"
+                    avg_s = f"{b['avg_pnl']:>+8.3f}" if closed else "       —"
+                    sum_s = f"{b['sum_pnl']:>+9.2f}" if closed else "        —"
+                    lines.append(
+                        f"  {b['bucket']:<10} {b['n_executed']:>5} "
+                        f"{b['n_wins']:>5} {b['n_losses']:>5}  "
+                        f"{hit_s}  {avg_s}  {sum_s}  {b['n_skipped']:>5}"
+                    )
+
+        lines += [
             "",
             "── MARKET INDEX ────────────────────────────────────────────────",
             f"  Markets tracked : {self._market_count}",

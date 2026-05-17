@@ -434,10 +434,15 @@ markets:
 #               anthropic/claude-haiku-4-5  (reliable JSON)
 #               meta-llama/llama-3.1-8b-instruct  (free tier)
 ai:
-  model: "google/gemini-2.5-flash-lite"    # cheap model for all batches
-  # premium_model: "google/gemini-2.5-flash"  # uncomment to use a better model
-  #                                            # for high-similarity (≥ threshold) batches
-  # premium_sim_threshold: 0.70               # similarity floor for premium routing
+  # Stage-3 prediction model. Upgraded from flash-lite → flash now that the
+  # relevance gate (Stage 2) culls irrelevant markets before this call —
+  # spend the reasoning budget on survivors. Cost still cheap on OpenRouter.
+  model: "google/gemini-2.5-flash"
+  # Cross-vendor premium fallback. Triggered when the relevance pass marks
+  # ≥2 markets STRONG_YES AND freshness=BREAKING (see relevance.py).
+  premium_model: "anthropic/claude-haiku-4-5"
+  premium_sim_threshold: 0.70               # legacy fallback gate
+  premium_trigger_breaking_strong: true     # cycle-9 premium routing
   api_key: ""                 # leave blank → uses OPENROUTER_API_KEY env var
   api_base: "https://openrouter.ai/api/v1"
   # Ensemble (cycle 6): N parallel classifier calls at higher temperature,
@@ -452,6 +457,34 @@ ai:
   min_agreement: 0.66         # 2-of-3 majority required for an ensemble of 3
   min_confidence: 0.35        # below this → treat as NEUTRAL, skip trade
 
+# ── Pre-headline market context (cycle 11) ──────────────────────────────────
+# After Stage-2 culls candidates, fetch 30 min of CLOB mid-price history per
+# survivor and derive 7 scalars (vol/mean/min/max/cur/drift/n) fed into the
+# Stage-3 prompt + persisted on every trade row. ~70 prompt-tokens/market;
+# 1-3 parallel GETs (~50-150ms added pre_ms). Disable to roll back.
+market_context:
+  enabled: true
+  window_secs: 1800     # 30 min — token cost is window-length agnostic
+  cache_ttl_secs: 30    # share fetches across variants on the same headline
+
+# ── Stage-2 relevance gate (cycle 9) ─────────────────────────────────────────
+# Cheap LLM call between embedding match (Stage 1, cosine ≥ 0.35) and
+# prediction (Stage 3). Asks "is this headline meaningfully about this market"
+# for each candidate; culls WEAK/NO before paying for Stage-3 reasoning.
+# Fails open on parse/API errors so we never silently drop trades.
+#
+# Cycle-13 token reduction (see also news_memory.short_circuit_labels):
+#   • min_top_similarity: 0.45 — if the best candidate market has cosine
+#     similarity below this, skip Stage 2 + Stage 3 entirely. Saves the
+#     LLM call on headlines that don't have any strong-match market.
+relevance:
+  enabled: true
+  model: "google/gemini-2.5-flash-lite"
+  temperature: 0.1
+  keep_scores: ["STRONG_YES", "YES"]
+  max_tokens_per_market: 60
+  min_top_similarity: 0.45
+
 # ── Paper trading ────────────────────────────────────────────────────────────
 trading:
   balance_usdc: 1000.0        # only used when infinite_balance is false
@@ -463,7 +496,8 @@ trading:
   position_timeout_hours: 24  # close any position open longer than this
   max_open_positions: 20      # hard cap on concurrent open positions
   max_unique_markets: 15      # max distinct markets with open positions at once
-  cold_position_hours: 12.0   # hours since last headline match before a losing market is culled
+  cold_position_hours: 4.0    # hours since last headline match before a losing market is culled
+                              # (was 12.0; cycle-10: 13-of-14 TIMEOUTs were losses — shorter leash)
   # When true: never block on balance. Keep buying until position caps or
   # timeouts close trades. The "balance" displayed is then cumulative
   # realized PnL (gain). Position-side caps (max_open / max_unique /
@@ -486,6 +520,14 @@ trading:
 # Unset fields inherit from global `trading:` defaults above.
 # Results are compared in data/dashboard/engine_comparison.txt.
 # Remove this section entirely for a single default engine.
+#
+# Variants (cycle 8): each engine declares a `variants:` list of shadow
+# strategies that share the engine's batched AI call but evaluate their own
+# buy/sell rules and write trades tagged with the variant name. AI token cost
+# is flat regardless of variant count — `classify_batch` is hoisted to the
+# runner level (see EngineRunner / build_engines). Use variants to sweep
+# confidence gates, TP/SL pairs, and invert flips cheaply; see
+# data/dashboard/variant_compare.txt for the live leaderboard.
 engines:
   - name: "aggressive"
     min_edge: 0.005           # fire on almost any positive edge
@@ -502,6 +544,23 @@ engines:
     # despite IC<0; preserve its behaviour as a regression check by opting
     # out of the rail-skip filter.
     rail_skip_threshold: 0.0
+    variants:
+      # ── Cycle-10: report.md showed 5 aggressive variants closed at the
+      # IDENTICAL −$20.32 because their guards didn't gate the loss-producing
+      # sub-25¢ entries. Retired conf25_tp003_sl010, conf40_tp005_sl015,
+      # conf25_tp005_sl015_inv75, conf00_tp005_sl015_e002. Slots reused for
+      # variants that actually cleave the entry distribution.
+      - name: "conf25_tp005_sl015"          # control — matches parent
+      - name: "conf25_tp010_sl020"          # let winners run
+        take_profit:   0.010
+        stop_loss:     0.020
+        trailing_stop: 0.005
+      - name: "conf25_tp005_sl015_norail"   # NEW: refuse sub-25¢ entries
+        rail_skip_threshold: 0.25
+      - name: "conf25_tp005_sl015_slpct10"  # NEW: price-relative SL floor (10% of entry)
+        stop_loss_pct: 0.10
+      - name: "conf25_tp005_sl015_lowvol"   # NEW (cycle-11): refuse high-vol markets
+        max_market_vol_30m: 0.02
 
   - name: "balanced"
     min_edge: 0.03
@@ -513,6 +572,30 @@ engines:
     stop_loss:        0.030
     trailing_stop:    0.010
     min_hold_seconds: 300
+    variants:
+      # Retired 2026-05-17 (REPORT_VALIDATION):
+      #   conf40_tp020_sl030          n=26  ROI -1.89%
+      #   conf55_tp020_sl030          n=26  ROI -1.89%
+      #   conf70_tp020_sl030          n=37  ROI -1.19%  (CI upper 43%, anti-edge)
+      # Kept: _lowvol (watch-list, n=24 +15.11% ROI), _inv65 / _norail / _slpct10
+      # (still negative but inside the inverted/rail/SL-pct experiments).
+      - name: "conf40_tp010_sl020"          # tight exits
+        take_profit:   0.010
+        stop_loss:     0.020
+        trailing_stop: 0.005
+      - name: "conf40_tp030_sl050"          # wide exits
+        take_profit:   0.030
+        stop_loss:     0.050
+        trailing_stop: 0.015
+      - name: "conf40_tp020_sl030_inv65"    # low-bar invert
+        invert_high_conf: true
+        invert_conf_threshold: 0.65
+      - name: "conf40_tp020_sl030_norail"   # NEW: refuse sub-25¢ entries
+        rail_skip_threshold: 0.25
+      - name: "conf40_tp020_sl030_slpct10"  # NEW: price-relative SL floor
+        stop_loss_pct: 0.10
+      - name: "conf40_tp020_sl030_lowvol"   # NEW (cycle-11): refuse high-vol markets
+        max_market_vol_30m: 0.02
 
   # conservative engine removed in cycle 4 — prior postmortem showed −$88.46 PnL
   # (lowest of all engines); dropping it gives a cleaner three-engine comparison
@@ -539,6 +622,34 @@ engines:
     # informative in the 6h analysis (n=21, 100% no_signal). Catching it too
     # gives the shadow engine enough signal to actually execute trades.
     invert_conf_threshold: 0.75
+    variants:
+      # Cycle-10: retired conf40_tp020_sl030_inv85 (zero closed trades, no
+      # signal). Added _norail and the two _hi-prefixed variants that bias
+      # toward the only consistently profitable slice from the win/loss
+      # report (entry mid 0.75-0.90 × direction=NO).
+      #
+      # Retired 2026-05-17 (REPORT_VALIDATION):
+      #   conf40_tp020_sl030_inv75            n=26  ROI -1.89%
+      #   conf55_tp020_sl030_inv75            n=26  ROI -1.89%
+      #   conf40_tp020_sl030_inv75_norail     n=34  ROI -0.45%
+      # Kept: _inv65, _hi65, _hi75, _lowvol (watch-list, high-ROI low-n)
+      # and conf40_tp010_sl020_inv75 (money-eligible, +0.81%).
+      - name: "conf40_tp020_sl030_inv65"
+        invert_conf_threshold: 0.65
+      - name: "conf40_tp010_sl020_inv75"    # tight exits
+        take_profit:   0.010
+        stop_loss:     0.020
+        trailing_stop: 0.005
+      - name: "conf40_tp030_sl050_inv75"    # wide exits
+        take_profit:   0.030
+        stop_loss:     0.050
+        trailing_stop: 0.015
+      - name: "conf40_tp020_sl030_inv75_hi75"    # NEW: only high-priced markets
+        min_entry_yes_mid: 0.75
+      - name: "conf40_tp020_sl030_inv75_hi65"    # NEW: only 0.65+ entries
+        min_entry_yes_mid: 0.65
+      - name: "conf40_tp020_sl030_inv75_lowvol" # NEW (cycle-11): vol cap
+        max_market_vol_30m: 0.02
 
 # ── Database ─────────────────────────────────────────────────────────────────
 db:
@@ -549,10 +660,26 @@ dashboard:
   data_dir: "/data/dashboard"   # all .txt files written here
   interval_secs: 30             # refresh interval; urgent events trigger faster
 
-# ── News deduplication (ChromaDB) ────────────────────────────────────────────
+# ── News deduplication + freshness (ChromaDB) ────────────────────────────────
+# Beyond binary dedup, the freshness module (cycle 9) labels every incoming
+# headline as one of BREAKING / EVOLVING / REHASH / STALE_RETURN based on
+# distance to the nearest stored neighbour AND how long ago that neighbour
+# landed. The label is injected into Stage-2 (relevance) and Stage-3
+# (prediction) prompts so the LLM can reason about prior coverage.
 news_memory:
   path: "/data/news_chroma"           # ChromaDB persistent directory
   dedup_distance_threshold: 0.12      # cosine distance below this = republish (~0.88 sim)
+  fresh_dist_threshold: 0.30          # > this ⇒ BREAKING regardless of age
+  rehash_age_secs: 21600              # 6h — REHASH window for near-duplicates
+  stale_age_secs: 86400               # 24h — STALE_RETURN window
+  recent_context_window_secs: 86400   # how far back to gather prior coverage
+  recent_context_n: 3                 # top-N similar prior headlines fed to AI
+  # Cycle-13 token reduction: freshness labels that bypass Stage 2 + Stage 3
+  # entirely (per-variant skip rows still written for accounting). STALE_RETURN
+  # added after the cycle-12 per-label win/loss report showed it cost
+  # −$138.64 across 26 closed trades. Removing it from this list re-enables
+  # the AI on STALE_RETURN headlines without a rebuild.
+  short_circuit_labels: ["REHASH", "STALE_RETURN"]
 
 # ── Brave Search budget ──────────────────────────────────────────────────────
 # Shared across all Twitter watchers. Free tier = 2000/month (~67/day, ~3/hr).

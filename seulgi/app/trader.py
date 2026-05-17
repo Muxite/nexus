@@ -362,6 +362,7 @@ class PaperTrader:
         classify_results: list[ClassifyResult],
         prompt_meta_json: Optional[str],
         pre_ai_skips: Optional[list[tuple[MarketMatch, str]]] = None,
+        relevance_skips: Optional[list] = None,  # list[(MarketMatch, RelevanceVerdict)]
     ) -> list[TradeDecision]:
         """
         Evaluate pre-classified survivors against this variant's rule set.
@@ -398,6 +399,40 @@ class PaperTrader:
             await self._record(
                 signal_id, decision, headline=headline, token_id=None,
                 trace=trace, result=None, prompt_meta_json=prompt_meta_json,
+                match=match,
+            )
+            decisions.append(decision)
+
+        # Record relevance gate drops — Stage-2 said this market is unrelated.
+        # One trade row per variant per dropped match, so the dashboard funnel
+        # still accounts for every (variant × match) decision.
+        for match, verdict in relevance_skips or []:
+            score = getattr(verdict, "score", "NO")
+            reason_text = getattr(verdict, "reason", "")
+            skip_reason = f"not_relevant:{score}"
+            decision = TradeDecision(
+                condition_id=match.condition_id,
+                question=match.question,
+                direction=Direction.NEUTRAL,
+                confidence=0.0,
+                similarity=match.similarity,
+                p_hat=0.0,
+                mid_price=match.mid_yes,
+                edge=0.0,
+                size_usdc=0.0,
+                executed=False,
+                skip_reason=skip_reason,
+                mid_yes=match.mid_yes,
+                mid_no=match.mid_no,
+            )
+            trace = [{
+                "step": "relevance", "pass": False,
+                "score": score, "reason": reason_text[:200],
+            }]
+            await self._record(
+                signal_id, decision, headline=headline, token_id=None,
+                trace=trace, result=None, prompt_meta_json=prompt_meta_json,
+                match=match,
             )
             decisions.append(decision)
 
@@ -411,6 +446,95 @@ class PaperTrader:
             )
             decisions.append(decision)
 
+        return decisions
+
+    async def evaluate_low_sim_skips(
+        self,
+        signal_id: int,
+        headline: RawHeadline,
+        matches: list[MarketMatch],
+        reason: str,
+        max_sim: float,
+        prompt_meta_json: Optional[str] = None,
+    ) -> list[TradeDecision]:
+        """Write per-variant skip rows for the cycle-13 low-similarity
+        bypass. Behaves like `evaluate_freshness_skips` but with a
+        `low_similarity` trace step and no AI artefacts attached.
+        """
+        decisions: list[TradeDecision] = []
+        for match in matches:
+            decision = TradeDecision(
+                condition_id=match.condition_id,
+                question=match.question,
+                direction=Direction.NEUTRAL,
+                confidence=0.0,
+                similarity=match.similarity,
+                p_hat=0.0,
+                mid_price=match.mid_yes,
+                edge=0.0,
+                size_usdc=0.0,
+                executed=False,
+                skip_reason=reason,
+                mid_yes=match.mid_yes,
+                mid_no=match.mid_no,
+            )
+            trace = [{
+                "step": "low_similarity", "pass": False,
+                "max_sim": round(max_sim, 4),
+            }]
+            await self._record(
+                signal_id, decision, headline=headline, token_id=None,
+                trace=trace, result=None, prompt_meta_json=prompt_meta_json,
+                match=match,
+            )
+            decisions.append(decision)
+        return decisions
+
+    async def evaluate_freshness_skips(
+        self,
+        signal_id: int,
+        headline: RawHeadline,
+        matches: list[MarketMatch],
+        freshness_label: str,
+        nearest_age_secs: Optional[float],
+        prompt_meta_json: Optional[str] = None,
+    ) -> list[TradeDecision]:
+        """Write per-variant skip rows for a freshness-driven short-circuit.
+
+        Used when the runner classifies a headline as REHASH (or any other
+        label we choose to gate on): no AI call is made, but the funnel
+        still needs a row per (variant × match) tagged with `freshness:rehash`
+        so the dashboard accounts for every decision.
+        """
+        decisions: list[TradeDecision] = []
+        age = int(nearest_age_secs) if nearest_age_secs is not None else 0
+        skip_reason = f"freshness:{freshness_label.lower()}:age={age}"
+        for match in matches:
+            decision = TradeDecision(
+                condition_id=match.condition_id,
+                question=match.question,
+                direction=Direction.NEUTRAL,
+                confidence=0.0,
+                similarity=match.similarity,
+                p_hat=0.0,
+                mid_price=match.mid_yes,
+                edge=0.0,
+                size_usdc=0.0,
+                executed=False,
+                skip_reason=skip_reason,
+                mid_yes=match.mid_yes,
+                mid_no=match.mid_no,
+            )
+            trace = [{
+                "step": "freshness", "label": freshness_label,
+                "nearest_age_secs": age,
+            }]
+            await self._record(
+                signal_id, decision, headline=headline, token_id=None,
+                trace=trace, result=None, prompt_meta_json=prompt_meta_json,
+                match=match,
+            )
+            decisions.append(decision)
         return decisions
 
     # ------------------------------------------------------------------
@@ -467,7 +591,7 @@ class PaperTrader:
             await self._record(
                 signal_id, decision, headline=headline, token_id=token_id,
                 trace=trace, result=result, prompt_meta_json=prompt_meta_json,
-                inverted=inverted_flag,
+                inverted=inverted_flag, match=match,
             )
             return decision
 
@@ -506,6 +630,36 @@ class PaperTrader:
             return await _finalize_skip(f"low_agreement:{agree:.2f}", token_id=None)
         trace.append({"step": "agreement", "pass": True,
                       "value": round(agree, 4), "threshold": min_agree})
+
+        # ── Min-entry-YES-mid gate (cycle 10) ─────────────────────────
+        # Asymmetric entry gate: refuse entries when the market's YES mid
+        # is below `min_entry_yes_mid`, regardless of AI direction. The
+        # observation: profitable slice was direction=NO × entry∈[0.75,0.90]
+        # on high-priced markets where consensus is wrong-side-up. Variants
+        # opt in to focus there; 0 disables.
+        min_entry = self._cfg.min_entry_yes_mid
+        if min_entry > 0 and match.mid_yes is not None and match.mid_yes < min_entry:
+            trace.append({"step": "min_entry", "pass": False,
+                          "mid_yes": round(match.mid_yes, 4),
+                          "threshold": min_entry})
+            return await _finalize_skip(
+                f"min_entry_yes_mid:{match.mid_yes:.3f}", token_id=None,
+            )
+
+        # ── Market volatility gate (cycle 11) ─────────────────────────
+        # Refuse entries when 30-min pre-headline stddev exceeds the
+        # variant's tolerance — wide-bouncing markets trip SL on noise
+        # alone. Reads the MarketContext stashed on the match by the
+        # runner; absent ctx → guard is skipped (fail-open). 0 disables.
+        max_vol = self._cfg.max_market_vol_30m
+        mkt_ctx = getattr(match, "_mkt_ctx", None)
+        if max_vol > 0 and mkt_ctx is not None and mkt_ctx.vol > max_vol:
+            trace.append({"step": "mkt_vol", "pass": False,
+                          "vol": round(mkt_ctx.vol, 4),
+                          "threshold": max_vol})
+            return await _finalize_skip(
+                f"market_too_noisy:{mkt_ctx.vol:.3f}", token_id=None,
+            )
 
         # ── Post-AI rule gate ─────────────────────────────────────────
         # Use the YES-side mid as the canonical reference price (matches the
@@ -700,6 +854,15 @@ class PaperTrader:
                 mid_no=match.mid_no,
                 inverted=1 if inverted_flag else 0,
                 variant_name=self._variant_name,
+                freshness_label=getattr(headline, "_freshness_label", None),
+                relevance_score=getattr(match, "_relevance_score", None),
+                relevance_reason=getattr(match, "_relevance_reason", None),
+                mkt_vol_30m=getattr(getattr(match, "_mkt_ctx", None), "vol", None),
+                mkt_mean_30m=getattr(getattr(match, "_mkt_ctx", None), "mean", None),
+                mkt_min_30m=getattr(getattr(match, "_mkt_ctx", None), "lo", None),
+                mkt_max_30m=getattr(getattr(match, "_mkt_ctx", None), "hi", None),
+                mkt_drift_30m=getattr(getattr(match, "_mkt_ctx", None), "drift", None),
+                mkt_n_samples=getattr(getattr(match, "_mkt_ctx", None), "n_samples", None),
             )
             await self._db.open_position(
                 trade_id=trade_id,
@@ -760,10 +923,26 @@ class PaperTrader:
         result: Optional[ClassifyResult] = None,
         prompt_meta_json: Optional[str] = None,
         inverted: bool = False,
+        match=None,
     ) -> None:
-        """Persist a skipped trade decision to the DB."""
+        """Persist a skipped trade decision to the DB.
+
+        Reads freshness label off `headline._freshness_label` and per-match
+        relevance verdict off `match._relevance_score` / `_relevance_reason`
+        when present (runner-level handoff; absent on legacy single-trader
+        paths and that's fine).
+        """
         ai_reason = getattr(result, "reason", None) if result is not None else None
         ai_raw = getattr(result, "raw_response", None) if result is not None else None
+        freshness_label = (
+            getattr(headline, "_freshness_label", None) if headline is not None else None
+        )
+        relevance_score = getattr(match, "_relevance_score", None) if match is not None else None
+        relevance_reason = getattr(match, "_relevance_reason", None) if match is not None else None
+        # Market context fields off the match (cycle 11). May be None
+        # when the runner skipped the fetch or it failed; insert_trade
+        # handles None for all six.
+        mkt_ctx = getattr(match, "_mkt_ctx", None) if match is not None else None
         await self._db.insert_trade(
             signal_id=signal_id,
             condition_id=decision.condition_id,
@@ -792,6 +971,15 @@ class PaperTrader:
             mid_no=decision.mid_no,
             inverted=1 if inverted else 0,
             variant_name=self._variant_name,
+            freshness_label=freshness_label,
+            relevance_score=relevance_score,
+            relevance_reason=relevance_reason,
+            mkt_vol_30m=getattr(mkt_ctx, "vol", None),
+            mkt_mean_30m=getattr(mkt_ctx, "mean", None),
+            mkt_min_30m=getattr(mkt_ctx, "lo", None),
+            mkt_max_30m=getattr(mkt_ctx, "hi", None),
+            mkt_drift_30m=getattr(mkt_ctx, "drift", None),
+            mkt_n_samples=getattr(mkt_ctx, "n_samples", None),
         )
 
     # ------------------------------------------------------------------
@@ -884,7 +1072,11 @@ class PaperTrader:
             hwm_mtm = local_hwm     - entry_price
 
             tp = self._cfg.take_profit
-            sl = self._cfg.stop_loss
+            # Price-relative SL floor (cycle-10): mid-price entries get a
+            # wider absolute SL so spread alone can't trip them; low-price
+            # entries keep the existing fixed floor. 0 disables (legacy).
+            sl_pct_floor = self._cfg.stop_loss_pct * entry_price
+            sl = max(self._cfg.stop_loss, sl_pct_floor)
             ts = self._cfg.trailing_stop
             min_hold = self._cfg.min_hold_seconds
 

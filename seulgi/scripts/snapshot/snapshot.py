@@ -145,15 +145,36 @@ def _sqlite_backup(src: Path, dst: Path) -> None:
         src_conn.close()
 
 
-def save(name: str, *, full: bool = True, overwrite: bool = False) -> Path:
+def _zip_dir(src: Path, dst_zip: Path, *, keep_dir: bool = False) -> Path:
+    """Zip `src` into `dst_zip` (uses DEFLATE). Removes `src` afterward unless keep_dir."""
+    import zipfile
+    dst_zip.parent.mkdir(parents=True, exist_ok=True)
+    if dst_zip.exists():
+        dst_zip.unlink()
+    with zipfile.ZipFile(dst_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        for path in src.rglob("*"):
+            if path.is_file():
+                zf.write(path, path.relative_to(src.parent))
+    if not keep_dir:
+        shutil.rmtree(src)
+    return dst_zip
+
+
+def save(name: str, *, full: bool = True, overwrite: bool = False,
+         zip: bool = False, keep_dir: bool = False) -> Path:
     """Take a snapshot of the current data folder."""
     target = SNAPSHOT_ROOT / name
-    if target.exists():
+    zip_path = SNAPSHOT_ROOT / f"{name}.zip"
+    if target.exists() or zip_path.exists():
         if not overwrite:
+            existing = zip_path if zip_path.exists() else target
             raise SystemExit(
-                f"snapshot {name!r} already exists at {target} — pass --overwrite to replace"
+                f"snapshot {name!r} already exists at {existing} — pass --overwrite to replace"
             )
-        shutil.rmtree(target)
+        if target.exists():
+            shutil.rmtree(target)
+        if zip_path.exists():
+            zip_path.unlink()
     target.mkdir(parents=True)
 
     # 1) DB via online backup
@@ -196,6 +217,11 @@ def save(name: str, *, full: bool = True, overwrite: bool = False) -> Path:
         f"{k}={v}" for k, v in sorted(manifest["row_counts"].items())
         if v > 0
     ))
+    if zip:
+        archive = _zip_dir(target, zip_path, keep_dir=keep_dir)
+        print(f"[snapshot] zipped → {archive} ({archive.stat().st_size/1e6:.1f} MB)"
+              + ("" if keep_dir else "  (source dir removed)"))
+        return archive
     return target
 
 
@@ -375,6 +401,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                     help="DB + news_chroma only (skip dashboard/analysis/postmortems)")
     sp.add_argument("--overwrite", action="store_true",
                     help="overwrite an existing snapshot with the same name")
+    sp.add_argument("--zip", action="store_true",
+                    help="compress snapshot to snapshots/<name>.zip after saving")
+    sp.add_argument("--keep-dir", action="store_true",
+                    help="with --zip, also keep the uncompressed directory")
 
     sub.add_parser("list", help="list available snapshots")
 
@@ -386,7 +416,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "save":
-        save(args.name, full=not args.minimal, overwrite=args.overwrite)
+        save(args.name, full=not args.minimal, overwrite=args.overwrite,
+             zip=args.zip, keep_dir=args.keep_dir)
     elif args.cmd == "list":
         _print_list()
     elif args.cmd == "restore":

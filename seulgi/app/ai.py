@@ -83,7 +83,7 @@ in the same order as the input list. No prose, no markdown.
 
 _BATCH_PROMPT_TEMPLATE = """\
 Headline: {headline}
-{source_block}{lessons_block}{republish_block}
+{source_block}{lessons_block}{republish_block}{mkt_ctx_block}
 Evaluate the headline against each of the following Polymarket questions:
 
 {questions_block}
@@ -114,6 +114,64 @@ IMPORTANT — possible republish: a semantically similar headline was seen befor
   "{similar_to}"
 If no new information is added vs. the original, return NEUTRAL for all markets.
 """
+
+# Cycle-9 freshness block — replaces the binary republish hint with a labelled
+# signal plus top-N prior coverage so the model can reason "is this fact new?"
+_FRESHNESS_BLOCK = """\
+FRESHNESS: {label} (nearest prior: {age_str}, cosine_dist={dist_str})
+{context_block}\
+"""
+
+
+def _mkt_ctx_to_dict(ctx) -> Optional[dict]:
+    """Serialize a MarketContext for prompt_meta. None passes through.
+
+    Inlined here to avoid a circular import between ai.py and
+    market_context.py — both ultimately depend on each other via the
+    runner, so this tiny duplicate keeps the import graph clean.
+    """
+    if ctx is None:
+        return None
+    return {
+        "vol": ctx.vol, "mean": ctx.mean, "lo": ctx.lo, "hi": ctx.hi,
+        "current": ctx.current, "drift": ctx.drift, "n_samples": ctx.n_samples,
+    }
+
+
+def _format_freshness_block(freshness) -> str:
+    """Render FreshnessResult as a single prompt block. Empty string if None."""
+    if freshness is None:
+        return ""
+    age = getattr(freshness, "nearest_age_secs", None)
+    if age is None:
+        age_str = "no prior"
+    elif age >= 3600:
+        age_str = f"{int(age // 3600)}h ago"
+    elif age >= 60:
+        age_str = f"{int(age // 60)}m ago"
+    else:
+        age_str = f"{int(age)}s ago"
+    dist = getattr(freshness, "nearest_dist", None)
+    dist_str = f"{dist:.2f}" if dist is not None else "—"
+
+    ctx_lines = []
+    for c in (getattr(freshness, "recent_context", None) or [])[:3]:
+        cage = c.get("age_secs") or 0
+        cage_s = (
+            f"{int(cage // 3600)}h" if cage >= 3600
+            else f"{int(cage // 60)}m"
+        )
+        ctx_lines.append(f"  - {cage_s} ago: {(c.get('headline') or '')[:140]}")
+    context_block = (
+        "PRIOR COVERAGE (similar headlines in last 24h):\n" + "\n".join(ctx_lines) + "\n"
+        if ctx_lines else ""
+    )
+    return _FRESHNESS_BLOCK.format(
+        label=getattr(freshness, "label", "BREAKING"),
+        age_str=age_str,
+        dist_str=dist_str,
+        context_block=context_block,
+    )
 
 
 class Direction(str, Enum):
@@ -219,6 +277,8 @@ class DirectionClassifier:
         similar_to: Optional[str] = None,
         source: Optional[str] = None,
         lesson_notes: Optional[list[str]] = None,
+        freshness=None,                          # FreshnessResult | None
+        relevance_verdicts: Optional[list] = None,  # list[RelevanceVerdict] aligned to matches
     ) -> tuple[list[ClassifyResult], dict]:
         """
         Classify a headline against ALL matching markets in a single API call.
@@ -233,10 +293,17 @@ class DirectionClassifier:
         if not matches:
             return [], {}
 
-        republish_block = (
-            _REPUBLISH_BLOCK.format(similar_to=similar_to[:200])
-            if is_republish and similar_to else ""
-        )
+        # Freshness block replaces the legacy binary republish hint when
+        # we have a labelled FreshnessResult. The legacy block stays as a
+        # fallback for callers that haven't migrated to the assess() API.
+        freshness_block = _format_freshness_block(freshness)
+        if freshness_block:
+            republish_block = ""
+        else:
+            republish_block = (
+                _REPUBLISH_BLOCK.format(similar_to=similar_to[:200])
+                if is_republish and similar_to else ""
+            )
         source_block = f"Source: {source}\n" if source else ""
         if lesson_notes:
             lesson_lines = "\n".join(f"  - {n}" for n in lesson_notes[:8])
@@ -246,20 +313,47 @@ class DirectionClassifier:
 
         # Build the numbered question block. mid_yes is the YES-token mid,
         # which is what "current likelihood of YES" maps to in [0,1].
+        # When relevance verdicts are available, surface the Stage-2 score +
+        # short reason so the prediction model can defer/agree explicitly.
+        rv_by_idx = {}
+        if relevance_verdicts:
+            for i, v in enumerate(relevance_verdicts[:len(matches)]):
+                rv_by_idx[i] = v
         lines = []
         for i, m in enumerate(matches):
             mid = getattr(m, "mid_yes", None)
             mid_str = f"{mid:.3f}" if mid is not None else "unknown"
+            rv = rv_by_idx.get(i)
+            if rv is not None:
+                rv_str = f" | relevance={rv.score}:{rv.reason[:70]}"
+            else:
+                rv_str = ""
             lines.append(
-                f"{i}. [YES mid={mid_str} | sim={m.similarity:.2f}] {m.question}"
+                f"{i}. [YES mid={mid_str} | sim={m.similarity:.2f}{rv_str}] {m.question}"
             )
         questions_block = "\n".join(lines)
 
+        # Cycle-11: optional pre-headline market behaviour block.
+        # Rendered from per-match `_mkt_ctx` attrs (populated by the
+        # runner via market_context.fetch_context_for_matches). Empty
+        # string when no match has context, so unbreached.
+        try:
+            from market_context import format_market_context_block
+            mkt_ctx_block = format_market_context_block(matches)
+        except Exception:  # noqa: BLE001
+            mkt_ctx_block = ""
+
+        # Prepend freshness on its own line so blocks don't run together.
+        if freshness_block and not freshness_block.endswith("\n"):
+            freshness_block_norm = freshness_block + "\n"
+        else:
+            freshness_block_norm = freshness_block
         prompt = _BATCH_PROMPT_TEMPLATE.format(
             headline=headline,
             source_block=source_block,
             lessons_block=lessons_block,
-            republish_block=republish_block,
+            republish_block=republish_block or freshness_block_norm,
+            mkt_ctx_block=mkt_ctx_block,
             questions_block=questions_block,
             n=len(matches),
         )
@@ -320,6 +414,16 @@ class DirectionClassifier:
             "similar_to": (similar_to or "")[:200] if similar_to else None,
             "source": source,
             "lessons_used": list(lesson_notes)[:8] if lesson_notes else [],
+            "freshness_label": getattr(freshness, "label", None) if freshness else None,
+            "nearest_age_secs": getattr(freshness, "nearest_age_secs", None) if freshness else None,
+            "nearest_dist": getattr(freshness, "nearest_dist", None) if freshness else None,
+            "relevance_scores": (
+                [getattr(v, "score", None) for v in relevance_verdicts]
+                if relevance_verdicts else None
+            ),
+            "market_context": [
+                _mkt_ctx_to_dict(getattr(m, "_mkt_ctx", None)) for m in matches
+            ],
         }
 
         if not per_sample_results:

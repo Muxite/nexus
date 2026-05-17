@@ -70,10 +70,17 @@ class MarketsConfig:
 
 @dataclass
 class AIConfig:
-    model: str = "google/gemini-2.5-flash-lite"
-    premium_model: str = ""            # if set, used for high-similarity batches
-    premium_sim_threshold: float = 0.70  # similarity ≥ this → use premium_model
-    api_key: str = ""                  # blank = use OPENROUTER_API_KEY env var
+    # Stage-3 (prediction) model. Default upgraded from flash-lite → flash:
+    # the relevance gate now culls irrelevant markets before this call, so
+    # the model can spend its reasoning budget on the survivors.
+    model: str = "google/gemini-2.5-flash"
+    # Cross-vendor premium fallback. Triggered when relevance scores ≥2
+    # markets STRONG_YES AND freshness=BREAKING — only the strongest signals
+    # justify the cost step-up.
+    premium_model: str = "anthropic/claude-haiku-4-5"
+    premium_sim_threshold: float = 0.70   # legacy: similarity ≥ this → premium
+    premium_trigger_breaking_strong: bool = True   # new gate (see relevance.py)
+    api_key: str = ""                     # blank = use OPENROUTER_API_KEY env var
     api_base: str = "https://openrouter.ai/api/v1"
     min_confidence: float = 0.45
     # Ensemble sampling: run N parallel calls per batch at higher temperature
@@ -87,6 +94,32 @@ class AIConfig:
     # 1.0 demands unanimity. Decoupled from `confidence` so the edge model
     # keeps using the model's native probability output.
     min_agreement: float = 0.66
+
+
+@dataclass
+class RelevanceConfig:
+    """Stage-2 cheap LLM gate between embedding match and prediction call.
+
+    Asks YES/NO+reason per candidate market; culls to the set of matches the
+    prediction model actually has a useful opinion on. On API/parse failure
+    we fail-open (keep every match) so a relevance hiccup never hides trades.
+    """
+    enabled: bool = True
+    model: str = "google/gemini-2.5-flash-lite"
+    temperature: float = 0.1
+    # Verdict scores that survive the gate. Keep STRONG_YES + YES; drop
+    # WEAK + NO. Tweak per A/B run to widen/narrow the funnel.
+    keep_scores: tuple = ("STRONG_YES", "YES")
+    # Maximum tokens reserved per market in the response. The prompt is
+    # batched; total budget = max_tokens × n_markets + ~150.
+    max_tokens_per_market: int = 60
+    # Cycle-13 token reduction: if no candidate market has cosine similarity
+    # ≥ this threshold, the runner skips Stage 2 + Stage 3 entirely and
+    # writes per-variant `low_similarity:<max_sim>` skips. The embedding
+    # index already gates at 0.35; this is a stricter floor so we don't
+    # pay LLM tokens to be told "the headline isn't about any of these."
+    # 0.0 disables (legacy behaviour).
+    min_top_similarity: float = 0.45
 
 
 @dataclass
@@ -128,6 +161,22 @@ class TradingConfig:
     # [0.98, 1]. Set to 0 to disable. Per-engine override IS respected so
     # this is still a knob, but the default protects aggressive too.
     entry_rail_skip_threshold: float = 0.02
+    # Price-relative stop-loss floor (cycle-10). Effective SL becomes
+    #   max(stop_loss, stop_loss_pct * entry_price)
+    # so mid-priced (~0.50) entries get a wider absolute SL than 0.015,
+    # surviving normal spread movement. Low-price entries keep the existing
+    # fixed `stop_loss` floor. 0.0 disables (legacy behaviour).
+    stop_loss_pct: float = 0.0
+    # Asymmetric entry gate. Refuses entries when match.mid_yes < this
+    # threshold, regardless of direction — gates the engine toward
+    # markets that are already heavily priced (0.75+) where a NO bet is
+    # the high-probability play. 0.0 disables. Per-engine override allowed.
+    min_entry_yes_mid: float = 0.0
+    # Volatility-aware entry gate (cycle 11). Refuses entries when the
+    # pre-headline 30m stddev of mid exceeds this. Lets a variant opt
+    # out of markets that bounce wider than the SL can survive.
+    # 0.0 disables (default). Per-engine override allowed.
+    max_market_vol_30m: float = 0.0
     # Invert direction when AI is highly confident in a non-rail market.
     # Empirically conf ≥ 0.85 is anti-informative (IC < 0). Off by default;
     # opt-in per engine as a shadow strategy.
@@ -144,9 +193,37 @@ class TradingConfig:
 
 
 @dataclass
+class MarketContextConfig:
+    """Cycle-11 pre-headline market-behaviour fetch.
+
+    When enabled, the runner fetches the YES-side mid-price history for
+    every relevance-survived candidate market right before classify_batch.
+    Seven derived scalars are persisted on the trade row + injected into
+    the prediction prompt. See app/market_context.py.
+    """
+    enabled: bool = True
+    window_secs: int = 1800              # 30 minutes
+    cache_ttl_secs: int = 30             # share fetches across variants
+
+
+@dataclass
 class NewsMemoryConfig:
     path: str = "/data/news_chroma"           # ChromaDB persistent directory
     dedup_distance_threshold: float = 0.12    # cosine distance below this = republish
+    # ── Freshness labelling (cycle-9): label every incoming headline as
+    # BREAKING / EVOLVING / REHASH / STALE_RETURN based on nearest-neighbour
+    # distance + age. See app/news_memory.py:assess() for the decision table.
+    fresh_dist_threshold: float = 0.30        # > this ⇒ BREAKING regardless of age
+    rehash_age_secs: float = 21600.0          # 6h — REHASH window for very close matches
+    stale_age_secs: float = 86400.0           # 24h — STALE_RETURN window
+    recent_context_window_secs: float = 86400.0
+    recent_context_n: int = 3                 # similar headlines fed back to AI
+    # Cycle-13 token reduction: freshness labels that short-circuit the
+    # entire pipeline. Each label here means "write per-variant skip rows
+    # and DO NOT call Stage 2 (relevance) or Stage 3 (prediction)." Default
+    # was just REHASH; STALE_RETURN added after the per-label win/loss
+    # report showed it costing −$138.64 over 26 closed trades.
+    short_circuit_labels: list = field(default_factory=lambda: ["REHASH", "STALE_RETURN"])
 
 
 @dataclass
@@ -201,6 +278,9 @@ class VariantConfig:
     invert_high_conf: Optional[bool] = None
     invert_conf_threshold: Optional[float] = None
     spread_cost_bps: Optional[float] = None
+    stop_loss_pct: Optional[float] = None
+    min_entry_yes_mid: Optional[float] = None
+    max_market_vol_30m: Optional[float] = None
 
 
 @dataclass
@@ -224,6 +304,9 @@ class EngineConfig:
     invert_high_conf: Optional[bool] = None
     invert_conf_threshold: Optional[float] = None
     spread_cost_bps: Optional[float] = None
+    stop_loss_pct: Optional[float] = None
+    min_entry_yes_mid: Optional[float] = None
+    max_market_vol_30m: Optional[float] = None
     # Optional shadow-strategy variants. When non-empty the engine spawns one
     # PaperTrader per variant; all variants share the engine's batched AI
     # call but record trades under their own variant_name. When empty the
@@ -243,6 +326,8 @@ class Config:
     db: DBConfig = field(default_factory=DBConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
     news_memory: NewsMemoryConfig = field(default_factory=NewsMemoryConfig)
+    relevance: RelevanceConfig = field(default_factory=RelevanceConfig)
+    market_context: MarketContextConfig = field(default_factory=MarketContextConfig)
     search_budget: SearchBudgetConfig = field(default_factory=SearchBudgetConfig)
     plotter: PlotterConfig = field(default_factory=PlotterConfig)
     log_level: str = "INFO"
@@ -301,6 +386,8 @@ def _build_config(raw: dict) -> Config:
     d = raw.get("db", {})
     dash = raw.get("dashboard", {})
     nm = raw.get("news_memory", {})
+    rv = raw.get("relevance", {})
+    mctx = raw.get("market_context", {})
     sb = raw.get("search_budget", {})
 
     social_cfgs = [
@@ -333,6 +420,9 @@ def _build_config(raw: dict) -> Config:
             invert_high_conf=v["invert_high_conf"] if "invert_high_conf" in v else None,
             invert_conf_threshold=_opt_float(v.get("invert_conf_threshold")),
             spread_cost_bps=_opt_float(v.get("spread_cost_bps")),
+            stop_loss_pct=_opt_float(v.get("stop_loss_pct")),
+            min_entry_yes_mid=_opt_float(v.get("min_entry_yes_mid")),
+            max_market_vol_30m=_opt_float(v.get("max_market_vol_30m")),
         )
 
     engine_cfgs = [
@@ -354,6 +444,9 @@ def _build_config(raw: dict) -> Config:
             entry_rail_skip_threshold=_opt_float(e.get("entry_rail_skip_threshold")),
             invert_high_conf=e["invert_high_conf"] if "invert_high_conf" in e else None,
             invert_conf_threshold=_opt_float(e.get("invert_conf_threshold")),
+            stop_loss_pct=_opt_float(e.get("stop_loss_pct")),
+            min_entry_yes_mid=_opt_float(e.get("min_entry_yes_mid")),
+            max_market_vol_30m=_opt_float(e.get("max_market_vol_30m")),
             variants=[_build_variant(j, v) for j, v in enumerate(e.get("variants", []) or [])],
         )
         for i, e in enumerate(raw.get("engines", []))
@@ -373,11 +466,33 @@ def _build_config(raw: dict) -> Config:
         news_memory=NewsMemoryConfig(
             path=str(nm.get("path", "/data/news_chroma")),
             dedup_distance_threshold=float(nm.get("dedup_distance_threshold", 0.12)),
+            fresh_dist_threshold=float(nm.get("fresh_dist_threshold", 0.30)),
+            rehash_age_secs=float(nm.get("rehash_age_secs", 21600.0)),
+            stale_age_secs=float(nm.get("stale_age_secs", 86400.0)),
+            recent_context_window_secs=float(nm.get("recent_context_window_secs", 86400.0)),
+            recent_context_n=int(nm.get("recent_context_n", 3)),
+            short_circuit_labels=list(
+                nm.get("short_circuit_labels") or ["REHASH", "STALE_RETURN"]
+            ),
+        ),
+        relevance=RelevanceConfig(
+            enabled=bool(rv.get("enabled", True)),
+            model=str(rv.get("model", "google/gemini-2.5-flash-lite")),
+            temperature=float(rv.get("temperature", 0.1)),
+            keep_scores=tuple(rv.get("keep_scores") or ("STRONG_YES", "YES")),
+            max_tokens_per_market=int(rv.get("max_tokens_per_market", 60)),
+            min_top_similarity=float(rv.get("min_top_similarity", 0.45)),
+        ),
+        market_context=MarketContextConfig(
+            enabled=bool(mctx.get("enabled", True)),
+            window_secs=int(mctx.get("window_secs", 1800)),
+            cache_ttl_secs=int(mctx.get("cache_ttl_secs", 30)),
         ),
         ai=AIConfig(
-            model=str(a.get("model", "google/gemini-2.5-flash-lite")),
-            premium_model=str(a.get("premium_model", "")),
+            model=str(a.get("model", "google/gemini-2.5-flash")),
+            premium_model=str(a.get("premium_model", "anthropic/claude-haiku-4-5")),
             premium_sim_threshold=float(a.get("premium_sim_threshold", 0.70)),
+            premium_trigger_breaking_strong=bool(a.get("premium_trigger_breaking_strong", True)),
             api_key=str(a.get("api_key", "")),
             api_base=str(a.get("api_base", "https://openrouter.ai/api/v1")),
             min_confidence=float(a.get("min_confidence", 0.45)),
@@ -405,6 +520,9 @@ def _build_config(raw: dict) -> Config:
             entry_rail_skip_threshold=float(t.get("entry_rail_skip_threshold", 0.02)),
             invert_high_conf=bool(t.get("invert_high_conf", False)),
             invert_conf_threshold=float(t.get("invert_conf_threshold", 0.85)),
+            stop_loss_pct=float(t.get("stop_loss_pct", 0.0)),
+            min_entry_yes_mid=float(t.get("min_entry_yes_mid", 0.0)),
+            max_market_vol_30m=float(t.get("max_market_vol_30m", 0.0)),
         ),
         db=DBConfig(path=str(d.get("path", "/data/seulgi.db"))),
         dashboard=DashboardConfig(

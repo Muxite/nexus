@@ -102,6 +102,8 @@ class EngineRunner:
         news_memory=None,     # Optional[NewsMemory] — avoids circular import
         impact_tracker=None,  # Optional[PriceImpactTracker] — avoids circular import
         article_fetcher=None, # Optional[ArticleFetcher] — fire-and-forget body capture
+        relevance_filter=None,  # Optional[RelevanceFilter] — Stage-2 cheap gate
+        market_context_cfg=None,  # Optional[MarketContextConfig] — Stage-3 input
     ) -> None:
         self._engines = engines
         self._index = index
@@ -113,6 +115,11 @@ class EngineRunner:
         self._news_memory = news_memory
         self._impact_tracker = impact_tracker
         self._article_fetcher = article_fetcher
+        self._relevance = relevance_filter
+        self._mkt_ctx_cfg = market_context_cfg
+        # token_id → (MarketContext|None, fetched_at_unix). Shared across
+        # variants; 30s TTL is applied inside market_context.fetch_*.
+        self._mkt_ctx_cache: dict = {}
         # Single shared aiohttp session for parallel price prefetches
         self._price_session: Optional[aiohttp.ClientSession] = None
         # Mid-price TTL cache shared across headlines — cuts CLOB API traffic
@@ -174,30 +181,38 @@ class EngineRunner:
             logger.warning("[runner] [hid=%s] embed error: %s", hid, exc)
             return
 
-        # Dedup check — runs in executor (ChromaDB is synchronous)
-        is_republish = False
-        similar_to: Optional[str] = None
+        # ── Stage 0: freshness assessment (cycle 9) ─────────────────────────
+        # Replaces the binary republish check with a labelled freshness
+        # signal + top-N prior-coverage context. The label drives the
+        # REHASH short-circuit below and feeds Stages 2/3.
+        from news_memory import FreshnessResult  # local import — avoid cycles
+        freshness: FreshnessResult = FreshnessResult(label="BREAKING")
         if self._news_memory is not None:
             try:
-                is_republish, similar_to = await loop.run_in_executor(
+                freshness = await loop.run_in_executor(
                     None,
-                    self._news_memory.check,
+                    self._news_memory.assess,
                     headline.headline,
                     embedding,
                     headline.site_url,
                     headline.article_url,
                 )
-                if is_republish:
-                    logger.info(
-                        "[runner] [hid=%s] republish detected: %s",
-                        hid, headline.headline[:80],
-                    )
+                logger.info(
+                    "[runner] [hid=%s] freshness=%s dist=%.3f age=%ss",
+                    hid, freshness.label,
+                    freshness.nearest_dist or 0.0,
+                    int(freshness.nearest_age_secs or 0),
+                )
             except Exception as exc:
-                logger.debug("[runner] news_memory error: %s", exc)
+                logger.debug("[runner] news_memory.assess error: %s", exc)
 
-        # Store republish context on headline for downstream use
+        # Stash on headline so downstream code (impact tracker, trader) can read.
+        is_republish = freshness.is_republish
+        similar_to = freshness.similar_to
         headline._is_republish = is_republish
         headline._similar_to = similar_to
+        headline._freshness_label = freshness.label
+        headline._nearest_age_secs = freshness.nearest_age_secs
 
         matches = self._index.find_matches(embedding)
         if not matches:
@@ -219,18 +234,49 @@ class EngineRunner:
 
         source = headline.source
         logger.info(
-            "[runner] [hid=%s] '%s' matched %d markets (republish=%s) — dispatching to %d engines",
-            hid, headline.headline[:60], len(matches), is_republish, len(self._engines),
+            "[runner] [hid=%s] '%s' matched %d markets (freshness=%s) — dispatching to %d engines",
+            hid, headline.headline[:60], len(matches), freshness.label, len(self._engines),
         )
 
-        # ── Signal insert + pre-AI gate (shared across all variants) ────────
-        # One signal row per headline (was: one per engine in trader.process).
+        # ── Signal insert (shared across all variants) ──────────────────────
+        # Freshness label + nearest-age land on the signal row so reporting
+        # can join trades→signals on freshness without parsing trade rows.
         signal_id = await self._db.insert_signal(
             site_url=headline.site_url,
             headline=headline.headline,
             headline_id=getattr(headline, "headline_id", None),
+            freshness_label=freshness.label,
+            nearest_age_secs=freshness.nearest_age_secs,
         )
 
+        # ── Freshness short-circuit (cycle-13 generalised) ──────────────────
+        # Configurable list of freshness labels that bypass Stage 2 + Stage 3
+        # entirely. REHASH was the original cycle-9 entry. STALE_RETURN added
+        # after the per-label win/loss report showed it lost −$138.64 over
+        # 26 closed trades — paying LLM tokens to lose money is the worst
+        # quadrant of the cost/benefit grid.
+        sc_labels = []
+        if self._news_memory is not None:
+            sc_labels = getattr(self._news_memory, "_short_circuit_labels", []) or []
+        if freshness.label in sc_labels:
+            logger.info(
+                "[runner] [hid=%s] %s short-circuit — %d variants × %d matches skipped",
+                hid, freshness.label, len(self._engines), len(matches),
+            )
+            await asyncio.gather(
+                *[
+                    engine.trader.evaluate_freshness_skips(
+                        signal_id, headline, matches,
+                        freshness_label=freshness.label,
+                        nearest_age_secs=freshness.nearest_age_secs,
+                    )
+                    for engine in self._engines
+                ],
+                return_exceptions=True,
+            )
+            return
+
+        # ── Pre-AI rule gate (shared across all variants) ───────────────────
         pre_skips: list[tuple[MarketMatch, str]] = []
         survivors: list[MarketMatch] = []
         if self._rules is not None:
@@ -245,13 +291,106 @@ class EngineRunner:
         else:
             survivors = list(matches)
 
-        # ── Single batched AI call (shared by every variant) ───────────────
+        # ── Low-similarity short-circuit (cycle-13 token reduction) ─────────
+        # If even the best embedding match scores below the relevance
+        # threshold, skip Stage 2 entirely — the cheap LLM cull would
+        # spend tokens to almost certainly say NO. Per-variant skip rows
+        # tag the bypass so the funnel reflects it.
+        min_top_sim = getattr(getattr(self._relevance, "_min_top_similarity", None), "real", None)
+        if min_top_sim is None:
+            min_top_sim = getattr(self._relevance, "_min_top_similarity", 0.0) or 0.0
+        if survivors and min_top_sim > 0:
+            max_sim = max(getattr(m, "similarity", 0.0) for m in survivors)
+            if max_sim < min_top_sim:
+                logger.info(
+                    "[runner] [hid=%s] low_similarity short-circuit "
+                    "(max_sim=%.3f < %.2f) — %d variants × %d matches skipped",
+                    hid, max_sim, min_top_sim,
+                    len(self._engines), len(survivors),
+                )
+                reason = f"low_similarity:{max_sim:.3f}"
+                await asyncio.gather(
+                    *[
+                        engine.trader.evaluate_low_sim_skips(
+                            signal_id, headline, survivors, reason=reason,
+                            max_sim=max_sim,
+                        )
+                        for engine in self._engines
+                    ],
+                    return_exceptions=True,
+                )
+                return
+
+        # ── Stage 2: relevance gate (cycle 9, cheap LLM cull) ───────────────
         source_host: Optional[str] = None
         if headline.site_url:
             try:
                 source_host = urlparse(headline.site_url).netloc or None
             except Exception:  # noqa: BLE001
                 source_host = None
+
+        relevance_skips: list = []
+        relevance_verdicts_kept: list = []
+        if self._relevance is not None and survivors:
+            try:
+                kept, verdicts, rmeta = await self._relevance.filter(
+                    headline=headline.headline,
+                    matches=survivors,
+                    freshness=freshness,
+                    source=source_host,
+                )
+                if rmeta.get("tokens"):
+                    asyncio.create_task(self._db.log_usage(
+                        kind="ai_tokens",
+                        count=float(rmeta["tokens"]),
+                        provider=rmeta.get("model"),
+                        meta=json.dumps({"hid": hid, "stage": "relevance",
+                                         "n_in": rmeta.get("n_in"),
+                                         "n_kept": rmeta.get("n_kept")}),
+                    ))
+                # Tag each match with its verdict so the trader can persist
+                # relevance_score / relevance_reason on every trade row.
+                kept_ids = {id(m) for m in kept}
+                for m, v in zip(survivors, verdicts):
+                    m._relevance_score = v.score
+                    m._relevance_reason = v.reason
+                    if id(m) not in kept_ids:
+                        relevance_skips.append((m, v))
+                # Verdicts for the matches that survived (preserve order).
+                v_by_id = {id(m): v for m, v in zip(survivors, verdicts)}
+                relevance_verdicts_kept = [v_by_id[id(m)] for m in kept]
+                survivors = kept
+                logger.info("[runner] [hid=%s] relevance kept %d/%d (model=%s tokens=%s)",
+                            hid, rmeta.get("n_kept", 0), rmeta.get("n_in", 0),
+                            rmeta.get("model"), rmeta.get("tokens"))
+            except Exception as exc:
+                logger.warning("[runner] relevance error: %s — fail open", exc)
+
+        # ── Cycle-11: pre-headline market context (parallel CLOB fetch) ─
+        # Run AFTER relevance gate so only kept markets pay the network
+        # cost. Stashes `_mkt_ctx` on each survivor; ai.py reads it for
+        # the prompt block and trader.py persists it on trade rows.
+        mctx_cfg = self._mkt_ctx_cfg
+        window_secs = mctx_cfg.window_secs if mctx_cfg else 1800
+        mctx_enabled = mctx_cfg.enabled if mctx_cfg else True
+        if mctx_enabled and survivors:
+            try:
+                from market_context import fetch_context_for_matches
+                mctx_session = self._get_price_session()
+                mctx_meta = await fetch_context_for_matches(
+                    mctx_session, survivors,
+                    window_secs=window_secs,
+                    cache=self._mkt_ctx_cache,
+                )
+                logger.info(
+                    "[runner] [hid=%s] market_context: %d/%d fetched in %dms",
+                    hid, mctx_meta["n_fetched"], mctx_meta["n_in"],
+                    int(mctx_meta["elapsed_ms"]),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[runner] market_context error: %s — proceeding without", exc)
+
+        # ── Stage 3: prediction (existing classify_batch, now with freshness) ─
         try:
             lesson_notes = await self._get_lesson_notes_cached()
         except Exception:  # noqa: BLE001
@@ -267,6 +406,8 @@ class EngineRunner:
                 similar_to=similar_to,
                 source=source_host,
                 lesson_notes=lesson_notes,
+                freshness=freshness,
+                relevance_verdicts=relevance_verdicts_kept or None,
             )
             # ONE usage_events row per headline — tokens are shared across all
             # variants by construction.
@@ -276,7 +417,8 @@ class EngineRunner:
                     kind="ai_tokens",
                     count=float(tokens_used),
                     provider=prompt_meta.get("model"),
-                    meta=json.dumps({"hid": hid, "n_markets": len(survivors)}),
+                    meta=json.dumps({"hid": hid, "n_markets": len(survivors),
+                                     "stage": "prediction"}),
                 ))
 
         prompt_meta_json = (
@@ -287,13 +429,14 @@ class EngineRunner:
         pre_ms = (time.monotonic() - _t0) * 1000.0
 
         # Fan out to all engines/variants concurrently. Every engine sees the
-        # same signal_id, same classify_results, same prompt_meta.
+        # same signal_id, same classify_results, same prompt_meta, same
+        # relevance_skips list (each variant persists its own copy).
         results: list[list[TradeDecision]] = await asyncio.gather(
             *[
                 self._run_engine(
                     engine, headline, signal_id,
                     survivors, classify_results, prompt_meta_json,
-                    pre_skips, pre_ms,
+                    pre_skips, pre_ms, relevance_skips=relevance_skips,
                 )
                 for engine in self._engines
             ],
@@ -387,6 +530,7 @@ class EngineRunner:
         prompt_meta_json: Optional[str],
         pre_skips: list[tuple[MarketMatch, str]],
         pre_ms: float = 0.0,
+        relevance_skips: Optional[list] = None,
     ) -> list[TradeDecision]:
         """
         Run one engine/variant on the pre-classified matches.
@@ -399,6 +543,7 @@ class EngineRunner:
         decisions = await engine.trader.evaluate(
             signal_id, headline, survivors, classify_results,
             prompt_meta_json, pre_ai_skips=pre_skips,
+            relevance_skips=relevance_skips,
         )
         total_latency_ms = pre_ms + (time.monotonic() - _t_engine) * 1000.0
         await self._db.record_engine_decisions(
@@ -565,6 +710,20 @@ def build_engines(
                 ),
             ))
 
+    # Carved-out strategy module (opt-in via env var). Lives in its own
+    # package so it owns its Trader ABC + guards + exits; here we only
+    # append a same-shaped Engine adapter to the legacy fan-out.
+    try:
+        try:
+            from strategies.aggressive_core.factory import maybe_append    # container path
+        except ImportError:
+            from app.strategies.aggressive_core.factory import maybe_append  # type: ignore[no-redef]
+        added = maybe_append(engines, db=db)
+        if added[0] is not None:
+            logger.info("[engine] aggressive_core engine appended")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[engine] aggressive_core registration failed: %s", exc)
+
     logger.info("[engine] built %d engines: %s", len(engines), [e.name for e in engines])
     return engines
 
@@ -598,6 +757,9 @@ def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
         invert_high_conf=_pick("invert_high_conf", base.invert_high_conf),
         invert_conf_threshold=_pick("invert_conf_threshold", base.invert_conf_threshold),
         spread_cost_bps=_pick("spread_cost_bps", base.spread_cost_bps),
+        stop_loss_pct=_pick("stop_loss_pct", base.stop_loss_pct),
+        min_entry_yes_mid=_pick("min_entry_yes_mid", base.min_entry_yes_mid),
+        max_market_vol_30m=_pick("max_market_vol_30m", base.max_market_vol_30m),
     )
 
 

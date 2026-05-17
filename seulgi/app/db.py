@@ -326,6 +326,28 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_trades_variant_name ON trades(variant_name)",
     "CREATE INDEX IF NOT EXISTS idx_trades_closed_at    ON trades(closed_at)",
     "CREATE INDEX IF NOT EXISTS idx_trades_headline_id  ON trades(headline_id)",
+    # Cycle 9 — 3-stage pipeline (freshness + relevance):
+    # `freshness_label` = BREAKING / EVOLVING / REHASH / STALE_RETURN (set on
+    # both signals and trades so post-hoc joins are cheap). `relevance_score`
+    # = STRONG_YES / YES / WEAK / NO from Stage-2 gate; relevance_reason is
+    # the one-line LLM explanation. `nearest_age_secs` (signals only) is
+    # how long ago the closest prior headline landed in news_memory.
+    "ALTER TABLE signals ADD COLUMN freshness_label   TEXT",
+    "ALTER TABLE signals ADD COLUMN nearest_age_secs  REAL",
+    "ALTER TABLE trades  ADD COLUMN freshness_label   TEXT",
+    "ALTER TABLE trades  ADD COLUMN relevance_score   TEXT",
+    "ALTER TABLE trades  ADD COLUMN relevance_reason  TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_signals_freshness ON signals(freshness_label)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_freshness  ON trades(freshness_label)",
+    # Cycle 11 — pre-headline market behaviour (6 derived scalars).
+    # `current` is omitted: it mirrors mid_yes at decision time, which
+    # we already store. `range` and `dist_to_rail` derive in queries.
+    "ALTER TABLE trades ADD COLUMN mkt_vol_30m   REAL",
+    "ALTER TABLE trades ADD COLUMN mkt_mean_30m  REAL",
+    "ALTER TABLE trades ADD COLUMN mkt_min_30m   REAL",
+    "ALTER TABLE trades ADD COLUMN mkt_max_30m   REAL",
+    "ALTER TABLE trades ADD COLUMN mkt_drift_30m REAL",
+    "ALTER TABLE trades ADD COLUMN mkt_n_samples INTEGER",
 ]
 
 
@@ -551,11 +573,20 @@ class SeulgiDB:
     # ------------------------------------------------------------------
 
     async def insert_signal(
-        self, site_url: str, headline: str, headline_id: Optional[str] = None
+        self,
+        site_url: str,
+        headline: str,
+        headline_id: Optional[str] = None,
+        freshness_label: Optional[str] = None,
+        nearest_age_secs: Optional[float] = None,
     ) -> int:
         cur = await self._conn.execute(
-            "INSERT INTO signals (site_url, headline, detected_at, headline_id) VALUES (?, ?, ?, ?)",
-            (site_url, headline, _now_iso(), headline_id),
+            """INSERT INTO signals
+                 (site_url, headline, detected_at, headline_id,
+                  freshness_label, nearest_age_secs)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (site_url, headline, _now_iso(), headline_id,
+             freshness_label, nearest_age_secs),
         )
         await self._conn.commit()
         return cur.lastrowid
@@ -593,6 +624,15 @@ class SeulgiDB:
         mid_no: Optional[float] = None,
         inverted: Optional[int] = None,
         variant_name: Optional[str] = None,
+        freshness_label: Optional[str] = None,
+        relevance_score: Optional[str] = None,
+        relevance_reason: Optional[str] = None,
+        mkt_vol_30m: Optional[float] = None,
+        mkt_mean_30m: Optional[float] = None,
+        mkt_min_30m: Optional[float] = None,
+        mkt_max_30m: Optional[float] = None,
+        mkt_drift_30m: Optional[float] = None,
+        mkt_n_samples: Optional[int] = None,
     ) -> int:
         cur = await self._conn.execute(
             """
@@ -602,16 +642,22 @@ class SeulgiDB:
                confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
                engine_name, agreement, p_alpha, risk_score,
                ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
-               mid_yes, mid_no, inverted, variant_name)
+               mid_yes, mid_no, inverted, variant_name,
+               freshness_label, relevance_score, relevance_reason,
+               mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
+               mkt_drift_30m, mkt_n_samples)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?)
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (signal_id, condition_id, question, token_id, direction, similarity,
              p_hat, mid_price, size_usdc, skip_reason, _now_iso(), headline_id,
              confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
              engine_name, agreement, p_alpha, risk_score,
              ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
-             mid_yes, mid_no, inverted, variant_name),
+             mid_yes, mid_no, inverted, variant_name,
+             freshness_label, relevance_score, relevance_reason,
+             mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
+             mkt_drift_30m, mkt_n_samples),
         )
         await self._conn.commit()
         return cur.lastrowid
@@ -1236,6 +1282,220 @@ class SeulgiDB:
         if not row or not row["total_n"]:
             return (None, 0)
         return (row["neutral_n"] / row["total_n"], int(row["total_n"]))
+
+    async def get_decision_funnel(self, since_secs: int = 3600) -> dict:
+        """
+        Guard-by-guard decision funnel over the last `since_secs` window.
+
+        Returns a dict keyed by funnel step (ordered as the trader evaluates):
+          {
+            "total":                int,
+            "ai_neutral":           int,
+            "pre_ai_dropped":       int,
+            "failed_min_confidence":int,
+            "failed_agreement":     int,
+            "failed_post_ai_rule":  int,
+            "failed_rail":          int,
+            "failed_edge":          int,
+            "failed_position_guard":int,
+            "failed_size":          int,
+            "other_skipped":        int,
+            "executed":             int,
+          }
+
+        Drives the DECISION FUNNEL block in dashboard.txt — the operator can
+        see at a glance which gate is killing trades (e.g. AI signal starved
+        vs ensemble-disagreement bleed vs balance exhaustion).
+
+        Implementation note: classifies each `trades` row by `skip_reason`
+        prefix. The trader writes skip_reason values whose prefixes match the
+        trace step names exactly (see `_evaluate_market` in app/trader.py),
+        so no JSON parsing is needed.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=since_secs)).isoformat()
+        async with self._conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN skip_reason LIKE 'freshness:%' THEN 1 ELSE 0 END)
+                                                                    AS failed_freshness,
+                SUM(CASE WHEN skip_reason LIKE 'not_relevant%' THEN 1 ELSE 0 END)
+                                                                    AS failed_relevance,
+                SUM(CASE WHEN skip_reason LIKE 'low_similarity%' THEN 1 ELSE 0 END)
+                                                                    AS failed_low_sim,
+                SUM(CASE WHEN skip_reason = 'neutral' THEN 1 ELSE 0 END)
+                                                                    AS ai_neutral,
+                SUM(CASE WHEN skip_reason LIKE 'pre_ai_rule%'
+                          OR skip_reason LIKE 'RULE_%' THEN 1 ELSE 0 END)
+                                                                    AS pre_ai_dropped,
+                SUM(CASE WHEN skip_reason LIKE 'low_confidence%' THEN 1 ELSE 0 END)
+                                                                    AS failed_min_confidence,
+                SUM(CASE WHEN skip_reason LIKE 'low_agreement%' THEN 1 ELSE 0 END)
+                                                                    AS failed_agreement,
+                SUM(CASE WHEN skip_reason LIKE 'post_ai_rule%' THEN 1 ELSE 0 END)
+                                                                    AS failed_post_ai_rule,
+                SUM(CASE WHEN skip_reason LIKE 'hard_rail%'
+                          OR skip_reason LIKE 'rail_price%'
+                          OR skip_reason IN ('no_token','no_price')
+                          THEN 1 ELSE 0 END)                       AS failed_rail,
+                SUM(CASE WHEN skip_reason LIKE 'min_entry_yes_mid%' THEN 1 ELSE 0 END)
+                                                                    AS failed_min_entry,
+                SUM(CASE WHEN skip_reason LIKE 'market_too_noisy%' THEN 1 ELSE 0 END)
+                                                                    AS failed_market_vol,
+                SUM(CASE WHEN skip_reason LIKE 'edge_too_small%' THEN 1 ELSE 0 END)
+                                                                    AS failed_edge,
+                SUM(CASE WHEN skip_reason LIKE 'max_positions%'
+                          OR skip_reason = 'duplicate_position'
+                          OR skip_reason LIKE 'max_unique_markets%'
+                          THEN 1 ELSE 0 END)                       AS failed_position_guard,
+                SUM(CASE WHEN skip_reason LIKE 'size_too_small%'
+                          OR skip_reason = 'no_balance'
+                          THEN 1 ELSE 0 END)                       AS failed_size,
+                SUM(CASE WHEN size_usdc > 0 AND skip_reason IS NULL THEN 1 ELSE 0 END)
+                                                                    AS executed
+            FROM trades
+            WHERE decided_at >= ?
+            """,
+            (cutoff,),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return {"total": 0, "failed_freshness": 0, "failed_relevance": 0,
+                    "failed_low_sim": 0,
+                    "ai_neutral": 0, "pre_ai_dropped": 0,
+                    "failed_min_confidence": 0, "failed_agreement": 0,
+                    "failed_post_ai_rule": 0, "failed_rail": 0,
+                    "failed_min_entry": 0, "failed_market_vol": 0,
+                    "failed_edge": 0, "failed_position_guard": 0,
+                    "failed_size": 0, "other_skipped": 0, "executed": 0}
+        d = dict(row)
+        # Coerce SUM(NULL) → 0 so callers can format safely.
+        for k, v in list(d.items()):
+            d[k] = int(v or 0)
+        accounted = (
+            d["failed_freshness"] + d["failed_relevance"] + d["failed_low_sim"]
+            + d["ai_neutral"] + d["pre_ai_dropped"] + d["failed_min_confidence"]
+            + d["failed_agreement"] + d["failed_post_ai_rule"] + d["failed_rail"]
+            + d["failed_min_entry"] + d["failed_market_vol"]
+            + d["failed_edge"] + d["failed_position_guard"] + d["failed_size"]
+            + d["executed"]
+        )
+        d["other_skipped"] = max(0, d["total"] - accounted)
+        return d
+
+    async def get_freshness_counts(self, since_secs: int = 3600) -> list[dict]:
+        """Per-label headline counts over the last window, from `signals`."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=since_secs)).isoformat()
+        async with self._conn.execute(
+            """
+            SELECT
+                COALESCE(freshness_label, 'UNLABELED') AS label,
+                COUNT(*)                               AS n
+            FROM signals
+            WHERE detected_at >= ?
+            GROUP BY label
+            ORDER BY n DESC
+            """,
+            (cutoff,),
+        ) as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_freshness_buckets(self, since_secs: int = 86400) -> list[dict]:
+        """Per-freshness trade outcome rollup. Mirrors get_confidence_buckets."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=since_secs)).isoformat()
+        async with self._conn.execute(
+            """
+            SELECT
+                COALESCE(freshness_label, 'UNLABELED') AS label,
+                SUM(CASE WHEN size_usdc > 0 AND skip_reason IS NULL THEN 1 ELSE 0 END)
+                                                                  AS n_executed,
+                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS n_wins,
+                SUM(CASE WHEN realized_pnl <= 0 AND realized_pnl IS NOT NULL THEN 1 ELSE 0 END)
+                                                                  AS n_losses,
+                SUM(CASE WHEN skip_reason IS NOT NULL THEN 1 ELSE 0 END)
+                                                                  AS n_skipped,
+                COALESCE(AVG(CASE WHEN realized_pnl IS NOT NULL THEN realized_pnl END), 0)
+                                                                  AS avg_pnl,
+                COALESCE(SUM(realized_pnl), 0)                    AS sum_pnl
+            FROM trades
+            WHERE decided_at >= ?
+            GROUP BY label
+            """,
+            (cutoff,),
+        ) as cur:
+            rows = await cur.fetchall()
+        order = {"BREAKING": 0, "EVOLVING": 1, "STALE_RETURN": 2,
+                 "REHASH": 3, "UNLABELED": 4}
+        out = []
+        for r in rows:
+            d = dict(r)
+            if (d.get("n_executed") or 0) == 0 and (d.get("n_skipped") or 0) == 0:
+                continue
+            out.append(d)
+        out.sort(key=lambda r: order.get(r["label"], 99))
+        return out
+
+    async def get_confidence_buckets(self, since_secs: int = 86400) -> list[dict]:
+        """
+        Hit-rate and avg PnL by AI confidence bucket over the last window.
+
+        Buckets: [0.0,0.4), [0.4,0.55), [0.55,0.7), [0.7,0.85), [0.85,1.0].
+        Returns one dict per non-empty bucket, ordered high→low:
+          { "bucket": "0.85-1.0", "lo": 0.85, "hi": 1.0,
+            "n_executed": int, "n_wins": int, "n_losses": int,
+            "n_skipped": int, "avg_pnl": float, "sum_pnl": float,
+            "avg_edge": float }
+
+        Powers CONFIDENCE BUCKETS block in dashboard.txt — answers "are
+        high-conf calls actually profitable?" without an analysis run.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=since_secs)).isoformat()
+        async with self._conn.execute(
+            """
+            SELECT
+                CASE
+                    WHEN confidence_raw >= 0.85 THEN '0.85-1.0'
+                    WHEN confidence_raw >= 0.70 THEN '0.70-0.85'
+                    WHEN confidence_raw >= 0.55 THEN '0.55-0.70'
+                    WHEN confidence_raw >= 0.40 THEN '0.40-0.55'
+                    ELSE '0.00-0.40'
+                END                                              AS bucket,
+                SUM(CASE WHEN size_usdc > 0 AND skip_reason IS NULL THEN 1 ELSE 0 END)
+                                                                  AS n_executed,
+                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS n_wins,
+                SUM(CASE WHEN realized_pnl <= 0 AND realized_pnl IS NOT NULL THEN 1 ELSE 0 END)
+                                                                  AS n_losses,
+                SUM(CASE WHEN skip_reason IS NOT NULL THEN 1 ELSE 0 END)
+                                                                  AS n_skipped,
+                COALESCE(AVG(CASE WHEN realized_pnl IS NOT NULL THEN realized_pnl END), 0)
+                                                                  AS avg_pnl,
+                COALESCE(SUM(realized_pnl), 0)                    AS sum_pnl,
+                COALESCE(AVG(CASE WHEN size_usdc > 0 AND skip_reason IS NULL
+                                  THEN signed_edge END), 0)       AS avg_edge
+            FROM trades
+            WHERE decided_at >= ? AND confidence_raw IS NOT NULL
+            GROUP BY bucket
+            """,
+            (cutoff,),
+        ) as cur:
+            rows = await cur.fetchall()
+        # Order buckets high→low, drop empty ones for compact display
+        order = {"0.85-1.0": 0, "0.70-0.85": 1, "0.55-0.70": 2,
+                 "0.40-0.55": 3, "0.00-0.40": 4}
+        edges = {"0.85-1.0": (0.85, 1.0), "0.70-0.85": (0.70, 0.85),
+                 "0.55-0.70": (0.55, 0.70), "0.40-0.55": (0.40, 0.55),
+                 "0.00-0.40": (0.00, 0.40)}
+        out = []
+        for r in rows:
+            d = dict(r)
+            if (d.get("n_executed") or 0) == 0 and (d.get("n_skipped") or 0) == 0:
+                continue
+            lo, hi = edges[d["bucket"]]
+            d["lo"] = lo
+            d["hi"] = hi
+            out.append(d)
+        out.sort(key=lambda r: order[r["bucket"]])
+        return out
 
     async def get_last_signal_at(self) -> Optional[datetime]:
         """Wall-clock time of the most recent inserted signal (DB-write liveness)."""
