@@ -317,7 +317,25 @@ async def main() -> None:
 
     # Build engines
     engines = build_engines(cfg, db, classifier, rule_engine=rule_engine)
+    # plan §1: dashboard mode reflects trading.mode. set_infinite_balance is
+    # kept for backwards compatibility (call after to honour legacy flag).
+    dash.set_mode(cfg.trading.mode)
     dash.set_infinite_balance(cfg.trading.infinite_balance)
+    # plan §2: in simulate mode, split a tiny bankroll evenly across active
+    # engines so each PaperTrader starts with a realistic micro-stake.
+    if cfg.trading.is_simulate() and engines:
+        per_engine = cfg.trading.simulate_total_usdc / len(engines)
+        for engine in engines:
+            engine.trader._cfg.balance_usdc = per_engine
+            engine.trader._cfg.min_trade_usdc = cfg.trading.simulate_min_trade_usdc
+            # Re-seed live balance (init_from_db below will overwrite if there
+            # are restored positions; this is the fresh-start value).
+            engine.trader._balance = per_engine
+        dash.set_simulate_total(cfg.trading.simulate_total_usdc)
+        logger.info(
+            "[main] simulate mode: $%.2f bankroll → %d engines × $%.2f each",
+            cfg.trading.simulate_total_usdc, len(engines), per_engine,
+        )
     # Pre-seed all engine names so the dashboard's per-engine block always
     # lists every engine, even before init_from_db has filled in real values.
     # Avoids a startup race where the render loop intermittently drops engines.

@@ -348,6 +348,16 @@ _MIGRATIONS = [
     "ALTER TABLE trades ADD COLUMN mkt_max_30m   REAL",
     "ALTER TABLE trades ADD COLUMN mkt_drift_30m REAL",
     "ALTER TABLE trades ADD COLUMN mkt_n_samples INTEGER",
+    # ── Simulate-mode fidelity (plan §7) ──────────────────────────────
+    # shares is the integer-cent share count actually held at the entry
+    # fill price. NULL on legacy rows; trader treats NULL as
+    # `size_usdc / entry_price` (the old implicit accounting).
+    "ALTER TABLE positions ADD COLUMN shares REAL",
+    # Polymarket dynamic taker fees applied to entry and exit fills under
+    # simulate mode. NULL outside simulate mode. Persisted so the audit
+    # script can re-derive realized_pnl independently.
+    "ALTER TABLE trades ADD COLUMN entry_fee_usdc REAL",
+    "ALTER TABLE trades ADD COLUMN exit_fee_usdc  REAL",
 ]
 
 
@@ -723,12 +733,29 @@ class SeulgiDB:
         trade_id: int,
         realized_pnl: float,
         close_reason: Optional[str] = None,
+        entry_fee_usdc: Optional[float] = None,
+        exit_fee_usdc: Optional[float] = None,
     ) -> None:
-        """Record the outcome of a closed position on the trade row."""
-        await self._conn.execute(
-            "UPDATE trades SET realized_pnl = ?, closed_at = ?, close_reason = ? WHERE id = ?",
-            (realized_pnl, _now_iso(), close_reason, trade_id),
-        )
+        """Record the outcome of a closed position on the trade row.
+
+        `entry_fee_usdc` / `exit_fee_usdc` are populated only under simulate
+        mode's fidelity layer (plan §7.2). Left NULL otherwise.
+        """
+        if entry_fee_usdc is not None or exit_fee_usdc is not None:
+            await self._conn.execute(
+                """UPDATE trades SET realized_pnl = ?, closed_at = ?,
+                                     close_reason = ?,
+                                     entry_fee_usdc = COALESCE(?, entry_fee_usdc),
+                                     exit_fee_usdc  = ?
+                   WHERE id = ?""",
+                (realized_pnl, _now_iso(), close_reason,
+                 entry_fee_usdc, exit_fee_usdc, trade_id),
+            )
+        else:
+            await self._conn.execute(
+                "UPDATE trades SET realized_pnl = ?, closed_at = ?, close_reason = ? WHERE id = ?",
+                (realized_pnl, _now_iso(), close_reason, trade_id),
+            )
         await self._conn.commit()
 
     async def recent_trades(self, limit: int = 20) -> list[dict]:
@@ -760,18 +787,26 @@ class SeulgiDB:
         entry_price: float,
         p_hat: float,
         engine_name: str = "default",
+        shares: Optional[float] = None,
+        entry_fee_usdc: Optional[float] = None,
     ) -> None:
         await self._conn.execute(
             """
             INSERT OR REPLACE INTO positions
               (trade_id, condition_id, question, token_id, direction,
                size_usdc, entry_price, opened_at, last_price, unrealized_pnl, p_hat,
-               engine_name)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?)
+               engine_name, shares)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?)
             """,
             (trade_id, condition_id, question, token_id, direction,
-             size_usdc, entry_price, _now_iso(), entry_price, p_hat, engine_name),
+             size_usdc, entry_price, _now_iso(), entry_price, p_hat,
+             engine_name, shares),
         )
+        if entry_fee_usdc is not None:
+            await self._conn.execute(
+                "UPDATE trades SET entry_fee_usdc = ? WHERE id = ?",
+                (entry_fee_usdc, trade_id),
+            )
         await self._conn.commit()
 
     async def get_open_positions(self, engine_name: Optional[str] = None) -> list[dict]:

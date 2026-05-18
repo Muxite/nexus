@@ -69,6 +69,7 @@ from ai import Direction, ClassifyResult, DirectionClassifier
 from db import SeulgiDB
 from markets import MarketMatch
 from watcher import RawHeadline
+import simulate as sim  # plan §7 — fees/slippage/Kelly helpers
 
 logger = logging.getLogger(__name__)
 
@@ -490,6 +491,46 @@ class PaperTrader:
             decisions.append(decision)
         return decisions
 
+    async def evaluate_ai_paused_skips(
+        self,
+        signal_id: int,
+        headline: RawHeadline,
+        matches: list[MarketMatch],
+    ) -> list[TradeDecision]:
+        """plan §3 — simulate mode AI pause. Persists per-engine×match skip
+        rows with reason='ai_paused_no_capital' so the decision funnel
+        accounts for the headline even though no LLM call fired.
+        """
+        decisions: list[TradeDecision] = []
+        for match in matches:
+            decision = TradeDecision(
+                condition_id=match.condition_id,
+                question=match.question,
+                direction=Direction.NEUTRAL,
+                confidence=0.0,
+                similarity=match.similarity,
+                p_hat=0.0,
+                mid_price=match.mid_yes,
+                edge=0.0,
+                size_usdc=0.0,
+                executed=False,
+                skip_reason="ai_paused_no_capital",
+                mid_yes=match.mid_yes,
+                mid_no=match.mid_no,
+            )
+            trace = [{
+                "step": "ai_paused", "pass": False,
+                "balance": round(self._balance, 4),
+                "min_trade_usdc": round(self._cfg.min_trade_usdc, 4),
+            }]
+            await self._record(
+                signal_id, decision, headline=headline, token_id=None,
+                trace=trace, result=None, prompt_meta_json=None,
+                match=match,
+            )
+            decisions.append(decision)
+        return decisions
+
     async def evaluate_freshness_skips(
         self,
         signal_id: int,
@@ -805,9 +846,44 @@ class PaperTrader:
                 )
 
             # Compute actual trade size.
+            # Simulate mode (plan §7.4): fractional Kelly sized off `p_hat`
+            #   vs current market price. Falls through to "fixed" branch if
+            #   the operator set simulate_sizing.method = "fixed".
             # Infinite mode: always trade max_position_usdc (no balance gating).
-            # Normal mode: capped by remaining balance, must clear min_trade_usdc.
-            if self._cfg.infinite_balance:
+            # Normal/simulate-fixed: capped by remaining balance, must clear
+            #   min_trade_usdc.
+            simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
+            if simulate_mode and self._cfg.simulate_sizing.method == "fractional_kelly":
+                # p_market = price we'd pay for the YES of the side we're
+                # buying. Direction is already resolved above; for a YES
+                # entry use mid_yes, for NO use mid_no (which equals
+                # 1 - mid_yes in a well-formed binary market).
+                if result.direction == Direction.YES:
+                    p_market = match.mid_yes if match.mid_yes is not None else mid_price
+                else:
+                    p_market = match.mid_no if match.mid_no is not None else (1.0 - mid_price)
+                kelly = sim.fractional_kelly(
+                    bankroll_usdc=self._balance,
+                    p_true=p_hat,
+                    p_market=p_market,
+                    max_position_usdc=self._cfg.max_position_usdc,
+                    cfg=self._cfg.simulate_sizing,
+                )
+                trace.append({"step": "kelly",
+                              "f_star": round(kelly.f_star, 4),
+                              "fractional": round(kelly.fractional, 4),
+                              "capped_pct": round(kelly.capped_pct, 4),
+                              "stake_usdc": round(kelly.stake_usdc, 4),
+                              "skip_reason": kelly.skip_reason,
+                              "bankroll": round(self._balance, 4),
+                              "p_market": round(p_market, 4),
+                              "p_true": round(p_hat, 4)})
+                if kelly.skip_reason is not None:
+                    return await _finalize_skip(
+                        kelly.skip_reason, token_id=token_id, p_hat=p_hat, mid=mid_price,
+                    )
+                size = kelly.stake_usdc
+            elif self._cfg.infinite_balance:
                 size = self._cfg.max_position_usdc
             else:
                 size = min(self._cfg.max_position_usdc, self._balance)
@@ -817,6 +893,51 @@ class PaperTrader:
                                   "size": round(size, 2), "balance": round(self._balance, 2)})
                     return await _finalize_skip(
                         reason, token_id=token_id, p_hat=p_hat, mid=mid_price,
+                    )
+
+            # plan §7.1 / §7.2 / §7.3 — slippage, fee, share quantization.
+            entry_fee = 0.0
+            shares_held: Optional[float] = None
+            effective_entry_price = mid_price
+            if simulate_mode:
+                # Market type drives the fee rate AND slippage opt-out.
+                market_type = getattr(match, "market_type", None) or getattr(match, "_market_type", None)
+                slip = sim.apply_slippage(
+                    mid=mid_price,
+                    notional_usdc=size,
+                    side=result.direction.value,
+                    market_type=market_type,
+                    cfg=self._cfg.simulate_slippage,
+                )
+                effective_entry_price = slip.effective_price
+                # Reject zero-liquidity rails (price after slippage is at the wall).
+                if sim.is_at_rail(effective_entry_price):
+                    trace.append({"step": "rail_zero_liquidity", "pass": False,
+                                  "effective_price": round(effective_entry_price, 4)})
+                    return await _finalize_skip(
+                        "rail_zero_liquidity", token_id=token_id, p_hat=p_hat, mid=mid_price,
+                    )
+                # Estimate fee first using a naive share count, then quantize.
+                naive_shares = size / effective_entry_price
+                fee_est = sim.compute_fee(naive_shares, effective_entry_price,
+                                          market_type, self._cfg.simulate_fees)
+                shares_held = sim.quantize_shares(size, effective_entry_price, fee_est.fee)
+                # Recompute fee using the actual share count for precision.
+                fee_res = sim.compute_fee(shares_held, effective_entry_price,
+                                          market_type, self._cfg.simulate_fees)
+                entry_fee = fee_res.fee
+                trace.append({"step": "fidelity",
+                              "mid": round(mid_price, 4),
+                              "slip_walk": round(slip.walk, 5),
+                              "entry_price": round(effective_entry_price, 4),
+                              "shares": round(shares_held, 4),
+                              "entry_fee_usdc": round(entry_fee, 6),
+                              "fee_rate": fee_res.rate,
+                              "market_type": market_type or "(none)"})
+                # Reject if the resulting stake leaves us under min_stake.
+                if shares_held <= 0:
+                    return await _finalize_skip(
+                        "shares_zero_after_quantize", token_id=token_id, p_hat=p_hat, mid=mid_price,
                     )
 
             trace.append({"step": "size", "pass": True, "size_usdc": round(size, 2)})
@@ -871,9 +992,13 @@ class PaperTrader:
                 token_id=token_id,
                 direction=result.direction.value,
                 size_usdc=size,
-                entry_price=mid_price,
+                # Simulate mode stamps the slipped fill price; paper/infinite
+                # keep the historical mid_price (no behaviour change there).
+                entry_price=effective_entry_price if simulate_mode else mid_price,
                 p_hat=p_hat,
                 engine_name=self._engine_name,
+                shares=shares_held,
+                entry_fee_usdc=(entry_fee if simulate_mode else None),
             )
 
         logger.info(
@@ -1002,22 +1127,38 @@ class PaperTrader:
             price = await _fetch_mid_price(session, pos["token_id"])
             if price is None:
                 continue
-            shares = pos["size_usdc"] / pos["entry_price"]
+            persisted_shares = pos.get("shares")
+            shares = persisted_shares if persisted_shares else (pos["size_usdc"] / pos["entry_price"])
             gross = (price - pos["entry_price"]) * shares
-            # Round-trip bid-ask cost (Polymarket has no protocol fees but the
-            # spread is real). Deducted from PnL at close so a flat buy+sell
-            # yields a small loss, not zero.
-            cost = pos["size_usdc"] * (self._cfg.spread_cost_bps / 10000.0)
-            pnl = gross - cost
+            simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
+            exit_fee = 0.0
+            if simulate_mode:
+                slip = sim.apply_slippage(
+                    mid=price, notional_usdc=shares * price,
+                    side="NO" if pos["direction"] == "YES" else "YES",
+                    market_type=None, cfg=self._cfg.simulate_slippage,
+                )
+                exit_price = slip.effective_price
+                fee_res = sim.compute_fee(shares, exit_price, None, self._cfg.simulate_fees)
+                exit_fee = fee_res.fee
+                proceeds = shares * exit_price - exit_fee
+                pnl = proceeds - pos["size_usdc"]
+            else:
+                cost = pos["size_usdc"] * (self._cfg.spread_cost_bps / 10000.0)
+                pnl = gross - cost
+                proceeds = pos["size_usdc"] + pnl
             async with self._lock:
-                # Infinite mode: balance == cumulative realized PnL, so add PnL only.
-                # Normal mode: credit stake + PnL back to bankroll.
                 if self._cfg.infinite_balance:
                     self._balance += pnl
+                elif simulate_mode:
+                    self._balance += proceeds
                 else:
                     self._balance += pos["size_usdc"] + pnl
                 await self._db.close_position(pos["trade_id"])
-                await self._db.close_trade(pos["trade_id"], pnl, close_reason="COLD_CULL")
+                await self._db.close_trade(
+                    pos["trade_id"], pnl, close_reason="COLD_CULL",
+                    exit_fee_usdc=(exit_fee if simulate_mode else None),
+                )
             logger.info(
                 "[trader] COLD_CULL %s %s  exit=%.3f  pnl=%.2f",
                 pos["direction"], pos["condition_id"][:12], price, pnl,
@@ -1053,7 +1194,11 @@ class PaperTrader:
                 opened_at = opened_at.replace(tzinfo=timezone.utc)
             age_secs = (now - opened_at).total_seconds()
 
-            shares = size_usdc / entry_price
+            # Prefer the persisted share count (simulate mode); fall back to
+            # the legacy implicit count for paper/infinite rows that pre-date
+            # the shares column.
+            persisted_shares = pos.get("shares")
+            shares = persisted_shares if persisted_shares else (size_usdc / entry_price)
             unrealized_pnl = (current_price - entry_price) * shares
 
             # Update price + high-water mark in DB. The DB MAX() guarantees
@@ -1104,18 +1249,61 @@ class PaperTrader:
             if close_reason is None:
                 continue
 
-            gross_pnl = (current_price - entry_price) * shares
-            # Round-trip bid-ask cost (see TradingConfig.spread_cost_bps).
-            cost = size_usdc * (self._cfg.spread_cost_bps / 10000.0)
-            realized_pnl = gross_pnl - cost
+            # plan §7 — simulate mode: model real Polymarket settlement +
+            # exit fees + slippage. Paper/infinite use the legacy
+            # spread_cost_bps round-trip drag.
+            simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
+            exit_fee = 0.0
+            if simulate_mode:
+                # WIN/LOSS price-rails in simulate mode mean the market has
+                # effectively resolved — settle at $1/$0 per share with no
+                # exit fee (settlement is on-chain and free).
+                if close_reason == "WIN":
+                    close_reason = "RESOLVE_WIN"
+                    exit_price = 1.00
+                    proceeds = sim.settlement_payout(shares, win=True)
+                elif close_reason == "LOSS":
+                    close_reason = "RESOLVE_LOSS"
+                    exit_price = 0.00
+                    proceeds = sim.settlement_payout(shares, win=False)
+                else:
+                    # Early exit (TP/SL/TRAIL/TIMEOUT): walk the book + fee.
+                    market_type = None  # no need to refetch; rate captured at entry
+                    slip = sim.apply_slippage(
+                        mid=current_price, notional_usdc=shares * current_price,
+                        # selling our held side → the opposite slippage direction
+                        side="NO" if direction == "YES" else "YES",
+                        market_type=market_type, cfg=self._cfg.simulate_slippage,
+                    )
+                    exit_price = slip.effective_price
+                    fee_res = sim.compute_fee(shares, exit_price, market_type,
+                                              self._cfg.simulate_fees)
+                    exit_fee = fee_res.fee
+                    proceeds = shares * exit_price - exit_fee
+                gross_pnl = (exit_price - entry_price) * shares
+                # realized_pnl = (what we got back) - (what we put in)
+                # what_we_put_in == size_usdc (already includes entry fee)
+                realized_pnl = proceeds - size_usdc
+            else:
+                gross_pnl = (current_price - entry_price) * shares
+                cost = size_usdc * (self._cfg.spread_cost_bps / 10000.0)
+                realized_pnl = gross_pnl - cost
+                proceeds = size_usdc + realized_pnl
 
             async with self._lock:
                 if self._cfg.infinite_balance:
                     self._balance += realized_pnl
+                elif simulate_mode:
+                    # In simulate mode, credit the actual proceeds back to
+                    # the wallet — entry fee was already debited at open.
+                    self._balance += proceeds
                 else:
                     self._balance += size_usdc + realized_pnl
                 await self._db.close_position(trade_id)
-                await self._db.close_trade(trade_id, realized_pnl, close_reason=close_reason)
+                await self._db.close_trade(
+                    trade_id, realized_pnl, close_reason=close_reason,
+                    exit_fee_usdc=(exit_fee if simulate_mode else None),
+                )
 
             sign = "+" if realized_pnl >= 0 else ""
             logger.info(
@@ -1146,3 +1334,8 @@ class PaperTrader:
     @property
     def infinite_balance(self) -> bool:
         return self._cfg.infinite_balance
+
+    @property
+    def cfg(self):
+        """Expose the per-engine trading config (read-only)."""
+        return self._cfg

@@ -502,8 +502,13 @@ trading:
   # timeouts close trades. The "balance" displayed is then cumulative
   # realized PnL (gain). Position-side caps (max_open / max_unique /
   # cold-cull / timeout / WIN / LOSS) still apply.
-  infinite_balance: true
-  mode: "paper"
+  infinite_balance: false
+  mode: "simulate"
+  # ── Simulate mode (4h soak, 2026-05-18) ────────────────────────────
+  # 17 active variants × $50 each = $850 total bankroll. AI calls
+  # pause automatically when no variant has free capital (plan §3).
+  simulate_total_usdc: 850.0
+  simulate_min_trade_usdc: 1.0
   # Soft rail-skip: reject trades when the entry-side mid is within this
   # distance of 0/1. 6h backtest: 99% of p≥0.95 entries were no_signal — the
   # market is pinned and the headline can't move it. Per-engine override

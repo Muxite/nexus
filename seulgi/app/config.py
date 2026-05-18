@@ -190,6 +190,74 @@ class TradingConfig:
     # costs and lets the bot accumulate tiny "edges" that don't exist net.
     # Per-engine override allowed.
     spread_cost_bps: float = 20.0
+    # ── Simulate mode (§1, §7) ────────────────────────────────────────
+    # When `mode == "simulate"`, Seulgi pretends it has a tiny real
+    # bankroll (simulate_total_usdc), splits it evenly across active
+    # engines, models Polymarket fees + slippage + share quantization,
+    # and pauses LLM calls when no engine has free capital to act on.
+    # See docs in plan §1 and §7.
+    simulate_total_usdc: float = 50.0
+    simulate_min_trade_usdc: float = 1.0
+    simulate_fees: "SimulateFeesConfig" = field(default_factory=lambda: SimulateFeesConfig())
+    simulate_slippage: "SimulateSlippageConfig" = field(default_factory=lambda: SimulateSlippageConfig())
+    simulate_sizing: "SimulateSizingConfig" = field(default_factory=lambda: SimulateSizingConfig())
+
+    def is_simulate(self) -> bool:
+        return self.mode == "simulate"
+
+
+@dataclass
+class SimulateFeesConfig:
+    """Polymarket dynamic taker-fee model.
+
+    Fee = max(min_fee_usdc, shares × rate × p × (1-p))
+    rate is looked up by market_type (from markets.market_type column).
+    """
+    enabled: bool = True
+    default_rate: float = 0.04        # politics/finance/tech default
+    category_rates: dict = field(default_factory=lambda: {
+        "crypto":      0.072,
+        "crypto_price": 0.072,
+        "economics":   0.05,
+        "weather":     0.05,
+        "sports":      0.03,
+        "geopolitics": 0.00,
+        "political":   0.04,
+        "politics":    0.04,
+        "finance":     0.04,
+        "tech":        0.04,
+        "event":       0.04,
+        "entertainment": 0.05,
+        "price_threshold": 0.04,
+    })
+    min_fee_usdc: float = 0.00001
+    # Informational only — we always take. Recorded in audit reports for
+    # operators considering a maker strategy.
+    maker_rebate_crypto: float = 0.20
+    maker_rebate_other:  float = 0.25
+
+
+@dataclass
+class SimulateSlippageConfig:
+    """Deterministic local approximation of order-book walk."""
+    enabled: bool = True
+    bps_per_dollar: float = 2.0       # entry walks 2 bps for every $1 notional
+    max_price_move: float = 0.02      # cap so micro-cap markets stay sane
+    disable_below_usdc: float = 5.0   # microtrades — assume top-of-book fill
+    disable_for_categories: list = field(default_factory=lambda: ["geopolitics"])
+
+
+@dataclass
+class SimulateSizingConfig:
+    """Kelly-based stake sizing for simulate mode.
+
+    method == "fractional_kelly" → stake = bankroll × kelly_fraction × f*
+    method == "fixed"            → legacy (min(max_position, balance))
+    """
+    method: str = "fractional_kelly"
+    kelly_fraction: float = 0.25
+    max_bankroll_pct: float = 0.05
+    min_stake_usdc: float = 1.0
 
 
 @dataclass
@@ -523,6 +591,11 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=float(t.get("stop_loss_pct", 0.0)),
             min_entry_yes_mid=float(t.get("min_entry_yes_mid", 0.0)),
             max_market_vol_30m=float(t.get("max_market_vol_30m", 0.0)),
+            simulate_total_usdc=float(t.get("simulate_total_usdc", 50.0)),
+            simulate_min_trade_usdc=float(t.get("simulate_min_trade_usdc", 1.0)),
+            simulate_fees=_load_simulate_fees(t.get("simulate_fees") or t.get("simulate", {}).get("fee_model")),
+            simulate_slippage=_load_simulate_slippage(t.get("simulate_slippage") or t.get("simulate", {}).get("slippage")),
+            simulate_sizing=_load_simulate_sizing(t.get("simulate_sizing") or t.get("simulate", {}).get("sizing")),
         ),
         db=DBConfig(path=str(d.get("path", "/data/seulgi.db"))),
         dashboard=DashboardConfig(
@@ -536,6 +609,47 @@ def _build_config(raw: dict) -> Config:
             interval_secs=float(raw.get("plotter", {}).get("interval_secs", 600.0)),
         ),
         log_level=str(raw.get("log_level", "INFO")),
+    )
+
+
+def _load_simulate_fees(raw: Optional[dict]) -> SimulateFeesConfig:
+    if not raw:
+        return SimulateFeesConfig()
+    base = SimulateFeesConfig()
+    rates = dict(base.category_rates)
+    rates.update(raw.get("category_rates") or {})
+    return SimulateFeesConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        default_rate=float(raw.get("default_rate", base.default_rate)),
+        category_rates=rates,
+        min_fee_usdc=float(raw.get("min_fee_usdc", base.min_fee_usdc)),
+        maker_rebate_crypto=float(raw.get("maker_rebate_crypto", base.maker_rebate_crypto)),
+        maker_rebate_other=float(raw.get("maker_rebate_other", base.maker_rebate_other)),
+    )
+
+
+def _load_simulate_slippage(raw: Optional[dict]) -> SimulateSlippageConfig:
+    if not raw:
+        return SimulateSlippageConfig()
+    base = SimulateSlippageConfig()
+    return SimulateSlippageConfig(
+        enabled=bool(raw.get("enabled", base.enabled)),
+        bps_per_dollar=float(raw.get("bps_per_dollar", base.bps_per_dollar)),
+        max_price_move=float(raw.get("max_price_move", base.max_price_move)),
+        disable_below_usdc=float(raw.get("disable_below_usdc", base.disable_below_usdc)),
+        disable_for_categories=list(raw.get("disable_for_categories", base.disable_for_categories)),
+    )
+
+
+def _load_simulate_sizing(raw: Optional[dict]) -> SimulateSizingConfig:
+    if not raw:
+        return SimulateSizingConfig()
+    base = SimulateSizingConfig()
+    return SimulateSizingConfig(
+        method=str(raw.get("method", base.method)),
+        kelly_fraction=float(raw.get("kelly_fraction", base.kelly_fraction)),
+        max_bankroll_pct=float(raw.get("max_bankroll_pct", base.max_bankroll_pct)),
+        min_stake_usdc=float(raw.get("min_stake_usdc", base.min_stake_usdc)),
     )
 
 

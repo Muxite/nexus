@@ -132,6 +132,41 @@ class EngineRunner:
         # across all engines/variants. The aggregator only runs every ~10m.
         self._lesson_notes: list[str] = []
         self._lesson_cache_until: float = 0.0
+        # plan §3 — simulate mode: pause LLM calls when no engine has free
+        # capital. Determined from the engines' cfg.is_simulate() (engines all
+        # share the same global trading mode in main.py).
+        self._simulate_mode: bool = bool(
+            engines and getattr(engines[0].trader.cfg, "mode", "paper") == "simulate"
+        )
+        self._ai_paused: bool = False
+
+    def _ai_should_pause(self) -> bool:
+        """plan §3 — every active simulate engine is fully staked? Skip the LLM."""
+        if not self._simulate_mode:
+            return False
+        for e in self._engines:
+            cfg = e.trader.cfg
+            if e.trader.balance >= cfg.min_trade_usdc:
+                return False
+        return True
+
+    def _update_ai_pause_state(self) -> bool:
+        """Recompute the pause flag, log on edges, notify dashboard. Returns paused."""
+        paused = self._ai_should_pause()
+        if paused != self._ai_paused:
+            self._ai_paused = paused
+            logger.info(
+                "[runner] simulate AI %s — global free=%.2f across %d engines",
+                "paused (no free capital)" if paused else "resumed",
+                sum(e.trader.balance for e in self._engines),
+                len(self._engines),
+            )
+            if self._dashboard is not None:
+                try:
+                    self._dashboard.set_ai_paused(paused)
+                except Exception:  # noqa: BLE001
+                    pass
+        return paused
 
     async def _get_lesson_notes_cached(self) -> list[str]:
         from time import monotonic
@@ -399,6 +434,25 @@ class EngineRunner:
 
         classify_results: list[ClassifyResult] = []
         prompt_meta: dict = {}
+        # plan §3 — simulate mode: short-circuit if every engine is fully
+        # staked. No LLM call, but persist skip rows per engine × match so
+        # the decision funnel still sees the headline.
+        if survivors and self._update_ai_pause_state():
+            logger.info(
+                "[runner] [hid=%s] ai_paused_no_capital short-circuit — "
+                "%d variants × %d matches skipped",
+                hid, len(self._engines), len(survivors),
+            )
+            await asyncio.gather(
+                *[
+                    engine.trader.evaluate_ai_paused_skips(
+                        signal_id, headline, survivors,
+                    )
+                    for engine in self._engines
+                ],
+                return_exceptions=True,
+            )
+            return
         if survivors:
             classify_results, prompt_meta = await self._classifier.classify_batch(
                 headline=headline.headline,

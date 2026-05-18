@@ -56,8 +56,21 @@ def validate(cfg) -> list[str]:
             f"trading.max_position_usdc ({t.max_position_usdc}) cannot exceed "
             f"balance_usdc ({t.balance_usdc}) outside infinite_balance mode"
         )
-    if t.mode not in ("paper", "live"):
-        errs.append(f"trading.mode: expected 'paper'|'live', got {t.mode!r}")
+    if t.mode not in ("paper", "live", "simulate", "infinite"):
+        errs.append(f"trading.mode: expected 'paper'|'live'|'simulate'|'infinite', got {t.mode!r}")
+    if t.is_simulate():
+        if t.infinite_balance:
+            errs.append("trading.mode='simulate' is mutually exclusive with infinite_balance=true")
+        errs += _check("trading.simulate_total_usdc", t.simulate_total_usdc, gt=0)
+        errs += _check("trading.simulate_min_trade_usdc", t.simulate_min_trade_usdc, gt=0)
+        s = t.simulate_sizing
+        if s.method not in ("fractional_kelly", "fixed"):
+            errs.append(
+                f"trading.simulate_sizing.method: expected 'fractional_kelly'|'fixed', got {s.method!r}"
+            )
+        errs += _check("trading.simulate_sizing.kelly_fraction", s.kelly_fraction, gt=0, le=1)
+        errs += _check("trading.simulate_sizing.max_bankroll_pct", s.max_bankroll_pct, gt=0, le=1)
+        errs += _check("trading.simulate_sizing.min_stake_usdc", s.min_stake_usdc, gt=0)
 
     # ── AI ─────────────────────────────────────────────────────────────────
     a = cfg.ai

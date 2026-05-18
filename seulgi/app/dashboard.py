@@ -195,6 +195,14 @@ class Dashboard:
         # Per-engine totals: engine_name → total_staked
         self._engine_staked: dict[str, float] = {}
         self._infinite_balance: bool = False
+        # plan §1: three modes — "paper" | "infinite" | "simulate"
+        self._mode: str = "paper"
+        # plan §3: True while LLM is paused because no engine has free capital
+        self._ai_paused: bool = False
+        self._ai_paused_since: Optional[str] = None
+        # plan §2: starting bankroll for simulate mode (recorded so the
+        # dashboard can show "free + staked + realized = total" reconciliation)
+        self._simulate_total_usdc: float = 0.0
 
         self._flush_now = asyncio.Event()
 
@@ -392,6 +400,25 @@ class Dashboard:
 
     def set_infinite_balance(self, infinite: bool) -> None:
         self._infinite_balance = infinite
+        if infinite and self._mode == "paper":
+            self._mode = "infinite"
+
+    def set_mode(self, mode: str) -> None:
+        """plan §1: 'paper' | 'infinite' | 'simulate' (live not rendered yet)."""
+        if mode not in ("paper", "infinite", "simulate", "live"):
+            return
+        self._mode = mode
+        self._infinite_balance = (mode == "infinite")
+
+    def set_simulate_total(self, total_usdc: float) -> None:
+        self._simulate_total_usdc = float(total_usdc)
+
+    def set_ai_paused(self, paused: bool) -> None:
+        """plan §3 — runner toggles this when LLM is suspended for cost discipline."""
+        if paused == self._ai_paused:
+            return
+        self._ai_paused = paused
+        self._ai_paused_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
     def set_market_index(self, count: int) -> None:
         self._market_count = count
@@ -471,7 +498,12 @@ class Dashboard:
 
         total_balance = sum(self._engine_balances.values()) if self._engine_balances else 0.0
         total_staked = sum(self._engine_staked.values()) if self._engine_staked else 0.0
-        mode_label = "INFINITE MODE — gain tracked vs staked" if self._infinite_balance else "PAPER TRADING"
+        if self._mode == "simulate":
+            mode_label = "SIMULATE MODE — micro-bankroll, live capital tracking"
+        elif self._mode == "infinite" or self._infinite_balance:
+            mode_label = "INFINITE MODE — gain tracked vs staked"
+        else:
+            mode_label = "PAPER TRADING"
         lines = [
             "╔══════════════════════════════════════════════════════════════╗",
             "║                    SEULGI  DASHBOARD                        ║",
@@ -495,7 +527,52 @@ class Dashboard:
         # Widen name column to fit the longest engine name (min 14).
         name_w = max(14, *(len(n) for n in engine_names)) if engine_names else 14
 
-        if self._infinite_balance:
+        if self._mode == "simulate":
+            # plan §4 — micro-bankroll, AI pause status, per-engine free/staked.
+            # Bankroll Δ = (free + staked) − starting. Differs from Σ closed
+            # realized_pnl by entry/exit fees already paid on still-open
+            # positions, so audit cross-checks must compare the right number.
+            bankroll_delta = (total_balance + total_staked) - self._simulate_total_usdc
+            lines.append(
+                f"  Starting bankroll   : ${self._simulate_total_usdc:>10.2f} USDC"
+            )
+            lines.append(f"  Total free          : ${total_balance:>10.2f} USDC")
+            lines.append(f"  Total staked        : ${total_staked:>10.2f} USDC")
+            bd_sign = "+" if bankroll_delta >= 0 else "-"
+            lines.append(
+                f"  Bankroll Δ vs start : {bd_sign}${abs(bankroll_delta):>10.2f} USDC"
+            )
+            sr_sign = "+" if self._total_realized_pnl >= 0 else "-"
+            lines.append(
+                f"  Realized PnL (sess) : {sr_sign}${abs(self._total_realized_pnl):>10.2f} USDC"
+            )
+            realized = bankroll_delta  # used below for conservation print
+            ai_status = "PAUSED (no free capital)" if self._ai_paused else "ACTIVE"
+            since = f"  since {self._ai_paused_since}" if (self._ai_paused and self._ai_paused_since) else ""
+            lines.append(f"  AI status           : {ai_status}{since}")
+            # Conservation check — surfaced on the dashboard itself so a
+            # mis-accounting bug shows up immediately.
+            conserv = total_balance + total_staked - self._simulate_total_usdc - realized
+            if abs(conserv) > 0.01 and self._simulate_total_usdc > 0:
+                lines.append(
+                    f"  ⚠ CONSERVATION OFF  : free+staked-start-realized = {conserv:+.4f}"
+                )
+            lines.append("")
+            lines.append(
+                f"  {'ENGINE':<{name_w}}  {'FREE':>10}  {'STAKED':>10}  "
+                f"{'OPEN':>5}  {'UNREALIZED':>11}"
+            )
+            lines.append("  " + "─" * (name_w + 2 + 10 + 2 + 10 + 2 + 5 + 2 + 11))
+            for eng_name in engine_names:
+                free = self._engine_balances.get(eng_name, 0.0)
+                staked = self._engine_staked.get(eng_name, 0.0)
+                unreal = per_engine_unreal.get(eng_name, 0.0)
+                eng_open = per_engine_open.get(eng_name, 0)
+                lines.append(
+                    f"  {eng_name:<{name_w}}  {free:>10.2f}  {staked:>10.2f}  "
+                    f"{eng_open:>5d}  {unreal:>+11.2f}"
+                )
+        elif self._infinite_balance:
             tb_sign = "+" if total_balance >= 0 else "-"
             roi = (total_balance / total_staked * 100.0) if total_staked > 0 else 0.0
             lines.append(f"  Total realized gain : {tb_sign}${abs(total_balance):>10.2f} USDC")
