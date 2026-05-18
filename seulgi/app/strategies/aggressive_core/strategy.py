@@ -143,9 +143,23 @@ class CoreStrategy:
         # Direction & price selection — uses YES side by default, flips token if NO.
         direction = getattr(result, "direction", None)
         direction_str = direction.value if hasattr(direction, "value") else str(direction)
+        confidence = float(getattr(result, "confidence", 0.0))
+        # invert_high_conf: shadow rule that flips direction when AI confidence
+        # exceeds threshold (originated as the inverted_highconf engine — the
+        # cycle-6 finding that high-conf calls were anti-informative).
+        if cfg.invert_high_conf and confidence >= cfg.invert_conf_threshold:
+            if direction_str == "YES":
+                direction_str = "NO"
+            elif direction_str == "NO":
+                direction_str = "YES"
         token_id = match.token_yes if direction_str == "YES" else match.token_no
         quoted_price = match.mid_yes if direction_str == "YES" else match.mid_no
         if not token_id or quoted_price is None:
+            return
+        # _hi65 / _hi75 variants: only enter when YES-side mid clears a floor
+        # (biases toward the 0.65–0.90 entry bucket which was the only
+        # consistently-profitable slice in the cycle-9 win/loss report).
+        if cfg.min_entry_yes_mid > 0 and (match.mid_yes or 0.0) < cfg.min_entry_yes_mid:
             return
 
         signed_edge = float(getattr(result, "p_alpha", 0.0)) - float(quoted_price)

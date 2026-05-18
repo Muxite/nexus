@@ -26,6 +26,7 @@ from .observability import EventBus
 from .paper_trader import PaperTrader
 from .strategy import CoreStrategy
 from .trader_base import Trader
+from .variants import VARIANT_CONFIGS
 
 logger = logging.getLogger(__name__)
 
@@ -77,3 +78,49 @@ def maybe_append(engines: list, *, db: SeulgiDB,
     engines.append(engine)
     logger.info("[aggressive_core] registered engine (mode=%s)", strategy._cfg.mode)
     return strategy, bus
+
+
+def build_all_variants(
+    *,
+    db: SeulgiDB,
+    events_dir: Optional[Path] = None,
+) -> tuple[list, list[CoreStrategy], EventBus]:
+    """Build one (Engine, CoreStrategy) per VARIANT_CONFIGS entry — every
+    surviving legacy variant runs through the new friction-aware pipeline.
+
+    All variants share a single EventBus so the dashboard sees one
+    unified event stream. Each variant gets its own PaperTrader instance
+    (= its own $50 bankroll, its own cash bookkeeping).
+
+    Returns (engines, strategies, bus). Strategies list lets the menu CLI
+    inspect per-variant balance without going through EngineRunner.
+    """
+    ndjson_path = (events_dir or Path("/data/dashboard")) / "events.ndjson"
+    bus = EventBus(ndjson_path=ndjson_path)
+    engines: list = []
+    strategies: list[CoreStrategy] = []
+    for cfg in VARIANT_CONFIGS:
+        # Honour SEULGI_LIVE at boot — but in practice multi-variant is
+        # paper-only; flipping a 17-variant fan-out to live is not the
+        # intended use of LiveTrader.
+        cfg_live = replace_mode(cfg)
+        trader = _build_trader(cfg=cfg_live, db=db, bus=bus)
+        strategy = CoreStrategy(cfg=cfg_live, db=db, trader=trader, bus=bus)
+        engines.append(Engine(name=cfg_live.engine_name, trader=strategy))
+        strategies.append(strategy)
+        bus.emit(
+            engine_name=cfg_live.engine_name, phase="boot", name="built",
+            payload={"mode": cfg_live.mode, "trader": trader.name,
+                     **cfg_live.derived()},
+        )
+    logger.info("[aggressive_core] built %d variants via CoreStrategy pipeline",
+                len(strategies))
+    return engines, strategies, bus
+
+
+def replace_mode(cfg: CoreConfig) -> CoreConfig:
+    """Apply SEULGI_LIVE env at construction time without mutating the
+    catalog instances (which would persist across boots in tests)."""
+    from dataclasses import replace
+    mode = "live" if os.getenv("SEULGI_LIVE") == "1" else "paper"
+    return replace(cfg, mode=mode)

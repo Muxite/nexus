@@ -691,6 +691,20 @@ def build_engines(
     if os.getenv("LEGACY_ENGINES_DISABLE") == "1":
         logger.info("[engine] LEGACY_ENGINES_DISABLE=1 — skipping all YAML-declared engines/variants")
         engine_cfgs = []
+    # Multi-variant CoreStrategy pipeline: every surviving variant runs
+    # through the friction-aware framework. Mutually exclusive with the
+    # legacy fan-out and the single-strategy AGGRESSIVE_CORE_ENABLE path.
+    if os.getenv("MULTI_CORE_ENABLE") == "1":
+        try:
+            try:
+                from strategies.aggressive_core.factory import build_all_variants  # container
+            except ImportError:
+                from app.strategies.aggressive_core.factory import build_all_variants  # type: ignore[no-redef]
+            multi_engines, _strats, _bus = build_all_variants(db=db)
+            logger.info("[engine] MULTI_CORE_ENABLE=1 — built %d CoreStrategy variants", len(multi_engines))
+            return multi_engines
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[engine] MULTI_CORE_ENABLE failed: %s — falling back to YAML engines", exc)
     for ec in engine_cfgs:
         base_trading = _merge_trading_cfg(cfg.trading, ec)
         base_ai = _merge_ai_cfg(cfg.ai, ec)
