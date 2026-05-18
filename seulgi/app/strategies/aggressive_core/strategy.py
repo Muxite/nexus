@@ -86,6 +86,20 @@ class CoreStrategy:
     # Compatibility surface for the legacy EngineRunner
     # ------------------------------------------------------------------
 
+    async def init_from_db(self) -> None:
+        """Legacy EngineRunner hook — restore paper cash from DB so a restart
+        doesn't double-spend on open positions."""
+        restore = getattr(self._trader, "restore_balance_from_db", None)
+        if restore is not None:
+            await restore()
+        # Also refresh total_staked from open commitments
+        try:
+            self._total_staked = await self._db.get_committed_usdc(
+                engine_name=self._cfg.engine_name,
+            )
+        except Exception:
+            self._total_staked = 0.0
+
     @property
     def balance(self) -> float:
         return getattr(self._trader, "cash", 0.0)

@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Optional
@@ -687,6 +688,9 @@ def build_engines(
         )]
 
     engines: list[Engine] = []
+    if os.getenv("LEGACY_ENGINES_DISABLE") == "1":
+        logger.info("[engine] LEGACY_ENGINES_DISABLE=1 — skipping all YAML-declared engines/variants")
+        engine_cfgs = []
     for ec in engine_cfgs:
         base_trading = _merge_trading_cfg(cfg.trading, ec)
         base_ai = _merge_ai_cfg(cfg.ai, ec)
