@@ -20,10 +20,24 @@ meaningful in the old infinite-balance regime.
 """
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import replace
+from pathlib import Path
 from typing import Iterable
 
 from .config import CoreConfig
+
+logger = logging.getLogger(__name__)
+
+# Operator-editable allow-list. One variant name per line; lines starting
+# with `#` are comments. Empty / missing file → all variants run (default).
+# Container path is /data/active_variants.txt; host path is
+# seulgi/data/active_variants.txt (the same file via the data volume mount).
+ACTIVE_FILE_PATHS = [
+    Path("/data/active_variants.txt"),                       # container
+    Path(__file__).resolve().parents[3] / "data" / "active_variants.txt",  # host
+]
 
 
 def _base() -> CoreConfig:
@@ -139,3 +153,42 @@ VARIANT_CONFIGS: list[CoreConfig] = [
 
 def all_variants() -> Iterable[CoreConfig]:
     return iter(VARIANT_CONFIGS)
+
+
+def _read_active_names() -> set[str] | None:
+    """Read the operator allow-list. Returns a set of engine_name strings,
+    or None if no file is present / no uncommented entries (= all enabled)."""
+    for path in ACTIVE_FILE_PATHS:
+        if not path.exists():
+            continue
+        names: set[str] = set()
+        for raw in path.read_text().splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if line:
+                names.add(line)
+        if names:
+            logger.info("[variants] active filter from %s: %d variant(s)", path, len(names))
+            return names
+        logger.info("[variants] active filter at %s is empty — running all variants", path)
+        return None
+    return None
+
+
+def load_active_variants() -> list[CoreConfig]:
+    """Return the variant configs the operator has enabled. Defaults to
+    the full catalog when no allow-list is configured."""
+    active = _read_active_names()
+    if active is None:
+        return list(VARIANT_CONFIGS)
+    selected = [c for c in VARIANT_CONFIGS if c.engine_name in active]
+    # Surface typos: any name in the file that doesn't match a known variant.
+    unknown = active - {c.engine_name for c in VARIANT_CONFIGS}
+    if unknown:
+        logger.warning("[variants] active file lists unknown variant(s): %s", sorted(unknown))
+    logger.info("[variants] %d/%d variants selected by allow-list",
+                len(selected), len(VARIANT_CONFIGS))
+    return selected
+
+
+def all_variant_names() -> list[str]:
+    return [c.engine_name for c in VARIANT_CONFIGS]

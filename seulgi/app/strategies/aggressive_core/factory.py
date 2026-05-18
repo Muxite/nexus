@@ -26,7 +26,7 @@ from .observability import EventBus
 from .paper_trader import PaperTrader
 from .strategy import CoreStrategy
 from .trader_base import Trader
-from .variants import VARIANT_CONFIGS
+from .variants import load_active_variants
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,8 @@ def build_all_variants(
     bus = EventBus(ndjson_path=ndjson_path)
     engines: list = []
     strategies: list[CoreStrategy] = []
-    for cfg in VARIANT_CONFIGS:
+    selected = load_active_variants()
+    for cfg in selected:
         # Honour SEULGI_LIVE at boot — but in practice multi-variant is
         # paper-only; flipping a 17-variant fan-out to live is not the
         # intended use of LiveTrader.

@@ -251,6 +251,69 @@ def fresh_cycle_50() -> int:
 # Main loop
 # ---------------------------------------------------------------------------
 
+def pick_variants() -> int:
+    """Interactive allow-list editor for the multi-variant pipeline.
+
+    Reads / writes seulgi/data/active_variants.txt. When the file lists
+    one or more variants, only those run; missing or empty file = all run.
+    Restart the container to apply changes."""
+    sys.path.insert(0, str(REPO / "app"))
+    try:
+        from strategies.aggressive_core.variants import (  # type: ignore[import-not-found]
+            ACTIVE_FILE_PATHS, all_variant_names, _read_active_names,
+        )
+    except ImportError:
+        print("!! could not import variants module (run from seulgi/ root)")
+        return 1
+    # Host-side file is the second entry (the first is the container path)
+    path = ACTIVE_FILE_PATHS[1]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    names = all_variant_names()
+    active = _read_active_names() or set(names)  # None = all on
+    while True:
+        print()
+        print(_hr("─"))
+        print(f"  Active variants — edit {path}")
+        print(_hr("─"))
+        for i, n in enumerate(names, 1):
+            mark = "[x]" if n in active else "[ ]"
+            print(f"  {mark} {i:>2}. {n}")
+        print(_hr("─"))
+        print(f"  {len(active)}/{len(names)} enabled")
+        raw = _ask("toggle #s (e.g. '3 5 7'), 'a'=all, 'n'=none, 's'=save & exit, 'q'=cancel")
+        cmd = raw.strip().lower()
+        if cmd in ("q", "quit", "exit"):
+            print("(cancelled, no changes written)")
+            return 0
+        if cmd == "a":
+            active = set(names); continue
+        if cmd == "n":
+            active = set(); continue
+        if cmd == "s":
+            lines = [
+                "# seulgi active-variants allow-list",
+                "# One engine_name per line. '#' starts a comment.",
+                "# Empty file (or no uncommented entries) = all variants run.",
+                "# Edit then restart the container to apply.",
+                "",
+            ]
+            for n in names:
+                lines.append(n if n in active else f"# {n}")
+            path.write_text("\n".join(lines) + "\n")
+            print(f"saved {len(active)}/{len(names)} variants to {path}")
+            print("→ restart the container to apply (menu option 1).")
+            return 0
+        # parse toggle list
+        try:
+            for tok in cmd.split():
+                idx = int(tok)
+                if 1 <= idx <= len(names):
+                    n = names[idx - 1]
+                    active.symmetric_difference_update({n})
+        except ValueError:
+            print(f"(unrecognized: {raw!r})")
+
+
 ACTIONS: list[tuple[str, str, callable]] = [
     ("1", "Start runner (paper, all engines + aggressive_core)", start_runner_all),
     ("2", "Start runner (paper, aggressive_core ONLY)",          start_runner_core_only),
@@ -261,6 +324,7 @@ ACTIONS: list[tuple[str, str, callable]] = [
     ("7", "Analysis …",                                           analysis_menu),
     ("8", "Tests …",                                              tests_menu),
     ("9", "Tail live events",                                     tail_logs),
+    ("V", "Pick active variants (multi-core allow-list)",         pick_variants),
     ("R", "Reset & start fresh $50 cycle (reinvestment ON)",      fresh_cycle_50),
     ("0", "Quit",                                                 lambda: None),
 ]
