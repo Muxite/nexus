@@ -192,6 +192,7 @@ class CoreStrategy:
             market_closed=market_closed,
             daily_ai_spend_usd=self.daily_ai_spend_usd,
             watcher_degraded_fraction=self.watcher_degraded_fraction,
+            freshness_label=getattr(headline, "_freshness_label", None),
         )
         guard_result = await run_cascade(self._guards, ctx)
         if not guard_result.passed:

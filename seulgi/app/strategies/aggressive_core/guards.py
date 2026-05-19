@@ -60,6 +60,7 @@ class GuardContext:
     market_closed: bool = False
     daily_ai_spend_usd: float = 0.0
     watcher_degraded_fraction: float = 0.0
+    freshness_label: Optional[str] = None
     trace: list = field(default_factory=list)
 
     def record(self, step: str, *, passed: bool, **payload) -> None:
@@ -91,6 +92,19 @@ class DirectionGuard:
             return GuardResult(False, f"low_confidence:{ctx.confidence:.2f}")
         if ctx.agreement and ctx.agreement < ctx.cfg.min_agreement:
             return GuardResult(False, f"low_agreement:{ctx.agreement:.2f}")
+        return GuardResult(True)
+
+
+class FreshnessGuard:
+    """Skip headlines whose freshness label is not in cfg.allowed_freshness_labels.
+    None on the cfg disables the gate; tuple = explicit allow-list."""
+    name = "freshness_label"
+    async def check(self, ctx: GuardContext) -> GuardResult:
+        allowed = ctx.cfg.allowed_freshness_labels
+        if not allowed:
+            return GuardResult(True)
+        if ctx.freshness_label not in allowed:
+            return GuardResult(False, f"freshness_label:{ctx.freshness_label or 'NONE'}")
         return GuardResult(True)
 
 
@@ -287,6 +301,7 @@ class WatcherHealthGuard:
 
 DEFAULT_GUARDS: list[Guard] = [
     DirectionGuard(),
+    FreshnessGuard(),
     MarketClosedGuard(),
     HardRailGuard(),
     SoftRailGuard(),

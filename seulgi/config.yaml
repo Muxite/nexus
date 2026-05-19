@@ -483,7 +483,7 @@ relevance:
   temperature: 0.1
   keep_scores: ["STRONG_YES", "YES"]
   max_tokens_per_market: 60
-  min_top_similarity: 0.45
+  min_top_similarity: 0.0
 
 # ── Paper trading ────────────────────────────────────────────────────────────
 trading:
@@ -534,38 +534,13 @@ trading:
 # confidence gates, TP/SL pairs, and invert flips cheaply; see
 # data/dashboard/variant_compare.txt for the live leaderboard.
 engines:
-  - name: "aggressive"
-    min_edge: 0.005           # fire on almost any positive edge
-    edge_increment: 0.20
-    max_position_usdc: 150.0
-    min_confidence: 0.25      # fires at conf ≥ 0.51 (edge = 0.20 × 0.02 > 0.005)
-    max_open_positions: 30
-    # Technical exits — micro-wins, recycle slots fast.
-    take_profit:      0.005   # close at +0.5¢ MTM
-    stop_loss:        0.015   # cut at -1.5¢ MTM
-    trailing_stop:    0.003   # after being in profit, lock in if 0.3¢ off the peak
-    min_hold_seconds: 60
-    # Aggressive harvests noise via TP=0.5¢ and was profitable in the 6h run
-    # despite IC<0; preserve its behaviour as a regression check by opting
-    # out of the rail-skip filter.
-    rail_skip_threshold: 0.0
-    variants:
-      # ── Cycle-10: report.md showed 5 aggressive variants closed at the
-      # IDENTICAL −$20.32 because their guards didn't gate the loss-producing
-      # sub-25¢ entries. Retired conf25_tp003_sl010, conf40_tp005_sl015,
-      # conf25_tp005_sl015_inv75, conf00_tp005_sl015_e002. Slots reused for
-      # variants that actually cleave the entry distribution.
-      - name: "conf25_tp005_sl015"          # control — matches parent
-      - name: "conf25_tp010_sl020"          # let winners run
-        take_profit:   0.010
-        stop_loss:     0.020
-        trailing_stop: 0.005
-      - name: "conf25_tp005_sl015_norail"   # NEW: refuse sub-25¢ entries
-        rail_skip_threshold: 0.25
-      - name: "conf25_tp005_sl015_slpct10"  # NEW: price-relative SL floor (10% of entry)
-        stop_loss_pct: 0.10
-      - name: "conf25_tp005_sl015_lowvol"   # NEW (cycle-11): refuse high-vol markets
-        max_market_vol_30m: 0.02
+  # ── Aggressive engine retired 2026-05-19 ──────────────────────────────────
+  # All 5 surviving aggressive variants closed net-negative in the post-
+  # simulate-mode 5h soak (worst: _norail -1.08, base -0.74, _lowvol -0.62,
+  # _slpct10 -0.46, _tp010_sl020 -0.10). The cycle-3 "aggressive harvests
+  # volatility" thesis no longer holds under the friction-aware paper trader
+  # at the $50/engine micro-bankroll. Variant configs preserved in git
+  # history (a39b0c8) for revival if a future cycle finds the regime change.
 
   - name: "balanced"
     min_edge: 0.03
@@ -578,28 +553,19 @@ engines:
     trailing_stop:    0.010
     min_hold_seconds: 300
     variants:
-      # Retired 2026-05-17 (REPORT_VALIDATION):
-      #   conf40_tp020_sl030          n=26  ROI -1.89%
-      #   conf55_tp020_sl030          n=26  ROI -1.89%
-      #   conf70_tp020_sl030          n=37  ROI -1.19%  (CI upper 43%, anti-edge)
-      # Kept: _lowvol (watch-list, n=24 +15.11% ROI), _inv65 / _norail / _slpct10
-      # (still negative but inside the inverted/rail/SL-pct experiments).
-      - name: "conf40_tp010_sl020"          # tight exits
-        take_profit:   0.010
-        stop_loss:     0.020
-        trailing_stop: 0.005
+      # 2026-05-19 cut: kept only the 3 balanced variants with sum_pnl ≥ 0
+      # in the 5h post-simulate-mode soak. Retired in this pass:
+      #   conf40_tp010_sl020          -0.08
+      #   conf40_tp020_sl030_inv65    -0.27
+      #   conf40_tp020_sl030_norail   -0.17
+      # Earlier retirements (2026-05-17): conf40_tp020_sl030, _conf55, _conf70.
       - name: "conf40_tp030_sl050"          # wide exits
         take_profit:   0.030
         stop_loss:     0.050
         trailing_stop: 0.015
-      - name: "conf40_tp020_sl030_inv65"    # low-bar invert
-        invert_high_conf: true
-        invert_conf_threshold: 0.65
-      - name: "conf40_tp020_sl030_norail"   # NEW: refuse sub-25¢ entries
-        rail_skip_threshold: 0.25
-      - name: "conf40_tp020_sl030_slpct10"  # NEW: price-relative SL floor
+      - name: "conf40_tp020_sl030_slpct10"  # price-relative SL floor
         stop_loss_pct: 0.10
-      - name: "conf40_tp020_sl030_lowvol"   # NEW (cycle-11): refuse high-vol markets
+      - name: "conf40_tp020_sl030_lowvol"   # vol cap
         max_market_vol_30m: 0.02
 
   # conservative engine removed in cycle 4 — prior postmortem showed −$88.46 PnL
@@ -628,32 +594,17 @@ engines:
     # gives the shadow engine enough signal to actually execute trades.
     invert_conf_threshold: 0.75
     variants:
-      # Cycle-10: retired conf40_tp020_sl030_inv85 (zero closed trades, no
-      # signal). Added _norail and the two _hi-prefixed variants that bias
-      # toward the only consistently profitable slice from the win/loss
-      # report (entry mid 0.75-0.90 × direction=NO).
-      #
-      # Retired 2026-05-17 (REPORT_VALIDATION):
-      #   conf40_tp020_sl030_inv75            n=26  ROI -1.89%
-      #   conf55_tp020_sl030_inv75            n=26  ROI -1.89%
-      #   conf40_tp020_sl030_inv75_norail     n=34  ROI -0.45%
-      # Kept: _inv65, _hi65, _hi75, _lowvol (watch-list, high-ROI low-n)
-      # and conf40_tp010_sl020_inv75 (money-eligible, +0.81%).
-      - name: "conf40_tp020_sl030_inv65"
-        invert_conf_threshold: 0.65
-      - name: "conf40_tp010_sl020_inv75"    # tight exits
-        take_profit:   0.010
-        stop_loss:     0.020
-        trailing_stop: 0.005
-      - name: "conf40_tp030_sl050_inv75"    # wide exits
+      # 2026-05-19 cut: kept only the 2 inverted_highconf variants with
+      # sum_pnl ≥ 0 in the 5h post-simulate-mode soak. Retired in this pass:
+      #   conf40_tp020_sl030_inv65        -0.27
+      #   conf40_tp010_sl020_inv75        -0.08
+      #   conf40_tp020_sl030_inv75_hi75   -0.17
+      #   conf40_tp020_sl030_inv75_hi65   -0.07
+      - name: "conf40_tp030_sl050_inv75"        # wide exits
         take_profit:   0.030
         stop_loss:     0.050
         trailing_stop: 0.015
-      - name: "conf40_tp020_sl030_inv75_hi75"    # NEW: only high-priced markets
-        min_entry_yes_mid: 0.75
-      - name: "conf40_tp020_sl030_inv75_hi65"    # NEW: only 0.65+ entries
-        min_entry_yes_mid: 0.65
-      - name: "conf40_tp020_sl030_inv75_lowvol" # NEW (cycle-11): vol cap
+      - name: "conf40_tp020_sl030_inv75_lowvol" # vol cap
         max_market_vol_30m: 0.02
 
 # ── Database ─────────────────────────────────────────────────────────────────
@@ -684,7 +635,7 @@ news_memory:
   # added after the cycle-12 per-label win/loss report showed it cost
   # −$138.64 across 26 closed trades. Removing it from this list re-enables
   # the AI on STALE_RETURN headlines without a rebuild.
-  short_circuit_labels: ["REHASH", "STALE_RETURN"]
+  short_circuit_labels: []
 
 # ── Brave Search budget ──────────────────────────────────────────────────────
 # Shared across all Twitter watchers. Free tier = 2000/month (~67/day, ~3/hr).

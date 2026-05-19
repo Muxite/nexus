@@ -57,6 +57,9 @@ class CoreConfig:
     min_entry_yes_mid: float = 0.0
     invert_high_conf: bool = False
     invert_conf_threshold: float = 0.85
+    # Freshness-label allow-list; None = no filter, tuple = only these labels
+    # are eligible (e.g. ("EVOLVING",) skips BREAKING/REHASH/STALE_RETURN).
+    allowed_freshness_labels: tuple[str, ...] | None = None
 
     # ── Capital (tuned for ~$50 bankroll) ───────────────────────────────────
     bankroll_usdc: float = 50.0

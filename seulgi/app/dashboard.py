@@ -514,63 +514,93 @@ class Dashboard:
             "",
             f"── {mode_label} " + "─" * (66 - len(mode_label) - 5),
         ]
-        # Per-engine unrealized PnL & open-position count (computed once,
-        # reused below)
+        # Per-engine aggregates derived strictly from currently-open
+        # positions (cost basis + MTM). _engine_staked is cumulative-staked-
+        # ever and not safe to use here — it never decrements on close, which
+        # is what produced the phantom "+$177 with 0 closes" headline.
         per_engine_unreal: dict[str, float] = {}
         per_engine_open: dict[str, int] = {}
+        per_engine_cost: dict[str, float] = {}
+        per_engine_mtm: dict[str, float] = {}
         for p in self._open_positions:
             eng = p.engine_name or "default"
             per_engine_unreal[eng] = per_engine_unreal.get(eng, 0.0) + p.unrealized_pnl
             per_engine_open[eng] = per_engine_open.get(eng, 0) + 1
+            per_engine_cost[eng] = per_engine_cost.get(eng, 0.0) + p.size_usdc
+            per_engine_mtm[eng] = per_engine_mtm.get(eng, 0.0) + (p.size_usdc + p.unrealized_pnl)
+        open_cost_total = sum(per_engine_cost.values())
+        open_mtm_total = sum(per_engine_mtm.values())
 
         engine_names = sorted(set(self._engine_balances) | set(self._engine_staked))
         # Widen name column to fit the longest engine name (min 14).
         name_w = max(14, *(len(n) for n in engine_names)) if engine_names else 14
 
         if self._mode == "simulate":
-            # plan §4 — micro-bankroll, AI pause status, per-engine free/staked.
-            # Bankroll Δ = (free + staked) − starting. Differs from Σ closed
-            # realized_pnl by entry/exit fees already paid on still-open
-            # positions, so audit cross-checks must compare the right number.
-            bankroll_delta = (total_balance + total_staked) - self._simulate_total_usdc
+            # Honest accounting (post-bankroll-drift fix):
+            #   MTM total = free cash + Σ (open position cost + unrealized)
+            #   Net PnL   = realized (closed trades) + unrealized (open)
+            # Drift = MTM_total - start - Net PnL.  Non-zero drift = bug.
+            start = self._simulate_total_usdc
+            free_cash = total_balance                  # trader._cash sum (safe)
+            mtm_total = free_cash + open_mtm_total
+            unrealized = open_mtm_total - open_cost_total
+            net_pnl = self._total_realized_pnl + unrealized
+            n_open = len(self._open_positions)
+
+            lines.append(f"  Starting bankroll       : ${start:>10.2f} USDC")
+            lines.append(f"  Free cash               : ${free_cash:>10.2f} USDC")
             lines.append(
-                f"  Starting bankroll   : ${self._simulate_total_usdc:>10.2f} USDC"
+                f"  Open positions (cost)   : ${open_cost_total:>10.2f} USDC  (n={n_open})"
             )
-            lines.append(f"  Total free          : ${total_balance:>10.2f} USDC")
-            lines.append(f"  Total staked        : ${total_staked:>10.2f} USDC")
-            bd_sign = "+" if bankroll_delta >= 0 else "-"
+            lines.append(f"  Open positions (MTM)    : ${open_mtm_total:>10.2f} USDC")
+            mtm_delta = mtm_total - start
+            md_sign = "+" if mtm_delta >= 0 else "-"
             lines.append(
-                f"  Bankroll Δ vs start : {bd_sign}${abs(bankroll_delta):>10.2f} USDC"
+                f"  Mark-to-market total    : ${mtm_total:>10.2f} USDC  "
+                f"Δ vs start: {md_sign}${abs(mtm_delta):.2f}"
             )
-            sr_sign = "+" if self._total_realized_pnl >= 0 else "-"
+            lines.append("")
+            r_sign = "+" if self._total_realized_pnl >= 0 else "-"
             lines.append(
-                f"  Realized PnL (sess) : {sr_sign}${abs(self._total_realized_pnl):>10.2f} USDC"
+                f"  Realized PnL (closed)   : {r_sign}${abs(self._total_realized_pnl):>9.2f} USDC"
             )
-            realized = bankroll_delta  # used below for conservation print
+            u_sign = "+" if unrealized >= 0 else "-"
+            lines.append(
+                f"  Unrealized PnL (open)   : {u_sign}${abs(unrealized):>9.2f} USDC"
+            )
+            n_sign = "+" if net_pnl >= 0 else "-"
+            lines.append(
+                f"  Net PnL (real+unreal)   : {n_sign}${abs(net_pnl):>9.2f} USDC  "
+                f"← are we up?"
+            )
             ai_status = "PAUSED (no free capital)" if self._ai_paused else "ACTIVE"
             since = f"  since {self._ai_paused_since}" if (self._ai_paused and self._ai_paused_since) else ""
-            lines.append(f"  AI status           : {ai_status}{since}")
-            # Conservation check — surfaced on the dashboard itself so a
-            # mis-accounting bug shows up immediately.
-            conserv = total_balance + total_staked - self._simulate_total_usdc - realized
-            if abs(conserv) > 0.01 and self._simulate_total_usdc > 0:
+            lines.append(f"  AI status               : {ai_status}{since}")
+
+            # Drift = (money currently in system) - (start + net pnl).
+            # Should be ≈ 0 (modulo fees already paid on open positions).
+            # Anything bigger than a few cents indicates an accounting bug.
+            drift = mtm_total - start - net_pnl
+            if abs(drift) > 0.05 and start > 0:
                 lines.append(
-                    f"  ⚠ CONSERVATION OFF  : free+staked-start-realized = {conserv:+.4f}"
+                    f"  ⚠ ACCOUNTING DRIFT      : MTM-start-NetPnL = {drift:+.4f} USDC"
                 )
+
             lines.append("")
             lines.append(
-                f"  {'ENGINE':<{name_w}}  {'FREE':>10}  {'STAKED':>10}  "
-                f"{'OPEN':>5}  {'UNREALIZED':>11}"
+                f"  {'ENGINE':<{name_w}}  {'FREE':>10}  {'OPEN_COST':>10}  "
+                f"{'OPEN_MTM':>10}  {'OPEN':>5}  {'UNREAL':>9}"
             )
-            lines.append("  " + "─" * (name_w + 2 + 10 + 2 + 10 + 2 + 5 + 2 + 11))
+            lines.append("  " + "─" * (name_w + 2 + 10 + 2 + 10 + 2 + 10 + 2 + 5 + 2 + 9))
             for eng_name in engine_names:
                 free = self._engine_balances.get(eng_name, 0.0)
-                staked = self._engine_staked.get(eng_name, 0.0)
+                cost = per_engine_cost.get(eng_name, 0.0)
+                mtm = per_engine_mtm.get(eng_name, 0.0)
                 unreal = per_engine_unreal.get(eng_name, 0.0)
                 eng_open = per_engine_open.get(eng_name, 0)
                 lines.append(
-                    f"  {eng_name:<{name_w}}  {free:>10.2f}  {staked:>10.2f}  "
-                    f"{eng_open:>5d}  {unreal:>+11.2f}"
+                    f"  {eng_name:<{name_w}}  {free:>10.2f}  {cost:>10.2f}  "
+                    f"{mtm:>10.2f}  {eng_open:>5d}  {unreal:>+9.2f}"
                 )
         elif self._infinite_balance:
             tb_sign = "+" if total_balance >= 0 else "-"
