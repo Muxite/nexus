@@ -707,25 +707,49 @@ class Dashboard:
             else:
                 v_stats_view = list(v_stats)
 
-            lines += ["", "── VARIANT LEADERBOARD (active engines, by sum PnL) ─────────────"]
+            lines += ["", "── VARIANT LEADERBOARD (active engines, by ROI% on $100 pot) ────"]
             if not v_stats_view:
                 if self._active_variants and v_stats:
                     lines.append("  (no closed trades yet for the active engines)")
                 else:
                     lines.append("  (no executed trades yet)")
             else:
-                lines.append(
-                    f"  {'VARIANT':<34}  {'N':>5} {'WINS':>5} {'LOSS':>5}  "
-                    f"{'HIT%':>6}  {'SUM PnL':>9}"
+                # M5: ROI on per-engine $100 pot is the right scoring metric.
+                # Sort active leaderboard by it. Each engine has its own pot;
+                # sum_pnl / 100 IS its ROI (no cross-engine borrowing).
+                from datetime import datetime, timezone
+                now = datetime.now(timezone.utc)
+                v_stats_view = sorted(
+                    v_stats_view,
+                    key=lambda r: (r.get("sum_pnl") or 0) / 100.0,
+                    reverse=True,
                 )
-                lines.append("  " + "─" * 76)
-                for r in v_stats_view[:8]:
+                lines.append(
+                    f"  {'VARIANT':<34}  {'N':>4} {'HIT%':>5}  "
+                    f"{'PnL':>7} {'ROI%':>6}  {'HOLDmn':>6}  {'LASTtr':>7}"
+                )
+                lines.append("  " + "─" * 84)
+                for r in v_stats_view[:14]:
                     closed = (r.get("n_wins") or 0) + (r.get("n_losses") or 0)
                     hit = (r["n_wins"] / closed * 100.0) if closed else 0.0
+                    pnl = r.get("sum_pnl") or 0.0
+                    roi_pot = (pnl / 100.0) * 100.0   # % on $100 pot
+                    avg_hold_min = (r.get("avg_hold_seconds") or 0) / 60.0
+                    last_at = r.get("last_trade_at")
+                    if last_at:
+                        try:
+                            t = datetime.fromisoformat(last_at.replace("Z", "+00:00"))
+                            mins = (now - t).total_seconds() / 60.0
+                            last_str = (f"{mins:.0f}m" if mins < 90
+                                        else f"{mins / 60:.1f}h")
+                        except Exception:  # noqa: BLE001
+                            last_str = "?"
+                    else:
+                        last_str = "—"
                     lines.append(
-                        f"  {(r['variant'] or '?')[:34]:<34}  {r['n_trades']:>5} "
-                        f"{r['n_wins']:>5} {r['n_losses']:>5}  "
-                        f"{hit:>5.1f}%  {r['sum_pnl']:>+9.2f}"
+                        f"  {(r['variant'] or '?')[:34]:<34}  {r['n_trades']:>4} "
+                        f"{hit:>4.1f}%  {pnl:>+7.2f} {roi_pot:>+5.2f}%  "
+                        f"{avg_hold_min:>5.1f}m  {last_str:>7}"
                     )
                 lines.append("  Full table (incl. retired): variant_compare.txt")
 

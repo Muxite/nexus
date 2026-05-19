@@ -589,6 +589,45 @@ engines:
         take_profit:   0.025
         stop_loss:     0.045
         trailing_stop: 0.012
+      # ── M4 expansion (2026-05-19) ─────────────────────────────────────
+      # Forensic on 192 closed trades shows YES direction is +EV (+$0.22,
+      # 50.7% hit) while NO loses hard (-$4.62, 19.8% hit). EVOLVING
+      # freshness beats BREAKING by ~33pp on hit-rate. mid_yes in
+      # [0.75, 0.85] had 60% hit-rate. These variants opt into those
+      # individual edges so we can score each in isolation.
+      - name: "conf40_tp025_sl045_yes_only"
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
+        direction_filter: "YES"
+      - name: "conf40_tp025_sl045_evolving"
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
+        freshness_filter: "EVOLVING"
+      - name: "conf40_tp025_sl045_mid075"   # narrow to historical best band
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
+        mid_yes_min: 0.75
+        mid_yes_max: 0.85
+      - name: "conf40_tp020_sl030_lowvol_resurrected"
+        # Lifetime 67% hit / +$0.07 in 5 trades. The "low vol = no flow"
+        # E.4 cut thesis is contradicted by this variant's own record;
+        # resurrected with the wide-exit set (closer to the survivors).
+        take_profit:    0.020
+        stop_loss:      0.030
+        trailing_stop:  0.010
+        max_market_vol_30m: 0.0050
+      - name: "conf50_tp025_sl045"
+        # Higher conf gate — historical conf 0.7-0.75 hit 38.2% while
+        # 0.6-0.7 hit only 5.1%. Test whether tightening to 0.50
+        # admit-floor materially raises hit-rate (downstream of
+        # ai_cfg.min_confidence which is 0.45 for most variants).
+        min_confidence: 0.50
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
 
   # conservative engine removed in cycle 4 — prior postmortem showed −$88.46 PnL
   # (lowest of all engines); dropping it gives a cleaner three-engine comparison
@@ -637,6 +676,13 @@ engines:
         take_profit:   0.030
         stop_loss:     0.050
         trailing_stop: 0.015
+      # M4 expansion: cross the inversion thesis with the freshness
+      # finding (EVOLVING ~3x hit-rate of BREAKING).
+      - name: "conf40_tp025_sl045_evolving_inv75"
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
+        freshness_filter: "EVOLVING"
 
 # ── Database ─────────────────────────────────────────────────────────────────
 db:

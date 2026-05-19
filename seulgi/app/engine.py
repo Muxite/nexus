@@ -897,6 +897,12 @@ def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
         stop_loss_pct=_pick("stop_loss_pct", base.stop_loss_pct),
         min_entry_yes_mid=_pick("min_entry_yes_mid", base.min_entry_yes_mid),
         max_market_vol_30m=_pick("max_market_vol_30m", base.max_market_vol_30m),
+        # M4 variant-level filters — strings default to "" (no filter); floats
+        # to the base value (which is 0.0 / 1.0 = "no filter").
+        direction_filter=_pick("direction_filter", base.direction_filter),
+        freshness_filter=_pick("freshness_filter", base.freshness_filter),
+        mid_yes_min=_pick("mid_yes_min", base.mid_yes_min),
+        mid_yes_max=_pick("mid_yes_max", base.mid_yes_max),
     )
 
 

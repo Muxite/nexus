@@ -182,6 +182,21 @@ class TradingConfig:
     # opt-in per engine as a shadow strategy.
     invert_high_conf: bool = False
     invert_conf_threshold: float = 0.85
+    # M4 — variant-level pre-trade filters. Used by the evolutionary engine
+    # expansion to test narrow strategy slices in isolation. All four default
+    # to "no filter"; per-engine override is the intended use.
+    #
+    # direction_filter: only fire when result.direction matches ("YES" / "NO").
+    #   Historical lifetime: YES is +EV (hit 50.7%); NO loses hard (hit 19.8%).
+    # freshness_filter: only fire when headline._freshness_label matches
+    #   ("EVOLVING" / "BREAKING"). Historical: EVOLVING 46.2% hit vs BREAKING
+    #   13.6%.
+    # mid_yes_min / mid_yes_max: variant-level tightening of the global E.3
+    #   mid-band ([0.65, 0.85]). Historical: mid_yes ∈ [0.75, 0.85] hit 60%.
+    direction_filter: str = ""
+    freshness_filter: str = ""
+    mid_yes_min: float = 0.0
+    mid_yes_max: float = 1.0
     # Round-trip trading cost in basis points of stake (1 bp = 0.01%). Default
     # 20 bps = 0.20% of stake deducted at close. Models the bid-ask spread
     # (Polymarket has no protocol fees, but you cross the spread on entry AND
@@ -367,6 +382,11 @@ class VariantConfig:
     stop_loss_pct: Optional[float] = None
     min_entry_yes_mid: Optional[float] = None
     max_market_vol_30m: Optional[float] = None
+    # M4 variant-level filters
+    direction_filter: Optional[str] = None
+    freshness_filter: Optional[str] = None
+    mid_yes_min: Optional[float] = None
+    mid_yes_max: Optional[float] = None
 
 
 @dataclass
@@ -509,6 +529,10 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=_opt_float(v.get("stop_loss_pct")),
             min_entry_yes_mid=_opt_float(v.get("min_entry_yes_mid")),
             max_market_vol_30m=_opt_float(v.get("max_market_vol_30m")),
+            direction_filter=v.get("direction_filter"),
+            freshness_filter=v.get("freshness_filter"),
+            mid_yes_min=_opt_float(v.get("mid_yes_min")),
+            mid_yes_max=_opt_float(v.get("mid_yes_max")),
         )
 
     engine_cfgs = [

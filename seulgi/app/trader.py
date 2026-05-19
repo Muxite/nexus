@@ -692,6 +692,40 @@ class PaperTrader:
                 f"min_entry_yes_mid:{match.mid_yes:.3f}", token_id=None,
             )
 
+        # ── M4 variant-level filters (direction / freshness / mid-band) ──
+        # Variants opt in by setting one or more of: direction_filter,
+        # freshness_filter, mid_yes_min/max. The defaults are "no filter".
+        # These run after min_confidence + min_entry_yes_mid because they
+        # are variant-narrowing rules — let the global gates fire their
+        # own skip_reasons first so the funnel attribution stays clean.
+        dir_filter = getattr(self._cfg, "direction_filter", "") or ""
+        if dir_filter and result.direction.value != dir_filter:
+            trace.append({"step": "direction_filter", "pass": False,
+                          "got": result.direction.value, "want": dir_filter})
+            return await _finalize_skip(
+                f"direction_filter:{dir_filter}_only", token_id=None,
+            )
+        fresh_filter = getattr(self._cfg, "freshness_filter", "") or ""
+        if fresh_filter:
+            hl_fresh = getattr(headline, "_freshness_label", None) or ""
+            if hl_fresh != fresh_filter:
+                trace.append({"step": "freshness_filter", "pass": False,
+                              "got": hl_fresh, "want": fresh_filter})
+                return await _finalize_skip(
+                    f"freshness_filter:{fresh_filter}_only", token_id=None,
+                )
+        v_mid_min = getattr(self._cfg, "mid_yes_min", 0.0) or 0.0
+        v_mid_max = getattr(self._cfg, "mid_yes_max", 1.0) or 1.0
+        if match.mid_yes is not None and (
+            match.mid_yes < v_mid_min or match.mid_yes > v_mid_max
+        ):
+            trace.append({"step": "variant_mid_band", "pass": False,
+                          "mid_yes": round(match.mid_yes, 4),
+                          "band": [v_mid_min, v_mid_max]})
+            return await _finalize_skip(
+                f"variant_mid_band:{match.mid_yes:.3f}", token_id=None,
+            )
+
         # ── Market volatility gate (cycle 11) ─────────────────────────
         # Refuse entries when 30-min pre-headline stddev exceeds the
         # variant's tolerance — wide-bouncing markets trip SL on noise

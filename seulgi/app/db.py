@@ -1137,6 +1137,9 @@ class SeulgiDB:
         if since_ts:
             where += " AND decided_at >= ?"
             params = (since_ts,)
+        # M5: extend with avg_hold_seconds and last_trade_at so the dashboard
+        # can render time-since-last-trade. realized-pnl-only avg_hold to
+        # avoid skewing on still-open positions.
         async with self._conn.execute(
             f"""
             SELECT
@@ -1151,7 +1154,14 @@ class SeulgiDB:
                 COALESCE(AVG(confidence_raw), 0)                AS avg_conf,
                 COALESCE(AVG(signed_edge), 0)                   AS avg_edge,
                 COALESCE(SUM(size_usdc), 0)                     AS total_staked,
-                SUM(CASE WHEN inverted = 1 THEN 1 ELSE 0 END)   AS n_inverted
+                SUM(CASE WHEN inverted = 1 THEN 1 ELSE 0 END)   AS n_inverted,
+                COALESCE(AVG(
+                  CASE WHEN closed_at IS NOT NULL
+                       THEN (julianday(closed_at) - julianday(decided_at)) * 86400.0
+                  END
+                ), 0)                                            AS avg_hold_seconds,
+                MAX(decided_at)                                  AS last_trade_at,
+                MAX(closed_at)                                   AS last_close_at
             FROM trades
             {where}
             GROUP BY variant
