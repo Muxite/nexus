@@ -92,13 +92,10 @@ For each question output exactly:
 {{"idx": <0-based index>, "p_yes": <0.0-1.0>, "p_no": <0.0-1.0>, "p_neutral": <0.0-1.0>, "p_alpha": <0.0-1.0>, "risk": <0.0-1.0>, "reason": "<one sentence>"}}
 
 Rules:
-- p_yes = YOUR best estimate of the TRUE probability the market resolves YES (post-headline, post-reasoning). Range 0.0-1.0.
-- p_no = YOUR best estimate of the TRUE probability it resolves NO. p_no = 1 - p_yes when p_neutral = 0.
-- p_neutral = probability the headline is truly unrelated to this market question and you can't reason about it at all.
-- p_yes + p_no + p_neutral MUST = 1.0.
-- **Do NOT just echo the current mid price as p_yes.** The mid is the market's consensus; your job is to express where YOUR estimate differs. If the headline supports YES, your p_yes should be ABOVE the mid (typically by at least 0.03-0.10). If the headline supports NO, p_yes should be BELOW the mid. Only equal the mid if the headline genuinely doesn't shift your view.
-- Polymarket markets often under-react to fresh news — small but real edges of 2-5 probability points are common; commit to them.
-- Reserve p_neutral ≥ 0.5 only for headlines that have nothing to do with the market question (e.g. a sports headline against a politics market).
+- p_yes  = probability the headline increases YES outcome likelihood
+- p_no   = probability the headline decreases YES outcome likelihood
+- p_neutral = probability the headline genuinely adds no new directional information
+- The three probabilities MUST sum to 1.0. **Commit to a directional view (p_yes or p_no) whenever you have ANY lean, even a small one — Polymarket markets often under-react to fresh news, so a 1-2% probability shift is real, tradable edge.** Reserve p_neutral for headlines that are truly unrelated to the market question or that you cannot interpret. Risk-calibration is downstream (p_alpha + min_confidence + min_edge gates handle low-conviction signals); your job here is to extract any directional information present.
 - Trust: state-media (Xinhua, TASS, RT, People's Daily) and partisan/tabloid sources move markets less — keep the directional lean but lower p_alpha on contested claims.
 
 - p_alpha = probability that a trade in the argmax direction (the highest of p_yes/p_no/p_neutral, ignoring NEUTRAL) makes money inside 5–30 minutes after this headline.
