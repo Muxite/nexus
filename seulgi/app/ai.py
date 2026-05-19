@@ -94,10 +94,9 @@ For each question output exactly:
 Rules:
 - p_yes  = probability the headline increases YES outcome likelihood
 - p_no   = probability the headline decreases YES outcome likelihood
-- p_neutral = probability the headline is not clearly related, ambiguous, or already priced in
-- The three probabilities MUST sum to 1.0. Express genuine uncertainty here, do not collapse to one bucket.
-- If current mid price already reflects the news (≥0.85 or ≤0.15), shift mass to p_neutral.
-- Trust: state-media (Xinhua, TASS, RT, People's Daily) and partisan/tabloid sources move markets less — shift mass to p_neutral on contested claims.
+- p_neutral = probability the headline genuinely adds no new directional information
+- The three probabilities MUST sum to 1.0. **Commit to a directional view (p_yes or p_no) whenever you have ANY lean, even a small one — Polymarket markets often under-react to fresh news, so a 1-2% probability shift is real, tradable edge.** Reserve p_neutral for headlines that are truly unrelated to the market question or that you cannot interpret. Risk-calibration is downstream (p_alpha + min_confidence + min_edge gates handle low-conviction signals); your job here is to extract any directional information present.
+- Trust: state-media (Xinhua, TASS, RT, People's Daily) and partisan/tabloid sources move markets less — keep the directional lean but lower p_alpha on contested claims.
 
 - p_alpha = probability that a trade in the argmax direction (the highest of p_yes/p_no/p_neutral, ignoring NEUTRAL) makes money inside 5–30 minutes after this headline.
     Lower it when mid is already pinned near 0/1, the headline is a restatement, or the source is low-trust.
@@ -110,9 +109,11 @@ Rules:
 """
 
 _REPUBLISH_BLOCK = """\
-IMPORTANT — possible republish: a semantically similar headline was seen before:
+NOTE — possible republish: a semantically similar headline was seen before:
   "{similar_to}"
-If no new information is added vs. the original, return NEUTRAL for all markets.
+If the current headline truly adds no new information vs. the original, lean NEUTRAL.
+If it sharpens the framing, adds a number, names a source, or escalates intensity,
+preserve the directional lean (the market may still react to the refreshed signal).
 """
 
 # Cycle-9 freshness block — replaces the binary republish hint with a labelled
