@@ -212,9 +212,23 @@ class SimulateFeesConfig:
 
     Fee = max(min_fee_usdc, shares × rate × p × (1-p))
     rate is looked up by market_type (from markets.market_type column).
+
+    Reconciled with the Polymarket reference manual (2026-05-19) — Phase E.7.2:
+    - default_rate matches "General" tier (0.05), not Politics (0.04).
+    - min_fee_usdc matches the safety floor.
+    - Maker rebates (20% crypto / 25% other) are informational only; we model
+      takers exclusively, so we don't claim them. Conservative for paper
+      trading a strategy that doesn't yet earn rebates.
+    - Gas (Polymarket runs on Polygon; meta-tx subsidises most web-app trades
+      but EOA / direct contract trades pay <$0.01 in POL each leg). We add
+      gas_cost_per_trade_usdc as a per-leg drag so paper PnL stays honest.
+    - On-ramp / off-ramp processing fees (1-4.5%) are NOT modelled — we
+      assume pre-existing USDC on Polygon (the cycle 10 micro-bankroll setup).
+    - 0% settlement tax: enforced via trader.py setting exit_fee=0.0 on
+      RESOLVE_WIN / RESOLVE_LOSS branches.
     """
     enabled: bool = True
-    default_rate: float = 0.04        # politics/finance/tech default
+    default_rate: float = 0.05        # "General / Economics / Culture / Weather" tier
     category_rates: dict = field(default_factory=lambda: {
         "crypto":      0.072,
         "crypto_price": 0.072,
@@ -226,11 +240,15 @@ class SimulateFeesConfig:
         "politics":    0.04,
         "finance":     0.04,
         "tech":        0.04,
-        "event":       0.04,
-        "entertainment": 0.05,
+        "event":       0.04,        # default fallback — "Mentions" tier (0.04)
+        "entertainment": 0.05,       # "Culture" tier
         "price_threshold": 0.04,
     })
     min_fee_usdc: float = 0.00001
+    # Per-leg gas cost in USDC. Spec: "<$0.01 in POL" per on-chain interaction.
+    # 0.005 = conservative midpoint; applied additively to entry_fee and
+    # exit_fee. Set to 0.0 if meta-tx subsidy keeps the operator gas-free.
+    gas_cost_per_trade_usdc: float = 0.005
     # Informational only — we always take. Recorded in audit reports for
     # operators considering a maker strategy.
     maker_rebate_crypto: float = 0.20
@@ -623,6 +641,7 @@ def _load_simulate_fees(raw: Optional[dict]) -> SimulateFeesConfig:
         default_rate=float(raw.get("default_rate", base.default_rate)),
         category_rates=rates,
         min_fee_usdc=float(raw.get("min_fee_usdc", base.min_fee_usdc)),
+        gas_cost_per_trade_usdc=float(raw.get("gas_cost_per_trade_usdc", base.gas_cost_per_trade_usdc)),
         maker_rebate_crypto=float(raw.get("maker_rebate_crypto", base.maker_rebate_crypto)),
         maker_rebate_other=float(raw.get("maker_rebate_other", base.maker_rebate_other)),
     )

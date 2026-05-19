@@ -941,21 +941,30 @@ class PaperTrader:
                     return await _finalize_skip(
                         "rail_zero_liquidity", token_id=token_id, p_hat=p_hat, mid=mid_price,
                     )
+                # E.7.2: per-leg gas drag, in addition to the dynamic taker
+                # fee. Reflects Polymarket-on-Polygon "<$0.01 in POL" cost
+                # for EOA / direct-contract trades.
+                gas_per_leg = (self._cfg.simulate_fees.gas_cost_per_trade_usdc
+                               if getattr(self._cfg.simulate_fees, "gas_cost_per_trade_usdc", 0) else 0.0)
                 # Estimate fee first using a naive share count, then quantize.
+                # fee_estimate fed to quantize_shares INCLUDES gas so the
+                # bankroll debit covers shares × price + fee + gas.
                 naive_shares = size / effective_entry_price
                 fee_est = sim.compute_fee(naive_shares, effective_entry_price,
                                           market_type, self._cfg.simulate_fees)
-                shares_held = sim.quantize_shares(size, effective_entry_price, fee_est.fee)
+                shares_held = sim.quantize_shares(size, effective_entry_price,
+                                                  fee_est.fee + gas_per_leg)
                 # Recompute fee using the actual share count for precision.
                 fee_res = sim.compute_fee(shares_held, effective_entry_price,
                                           market_type, self._cfg.simulate_fees)
-                entry_fee = fee_res.fee
+                entry_fee = fee_res.fee + gas_per_leg
                 trace.append({"step": "fidelity",
                               "mid": round(mid_price, 4),
                               "slip_walk": round(slip.walk, 5),
                               "entry_price": round(effective_entry_price, 4),
                               "shares": round(shares_held, 4),
                               "entry_fee_usdc": round(entry_fee, 6),
+                              "gas_usdc": round(gas_per_leg, 6),
                               "fee_rate": fee_res.rate,
                               "market_type": market_type or "(none)"})
                 # Reject if the resulting stake leaves us under min_stake.
@@ -1164,7 +1173,10 @@ class PaperTrader:
                 )
                 exit_price = slip.effective_price
                 fee_res = sim.compute_fee(shares, exit_price, None, self._cfg.simulate_fees)
-                exit_fee = fee_res.fee
+                # E.7.2: gas drag on the exit leg too.
+                gas_per_leg = (self._cfg.simulate_fees.gas_cost_per_trade_usdc
+                               if getattr(self._cfg.simulate_fees, "gas_cost_per_trade_usdc", 0) else 0.0)
+                exit_fee = fee_res.fee + gas_per_leg
                 proceeds = shares * exit_price - exit_fee
                 pnl = proceeds - pos["size_usdc"]
             else:
@@ -1304,7 +1316,7 @@ class PaperTrader:
                     exit_price = 0.00
                     proceeds = sim.settlement_payout(shares, win=False)
                 else:
-                    # Early exit (TP/SL/TRAIL/TIMEOUT): walk the book + fee.
+                    # Early exit (TP/SL/TRAIL/TIMEOUT/TIMEOUT_BLEED): walk the book + fee.
                     market_type = None  # no need to refetch; rate captured at entry
                     slip = sim.apply_slippage(
                         mid=current_price, notional_usdc=shares * current_price,
@@ -1315,7 +1327,12 @@ class PaperTrader:
                     exit_price = slip.effective_price
                     fee_res = sim.compute_fee(shares, exit_price, market_type,
                                               self._cfg.simulate_fees)
-                    exit_fee = fee_res.fee
+                    # E.7.2: gas drag on the exit leg. Settlement WIN/LOSS
+                    # branches above keep exit_fee=0 per the 0% settlement
+                    # tax rule, so gas only applies to active book exits.
+                    gas_per_leg = (self._cfg.simulate_fees.gas_cost_per_trade_usdc
+                                   if getattr(self._cfg.simulate_fees, "gas_cost_per_trade_usdc", 0) else 0.0)
+                    exit_fee = fee_res.fee + gas_per_leg
                     proceeds = shares * exit_price - exit_fee
                 gross_pnl = (exit_price - entry_price) * shares
                 # realized_pnl = (what we got back) - (what we put in)
