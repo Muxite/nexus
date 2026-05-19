@@ -1255,6 +1255,14 @@ class PaperTrader:
                 close_reason = "SL"
             elif age_secs >= timeout_secs:
                 close_reason = "TIMEOUT"
+            elif min_hold_met and sl > 0 and age_secs >= 3600 and mtm <= -0.5 * sl:
+                # E.5a Short-hold bleed exit: trades held >1h that are
+                # underwater by >=50% of the SL distance rarely recover
+                # (Phase A.6: <6h holds n=226, hit 17.1%, -$2.21 vs
+                # 6-24h holds n=26, hit 7.7%, -$0.045 — short-hold cell
+                # is the largest residual bleed). Exit at market before
+                # the slow drift to a full SL.
+                close_reason = "TIMEOUT_BLEED"
             if close_reason is None:
                 continue
 
