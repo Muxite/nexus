@@ -1238,7 +1238,12 @@ class PaperTrader:
                 close_reason = "WIN"
             elif current_price <= _LOSS_PRICE:
                 close_reason = "LOSS"
-            elif min_hold_met and ts > 0 and hwm_mtm >= ts and (hwm_mtm - mtm) >= ts:
+            elif min_hold_met and ts > 0 and hwm_mtm >= ts and (hwm_mtm - mtm) >= ts and mtm >= 0:
+                # E10: gate TRAIL on current price being at-or-above entry.
+                # Phase A.6 saw TRAIL fire underwater (n=57, avg -$0.032) when
+                # HWM had been high enough to arm the trail but price then
+                # retreated below entry — locked in losses that often recovered.
+                # Falls through to SL/TIMEOUT instead.
                 close_reason = "TRAIL"
             elif min_hold_met and tp > 0 and mtm >= tp:
                 close_reason = "TP"
