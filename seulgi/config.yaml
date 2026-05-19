@@ -483,7 +483,10 @@ relevance:
   temperature: 0.1
   keep_scores: ["STRONG_YES", "YES"]
   max_tokens_per_market: 60
-  min_top_similarity: 0.0
+  # Phase-E E2 (2026-05-19): restored to 0.55 after the 0.0 experiment
+  # showed sub-0.45 similarity trades hit 17.8% vs 0.65-0.75 at 50%.
+  # The flood of low-quality matches cost ~$2.6 over 117 trades.
+  min_top_similarity: 0.55
 
 # ── Paper trading ────────────────────────────────────────────────────────────
 trading:
@@ -553,11 +556,12 @@ engines:
     trailing_stop:    0.010
     min_hold_seconds: 300
     variants:
-      # 2026-05-19 cut: kept only the 3 balanced variants with sum_pnl ≥ 0
-      # in the 5h post-simulate-mode soak. Retired in this pass:
-      #   conf40_tp010_sl020          -0.08
-      #   conf40_tp020_sl030_inv65    -0.27
-      #   conf40_tp020_sl030_norail   -0.17
+      # 2026-05-19 Phase-E cut: drop _lowvol — forensic showed vol<0.005
+      # bucket (which is where the _lowvol filter lands trades) had hit
+      # 32.3% / −$3.10 across 158 trades. The "low-vol = stable" thesis
+      # is wrong: low-vol = "no flow, no edge".
+      # 2026-05-19 earlier cut: removed _tp010_sl020 (-0.08),
+      # _inv65 (-0.27), _norail (-0.17).
       # Earlier retirements (2026-05-17): conf40_tp020_sl030, _conf55, _conf70.
       - name: "conf40_tp030_sl050"          # wide exits
         take_profit:   0.030
@@ -565,8 +569,6 @@ engines:
         trailing_stop: 0.015
       - name: "conf40_tp020_sl030_slpct10"  # price-relative SL floor
         stop_loss_pct: 0.10
-      - name: "conf40_tp020_sl030_lowvol"   # vol cap
-        max_market_vol_30m: 0.02
 
   # conservative engine removed in cycle 4 — prior postmortem showed −$88.46 PnL
   # (lowest of all engines); dropping it gives a cleaner three-engine comparison
@@ -594,18 +596,13 @@ engines:
     # gives the shadow engine enough signal to actually execute trades.
     invert_conf_threshold: 0.75
     variants:
-      # 2026-05-19 cut: kept only the 2 inverted_highconf variants with
-      # sum_pnl ≥ 0 in the 5h post-simulate-mode soak. Retired in this pass:
-      #   conf40_tp020_sl030_inv65        -0.27
-      #   conf40_tp010_sl020_inv75        -0.08
-      #   conf40_tp020_sl030_inv75_hi75   -0.17
-      #   conf40_tp020_sl030_inv75_hi65   -0.07
+      # 2026-05-19 Phase-E cut: drop _lowvol (see balanced engine note).
+      # 2026-05-19 earlier cut: removed _inv65 (-0.27), _tp010_sl020_inv75
+      # (-0.08), _hi75 (-0.17), _hi65 (-0.07).
       - name: "conf40_tp030_sl050_inv75"        # wide exits
         take_profit:   0.030
         stop_loss:     0.050
         trailing_stop: 0.015
-      - name: "conf40_tp020_sl030_inv75_lowvol" # vol cap
-        max_market_vol_30m: 0.02
 
 # ── Database ─────────────────────────────────────────────────────────────────
 db:

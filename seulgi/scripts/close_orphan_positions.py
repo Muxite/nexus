@@ -16,10 +16,8 @@ from datetime import datetime, timezone
 import aiosqlite
 
 ACTIVE_ENGINES = {
-    "balanced/conf40_tp020_sl030_lowvol",
     "balanced/conf40_tp020_sl030_slpct10",
     "balanced/conf40_tp030_sl050",
-    "inverted_highconf/conf40_tp020_sl030_inv75_lowvol",
     "inverted_highconf/conf40_tp030_sl050_inv75",
 }
 

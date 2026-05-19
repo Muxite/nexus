@@ -65,6 +65,13 @@ class Rule:
     confidence_max: Optional[float] = None
     has_exceptions: bool = False
     source_path: str = ""
+    # Phase-E extensions (2026-05-19): freshness label + question regex.
+    # Both default to None = "any". The freshness check is exact-match on
+    # one of BREAKING / EVOLVING / REHASH / STALE_RETURN. The question regex
+    # is searched (not matched) against trades.question and is the cheap path
+    # for topic-level skip rules.
+    freshness_label: Optional[str] = None
+    question_rx: Optional[re.Pattern] = None
 
     def skip_reason(self) -> str:
         return f"RULE_{self.name}_SKIP"
@@ -132,6 +139,18 @@ def _compile_rule(fm: dict, source_path: Path) -> Optional[Rule]:
     direction = fm.get("direction", "any").upper()
     if direction not in ("YES", "NO", "ANY"):
         direction = "ANY"
+
+    freshness_label = fm.get("freshness_label", "").strip().upper() or None
+
+    question_rx_raw = fm.get("question_rx", "").strip()
+    question_rx: Optional[re.Pattern] = None
+    if question_rx_raw:
+        try:
+            question_rx = re.compile(question_rx_raw)
+        except re.error as exc:
+            logger.warning("[rules] %s: bad question_rx (%s) — skipping", source_path, exc)
+            return None
+
     return Rule(
         name=name,
         enabled=_to_bool(fm.get("enabled", "true"), default=True),
@@ -145,6 +164,8 @@ def _compile_rule(fm: dict, source_path: Path) -> Optional[Rule]:
         confidence_max=_to_float(fm.get("confidence_max", "")),
         has_exceptions=_to_bool(fm.get("has_exceptions", "false")),
         source_path=str(source_path),
+        freshness_label=freshness_label,
+        question_rx=question_rx,
     )
 
 
@@ -175,16 +196,22 @@ def _rule_matches(
     mid_price: Optional[float],
     direction: Optional[str] = None,
     confidence: Optional[float] = None,
+    freshness_label: Optional[str] = None,
+    question: Optional[str] = None,
 ) -> bool:
     if not rule.enabled:
         return False
-    # market_type is optional metadata; treat missing column as empty string so
-    # a rule with `market_type: .*` still matches.
     mt = market_type or ""
     if not rule.market_type_rx.search(mt):
         return False
     if not _in_range(mid_price, rule.mid_min, rule.mid_max):
         return False
+    if rule.freshness_label is not None:
+        if (freshness_label or "").upper() != rule.freshness_label:
+            return False
+    if rule.question_rx is not None:
+        if question is None or not rule.question_rx.search(question):
+            return False
     if rule.stage == "post_ai":
         if rule.direction != "any":
             if direction is None or direction.upper() != rule.direction.upper():
@@ -241,17 +268,22 @@ class RuleEngine:
 
     def gate_pre_ai(
         self, *, market_type: Optional[str], mid_price: Optional[float],
+        freshness_label: Optional[str] = None, question: Optional[str] = None,
     ) -> Optional[str]:
         for r in self._rules:
             if r.stage != "pre_ai":
                 continue
-            if _rule_matches(r, market_type=market_type, mid_price=mid_price):
+            if _rule_matches(
+                r, market_type=market_type, mid_price=mid_price,
+                freshness_label=freshness_label, question=question,
+            ):
                 return r.skip_reason()
         return None
 
     def gate_post_ai(
         self, *, market_type: Optional[str], mid_price: Optional[float],
         direction: str, confidence: float,
+        freshness_label: Optional[str] = None, question: Optional[str] = None,
     ) -> Optional[str]:
         for r in self._rules:
             if r.stage != "post_ai":
@@ -260,6 +292,7 @@ class RuleEngine:
                 r,
                 market_type=market_type, mid_price=mid_price,
                 direction=direction, confidence=confidence,
+                freshness_label=freshness_label, question=question,
             ):
                 return r.skip_reason()
         return None

@@ -300,9 +300,11 @@ class PaperTrader:
         survivors: list[MarketMatch] = []
         pre_skips: list[tuple[MarketMatch, str]] = []
         if self._rules is not None:
+            fresh_lbl = getattr(headline, "_freshness_label", None)
             for m in matches:
                 reason = self._rules.gate_pre_ai(
                     market_type=m.market_type, mid_price=m.mid_yes,
+                    freshness_label=fresh_lbl, question=m.question,
                 )
                 if reason is None:
                     survivors.append(m)
@@ -713,6 +715,8 @@ class PaperTrader:
                 mid_price=match.mid_yes,
                 direction=result.direction.value,
                 confidence=result.confidence,
+                freshness_label=getattr(headline, "_freshness_label", None),
+                question=match.question,
             )
             if reason is not None:
                 trace.append({"step": "post_ai_rule", "pass": False, "reason": reason})

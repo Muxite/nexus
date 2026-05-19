@@ -44,6 +44,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -196,6 +197,15 @@ class EngineRunner:
         """
         _t0 = time.monotonic()
         hid = getattr(headline, "headline_id", "")
+        # Phase-E E11 (2026-05-19): UTC hour dead-zone pause. Forensic of
+        # 190 organic closes showed hours 23/00/01 UTC produced 28 trades
+        # at 0/0/28% hit and −$1.83 combined. Disable via env var
+        # SEULGI_DISABLE_HOUR_GATE=1 if a future regime warrants reopening.
+        if os.getenv("SEULGI_DISABLE_HOUR_GATE") != "1":
+            _hour_utc = datetime.now(timezone.utc).hour
+            if _hour_utc in (23, 0, 1):
+                logger.debug("[runner] [hid=%s] hour_gate: skipping (UTC %02d)", hid, _hour_utc)
+                return
         # Fire-and-forget article body capture — runs in parallel with the rest
         # of the pipeline; never blocks the trade decision. Data collection
         # only (lands in headline_articles for later analysis / re-classification).
@@ -319,6 +329,8 @@ class EngineRunner:
             for m in matches:
                 reason = self._rules.gate_pre_ai(
                     market_type=m.market_type, mid_price=m.mid_yes,
+                    freshness_label=freshness.label,
+                    question=m.question,
                 )
                 if reason is None:
                     survivors.append(m)
