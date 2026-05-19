@@ -41,6 +41,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, field
@@ -653,10 +654,16 @@ class EngineRunner:
         """
         hid = getattr(headline, "headline_id", "")
         _t_engine = time.monotonic()
+        # E8 cluster-size sizing: N = number of markets surviving the
+        # pre-AI gate for this headline. Each engine sees the same survivors,
+        # so the cluster_factor is shared. 1.0 when N<=1 (no scaling).
+        n_cluster = max(len(survivors), 1)
+        cluster_factor = 1.0 / math.sqrt(n_cluster) if n_cluster > 1 else 1.0
         decisions = await engine.trader.evaluate(
             signal_id, headline, survivors, classify_results,
             prompt_meta_json, pre_ai_skips=pre_skips,
             relevance_skips=relevance_skips,
+            cluster_factor=cluster_factor,
         )
         total_latency_ms = pre_ms + (time.monotonic() - _t_engine) * 1000.0
         await self._db.record_engine_decisions(

@@ -366,6 +366,7 @@ class PaperTrader:
         prompt_meta_json: Optional[str],
         pre_ai_skips: Optional[list[tuple[MarketMatch, str]]] = None,
         relevance_skips: Optional[list] = None,  # list[(MarketMatch, RelevanceVerdict)]
+        cluster_factor: float = 1.0,
     ) -> list[TradeDecision]:
         """
         Evaluate pre-classified survivors against this variant's rule set.
@@ -897,6 +898,25 @@ class PaperTrader:
                                   "size": round(size, 2), "balance": round(self._balance, 2)})
                     return await _finalize_skip(
                         reason, token_id=token_id, p_hat=p_hat, mid=mid_price,
+                    )
+
+            # E8 cluster-size sizing: when N markets survive for the same
+            # headline, scale each stake by 1/sqrt(N) so total capital exposure
+            # on a single headline is bounded by sqrt(N) instead of growing
+            # linearly. Phase A.6: 7 headlines × 5 trades each lost $2.16
+            # simultaneously; worst single headline (OpenAI IPO) fanned out
+            # to 11 positions. Variance reducer, not edge change. Applied
+            # BEFORE the simulate fidelity block so slippage/fee/quantize all
+            # operate on the scaled size.
+            if cluster_factor < 1.0:
+                size *= cluster_factor
+                trace.append({"step": "cluster_scale",
+                              "factor": round(cluster_factor, 4),
+                              "size_usdc": round(size, 4)})
+                if size < self._cfg.min_trade_usdc:
+                    return await _finalize_skip(
+                        f"cluster_size_too_small:{size:.2f}",
+                        token_id=token_id, p_hat=p_hat, mid=mid_price,
                     )
 
             # plan §7.1 / §7.2 / §7.3 — slippage, fee, share quantization.
