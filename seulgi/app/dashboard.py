@@ -464,29 +464,41 @@ class Dashboard:
                 logger.warning("[dash] write error: %s", exc)
 
     async def _write_all(self) -> None:
-        """Rewrite all dashboard files."""
-        await asyncio.gather(
-            self._write_main(),
-            self._write_positions(),
-            self._write_executed(),
-            self._write_declined(),
-            self._write_near_miss(),
-            self._write_news(),
-            self._write_ai(),
-            self._write_watcher_status(),
-            self._write_market_index(),
-            self._write_engine_comparison(),
-            self._write_activity_log(),
-            self._write_trace_log(),
-            self._write_signal_journal(),
-            self._write_quant_stats(),
-            self._write_usage(),
-            self._write_trade_log(),
-            self._write_variant_compare(),
-            self._write_wins_losses(),
-            self._write_headline_journal(),
-            self._write_headline_winners(),
+        """Rewrite all dashboard files.
+
+        Uses return_exceptions=True so one writer's failure doesn't
+        silently cancel its peers via asyncio.gather's default behaviour.
+        Per-task exceptions are surfaced as WARN lines with the file name
+        so future regressions don't masquerade as "stale dashboard.txt".
+        """
+        writers = [
+            ("main", self._write_main()),
+            ("positions", self._write_positions()),
+            ("executed", self._write_executed()),
+            ("declined", self._write_declined()),
+            ("near_miss", self._write_near_miss()),
+            ("news", self._write_news()),
+            ("ai", self._write_ai()),
+            ("watcher_status", self._write_watcher_status()),
+            ("market_index", self._write_market_index()),
+            ("engine_comparison", self._write_engine_comparison()),
+            ("activity_log", self._write_activity_log()),
+            ("trace_log", self._write_trace_log()),
+            ("signal_journal", self._write_signal_journal()),
+            ("quant_stats", self._write_quant_stats()),
+            ("usage", self._write_usage()),
+            ("trade_log", self._write_trade_log()),
+            ("variant_compare", self._write_variant_compare()),
+            ("wins_losses", self._write_wins_losses()),
+            ("headline_journal", self._write_headline_journal()),
+            ("headline_winners", self._write_headline_winners()),
+        ]
+        results = await asyncio.gather(
+            *[coro for _, coro in writers], return_exceptions=True,
         )
+        for (name, _), result in zip(writers, results):
+            if isinstance(result, BaseException):
+                logger.warning("[dash] %s writer failed: %r", name, result, exc_info=result)
 
     # ------------------------------------------------------------------
     # Individual file writers
@@ -717,8 +729,10 @@ class Dashboard:
                 # M5: ROI on per-engine $100 pot is the right scoring metric.
                 # Sort active leaderboard by it. Each engine has its own pot;
                 # sum_pnl / 100 IS its ROI (no cross-engine borrowing).
-                from datetime import datetime, timezone
-                now = datetime.now(timezone.utc)
+                # NOTE: datetime is already module-imported at top of file
+                # (line 39). Re-importing here would shadow it and trigger
+                # "local variable not associated" earlier in _write_main.
+                now_for_last = datetime.now(timezone.utc)
                 v_stats_view = sorted(
                     v_stats_view,
                     key=lambda r: (r.get("sum_pnl") or 0) / 100.0,
@@ -739,7 +753,7 @@ class Dashboard:
                     if last_at:
                         try:
                             t = datetime.fromisoformat(last_at.replace("Z", "+00:00"))
-                            mins = (now - t).total_seconds() / 60.0
+                            mins = (now_for_last - t).total_seconds() / 60.0
                             last_str = (f"{mins:.0f}m" if mins < 90
                                         else f"{mins / 60:.1f}h")
                         except Exception:  # noqa: BLE001

@@ -511,7 +511,9 @@ trading:
   # Phase E.7.3 (2026-05-19): 8 active variants × $100 each = $800.
   # Reset cycle with evolutionary expansion — 3 parents + 5 mutants.
   # AI calls pause automatically when no variant has free capital.
-  simulate_total_usdc: 800.0
+  # M4 expansion: 14 engines × $100 = $1400. Each engine has its own pot;
+  # the total is split evenly by the simulate-mode bootstrap.
+  simulate_total_usdc: 1400.0
   simulate_min_trade_usdc: 1.0
   # Soft rail-skip: reject trades when the entry-side mid is within this
   # distance of 0/1. 6h backtest: 99% of p≥0.95 entries were no_signal — the
