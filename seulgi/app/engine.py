@@ -140,6 +140,43 @@ class EngineRunner:
             engines and getattr(engines[0].trader.cfg, "mode", "paper") == "simulate"
         )
         self._ai_paused: bool = False
+        # E.5b variant rolling hit-rate pause: cache (rate, n, expiry_monotonic)
+        # per engine_name. Refreshed every 300s; engines with last-50 hit-rate
+        # below 12% are skipped at dispatch time. Requires n >= 25 to engage
+        # so brand-new variants aren't paused on noise.
+        self._hit_rate_cache: dict[str, tuple[float, int, float]] = {}
+        self._hit_rate_ttl_secs: float = 300.0
+        self._hit_rate_floor: float = 0.12
+        self._hit_rate_min_n: int = 25
+        self._paused_engines: set[str] = set()
+
+    async def _engine_should_pause(self, engine_name: str) -> bool:
+        """E.5b: True if engine's last-50 hit-rate is below the floor (n>=min_n)."""
+        from time import monotonic
+        now = monotonic()
+        cached = self._hit_rate_cache.get(engine_name)
+        if cached is None or cached[2] < now:
+            try:
+                rate, n = await self._db.get_engine_rolling_hit_rate(engine_name, 50)
+            except Exception:  # noqa: BLE001
+                return False
+            rate_val = rate if rate is not None else 1.0  # unknown → don't pause
+            self._hit_rate_cache[engine_name] = (rate_val, n, now + self._hit_rate_ttl_secs)
+        rate_val, n, _ = self._hit_rate_cache[engine_name]
+        paused = (n >= self._hit_rate_min_n and rate_val < self._hit_rate_floor)
+        if paused and engine_name not in self._paused_engines:
+            self._paused_engines.add(engine_name)
+            logger.info(
+                "[runner] E.5b PAUSE engine '%s' — rolling-%d hit_rate=%.1f%% < %.0f%% floor",
+                engine_name, n, rate_val * 100, self._hit_rate_floor * 100,
+            )
+        elif (not paused) and engine_name in self._paused_engines:
+            self._paused_engines.discard(engine_name)
+            logger.info(
+                "[runner] E.5b RESUME engine '%s' — rolling-%d hit_rate=%.1f%% >= floor",
+                engine_name, n, rate_val * 100,
+            )
+        return paused
 
     def _ai_should_pause(self) -> bool:
         """plan §3 — every active simulate engine is fully staked? Skip the LLM."""
@@ -495,6 +532,15 @@ class EngineRunner:
         # Embed + dedup + match time — passed in; AI call time is measured per-engine
         pre_ms = (time.monotonic() - _t0) * 1000.0
 
+        # E.5b: skip engines paused by the rolling hit-rate guard. Computed
+        # once per headline (cache hides the DB cost). Paused engines log on
+        # state transition only, never per-headline.
+        active_engines: list[Engine] = []
+        for engine in self._engines:
+            if await self._engine_should_pause(engine.name):
+                continue
+            active_engines.append(engine)
+
         # Fan out to all engines/variants concurrently. Every engine sees the
         # same signal_id, same classify_results, same prompt_meta, same
         # relevance_skips list (each variant persists its own copy).
@@ -505,12 +551,12 @@ class EngineRunner:
                     survivors, classify_results, prompt_meta_json,
                     pre_skips, pre_ms, relevance_skips=relevance_skips,
                 )
-                for engine in self._engines
+                for engine in active_engines
             ],
             return_exceptions=True,
         )
 
-        for engine, engine_results in zip(self._engines, results):
+        for engine, engine_results in zip(active_engines, results):
             if isinstance(engine_results, BaseException):
                 logger.warning("[runner] engine '%s' error: %s", engine.name, engine_results)
                 continue

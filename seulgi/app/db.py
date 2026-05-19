@@ -1819,6 +1819,30 @@ class SeulgiDB:
             rows = await cur.fetchall()
         return [dict(row) for row in rows]
 
+    async def get_engine_rolling_hit_rate(
+        self, engine_name: str, limit: int = 50
+    ) -> tuple[Optional[float], int]:
+        """Return (hit_rate, n) over the last `limit` closed trades for an engine.
+
+        A trade counts as a hit when realized_pnl > 0. Open trades (NULL
+        realized_pnl) are excluded. Returns (None, 0) if no closed trades yet.
+        Used by EngineRunner for the E.5b variant-pause guard.
+        """
+        async with self._conn.execute(
+            """
+            SELECT realized_pnl FROM trades
+            WHERE engine_name = ? AND realized_pnl IS NOT NULL
+            ORDER BY closed_at DESC LIMIT ?
+            """,
+            (engine_name, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+        n = len(rows)
+        if n == 0:
+            return None, 0
+        hits = sum(1 for r in rows if (r[0] or 0.0) > 0.0)
+        return hits / n, n
+
     # ------------------------------------------------------------------
     # Market heat tracking
     # ------------------------------------------------------------------
