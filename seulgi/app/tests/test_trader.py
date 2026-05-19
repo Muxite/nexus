@@ -68,6 +68,13 @@ def _make_cfg(
     cfg.trailing_stop = 0.0
     cfg.min_hold_seconds = 0.0
     cfg.spread_cost_bps = 0.0
+    # Cycle 10+ additions — must be explicit so MagicMock comparisons don't TypeError.
+    cfg.min_entry_yes_mid = 0.0
+    cfg.stop_loss_pct = 0.0
+    cfg.max_market_vol_30m = 0.0
+    cfg.simulate_fees = None
+    cfg.simulate_sizing = None
+    cfg.simulate_slippage = None
     return cfg
 
 

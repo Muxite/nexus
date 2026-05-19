@@ -447,6 +447,7 @@ class PaperTrader:
         for match, result in zip(survivors, classify_results):
             decision = await self._evaluate_market(
                 session, signal_id, headline, match, result, prompt_meta_json,
+                cluster_factor=cluster_factor,
             )
             decisions.append(decision)
 
@@ -593,6 +594,7 @@ class PaperTrader:
         match: MarketMatch,
         result: ClassifyResult,
         prompt_meta_json: Optional[str],
+        cluster_factor: float = 1.0,
     ) -> TradeDecision:
         """Evaluate one match and record the trade decision."""
         # Step-by-step audit trail of guard outcomes. Persisted as JSON on
