@@ -547,7 +547,7 @@ engines:
   # history (a39b0c8) for revival if a future cycle finds the regime change.
 
   - name: "balanced"
-    min_edge: 0.03
+    min_edge: 0.015
     edge_increment: 0.12
     max_position_usdc: 100.0
     min_confidence: 0.40
@@ -601,7 +601,7 @@ engines:
   # the failure mode rather than the rule set, and we should ship the
   # inversion as a global gate.
   - name: "inverted_highconf"
-    min_edge: 0.03
+    min_edge: 0.015
     edge_increment: 0.12
     max_position_usdc: 100.0
     min_confidence: 0.40
