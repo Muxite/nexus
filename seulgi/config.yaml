@@ -507,10 +507,11 @@ trading:
   # cold-cull / timeout / WIN / LOSS) still apply.
   infinite_balance: false
   mode: "simulate"
-  # ── Simulate mode (4h soak, 2026-05-18) ────────────────────────────
-  # 17 active variants × $50 each = $850 total bankroll. AI calls
-  # pause automatically when no variant has free capital (plan §3).
-  simulate_total_usdc: 850.0
+  # ── Simulate mode ──────────────────────────────────────────────────
+  # Phase E.7.3 (2026-05-19): 8 active variants × $100 each = $800.
+  # Reset cycle with evolutionary expansion — 3 parents + 5 mutants.
+  # AI calls pause automatically when no variant has free capital.
+  simulate_total_usdc: 800.0
   simulate_min_trade_usdc: 1.0
   # Soft rail-skip: reject trades when the entry-side mid is within this
   # distance of 0/1. 6h backtest: 99% of p≥0.95 entries were no_signal — the
@@ -563,12 +564,31 @@ engines:
       # 2026-05-19 earlier cut: removed _tp010_sl020 (-0.08),
       # _inv65 (-0.27), _norail (-0.17).
       # Earlier retirements (2026-05-17): conf40_tp020_sl030, _conf55, _conf70.
-      - name: "conf40_tp030_sl050"          # wide exits
+      #
+      # 2026-05-19 Phase E.7.3 evolutionary expansion: 2 parents +
+      # 3 balanced mutants. Mutations vary one feature at a time
+      # against the wide-exit parent so per-variant attribution stays
+      # clean. E.5b rolling hit-rate guard provides defensive kill.
+      - name: "conf40_tp030_sl050"          # parent: wide exits
         take_profit:   0.030
         stop_loss:     0.050
         trailing_stop: 0.015
-      - name: "conf40_tp020_sl030_slpct10"  # price-relative SL floor
+      - name: "conf40_tp020_sl030_slpct10"  # parent: price-relative SL floor
         stop_loss_pct: 0.10
+      - name: "conf40_tp030_sl050_slpct10"  # mutant: wide exits + pct floor
+        take_profit:   0.030
+        stop_loss:     0.050
+        trailing_stop: 0.015
+        stop_loss_pct: 0.10
+      - name: "conf45_tp030_sl050"          # mutant: tighter conf gate on wide
+        min_confidence: 0.45
+        take_profit:   0.030
+        stop_loss:     0.050
+        trailing_stop: 0.015
+      - name: "conf40_tp025_sl045"          # mutant: slightly tighter exits
+        take_profit:   0.025
+        stop_loss:     0.045
+        trailing_stop: 0.012
 
   # conservative engine removed in cycle 4 — prior postmortem showed −$88.46 PnL
   # (lowest of all engines); dropping it gives a cleaner three-engine comparison
@@ -599,7 +619,21 @@ engines:
       # 2026-05-19 Phase-E cut: drop _lowvol (see balanced engine note).
       # 2026-05-19 earlier cut: removed _inv65 (-0.27), _tp010_sl020_inv75
       # (-0.08), _hi75 (-0.17), _hi65 (-0.07).
-      - name: "conf40_tp030_sl050_inv75"        # wide exits
+      #
+      # 2026-05-19 Phase E.7.3 evolutionary expansion: 1 parent +
+      # 2 inverted mutants — cross-breed with best balanced features
+      # (slpct10) and tighter conf gate.
+      - name: "conf40_tp030_sl050_inv75"            # parent: wide exits
+        take_profit:   0.030
+        stop_loss:     0.050
+        trailing_stop: 0.015
+      - name: "conf40_tp030_sl050_slpct10_inv75"    # mutant: wide + pct + inv
+        take_profit:   0.030
+        stop_loss:     0.050
+        trailing_stop: 0.015
+        stop_loss_pct: 0.10
+      - name: "conf45_tp030_sl050_inv75"            # mutant: tighter conf + inv
+        min_confidence: 0.45
         take_profit:   0.030
         stop_loss:     0.050
         trailing_stop: 0.015
