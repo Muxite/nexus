@@ -3,7 +3,17 @@ name: high_confidence_anti_informative
 stage: post_ai
 action: skip
 confidence_min: 0.75
+engines_exclude: inverted_highconf
 ---
+
+<!-- M2 (2026-05-19): engines_exclude added so the rule no longer
+short-circuits the inverted_highconf variants. Those variants exist
+specifically to test the inversion-of-high-confidence thesis; with the
+rule firing universally they had zero opportunity to demonstrate it.
+The rule still applies to `balanced` and any future non-inverted
+engines. Compare per-engine ROI after 24h to decide whether to make
+the exclusion permanent or revert. -->
+
 
 # Skip when the AI is highly confident
 

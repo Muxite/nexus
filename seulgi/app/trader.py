@@ -754,6 +754,7 @@ class PaperTrader:
                 confidence=result.confidence,
                 freshness_label=getattr(headline, "_freshness_label", None),
                 question=match.question,
+                engine_root=self._parent_engine,
             )
             if reason is not None:
                 trace.append({"step": "post_ai_rule", "pass": False, "reason": reason})

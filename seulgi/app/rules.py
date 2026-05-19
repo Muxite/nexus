@@ -72,6 +72,11 @@ class Rule:
     # for topic-level skip rules.
     freshness_label: Optional[str] = None
     question_rx: Optional[re.Pattern] = None
+    # M2 — per-engine exemption. Listed engine roots (parent engine name,
+    # e.g. "inverted_highconf") cause this rule to NOT fire for trades from
+    # variants under those engines. Used to A/B a rule against a subset of
+    # the engine population. Empty tuple = applies to all engines (default).
+    engines_exclude: tuple = ()
 
     def skip_reason(self) -> str:
         return f"RULE_{self.name}_SKIP"
@@ -142,6 +147,16 @@ def _compile_rule(fm: dict, source_path: Path) -> Optional[Rule]:
 
     freshness_label = fm.get("freshness_label", "").strip().upper() or None
 
+    # M2 — engines_exclude: comma-separated list of engine roots, e.g.
+    # `engines_exclude: inverted_highconf, aggressive`. Frontmatter parser
+    # gives us the raw string; we split + lowercase here.
+    engines_exclude_raw = fm.get("engines_exclude", "").strip()
+    engines_exclude: tuple = ()
+    if engines_exclude_raw:
+        engines_exclude = tuple(
+            s.strip().lower() for s in engines_exclude_raw.split(",") if s.strip()
+        )
+
     question_rx_raw = fm.get("question_rx", "").strip()
     question_rx: Optional[re.Pattern] = None
     if question_rx_raw:
@@ -166,6 +181,7 @@ def _compile_rule(fm: dict, source_path: Path) -> Optional[Rule]:
         source_path=str(source_path),
         freshness_label=freshness_label,
         question_rx=question_rx,
+        engines_exclude=engines_exclude,
     )
 
 
@@ -284,9 +300,16 @@ class RuleEngine:
         self, *, market_type: Optional[str], mid_price: Optional[float],
         direction: str, confidence: float,
         freshness_label: Optional[str] = None, question: Optional[str] = None,
+        engine_root: Optional[str] = None,
     ) -> Optional[str]:
+        engine_root_lc = (engine_root or "").lower()
         for r in self._rules:
             if r.stage != "post_ai":
+                continue
+            # M2 — honor per-engine exemption. `engine_root` is the parent
+            # engine name (e.g. "inverted_highconf"); skipped rules don't
+            # fire for variants under those engines.
+            if engine_root_lc and engine_root_lc in r.engines_exclude:
                 continue
             if _rule_matches(
                 r,
