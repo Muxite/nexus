@@ -94,6 +94,61 @@ class TestParseResponse:
         assert result.reason == "parse_error"
 
 
+def _make_dist_response(p_yes, p_no, p_neu, p_alpha=None, reason="r") -> dict:
+    body = {"p_yes": p_yes, "p_no": p_no, "p_neutral": p_neu, "reason": reason}
+    if p_alpha is not None:
+        body["p_alpha"] = p_alpha
+    return {
+        "choices": [{"message": {"content": json.dumps(body)}}],
+        "usage": {"total_tokens": 1},
+    }
+
+
+class TestProductionConfidenceContract:
+    """Pin the cycle-7+ contract: ClassifyResult.confidence delivered to the
+    trader is `p_alpha` when present (probability the trade is +EV), not the
+    argmax probability of the distribution. This is the contract the trader
+    edge model relies on — edge = edge_increment × (2·p_alpha − 1). Changing
+    this without updating min_edge / edge_increment will silently break the
+    drought-recovery hypothesis behind Phase E.9."""
+
+    def test_confidence_is_p_alpha_when_provided(self):
+        # argmax = p_no (0.5) but p_alpha = 0.7 → trader sees 0.7
+        result = _parse_response(_make_dist_response(0.3, 0.5, 0.2, p_alpha=0.7))
+        assert result.direction == Direction.NO
+        assert result.confidence == pytest.approx(0.7)
+
+    def test_confidence_falls_back_to_argmax_when_p_alpha_missing(self):
+        # p_alpha omitted → confidence = argmax probability (= p_yes)
+        result = _parse_response(_make_dist_response(0.6, 0.3, 0.1))
+        assert result.direction == Direction.YES
+        assert result.confidence == pytest.approx(0.6)
+
+    def test_p_alpha_zero_falls_back_to_argmax(self):
+        # p_alpha = 0.0 is treated as "missing" so a forgotten field doesn't
+        # silently zero out every signal.
+        result = _parse_response(_make_dist_response(0.55, 0.35, 0.10, p_alpha=0.0))
+        assert result.direction == Direction.YES
+        assert result.confidence == pytest.approx(0.55)
+
+    def test_e9_min_edge_admits_conf_between_0_56_and_0_625(self):
+        """With edge_increment=0.12, the band conf ∈ [0.5625, 0.625) produces
+        edge ∈ [0.015, 0.030). The Phase E.9 cut (min_edge 0.03 → 0.015) is
+        designed to admit exactly this band. Regression-pin so a future
+        edge_increment change can't silently re-close it."""
+        edge_increment = 0.12
+        for conf in [0.5625, 0.58, 0.60, 0.624]:
+            edge = edge_increment * max(0.0, 2 * conf - 1)
+            assert edge >= 0.015 - 1e-9, f"conf={conf} edge={edge} fails E.9 floor"
+            assert edge < 0.030, f"conf={conf} edge={edge} would also pass old min_edge"
+
+    def test_e9_min_edge_still_excludes_conf_below_0_5625(self):
+        edge_increment = 0.12
+        for conf in [0.50, 0.55, 0.56]:
+            edge = edge_increment * max(0.0, 2 * conf - 1)
+            assert edge < 0.015, f"conf={conf} edge={edge} should still be excluded"
+
+
 # ---------------------------------------------------------------------------
 # DirectionClassifier.classify
 # ---------------------------------------------------------------------------
