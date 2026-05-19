@@ -75,6 +75,11 @@ def _make_cfg(
     cfg.simulate_fees = None
     cfg.simulate_sizing = None
     cfg.simulate_slippage = None
+    # M4 variant-level filter defaults
+    cfg.direction_filter = ""
+    cfg.freshness_filter = ""
+    cfg.mid_yes_min = 0.0
+    cfg.mid_yes_max = 1.0
     return cfg
 
 
