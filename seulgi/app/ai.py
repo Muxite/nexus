@@ -384,7 +384,7 @@ class DirectionClassifier:
                     {"role": "system", "content": _BATCH_SYSTEM_MESSAGE},
                     {"role": "user",   "content": prompt},
                 ],
-                "max_tokens": 80 * len(matches) + 50,
+                "max_tokens": 160 * len(matches) + 100,
                 "temperature": temp,
                 "response_format": {"type": "json_object"},
             }
