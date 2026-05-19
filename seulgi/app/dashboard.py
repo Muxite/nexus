@@ -179,6 +179,9 @@ class Dashboard:
         # Per-engine balances: engine_name → balance
         self._engine_balances: dict[str, float] = {}
         self._total_realized_pnl: float = 0.0
+        # E.7.1: active-variant filter for the lifetime leaderboard render.
+        # Populated by register_engines(). Empty set → no filter (all-time view).
+        self._active_variants: set[str] = set()
         # Engine comparison summary rows (from DB query)
         self._engine_summary: list[dict] = []
         self._engine_skip_reasons: list[dict] = []
@@ -346,10 +349,18 @@ class Dashboard:
         completes. Without this, the dashboard render loop can race the
         sequential init in main.py and intermittently drop engines from the
         per-engine block.
+
+        Also records the active-variant set so the lifetime leaderboard can
+        hide retired variants (E.7.1). Lifetime stats query the trades table
+        across all-time, so without this filter the top of the table is
+        dominated by variants no longer running (e.g. the aggressive core
+        retired 2026-05-18, _lowvol retired 2026-05-19).
         """
         for name in engine_names:
             self._engine_balances.setdefault(name, 0.0)
             self._engine_staked.setdefault(name, 0.0)
+        # Set the active-variant filter (variant_name == engine name in DB).
+        self._active_variants: set[str] = set(engine_names)
 
     def set_engine_summary(self, summary: list[dict], skip_reasons: list[dict]) -> None:
         """Refresh engine comparison data (called after each position monitor cycle)."""
@@ -686,16 +697,29 @@ class Dashboard:
                 logger.warning("[dash] freshness_buckets query failed: %s", exc)
                 fresh_buckets = []
 
-            lines += ["", "── VARIANT LEADERBOARD (lifetime, top 5 by sum PnL) ─────────────"]
-            if not v_stats:
-                lines.append("  (no executed trades yet)")
+            # E.7.1: filter to active variants only. The lifetime leaderboard
+            # is otherwise dominated by retired variants (aggressive/_lowvol
+            # whose lifetime PnL still ranks ahead of newly-cut survivors).
+            # variant_compare.txt retains the unfiltered full table.
+            if self._active_variants:
+                v_stats_view = [r for r in v_stats
+                                if (r.get("variant") or "") in self._active_variants]
+            else:
+                v_stats_view = list(v_stats)
+
+            lines += ["", "── VARIANT LEADERBOARD (active engines, by sum PnL) ─────────────"]
+            if not v_stats_view:
+                if self._active_variants and v_stats:
+                    lines.append("  (no closed trades yet for the active engines)")
+                else:
+                    lines.append("  (no executed trades yet)")
             else:
                 lines.append(
                     f"  {'VARIANT':<34}  {'N':>5} {'WINS':>5} {'LOSS':>5}  "
                     f"{'HIT%':>6}  {'SUM PnL':>9}"
                 )
                 lines.append("  " + "─" * 76)
-                for r in v_stats[:5]:
+                for r in v_stats_view[:8]:
                     closed = (r.get("n_wins") or 0) + (r.get("n_losses") or 0)
                     hit = (r["n_wins"] / closed * 100.0) if closed else 0.0
                     lines.append(
@@ -703,7 +727,7 @@ class Dashboard:
                         f"{r['n_wins']:>5} {r['n_losses']:>5}  "
                         f"{hit:>5.1f}%  {r['sum_pnl']:>+9.2f}"
                     )
-                lines.append("  Full table: variant_compare.txt")
+                lines.append("  Full table (incl. retired): variant_compare.txt")
 
             lines += ["", "── DECISION FUNNEL (last 1h) ────────────────────────────────────"]
             if funnel is None or funnel["total"] == 0:
