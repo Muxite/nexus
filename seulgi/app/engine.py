@@ -623,35 +623,41 @@ class EngineRunner:
         #
         #   - Replay harness validates this combination at 500/c=16
         #     with zero gaps. Production soak in progress to confirm.
+        # 2026-05-21 08:50 UTC: timeout MUST be OUTSIDE the batch context
+        # manager, not inside. Earlier the wait_for was nested inside
+        # `async with db.batch():` — but `async with` calls __aenter__
+        # which awaits the lock and runs BEGIN BEFORE the body. If
+        # that __aenter__ hangs (the actual production failure mode —
+        # aiosqlite worker thread stuck holding a cursor result the
+        # event loop never woke for), the timeout inside the body
+        # never runs because we never enter the body. With the
+        # timeout wrapping the whole async-with, a hang in __aenter__
+        # IS caught: asyncio.wait_for cancels the awaiting
+        # coroutine, which triggers __aexit__ via the cancellation
+        # path → rollback → lock release.
+        async def _batched_gather():
+            async with self._db.batch():
+                return await asyncio.gather(
+                    *[
+                        self._run_engine(
+                            engine, headline, signal_id,
+                            survivors, classify_results, prompt_meta_json,
+                            pre_skips, pre_ms, relevance_skips=relevance_skips,
+                            freshness_label=freshness.label,
+                        )
+                        for engine in active_engines
+                    ],
+                    return_exceptions=True,
+                )
+
         results: list[list[TradeDecision]] = []
         try:
-            async with self._db.batch():
-                results = await asyncio.wait_for(
-                    asyncio.gather(
-                        *[
-                            self._run_engine(
-                                engine, headline, signal_id,
-                                survivors, classify_results, prompt_meta_json,
-                                pre_skips, pre_ms, relevance_skips=relevance_skips,
-                                freshness_label=freshness.label,
-                            )
-                            for engine in active_engines
-                        ],
-                        return_exceptions=True,
-                    ),
-                    timeout=90.0,
-                )
+            results = await asyncio.wait_for(_batched_gather(), timeout=90.0)
         except asyncio.TimeoutError:
-            # The gather did not complete within 90s. The
-            # async-with context exits via the TimeoutError so
-            # db.batch()'s rollback path runs: BEGIN is rolled back,
-            # `_batch_lock` is released, subsequent process() calls
-            # proceed cleanly. The lost data is at most one headline's
-            # engine_results — recoverable from price_impacts later.
             logger.error(
                 "[runner] [hid=%s] ENGINE GATHER TIMEOUT 90 s — batch "
-                "rolled back, lock released. %d engines were running.",
-                hid, len(active_engines),
+                "cancelled, lock released via __aexit__. %d engines "
+                "were running.", hid, len(active_engines),
             )
             results = []
 
