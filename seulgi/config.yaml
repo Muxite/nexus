@@ -434,17 +434,24 @@ markets:
 #               anthropic/claude-haiku-4-5  (reliable JSON)
 #               meta-llama/llama-3.1-8b-instruct  (free tier)
 ai:
-  # Stage-3 prediction model. 2026-05-21: switched from gemini-2.5-flash
-  # → gemini-3.1-flash-lite-preview. OpenRouter pricing comparison:
-  #   2.5-flash      : in $0.300/M  out $2.500/M
-  #   3.1-flash-lite : in $0.250/M  out $1.500/M  ← 40% cheaper output
+  # Stage-3 prediction model. 2026-05-21 evening: REVERTED to gemini-2.5-flash
+  # after the gemini-3.1-flash-lite-preview swap (06:00 UTC) produced only
+  # 1 executed trade across 330,570 decisions in the same trading day.
+  # Diagnostic: ~99.9% of predictions came back NEUTRAL — including 44
+  # high-confidence (≥0.65) NEUTRALs labelled "neutral" by trader.evaluate.
+  # The new model is dramatically more conservative than 2.5-flash under
+  # the current prompt; until the prompt is tuned for it (or a backtest
+  # validates a new prompt), pay the higher per-token cost rather than
+  # lose trade volume.
+  #
+  # OpenRouter pricing reference (refresh against /v1/models):
+  #   2.5-flash      : in $0.300/M  out $2.500/M  ← current
+  #   3.1-flash-lite : in $0.250/M  out $1.500/M  (cheaper but too quiet)
   #   2.5-flash-lite : in $0.100/M  out $0.400/M  (used for relevance below)
-  # Output dominates spend (structured JSON, per-market reasoning). The
-  # 3.1-flash-lite-preview is "almost as good as 2.5 flash" per user
-  # guidance and gives ~30% overall LLM cost reduction. Relevance gate
-  # already culls bad candidates upstream so the prediction call only
-  # reasons about survivors.
-  model: "google/gemini-3.1-flash-lite-preview"
+  #
+  # Pre-swap snapshot lives at snapshots/pre_3.1_flash_lite_swap_20260521/
+  # if a future revisit needs a clean baseline DB.
+  model: "google/gemini-2.5-flash"
   # Cross-vendor premium fallback. Triggered when the relevance pass marks
   # ≥2 markets STRONG_YES AND freshness=BREAKING (see relevance.py).
   premium_model: "anthropic/claude-haiku-4-5"
