@@ -3,6 +3,17 @@ aiosqlite>=0.20,<1.0
 numpy>=1.26,<3.0
 pyyaml>=6.0,<7.0
 sentence-transformers>=3.0,<4.0
+# 2026-05-21: faulthandler caught a SIGSEGV inside
+# chromadb/segment/impl/vector/local_hnsw.py:94 (HNSW.start) on
+# concurrent Collection.query calls from news_memory.assess. Likely
+# trigger: the dual-container day left two writers competing for the
+# same on-disk HNSW index, plus chromadb 0.6.x's HNSW init is not
+# crash-safe. Tried pinning to 0.4.x — the C++ wheel for chroma-hnswlib
+# fails to build in python:3.12-slim without build-essential. For now
+# we keep the >=0.5,<1.0 range and use the SEULGI_DISABLE_NEWS_MEMORY
+# kill switch in docker-compose.yml. Follow-up: install build-essential
+# + g++ in the Dockerfile, then re-pin chromadb to 0.4.24, OR rebuild
+# the news_chroma index from headlines.headline.
 chromadb>=0.5,<1.0
 matplotlib>=3.8,<4.0
 # Test deps (small, baked-in so `docker compose run --rm seulgi-test` works)

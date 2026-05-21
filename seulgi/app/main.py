@@ -19,6 +19,16 @@ Ctrl-C / SIGTERM shuts down cleanly.
 
 from __future__ import annotations
 
+# Install C-level signal handlers as the FIRST thing — before any C
+# extensions (chromadb / sentence_transformers / aiohttp / aiosqlite)
+# get a chance to corrupt state. On SIGSEGV / SIGABRT / SIGFPE / SIGBUS
+# / SIGILL faulthandler dumps every thread's Python call stack to
+# stderr, which `docker logs` captures because PYTHONUNBUFFERED=1.
+# Added 2026-05-21 after a post-restart segfault loop (exitCode=139,
+# ~60-70s lifespan per cycle) left no Python traceback in the logs.
+import faulthandler
+faulthandler.enable()
+
 import asyncio
 import logging
 import os
@@ -495,12 +505,20 @@ async def main() -> None:
 
     refresh_secs = cfg.markets.refresh_hours * 3600
 
-    # Periodic matplotlib quant plots (every 10 minutes by default)
-    plotter = QuantPlotter(
+    # Periodic matplotlib quant plots (every 10 minutes by default).
+    # 2026-05-21: opt-out kill switch added after a SIGSEGV restart loop
+    # caught by faulthandler — backend_agg.draw_path crashing inside the
+    # default ThreadPoolExecutor on the first chart render. Until the
+    # plotter is moved to a dedicated single-thread executor (or
+    # subprocess), set SEULGI_DISABLE_PLOTTER=1 to skip task creation.
+    plotter_disabled = os.getenv("SEULGI_DISABLE_PLOTTER") == "1"
+    plotter = None if plotter_disabled else QuantPlotter(
         db=db,
         dashboard_dir=cfg.dashboard.data_dir,
         interval_secs=cfg.plotter.interval_secs,
     )
+    if plotter_disabled:
+        logger.warning("[main] plotter DISABLED via SEULGI_DISABLE_PLOTTER=1")
 
     # Scraper health poller — surfaces a single root cause when every watcher
     # is dead at once because the shared scraper is unreachable.
@@ -517,9 +535,10 @@ async def main() -> None:
             name="system-health",
         ),
         asyncio.create_task(_headline_drain_loop(queue, runner, dash), name="drain"),
-        asyncio.create_task(plotter.run(), name="quant-plotter"),
         asyncio.create_task(lessons.runner(db, interval_secs=600.0), name="lessons"),
     ]
+    if plotter is not None:
+        bg_tasks.append(asyncio.create_task(plotter.run(), name="quant-plotter"))
     for t in bg_tasks:
         t.add_done_callback(_log_task_exception)
 

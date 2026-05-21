@@ -16,6 +16,17 @@ Charts produced:
 All renders run in a thread executor — matplotlib is synchronous and CPU-bound,
 so off-loading keeps the asyncio loop responsive. Failure to plot is logged
 and swallowed; the rest of seulgi continues regardless.
+
+KNOWN BUG (2026-05-21): matplotlib's backend_agg.draw_path SIGSEGVs on the
+first render when called from the default ThreadPoolExecutor (faulthandler
+trace caught it at plotter.py:1164 fig.savefig). Plotter is currently disabled
+in production via SEULGI_DISABLE_PLOTTER=1 set in docker-compose.yml. To
+re-enable safely, either:
+  (a) route every loop.run_in_executor() call here through a dedicated
+      ThreadPoolExecutor(max_workers=1, thread_name_prefix="plotter") so
+      matplotlib's process-wide state is owned by exactly one thread, OR
+  (b) move the renders into a subprocess (multiprocessing.Process) so a
+      segfault can never take down the main bot.
 """
 
 from __future__ import annotations
