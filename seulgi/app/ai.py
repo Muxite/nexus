@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from enum import Enum
@@ -305,7 +306,13 @@ class DirectionClassifier:
                 if is_republish and similar_to else ""
             )
         source_block = f"Source: {source}\n" if source else ""
-        if lesson_notes:
+        # Lessons inject "treat as NEUTRAL" advisories into every prompt.
+        # The current lesson set was seeded 2026-05-18 from the broken-
+        # MTM-accounting era ("Conf >=0.85 was 100% no-signal in last cycle;
+        # treat as NEUTRAL ..."), and is currently driving 100% NEUTRAL output
+        # post-M1-prompt-revert. Env-gate the block so we can disable it
+        # cleanly during the drought-diagnosis window without mutating the DB.
+        if lesson_notes and not os.getenv("SEULGI__LESSONS_DISABLE"):
             lesson_lines = "\n".join(f"  - {n}" for n in lesson_notes[:8])
             lessons_block = f"Recent lessons (apply to confidence + direction):\n{lesson_lines}\n"
         else:
@@ -586,10 +593,13 @@ def _parse_one(obj: dict) -> ClassifyResult:
                                   p_yes=0.0, p_no=0.0, p_neutral=1.0,
                                   p_alpha=p_alpha, risk_score=risk_score)
         p_yes /= total; p_no /= total; p_neu /= total
-        # Pick argmax; tie → NEUTRAL.
-        if p_yes > p_no and p_yes > p_neu:
+        # Pick argmax. Ties between a directional and p_neutral resolve to
+        # the directional — the LLM clearly leaned (one side has more mass
+        # than the other) and hedging with p_neutral shouldn't blank that
+        # signal. Pure ties between p_yes and p_no still resolve to NEUTRAL.
+        if p_yes > p_no and p_yes >= p_neu:
             direction, conf = Direction.YES, p_yes
-        elif p_no > p_yes and p_no > p_neu:
+        elif p_no > p_yes and p_no >= p_neu:
             direction, conf = Direction.NO, p_no
         else:
             direction, conf = Direction.NEUTRAL, p_neu

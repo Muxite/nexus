@@ -3,6 +3,7 @@ name: mid_above_085
 stage: pre_ai
 action: skip
 mid_min: 0.85
+engines_exclude: scout
 ---
 
 # Skip markets with mid > 0.85

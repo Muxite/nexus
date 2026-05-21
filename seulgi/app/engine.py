@@ -77,6 +77,11 @@ class Engine:
     """
     name: str
     trader: PaperTrader
+    # Set to the parent EngineConfig.balance_usdc when YAML explicitly
+    # specifies a per-engine pot. main.py's simulate-mode split respects
+    # this — fixed-balance engines keep their pot; remaining engines split
+    # the remainder of simulate_total_usdc. None → engine pools in the split.
+    fixed_balance: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------
@@ -303,8 +308,10 @@ class EngineRunner:
             logger.debug("[runner] [hid=%s] no matches: %s", hid, headline.headline[:80])
             return
 
-        # Bump heat scores for matched markets (fire-and-forget)
-        asyncio.create_task(self._db.bump_market_heat([m.condition_id for m in matches]))
+        # Bump heat scores for matched markets — awaited so it joins the
+        # outer db.batch() in process() instead of escaping into its own
+        # transaction (Phase B coalescing).
+        await self._db.bump_market_heat([m.condition_id for m in matches])
 
         # ── Parallel mid-price prefetch ─────────────────────────────────────
         # Fetch every match's YES and NO mid price in ONE gather. Drops matches
@@ -360,12 +367,19 @@ class EngineRunner:
             )
             return
 
-        # ── Pre-AI rule gate (shared across all variants) ───────────────────
+        # ── Pre-AI rule gate (two-tier: universal here, scoped per-engine) ──
+        # Shared pass runs only "universal" rules (those with empty
+        # `engines_exclude`). Rules that opt some engine out via
+        # `engines_exclude: <name>` defer to per-engine evaluation inside
+        # `_run_engine`, so scout can bypass them while production engines
+        # still apply them. The shared pass keeps the optimization for
+        # truly-universal rules; today's 7 scout-excluding rules all run
+        # in the per-engine pass.
         pre_skips: list[tuple[MarketMatch, str]] = []
         survivors: list[MarketMatch] = []
         if self._rules is not None:
             for m in matches:
-                reason = self._rules.gate_pre_ai(
+                reason = self._rules.gate_pre_ai_universal(
                     market_type=m.market_type, mid_price=m.mid_yes,
                     freshness_label=freshness.label,
                     question=m.question,
@@ -426,14 +440,14 @@ class EngineRunner:
                     source=source_host,
                 )
                 if rmeta.get("tokens"):
-                    asyncio.create_task(self._db.log_usage(
+                    await self._db.log_usage(
                         kind="ai_tokens",
                         count=float(rmeta["tokens"]),
                         provider=rmeta.get("model"),
                         meta=json.dumps({"hid": hid, "stage": "relevance",
                                          "n_in": rmeta.get("n_in"),
                                          "n_kept": rmeta.get("n_kept")}),
-                    ))
+                    )
                 # Tag each match with its verdict so the trader can persist
                 # relevance_score / relevance_reason on every trade row.
                 kept_ids = {id(m) for m in kept}
@@ -518,13 +532,13 @@ class EngineRunner:
             # variants by construction.
             tokens_used = sum(r.tokens_used for r in classify_results)
             if tokens_used:
-                asyncio.create_task(self._db.log_usage(
+                await self._db.log_usage(
                     kind="ai_tokens",
                     count=float(tokens_used),
                     provider=prompt_meta.get("model"),
                     meta=json.dumps({"hid": hid, "n_markets": len(survivors),
                                      "stage": "prediction"}),
-                ))
+                )
 
         prompt_meta_json = (
             json.dumps(prompt_meta, separators=(",", ":")) if prompt_meta else None
@@ -545,17 +559,26 @@ class EngineRunner:
         # Fan out to all engines/variants concurrently. Every engine sees the
         # same signal_id, same classify_results, same prompt_meta, same
         # relevance_skips list (each variant persists its own copy).
-        results: list[list[TradeDecision]] = await asyncio.gather(
-            *[
-                self._run_engine(
-                    engine, headline, signal_id,
-                    survivors, classify_results, prompt_meta_json,
-                    pre_skips, pre_ms, relevance_skips=relevance_skips,
-                )
-                for engine in active_engines
-            ],
-            return_exceptions=True,
-        )
+        # Phase B (2026-05-21): wrap the engine fan-out in db.batch() so
+        # the ~400 writes per headline (insert_trade × N + open_position
+        # × M + record_engine_decisions × engines) commit as ONE
+        # transaction = ONE fsync. The lock inside batch() serialises
+        # this against other process() coroutines so concurrent
+        # headlines don't race on BEGIN/COMMIT. HTTP/AI work above is
+        # parallel; only the write phase is serialised.
+        async with self._db.batch():
+            results: list[list[TradeDecision]] = await asyncio.gather(
+                *[
+                    self._run_engine(
+                        engine, headline, signal_id,
+                        survivors, classify_results, prompt_meta_json,
+                        pre_skips, pre_ms, relevance_skips=relevance_skips,
+                        freshness_label=freshness.label,
+                    )
+                    for engine in active_engines
+                ],
+                return_exceptions=True,
+            )
 
         for engine, engine_results in zip(active_engines, results):
             if isinstance(engine_results, BaseException):
@@ -645,6 +668,7 @@ class EngineRunner:
         pre_skips: list[tuple[MarketMatch, str]],
         pre_ms: float = 0.0,
         relevance_skips: Optional[list] = None,
+        freshness_label: Optional[str] = None,
     ) -> list[TradeDecision]:
         """
         Run one engine/variant on the pre-classified matches.
@@ -654,21 +678,74 @@ class EngineRunner:
         """
         hid = getattr(headline, "headline_id", "")
         _t_engine = time.monotonic()
+
+        # ── Per-engine scoped pre-AI gate ──────────────────────────────────
+        # The shared loop in process() applied only universal rules. Rules
+        # with `engines_exclude` set (today: all 7 of them, all excluding
+        # scout) apply here so scout can bypass while production engines
+        # keep the same behavior they had before the split. We must keep
+        # survivors and classify_results aligned by index when filtering.
+        engine_pre_skips: list[tuple[MarketMatch, str]] = list(pre_skips or [])
+        engine_survivors: list[MarketMatch] = []
+        engine_classify: list[ClassifyResult] = []
+        parent_root = getattr(engine.trader, "_parent_engine", engine.name) or engine.name
+        if self._rules is not None:
+            for m, cr in zip(survivors, classify_results):
+                scoped_reason = self._rules.gate_pre_ai_scoped(
+                    market_type=m.market_type, mid_price=m.mid_yes,
+                    engine_root=parent_root,
+                    freshness_label=freshness_label,
+                    question=m.question,
+                )
+                if scoped_reason is None:
+                    engine_survivors.append(m)
+                    engine_classify.append(cr)
+                else:
+                    engine_pre_skips.append((m, scoped_reason))
+        else:
+            engine_survivors = list(survivors)
+            engine_classify = list(classify_results)
+
         # E8 cluster-size sizing: N = number of markets surviving the
-        # pre-AI gate for this headline. Each engine sees the same survivors,
-        # so the cluster_factor is shared. 1.0 when N<=1 (no scaling).
-        n_cluster = max(len(survivors), 1)
+        # pre-AI gate for this engine. The factor is per-engine now (scout's
+        # broader survivor set scales its own sizing, not production's).
+        n_cluster = max(len(engine_survivors), 1)
         cluster_factor = 1.0 / math.sqrt(n_cluster) if n_cluster > 1 else 1.0
-        decisions = await engine.trader.evaluate(
-            signal_id, headline, survivors, classify_results,
-            prompt_meta_json, pre_ai_skips=pre_skips,
-            relevance_skips=relevance_skips,
-            cluster_factor=cluster_factor,
-        )
+        # Tier 3 (2026-05-20): the batch() wrap had a concurrency bug —
+        # 15 engines call this concurrently on one shared aiosqlite conn;
+        # multiple `outer == True` reads stage interleaved BEGIN/COMMITs
+        # and silently roll back trader.evaluate's inserts. Reverted.
+        # WAL+synchronous=NORMAL already make per-insert commits cheap
+        # (~0.5 ms each); ~30 commits per engine per headline = ~15 ms.
+        # R3 Phase 1: wrap evaluate + record so one engine crashing doesn't
+        # contaminate the shared aiosqlite connection for the other 14
+        # engines fanning out in parallel. The decisions list is reset to
+        # [] on failure so the rest of this method (impact tracking,
+        # dashboard event hooks) becomes a no-op for the failed engine.
+        try:
+            decisions = await engine.trader.evaluate(
+                signal_id, headline, engine_survivors, engine_classify,
+                prompt_meta_json, pre_ai_skips=engine_pre_skips,
+                relevance_skips=relevance_skips,
+                cluster_factor=cluster_factor,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[runner] [hid=%s] engine '%s' evaluate crashed: %r",
+                hid, engine.name, exc, exc_info=True,
+            )
+            decisions = []
         total_latency_ms = pre_ms + (time.monotonic() - _t_engine) * 1000.0
-        await self._db.record_engine_decisions(
-            engine.name, decisions, headline_id=hid, signal_latency_ms=total_latency_ms
-        )
+        try:
+            await self._db.record_engine_decisions(
+                engine.name, decisions, headline_id=hid,
+                signal_latency_ms=total_latency_ms,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[runner] [hid=%s] engine '%s' record_engine_decisions failed: %r",
+                hid, engine.name, exc, exc_info=True,
+            )
 
         # Reconstruct the matches set for impact tracking (survivors only —
         # pre-AI skips never get a token assignment for the impact row).
@@ -845,6 +922,7 @@ def build_engines(
                     engine_name=v_name, rule_engine=rule_engine,
                     variant_name=v_name, parent_engine=ec.name,
                 ),
+                fixed_balance=ec.balance_usdc,
             ))
 
     # Carved-out strategy module (opt-in via env var). Lives in its own

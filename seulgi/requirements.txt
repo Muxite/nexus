@@ -5,3 +5,6 @@ pyyaml>=6.0,<7.0
 sentence-transformers>=3.0,<4.0
 chromadb>=0.5,<1.0
 matplotlib>=3.8,<4.0
+# Test deps (small, baked-in so `docker compose run --rm seulgi-test` works)
+pytest>=8.0,<10.0
+pytest-asyncio>=0.23,<1.0

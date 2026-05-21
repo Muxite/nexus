@@ -3,6 +3,7 @@ name: extreme_low_price
 stage: pre_ai
 action: skip
 mid_max: 0.10
+engines_exclude: scout
 ---
 
 # Skip markets priced ≤ 0.10

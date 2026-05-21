@@ -282,12 +282,20 @@ class RuleEngine:
     def rules(self) -> list[Rule]:
         return list(self._rules)
 
-    def gate_pre_ai(
+    def gate_pre_ai_universal(
         self, *, market_type: Optional[str], mid_price: Optional[float],
         freshness_label: Optional[str] = None, question: Optional[str] = None,
     ) -> Optional[str]:
+        """Apply only pre_ai rules with NO `engines_exclude` (apply to all engines).
+
+        Run once per headline before the per-engine fan-out: any rule that
+        would skip every engine equally lives here, so the work isn't
+        repeated 14× downstream.
+        """
         for r in self._rules:
             if r.stage != "pre_ai":
+                continue
+            if r.engines_exclude:
                 continue
             if _rule_matches(
                 r, market_type=market_type, mid_price=mid_price,
@@ -295,6 +303,57 @@ class RuleEngine:
             ):
                 return r.skip_reason()
         return None
+
+    def gate_pre_ai_scoped(
+        self, *, market_type: Optional[str], mid_price: Optional[float],
+        engine_root: str,
+        freshness_label: Optional[str] = None, question: Optional[str] = None,
+    ) -> Optional[str]:
+        """Apply only pre_ai rules WITH `engines_exclude` set, honoring it per engine.
+
+        Called once per engine inside _run_engine. Engines listed in a
+        rule's `engines_exclude` skip that rule (e.g. scout opting out of
+        the 7 standard pre-AI filters). Production engines re-apply the
+        same rules they applied today.
+        """
+        engine_root_lc = (engine_root or "").lower()
+        for r in self._rules:
+            if r.stage != "pre_ai":
+                continue
+            if not r.engines_exclude:
+                continue  # handled by gate_pre_ai_universal in the shared pass
+            if engine_root_lc and engine_root_lc in r.engines_exclude:
+                continue
+            if _rule_matches(
+                r, market_type=market_type, mid_price=mid_price,
+                freshness_label=freshness_label, question=question,
+            ):
+                return r.skip_reason()
+        return None
+
+    def gate_pre_ai(
+        self, *, market_type: Optional[str], mid_price: Optional[float],
+        freshness_label: Optional[str] = None, question: Optional[str] = None,
+        engine_root: Optional[str] = None,
+    ) -> Optional[str]:
+        """Backwards-compatible single-call gate (universal then scoped).
+
+        New callers should prefer the explicit universal/scoped pair so the
+        scoped pass can run inside the per-engine loop. This wrapper is
+        kept for tests and the legacy single-trader path at
+        `seulgi/app/trader.py`.
+        """
+        reason = self.gate_pre_ai_universal(
+            market_type=market_type, mid_price=mid_price,
+            freshness_label=freshness_label, question=question,
+        )
+        if reason is not None:
+            return reason
+        return self.gate_pre_ai_scoped(
+            market_type=market_type, mid_price=mid_price,
+            engine_root=engine_root or "",
+            freshness_label=freshness_label, question=question,
+        )
 
     def gate_post_ai(
         self, *, market_type: Optional[str], mid_price: Optional[float],

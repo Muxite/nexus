@@ -3,6 +3,7 @@ name: iran_topic_anti_edge
 stage: pre_ai
 action: skip
 question_rx: (?i)\biran\b
+engines_exclude: scout
 ---
 
 # Skip "Iran" questions

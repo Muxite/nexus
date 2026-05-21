@@ -3,6 +3,7 @@ name: us_election_topic_low_edge
 stage: pre_ai
 action: skip
 question_rx: (?i)\b(election|democratic\s+party|republican\s+party|house\s+seat|senate\s+seat)\b
+engines_exclude: scout
 ---
 
 # Skip US-election micro-races

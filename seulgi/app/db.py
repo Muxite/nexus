@@ -16,12 +16,33 @@ if the column already exists (SQLite's only safe migration pattern).
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiosqlite
 import numpy as np
+
+# Reentrancy flag for the write-lock: set True inside a batch() so that
+# nested write calls (insert_signal, insert_trade, etc.) running in the
+# SAME task skip the lock acquire (they're already serialized by the
+# enclosing batch). Other tasks see False and must acquire the lock.
+# contextvars is per-task — asyncio.create_task / gather copies the
+# context so child coroutines inherit the flag.
+_in_batch_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "seulgi_db_in_batch", default=False,
+)
+
+# Phase-0 observability: write-path counters bump into metrics + logs.
+# Import lazily/defensively because db.py is imported by scripts that
+# may not have the metrics module on their path (analysis CLIs).
+try:
+    import metrics as _metrics
+except Exception:  # noqa: BLE001
+    _metrics = None
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +379,35 @@ _MIGRATIONS = [
     # script can re-derive realized_pnl independently.
     "ALTER TABLE trades ADD COLUMN entry_fee_usdc REAL",
     "ALTER TABLE trades ADD COLUMN exit_fee_usdc  REAL",
+    # Tier 2 (2026-05-20 perf) — see plan-file: DB + program perf.
+    # Dashboard queries (variant_stats, decision_funnel, freshness_buckets,
+    # confidence_buckets) all WHERE decided_at >= ?. Without these indexes
+    # SQLite does full scans over 4 M-row trades + 1.7 M-row engine_results
+    # and the queries time out at 10 s. Composite (engine_name, decided_at)
+    # serves the common per-engine GROUP BY / ORDER BY pattern.
+    "CREATE INDEX IF NOT EXISTS idx_trades_decided_at ON trades(decided_at)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_engine_decided ON trades(engine_name, decided_at)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_variant_decided ON trades(variant_name, decided_at)",
+    "CREATE INDEX IF NOT EXISTS idx_engine_results_decided ON engine_results(decided_at)",
+    "CREATE INDEX IF NOT EXISTS idx_engine_results_engine_decided ON engine_results(engine_name, decided_at)",
+    # 2026-05-20 observability: minute-bucketed metrics from app.metrics.
+    # One row per (bucket_ts, name, tags). counters write count only;
+    # timers write count + sum + percentiles from a reservoir sample.
+    """CREATE TABLE IF NOT EXISTS metrics_minutely (
+        bucket_ts TEXT NOT NULL,
+        name      TEXT NOT NULL,
+        tags      TEXT NOT NULL DEFAULT '',
+        count     INTEGER NOT NULL,
+        sum       REAL,
+        min       REAL,
+        max       REAL,
+        p50       REAL,
+        p95       REAL,
+        p99       REAL,
+        PRIMARY KEY (bucket_ts, name, tags)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_metrics_name_bucket ON metrics_minutely(name, bucket_ts)",
+    "CREATE INDEX IF NOT EXISTS idx_metrics_bucket ON metrics_minutely(bucket_ts)",
 ]
 
 
@@ -376,14 +426,50 @@ class SeulgiDB:
     def __init__(self, path: str) -> None:
         self._path = path
         self._conn: Optional[aiosqlite.Connection] = None
+        # Tier 3 (2026-05-20 perf): nesting depth for db.batch(). Insert
+        # functions check this — if > 0, they skip the per-insert commit
+        # so the outer batch's single commit covers everything (one fsync
+        # per headline instead of 30-150).
+        self._in_batch: int = 0
+        # Phase B (2026-05-21): serialise outer batch() entries so
+        # concurrent process() calls don't race on the BEGIN/COMMIT
+        # bracket. Lazy-init in batch() because asyncio.Lock must be
+        # created inside a running event loop.
+        self._batch_lock: Optional[asyncio.Lock] = None
+        # Phase-0 observability: track per-table last successful insert
+        # and per-method ok/err counters. Surfaced by `write_health()`
+        # and the `db_health.txt` dashboard tile. Previously the silent-
+        # rollback bug ate inserts invisibly; these counters make it
+        # impossible to lose visibility again.
+        self._last_insert_at: dict[str, datetime] = {}
+        self._write_counters: dict[str, dict[str, int]] = {}
 
     async def connect(self) -> None:
         """Open the DB connection, create schema, and apply migrations."""
         self._conn = await aiosqlite.connect(self._path)
         self._conn.row_factory = aiosqlite.Row
+        # Tier 1 (2026-05-20 perf) — see plan-file: DB + program perf:
+        #   WAL: readers don't block writers (was journal_mode=delete).
+        #   synchronous=NORMAL: fsync at WAL checkpoint, not every commit.
+        #     Still crash-safe; on power loss only last few txns may be lost.
+        #   cache_size=-65536: 64 MB page cache (was 2 MB on a 3.7 GB DB).
+        #   temp_store=MEMORY: GROUP BY / ORDER BY in RAM, not disk.
+        #   mmap_size: cheap reads via memory map.
+        #   wal_autocheckpoint: keep -wal file bounded.
+        #   busy_timeout: writers wait up to 30 s instead of raising
+        #     "database is locked" immediately on transient contention.
+        await self._conn.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA cache_size=-65536;
+            PRAGMA temp_store=MEMORY;
+            PRAGMA mmap_size=268435456;
+            PRAGMA wal_autocheckpoint=1000;
+            PRAGMA busy_timeout=30000;
+        """)
         await self._conn.executescript(_SCHEMA)
         await self._conn.executescript(_PRICE_IMPACT_SCHEMA)
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         await self._migrate()
         # One-time backfill: tag any historical NULL-engine trades using the
         # closest engine_results match. Cheap (one UPDATE), idempotent, and
@@ -397,6 +483,238 @@ class SeulgiDB:
         except Exception as exc:  # noqa: BLE001
             logger.warning("[db] engine_name backfill failed: %s", exc)
         logger.info("SeulgiDB connected: %s", self._path)
+
+    @asynccontextmanager
+    async def batch(self):
+        """Group inserts into a single transaction = single fsync.
+
+        Tier 3 (2026-05-20 perf): per-headline write fan-out used to call
+        commit() 30-150 times. With WAL+synchronous=NORMAL each fsync is
+        cheap, but commit() still serialises the write thread. Batching
+        keeps the writer occupied with INSERTs instead of BEGIN/COMMIT
+        churn and amortises the WAL frame writes.
+
+        Insert functions check `self._in_batch`: if > 0 they skip their
+        per-insert commit; the outer batch commits once at exit.
+
+        Concurrency model (2026-05-21 v2): batches are **strictly
+        serialised** across coroutines via `_batch_lock`. The earlier
+        "outer / inner via counter" design let a second coroutine join
+        an open batch (saw `_in_batch > 0`, took the no-op path) and
+        kept `_in_batch` positive past the original holder's exit. The
+        original holder's `_commit_if_unbatched` then saw `_in_batch >
+        0` and SKIPPED the COMMIT. The transaction stayed open. The
+        next coroutine entering batch saw `_in_batch == 0`, did BEGIN,
+        and SQLite raised "cannot start a transaction within a
+        transaction". Any inserts that landed in the stranded
+        transaction got silently rolled back when the connection
+        eventually recycled — the actual B-WRITES bug.
+
+        The fix: always acquire the lock, always BEGIN, always COMMIT.
+        `_in_batch` is now binary (0 or 1) used ONLY by
+        `_commit_if_unbatched` so individual inserts skip their per-row
+        commits while a batch is active. No code path nests batches
+        today; if one ever does it now deadlocks loudly instead of
+        silently corrupting the writer.
+
+        Latency cost: concurrent process() calls serialise their write
+        phases (~50 ms typical at production size). HTTP/AI work in
+        process() still runs in parallel before the batch opens.
+        """
+        if self._batch_lock is None:
+            self._batch_lock = asyncio.Lock()
+        async with self._batch_lock:
+            # Mark "inside batch" in THIS task's context. Child coroutines
+            # awaited inside the batch inherit the flag via contextvars,
+            # so their writes route through _write_lock's reentrant path
+            # and don't deadlock or skip commit.
+            token = _in_batch_var.set(True)
+            await self._conn.execute("BEGIN")
+            self._in_batch = 1
+            try:
+                yield
+            except BaseException as exc:
+                self._in_batch = 0
+                logger.warning(
+                    "[db.batch] rolling back due to %s: %r",
+                    type(exc).__name__, exc, exc_info=True,
+                )
+                if _metrics is not None:
+                    try:
+                        _metrics.incr(
+                            "db.batch.rollback",
+                            tags={"exc": type(exc).__name__},
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+                try:
+                    await self._conn.rollback()
+                except Exception as r_exc:  # noqa: BLE001
+                    logger.error(
+                        "[db.batch] rollback() raised: %r — connection state may be corrupt",
+                        r_exc, exc_info=True,
+                    )
+                    if _metrics is not None:
+                        try:
+                            _metrics.incr("db.batch.rollback_failed")
+                        except Exception:  # noqa: BLE001
+                            pass
+                raise
+            else:
+                self._in_batch = 0
+                await self._conn.commit()
+            finally:
+                _in_batch_var.reset(token)
+
+    @asynccontextmanager
+    async def _write_lock(self):
+        """Acquire the writer serializer for an individual write.
+
+        Reentrant: when called from inside an active batch() in the SAME
+        task, skip the lock (the enclosing batch is already holding it
+        and the implicit-txn from this write joins the batch's
+        transaction). When called from outside any batch, acquire the
+        lock so this write cannot interleave with another task's batch.
+
+        Why this exists (2026-05-21): without it, an individual insert
+        from task B (e.g. `insert_signal`) executes the INSERT, yields
+        the event loop on the `await`, and task A's `batch()` can grab
+        the asyncio.Lock and call BEGIN — which fails with "cannot
+        start a transaction within a transaction" because B's implicit
+        transaction is still open. Wrapping every write in this lock
+        ensures the implicit-txn window is fully serialized against
+        the batch BEGIN.
+        """
+        if self._batch_lock is None:
+            self._batch_lock = asyncio.Lock()
+        if _in_batch_var.get():
+            # Already inside this task's batch — the enclosing async-with
+            # holds the lock; just yield.
+            yield
+            return
+        async with self._batch_lock:
+            yield
+
+    async def _commit_if_unbatched(self) -> None:
+        """Helper for insert/update functions: commit only outside a batch()."""
+        if self._in_batch == 0:
+            await self._conn.commit()
+
+    @asynccontextmanager
+    async def savepoint(self, name: str = "sp"):
+        """Inner-scope SAVEPOINT — survives outer commits/rollbacks.
+
+        Phase 1 R2: trader.evaluate wraps `insert_trade + open_position`
+        in this so if open_position fails the trade audit row survives
+        rather than being silently rolled back together with the position
+        attempt. Compatible with autocommit and with `batch()`.
+        """
+        safe = "".join(c if c.isalnum() else "_" for c in name)[:32] or "sp"
+        await self._conn.execute(f"SAVEPOINT {safe}")
+        try:
+            yield
+        except BaseException as exc:
+            logger.warning(
+                "[db.savepoint:%s] rolling back due to %s: %r",
+                safe, type(exc).__name__, exc, exc_info=True,
+            )
+            if _metrics is not None:
+                try:
+                    _metrics.incr(
+                        "db.savepoint.rollback",
+                        tags={"name": safe, "exc": type(exc).__name__},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                await self._conn.execute(f"ROLLBACK TO SAVEPOINT {safe}")
+            except Exception as r_exc:  # noqa: BLE001
+                logger.error(
+                    "[db.savepoint:%s] ROLLBACK TO raised: %r",
+                    safe, r_exc, exc_info=True,
+                )
+            try:
+                await self._conn.execute(f"RELEASE SAVEPOINT {safe}")
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        else:
+            await self._conn.execute(f"RELEASE SAVEPOINT {safe}")
+
+    # ------------------------------------------------------------------
+    # Phase-0 observability helpers
+    # ------------------------------------------------------------------
+
+    def _bump_ok(self, method: str, table: str) -> None:
+        """Record a successful write — update last_insert_at + counter + metric."""
+        self._last_insert_at[table] = datetime.now(timezone.utc)
+        c = self._write_counters.setdefault(method, {"ok": 0, "err": 0})
+        c["ok"] += 1
+        if _metrics is not None:
+            try:
+                _metrics.incr(f"db.{method}.ok")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _bump_err(self, method: str, exc: BaseException) -> None:
+        """Record a failed write — log with traceback + counter + metric."""
+        c = self._write_counters.setdefault(method, {"ok": 0, "err": 0})
+        c["err"] += 1
+        logger.warning("[db] %s failed: %r", method, exc, exc_info=True)
+        if _metrics is not None:
+            try:
+                _metrics.incr(
+                    f"db.{method}.err",
+                    tags={"exc": type(exc).__name__},
+                )
+            except Exception:  # noqa: BLE001
+                pass
+
+    def write_health_snapshot(self) -> dict:
+        """Synchronous snapshot of in-memory write counters.
+
+        Pure dict construction — no DB call. Safe to invoke from the
+        30 s dashboard render path even when the writer is contended.
+        WAL frame count is reported by the host-side audit CLI, not
+        from here.
+        """
+        return {
+            "last_insert_at": {
+                table: ts.isoformat()
+                for table, ts in self._last_insert_at.items()
+            },
+            "counters": {m: dict(c) for m, c in self._write_counters.items()},
+        }
+
+    async def write_health(self) -> dict:
+        """Async wrapper that also probes PRAGMAs.
+
+        The PRAGMA calls share the writer connection — under load they
+        queue behind real writes and can be slow. Callers that need a
+        fast non-blocking snapshot should use `write_health_snapshot()`
+        directly. The dashboard uses the sync version; analysis CLIs
+        use this async one.
+        """
+        health = self.write_health_snapshot()
+        try:
+            async with self._conn.execute(
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            ) as cur:
+                row = await cur.fetchone()
+                if row:
+                    health["wal_busy"] = row[0]
+                    health["wal_total_frames"] = row[1]
+                    health["wal_checkpointed_frames"] = row[2]
+        except Exception as exc:  # noqa: BLE001
+            health["wal_error"] = repr(exc)
+        try:
+            async with self._conn.execute("PRAGMA busy_timeout") as cur:
+                row = await cur.fetchone()
+                if row:
+                    health["busy_timeout_ms"] = row[0]
+        except Exception:  # noqa: BLE001
+            pass
+        return health
 
     async def connect_ro(self) -> None:
         """
@@ -412,12 +730,52 @@ class SeulgiDB:
         self._conn.row_factory = aiosqlite.Row
         logger.info("SeulgiDB connected RO: %s", self._path)
 
+    @classmethod
+    async def open_ro_clone(cls, path: str) -> "SeulgiDB":
+        """Open a sibling SeulgiDB with its own RO aiosqlite connection.
+
+        Phase 2 (2026-05-21): the dashboard's heavy-query cache used to
+        run all 5+ SELECTs on the writer's `self._conn`, which serialised
+        with the writer in aiosqlite's single-connection worker thread.
+        With this clone the cache runs on its own thread; WAL guarantees
+        zero blocking against the writer.
+        """
+        inst = cls(path)
+        uri = f"file:{path}?mode=ro"
+        inst._conn = await aiosqlite.connect(uri, uri=True)
+        inst._conn.row_factory = aiosqlite.Row
+        await inst._conn.executescript("PRAGMA busy_timeout=10000;")
+        logger.info("SeulgiDB RO clone connected: %s", path)
+        return inst
+
+    @classmethod
+    async def open_writer_clone(cls, path: str) -> "SeulgiDB":
+        """Open a sibling SeulgiDB with its OWN aiosqlite writer connection.
+
+        Phase 3 (2026-05-21): the metrics flush task used to share the
+        main writer's connection — if a flush queued up behind a slow
+        write, both stalled together. With this clone the metrics writer
+        runs on its own thread; WAL still serialises actual lock
+        acquisition (one writer at a time on the file), but the main
+        writer's worker thread is never blocked by flush work.
+        """
+        inst = cls(path)
+        inst._conn = await aiosqlite.connect(path)
+        inst._conn.row_factory = aiosqlite.Row
+        await inst._conn.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            PRAGMA busy_timeout=10000;
+        """)
+        logger.info("SeulgiDB writer clone connected: %s", path)
+        return inst
+
     async def _migrate(self) -> None:
         """Apply column additions idempotently — ignores 'duplicate column' errors."""
         for sql in _MIGRATIONS:
             try:
                 await self._conn.execute(sql)
-                await self._conn.commit()
+                await self._commit_if_unbatched()
             except Exception:
                 pass  # column already exists
 
@@ -430,7 +788,7 @@ class SeulgiDB:
             # (locked, busy, etc.) we still close.
             try:
                 await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                await self._conn.commit()
+                await self._commit_if_unbatched()
             except Exception as exc:  # noqa: BLE001
                 logger.warning("[db] wal_checkpoint on close failed: %s", exc)
             await self._conn.close()
@@ -474,7 +832,7 @@ class SeulgiDB:
             (condition_id, question, token_yes, token_no, end_date,
              volume_usdc, emb_bytes, _now_iso()),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
 
     async def get_markets_with_embeddings(self) -> list[dict]:
         async with self._conn.execute(
@@ -558,7 +916,7 @@ class SeulgiDB:
             """,
             (now, now),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         return newly_closed_by_fetch
 
     async def prune_closed_markets(self, older_than_days: int = 30) -> int:
@@ -575,7 +933,7 @@ class SeulgiDB:
             """,
             (f"-{older_than_days}",),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         return cur.rowcount or 0
 
     # ------------------------------------------------------------------
@@ -590,16 +948,22 @@ class SeulgiDB:
         freshness_label: Optional[str] = None,
         nearest_age_secs: Optional[float] = None,
     ) -> int:
-        cur = await self._conn.execute(
-            """INSERT INTO signals
-                 (site_url, headline, detected_at, headline_id,
-                  freshness_label, nearest_age_secs)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (site_url, headline, _now_iso(), headline_id,
-             freshness_label, nearest_age_secs),
-        )
-        await self._conn.commit()
-        return cur.lastrowid
+        async with self._write_lock():
+            try:
+                cur = await self._conn.execute(
+                    """INSERT INTO signals
+                         (site_url, headline, detected_at, headline_id,
+                          freshness_label, nearest_age_secs)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (site_url, headline, _now_iso(), headline_id,
+                     freshness_label, nearest_age_secs),
+                )
+                await self._commit_if_unbatched()
+                self._bump_ok("insert_signal", "signals")
+                return cur.lastrowid
+            except Exception as exc:
+                self._bump_err("insert_signal", exc)
+                raise
 
     # ------------------------------------------------------------------
     # Trades
@@ -644,33 +1008,39 @@ class SeulgiDB:
         mkt_drift_30m: Optional[float] = None,
         mkt_n_samples: Optional[int] = None,
     ) -> int:
-        cur = await self._conn.execute(
-            """
-            INSERT INTO trades
-              (signal_id, condition_id, question, token_id, direction, similarity,
-               p_hat, mid_price, size_usdc, skip_reason, decided_at, headline_id,
-               confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
-               engine_name, agreement, p_alpha, risk_score,
-               ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
-               mid_yes, mid_no, inverted, variant_name,
-               freshness_label, relevance_score, relevance_reason,
-               mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
-               mkt_drift_30m, mkt_n_samples)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (signal_id, condition_id, question, token_id, direction, similarity,
-             p_hat, mid_price, size_usdc, skip_reason, _now_iso(), headline_id,
-             confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
-             engine_name, agreement, p_alpha, risk_score,
-             ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
-             mid_yes, mid_no, inverted, variant_name,
-             freshness_label, relevance_score, relevance_reason,
-             mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
-             mkt_drift_30m, mkt_n_samples),
-        )
-        await self._conn.commit()
-        return cur.lastrowid
+        async with self._write_lock():
+            try:
+                cur = await self._conn.execute(
+                    """
+                    INSERT INTO trades
+                      (signal_id, condition_id, question, token_id, direction, similarity,
+                       p_hat, mid_price, size_usdc, skip_reason, decided_at, headline_id,
+                       confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
+                       engine_name, agreement, p_alpha, risk_score,
+                       ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
+                       mid_yes, mid_no, inverted, variant_name,
+                       freshness_label, relevance_score, relevance_reason,
+                       mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
+                       mkt_drift_30m, mkt_n_samples)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (signal_id, condition_id, question, token_id, direction, similarity,
+                     p_hat, mid_price, size_usdc, skip_reason, _now_iso(), headline_id,
+                     confidence_raw, p_hat_if_raw, signed_edge, signed_edge_if_raw,
+                     engine_name, agreement, p_alpha, risk_score,
+                     ai_reason, ai_raw_response, ai_prompt_meta, trader_trace,
+                     mid_yes, mid_no, inverted, variant_name,
+                     freshness_label, relevance_score, relevance_reason,
+                     mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
+                     mkt_drift_30m, mkt_n_samples),
+                )
+                await self._commit_if_unbatched()
+                self._bump_ok("insert_trade", "trades")
+                return cur.lastrowid
+            except Exception as exc:
+                self._bump_err("insert_trade", exc)
+                raise
 
     async def backfill_trades_engine_name(self) -> int:
         """
@@ -725,7 +1095,7 @@ class SeulgiDB:
                 (best[0], tid),
             )
             updated += 1
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         return updated
 
     async def close_trade(
@@ -756,7 +1126,7 @@ class SeulgiDB:
                 "UPDATE trades SET realized_pnl = ?, closed_at = ?, close_reason = ? WHERE id = ?",
                 (realized_pnl, _now_iso(), close_reason, trade_id),
             )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
 
     async def recent_trades(self, limit: int = 20) -> list[dict]:
         async with self._conn.execute(
@@ -790,24 +1160,30 @@ class SeulgiDB:
         shares: Optional[float] = None,
         entry_fee_usdc: Optional[float] = None,
     ) -> None:
-        await self._conn.execute(
-            """
-            INSERT OR REPLACE INTO positions
-              (trade_id, condition_id, question, token_id, direction,
-               size_usdc, entry_price, opened_at, last_price, unrealized_pnl, p_hat,
-               engine_name, shares)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?)
-            """,
-            (trade_id, condition_id, question, token_id, direction,
-             size_usdc, entry_price, _now_iso(), entry_price, p_hat,
-             engine_name, shares),
-        )
-        if entry_fee_usdc is not None:
-            await self._conn.execute(
-                "UPDATE trades SET entry_fee_usdc = ? WHERE id = ?",
-                (entry_fee_usdc, trade_id),
-            )
-        await self._conn.commit()
+        async with self._write_lock():
+            try:
+                await self._conn.execute(
+                    """
+                    INSERT OR REPLACE INTO positions
+                      (trade_id, condition_id, question, token_id, direction,
+                       size_usdc, entry_price, opened_at, last_price, unrealized_pnl, p_hat,
+                       engine_name, shares)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?, ?)
+                    """,
+                    (trade_id, condition_id, question, token_id, direction,
+                     size_usdc, entry_price, _now_iso(), entry_price, p_hat,
+                     engine_name, shares),
+                )
+                if entry_fee_usdc is not None:
+                    await self._conn.execute(
+                        "UPDATE trades SET entry_fee_usdc = ? WHERE id = ?",
+                        (entry_fee_usdc, trade_id),
+                    )
+                await self._commit_if_unbatched()
+                self._bump_ok("open_position", "positions")
+            except Exception as exc:
+                self._bump_err("open_position", exc)
+                raise
 
     async def get_open_positions(self, engine_name: Optional[str] = None) -> list[dict]:
         """Return open positions, optionally filtered to one engine."""
@@ -889,13 +1265,19 @@ class SeulgiDB:
                 """,
                 (last_price, unrealized_pnl, high_water_price, high_water_price, trade_id),
             )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
 
     async def close_position(self, trade_id: int) -> None:
-        await self._conn.execute(
-            "DELETE FROM positions WHERE trade_id = ?", (trade_id,)
-        )
-        await self._conn.commit()
+        async with self._write_lock():
+            try:
+                await self._conn.execute(
+                    "DELETE FROM positions WHERE trade_id = ?", (trade_id,)
+                )
+                await self._commit_if_unbatched()
+                self._bump_ok("close_position", "positions")
+            except Exception as exc:
+                self._bump_err("close_position", exc)
+                raise
 
     # ------------------------------------------------------------------
     # Balance state restoration
@@ -933,7 +1315,7 @@ class SeulgiDB:
             "INSERT INTO cycles (name, started_at) VALUES (?, ?)",
             (default_name, _now_iso()),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         result = await self.get_current_cycle()
         assert result is not None
         return result
@@ -986,7 +1368,7 @@ class SeulgiDB:
              ema_latency_ms, current_interval_s,
              1 if success else 0),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
 
     async def start_new_cycle(self, name: str, notes: Optional[str] = None) -> dict:
         """Close the current cycle and open a new one. No data deletion.
@@ -1004,7 +1386,7 @@ class SeulgiDB:
             "INSERT INTO cycles (name, started_at, notes) VALUES (?, ?, ?)",
             (name, now, notes),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         result = await self.get_current_cycle()
         assert result is not None
         logger.info("[db] new cycle started: %s (id=%d, ts=%s)",
@@ -1065,6 +1447,8 @@ class SeulgiDB:
         signal_latency_ms: Optional[float] = None,
     ) -> None:
         """Bulk-insert all TradeDecision objects from one engine run."""
+        if not decisions:
+            return
         now = _now_iso()
         rows = [
             (
@@ -1086,17 +1470,79 @@ class SeulgiDB:
             )
             for d in decisions
         ]
-        await self._conn.executemany(
-            """
+        sql = """
             INSERT INTO engine_results
               (engine_name, condition_id, question, direction, confidence,
                similarity, p_hat, mid_price, edge, size_usdc, executed,
                skip_reason, decided_at, headline_id, signal_latency_ms)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        await self._conn.commit()
+        """
+        async with self._write_lock():
+            try:
+                await self._conn.executemany(sql, rows)
+                await self._commit_if_unbatched()
+                self._bump_ok("record_engine_decisions", "engine_results")
+                if _metrics is not None:
+                    try:
+                        _metrics.incr(
+                            "db.record_engine_decisions.rows",
+                            n=len(rows),
+                            tags={"engine": engine_name.split("/")[0]},
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as exc:  # noqa: BLE001
+                # R6 Phase 1: per-row fallback. executemany is atomic — if one
+                # row violates a constraint, none commit. Retry as N individual
+                # INSERTs so good rows still land. The first failure is logged
+                # at warning; subsequent ones bump a counter only to avoid log
+                # spam under pathological data.
+                logger.warning(
+                    "[db] record_engine_decisions batch failed for engine=%s "
+                    "n_rows=%d: %r — retrying per-row",
+                    engine_name, len(rows), exc,
+                )
+                self._bump_err("record_engine_decisions", exc)
+                ok_n = 0
+                err_n = 0
+                first_err: Optional[BaseException] = None
+                for row in rows:
+                    try:
+                        await self._conn.execute(sql, row)
+                        ok_n += 1
+                    except Exception as row_exc:  # noqa: BLE001
+                        err_n += 1
+                        if first_err is None:
+                            first_err = row_exc
+                            logger.warning(
+                                "[db] record_engine_decisions per-row INSERT failed "
+                                "engine=%s cond=%s: %r",
+                                engine_name, row[1], row_exc,
+                            )
+                try:
+                    await self._commit_if_unbatched()
+                except Exception as c_exc:  # noqa: BLE001
+                    logger.error(
+                        "[db] record_engine_decisions per-row fallback commit failed: %r",
+                        c_exc, exc_info=True,
+                    )
+                if _metrics is not None:
+                    try:
+                        _metrics.incr(
+                            "db.record_engine_decisions.rows",
+                            n=ok_n,
+                            tags={"engine": engine_name.split("/")[0]},
+                        )
+                        if err_n:
+                            _metrics.incr(
+                                "db.record_engine_decisions.err_row",
+                                n=err_n,
+                                tags={"engine": engine_name.split("/")[0]},
+                            )
+                    except Exception:  # noqa: BLE001
+                        pass
+                if ok_n:
+                    self._last_insert_at["engine_results"] = datetime.now(timezone.utc)
 
     async def get_engine_summary(self) -> list[dict]:
         """
@@ -1120,6 +1566,40 @@ class SeulgiDB:
             GROUP BY engine_name
             ORDER BY executed_count DESC
             """
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_scout_trader_traces(
+        self,
+        *,
+        engine_prefix: str = "scout",
+        since_ts: Optional[str] = None,
+        limit: int = 200_000,
+    ) -> list[dict]:
+        """Fetch trader_trace rows for the scout/probe engine's decision funnel.
+
+        Column set matches `scout_funnel_core.SCOUT_FUNNEL_COLUMNS` so both
+        the live dashboard tile and the CLI analyzer share one parser.
+        Cycle-scope `since_ts` (or use a window like 1h) to keep the scan
+        cheap on the multi-million-row trades table.
+        """
+        where = "WHERE engine_name LIKE ?"
+        params: tuple = (f"{engine_prefix}%",)
+        if since_ts:
+            where += " AND decided_at >= ?"
+            params = (f"{engine_prefix}%", since_ts)
+        async with self._conn.execute(
+            f"""
+            SELECT decided_at, engine_name, direction, confidence_raw,
+                   signed_edge, mid_yes, size_usdc, skip_reason,
+                   trader_trace, realized_pnl, closed_at
+            FROM trades
+            {where}
+            ORDER BY decided_at
+            LIMIT ?
+            """,
+            params + (limit,),
         ) as cur:
             rows = await cur.fetchall()
         return [dict(row) for row in rows]
@@ -1609,7 +2089,7 @@ class SeulgiDB:
              price_pre_60s, price_pre_300s, d60, d300),
         ) as cur:
             row_id = cur.lastrowid
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         return row_id
 
     async def update_price_impact_snapshot(
@@ -1630,7 +2110,7 @@ class SeulgiDB:
             """,
             (price, price, row_id),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
 
     # ------------------------------------------------------------------
     # Full price time-series (diagnostic, not used for live trading)
@@ -1685,7 +2165,7 @@ class SeulgiDB:
             """,
             rows,
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
         return len(rows)
 
     async def get_plot_candidate_impacts(
@@ -1756,7 +2236,7 @@ class SeulgiDB:
             "UPDATE price_impacts SET timeseries_backfilled_at = ? WHERE id = ?",
             (_now_iso(), impact_id),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
 
     # ------------------------------------------------------------------
     # Article bodies (headline first-paragraph capture)
@@ -1786,7 +2266,7 @@ class SeulgiDB:
                 len(body) if body else 0, _now_iso(), fetch_error,
             ),
         )
-        await self._conn.commit()
+        await self._commit_if_unbatched()
 
     async def get_pending_price_impacts(self) -> list[dict]:
         """Return rows that still have at least one bucket unfilled (up to 2h old)."""
@@ -1862,11 +2342,17 @@ class SeulgiDB:
         if not condition_ids:
             return
         now = _now_iso()
-        await self._conn.executemany(
-            "UPDATE markets SET match_count = match_count + 1, last_matched_at = ? WHERE condition_id = ?",
-            [(now, cid) for cid in condition_ids],
-        )
-        await self._conn.commit()
+        async with self._write_lock():
+            try:
+                await self._conn.executemany(
+                    "UPDATE markets SET match_count = match_count + 1, last_matched_at = ? WHERE condition_id = ?",
+                    [(now, cid) for cid in condition_ids],
+                )
+                await self._commit_if_unbatched()
+                self._bump_ok("bump_market_heat", "markets")
+            except Exception as exc:
+                self._bump_err("bump_market_heat", exc)
+                raise
 
     async def count_unique_open_markets(self, engine_name: Optional[str] = None) -> int:
         """Return number of distinct condition_ids with open positions (optionally per engine)."""
@@ -2026,11 +2512,17 @@ class SeulgiDB:
         meta: Optional[str] = None,
     ) -> None:
         """Append a usage event (AI tokens or Brave search). Cheap, batched OK."""
-        await self._conn.execute(
-            "INSERT INTO usage_events (ts, kind, provider, count, meta) VALUES (?, ?, ?, ?, ?)",
-            (_now_iso(), kind, provider, count, meta),
-        )
-        await self._conn.commit()
+        async with self._write_lock():
+            try:
+                await self._conn.execute(
+                    "INSERT INTO usage_events (ts, kind, provider, count, meta) VALUES (?, ?, ?, ?, ?)",
+                    (_now_iso(), kind, provider, count, meta),
+                )
+                await self._commit_if_unbatched()
+                self._bump_ok("log_usage", "usage_events")
+            except Exception as exc:
+                self._bump_err("log_usage", exc)
+                raise
 
     async def get_usage_totals(self) -> dict:
         """

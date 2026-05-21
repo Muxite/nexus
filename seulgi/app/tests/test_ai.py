@@ -290,5 +290,10 @@ class TestDirectionClassifier:
     @pytest.mark.asyncio
     async def test_semaphore_limits_concurrency(self):
         """Max concurrent requests is enforced by the semaphore."""
-        clf = DirectionClassifier(api_key="key", model="gemini-2.5-flash", max_concurrent=2)
+        # ensemble_samples=1 isolates the max_concurrent setting from the
+        # ensemble_samples*2 floor in DirectionClassifier.__init__ (ai.py:249).
+        clf = DirectionClassifier(
+            api_key="key", model="gemini-2.5-flash",
+            max_concurrent=2, ensemble_samples=1,
+        )
         assert clf._semaphore._value == 2

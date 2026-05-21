@@ -37,6 +37,7 @@ from rules import RuleEngine
 from markets import Embedder, MarketIndex
 from impact_tracker import PriceImpactTracker
 import lessons
+import metrics
 from news_memory import NewsMemory
 from plotter import QuantPlotter
 from watcher import (
@@ -206,6 +207,22 @@ async def _watcher_status_loop(
             logging.getLogger(__name__).warning("[main] watcher status error: %s", exc)
 
 
+def _log_task_exception(task: "asyncio.Task") -> None:
+    """add_done_callback that surfaces unhandled exceptions from background
+    tasks. Without this, fire-and-forget asyncio.create_task() calls eat any
+    raised exception silently — the runner can crash on every headline with
+    only a "Task exception was never retrieved" trace at GC time.
+    """
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    logging.getLogger(__name__).error(
+        "[task %s] crashed: %r", task.get_name() or "?", exc, exc_info=exc,
+    )
+
+
 async def _headline_drain_loop(
     queue: asyncio.Queue,
     runner: EngineRunner,
@@ -216,7 +233,11 @@ async def _headline_drain_loop(
         try:
             headline: RawHeadline = await queue.get()
             dash.record_news(headline.site_url, headline.headline, headline.article_url)
-            asyncio.create_task(runner.process(headline))
+            t = asyncio.create_task(
+                runner.process(headline),
+                name=f"process:{getattr(headline, 'headline_id', '?')[:12]}",
+            )
+            t.add_done_callback(_log_task_exception)
         except asyncio.CancelledError:
             break
         except Exception as exc:
@@ -255,6 +276,11 @@ async def main() -> None:
     _current_cycle = await db.ensure_current_cycle(default_name=_default_cycle_name)
     logger.info("[main] current cycle: %s (id=%d, started=%s)",
                 _current_cycle["name"], _current_cycle["id"], _current_cycle["started_at"])
+    # Scope dashboard leaderboard queries to the current cycle. Lifetime
+    # GROUP BY on a 3M-row trades table takes ~10s+ and hangs _write_main
+    # under live writer contention; per-cycle is the right semantics
+    # (pots reset each cycle) and is sub-second.
+    dash.set_cycle_started_at(_current_cycle["started_at"])
 
     # Embedder + Market index
     embedder = Embedder()
@@ -324,18 +350,37 @@ async def main() -> None:
     # plan §2: in simulate mode, split a tiny bankroll evenly across active
     # engines so each PaperTrader starts with a realistic micro-stake.
     if cfg.trading.is_simulate() and engines:
-        per_engine = cfg.trading.simulate_total_usdc / len(engines)
-        for engine in engines:
+        # Engines with fixed_balance (YAML-set EngineConfig.balance_usdc) keep
+        # their pot; remaining engines split the remainder of
+        # simulate_total_usdc. Used for ephemeral test engines like the
+        # pre-flight canary that need an isolated pot outside the main split.
+        fixed = [e for e in engines if e.fixed_balance is not None]
+        pooled = [e for e in engines if e.fixed_balance is None]
+        fixed_total = sum(e.fixed_balance for e in fixed)
+        remainder = cfg.trading.simulate_total_usdc - fixed_total
+        per_engine = (remainder / len(pooled)) if pooled else 0.0
+        for engine in fixed:
+            bal = engine.fixed_balance
+            engine.trader._cfg.balance_usdc = bal
+            engine.trader._cfg.min_trade_usdc = cfg.trading.simulate_min_trade_usdc
+            engine.trader._balance = bal
+        for engine in pooled:
             engine.trader._cfg.balance_usdc = per_engine
             engine.trader._cfg.min_trade_usdc = cfg.trading.simulate_min_trade_usdc
             # Re-seed live balance (init_from_db below will overwrite if there
             # are restored positions; this is the fresh-start value).
             engine.trader._balance = per_engine
         dash.set_simulate_total(cfg.trading.simulate_total_usdc)
-        logger.info(
-            "[main] simulate mode: $%.2f bankroll → %d engines × $%.2f each",
-            cfg.trading.simulate_total_usdc, len(engines), per_engine,
-        )
+        if fixed:
+            logger.info(
+                "[main] simulate mode: $%.2f bankroll → %d fixed ($%.2f total) + %d pooled × $%.2f each",
+                cfg.trading.simulate_total_usdc, len(fixed), fixed_total, len(pooled), per_engine,
+            )
+        else:
+            logger.info(
+                "[main] simulate mode: $%.2f bankroll → %d engines × $%.2f each",
+                cfg.trading.simulate_total_usdc, len(engines), per_engine,
+            )
     # Pre-seed all engine names so the dashboard's per-engine block always
     # lists every engine, even before init_from_db has filled in real values.
     # Avoids a startup race where the render loop intermittently drops engines.
@@ -475,6 +520,25 @@ async def main() -> None:
         asyncio.create_task(plotter.run(), name="quant-plotter"),
         asyncio.create_task(lessons.runner(db, interval_secs=600.0), name="lessons"),
     ]
+    for t in bg_tasks:
+        t.add_done_callback(_log_task_exception)
+
+    # Phase C (2026-05-21): metrics flush back on the MAIN writer.
+    # The previous attempt used a separate writer clone, which doubled
+    # the WAL-lock queue depth instead of halving it (WAL serialises
+    # all writers at the file lock). With Phase B coalescing the per-
+    # headline write fan-out into one transaction, the main writer is
+    # idle between bursts — flush slots cleanly into those gaps.
+    # 300s interval (was 60s) leaves headroom; flush itself is a
+    # single db.batch() per tick so it's one fsync regardless of how
+    # many buckets are flushed.
+    metrics_flush_task = asyncio.create_task(
+        metrics.start_flush_task(db, interval_secs=300.0),
+        name="metrics-flush",
+    )
+    metrics_flush_task.add_done_callback(_log_task_exception)
+    bg_tasks.append(metrics_flush_task)
+    logger.info("[main] metrics flush enabled on main writer (interval=300s)")
 
     all_tasks = watcher_tasks + bg_tasks
 

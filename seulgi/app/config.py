@@ -581,8 +581,15 @@ def _build_config(raw: dict) -> Config:
             stale_age_secs=float(nm.get("stale_age_secs", 86400.0)),
             recent_context_window_secs=float(nm.get("recent_context_window_secs", 86400.0)),
             recent_context_n=int(nm.get("recent_context_n", 3)),
+            # Distinguish "key missing" from "explicit empty list":
+            # config.yaml has `short_circuit_labels: []` to disable
+            # short-circuit entirely, but `[] or default` evaluates to the
+            # default in Python — silently overriding the operator's intent
+            # and dropping ~57% of decisions to freshness:stale_return.
             short_circuit_labels=list(
-                nm.get("short_circuit_labels") or ["REHASH", "STALE_RETURN"]
+                nm["short_circuit_labels"]
+                if "short_circuit_labels" in nm
+                else ["REHASH", "STALE_RETURN"]
             ),
         ),
         relevance=RelevanceConfig(

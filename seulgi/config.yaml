@@ -486,7 +486,15 @@ relevance:
   # Phase-E E2 (2026-05-19): restored to 0.55 after the 0.0 experiment
   # showed sub-0.45 similarity trades hit 17.8% vs 0.65-0.75 at 50%.
   # The flood of low-quality matches cost ~$2.6 over 117 trades.
-  min_top_similarity: 0.55
+  # 2026-05-20 drought-fix: lowered from 0.55 → 0.30 (matches the
+  # markets.similarity_threshold env default in docker-compose.yml). Phase
+  # E.1's E2 gate raised this to 0.55 on small-sample evidence; combined
+  # with the freshness short-circuit bug, broken-MTM lessons, AND the
+  # markets.similarity_threshold env-override discrepancy (0.35 vs YAML
+  # 0.55) it contributed to the 100%-NEUTRAL drought. Single floor at
+  # 0.30 — matches at all are uncommon, let the LLM + edge model do the
+  # actual filtering. Tighten back to 0.45 if signal proves poor.
+  min_top_similarity: 0.30
 
 # ── Paper trading ────────────────────────────────────────────────────────────
 trading:
@@ -513,7 +521,10 @@ trading:
   # AI calls pause automatically when no variant has free capital.
   # M4 expansion: 14 engines × $100 = $1400. Each engine has its own pot;
   # the total is split evenly by the simulate-mode bootstrap.
-  simulate_total_usdc: 1400.0
+  # 2026-05-20: bumped to 1450 so scout's fixed $50 pot sits OUTSIDE the
+  # 14-engine production split (14 × $100 = $1400 still flows to real
+  # engines). Restore to 1400.0 if scout is retired.
+  simulate_total_usdc: 1450.0
   simulate_min_trade_usdc: 1.0
   # Soft rail-skip: reject trades when the entry-side mid is within this
   # distance of 0/1. 6h backtest: 99% of p≥0.95 entries were no_signal — the
@@ -685,6 +696,30 @@ engines:
         stop_loss:      0.045
         trailing_stop:  0.012
         freshness_filter: "EVOLVING"
+
+  # ── SCOUT — research engine, all gates wide open ─────────────────────────
+  # Purpose: trade on EVERY non-NEUTRAL LLM signal so we can post-hoc
+  # analyze the full decision funnel: which filters pass/fail, what each
+  # variant filter would have killed, where the LLM's edge actually lives.
+  # Every decision lands in `trades` with a full `trader_trace` JSON. Scout
+  # exists OUTSIDE the 14-engine production split (own $50 pot, bumped in
+  # simulate_total_usdc → $1450). Bypasses Kelly via the `scout` name
+  # prefix check in trader.py (fixed micro-stakes regardless of edge sign).
+  # Companion script: scripts/analysis/scout_funnel.py reads trader_trace
+  # for filter-by-filter pass/cut stats.
+  - name: "scout"
+    balance_usdc: 50.0
+    min_edge: -10.0           # admit any signal (including negative-edge)
+    edge_increment: 0.12
+    max_position_usdc: 1.0    # $1 stake per trade — high volume, low risk
+    min_confidence: 0.0       # admit any AI signal, even very low p_alpha
+    max_open_positions: 50    # cap total exposure but allow burst data
+    take_profit:      0.05
+    stop_loss:        0.05
+    trailing_stop:    0.020
+    min_hold_seconds: 60
+    variants:
+      - name: "all_signals"
 
 # ── Database ─────────────────────────────────────────────────────────────────
 db:

@@ -95,6 +95,16 @@ def _make_trader(balance: float = 1000.0):
     cfg.trailing_stop = 0.0
     cfg.min_hold_seconds = 0.0
     cfg.spread_cost_bps = 0.0
+    cfg.min_entry_yes_mid = 0.0
+    cfg.stop_loss_pct = 0.0
+    cfg.max_market_vol_30m = 0.0
+    cfg.simulate_fees = None
+    cfg.simulate_sizing = None
+    cfg.simulate_slippage = None
+    cfg.direction_filter = ""
+    cfg.freshness_filter = ""
+    cfg.mid_yes_min = 0.0
+    cfg.mid_yes_max = 1.0
 
     ai_cfg = MagicMock()
     ai_cfg.min_confidence = 0.45

@@ -895,7 +895,13 @@ class PaperTrader:
             # Normal/simulate-fixed: capped by remaining balance, must clear
             #   min_trade_usdc.
             simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
-            if simulate_mode and self._cfg.simulate_sizing.method == "fractional_kelly":
+            # SCOUT research engine bypasses Kelly: it must fire on every
+            # non-NEUTRAL signal (including negative-edge ones) so the post-
+            # hoc analyzer sees full trader_trace data for what each filter
+            # would or wouldn't have caught. Kelly's "negative edge → skip"
+            # path would defeat this. Fixed micro-stakes via the else branch.
+            is_scout = self._engine_name.startswith("scout")
+            if simulate_mode and self._cfg.simulate_sizing.method == "fractional_kelly" and not is_scout:
                 # p_market = price we'd pay for the YES of the side we're
                 # buying. Direction is already resolved above; for a YES
                 # entry use mid_yes, for NO use mid_no (which equals
@@ -1055,21 +1061,38 @@ class PaperTrader:
                 mkt_drift_30m=getattr(getattr(match, "_mkt_ctx", None), "drift", None),
                 mkt_n_samples=getattr(getattr(match, "_mkt_ctx", None), "n_samples", None),
             )
-            await self._db.open_position(
-                trade_id=trade_id,
-                condition_id=match.condition_id,
-                question=match.question,
-                token_id=token_id,
-                direction=result.direction.value,
-                size_usdc=size,
-                # Simulate mode stamps the slipped fill price; paper/infinite
-                # keep the historical mid_price (no behaviour change there).
-                entry_price=effective_entry_price if simulate_mode else mid_price,
-                p_hat=p_hat,
-                engine_name=self._engine_name,
-                shares=shares_held,
-                entry_fee_usdc=(entry_fee if simulate_mode else None),
-            )
+            # R2: open_position runs under its own try/except so that if it
+            # fails (FK / lock timeout / constraint), the trade audit row
+            # already committed by insert_trade survives. Bookkeeping (cash,
+            # staked) is also rolled back to match.
+            try:
+                await self._db.open_position(
+                    trade_id=trade_id,
+                    condition_id=match.condition_id,
+                    question=match.question,
+                    token_id=token_id,
+                    direction=result.direction.value,
+                    size_usdc=size,
+                    # Simulate mode stamps the slipped fill price; paper/infinite
+                    # keep the historical mid_price (no behaviour change there).
+                    entry_price=effective_entry_price if simulate_mode else mid_price,
+                    p_hat=p_hat,
+                    engine_name=self._engine_name,
+                    shares=shares_held,
+                    entry_fee_usdc=(entry_fee if simulate_mode else None),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[trader] open_position failed after insert_trade trade_id=%s "
+                    "engine=%s cond=%s: %r",
+                    trade_id, self._engine_name, match.condition_id[:12], exc,
+                )
+                # Roll back the bookkeeping we did between insert_trade and here.
+                if not self._cfg.infinite_balance:
+                    self._balance += size
+                self._total_staked -= size
+                # Trade audit row stays as-is so the funnel still attributes
+                # this decision. Caller treats this as a no-position trade.
 
         logger.info(
             "[trader] PAPER %s %s  $%.2f @ %.3f  edge=%.4f  sim=%.2f  conf=%.0f%%  %s",

@@ -36,7 +36,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -206,6 +206,38 @@ class Dashboard:
         # plan §2: starting bankroll for simulate mode (recorded so the
         # dashboard can show "free + staked + realized = total" reconciliation)
         self._simulate_total_usdc: float = 0.0
+        # Cycle scope for the leaderboard queries. trades table can grow to
+        # millions of rows; lifetime GROUP BY variant_name takes 10s+. The
+        # current cycle's pots are what matters for the per-engine ROI block,
+        # so scope queries to >= cycle started_at when known.
+        self._cycle_started_at: Optional[str] = None
+
+        # Heavy-query cache. Five aggregate queries (variant_stats,
+        # decision_funnel, confidence_buckets, freshness_counts,
+        # freshness_buckets) used to run inline in _write_main every 30s
+        # with 10s timeouts each — under load they piled up and starved
+        # aiosqlite's writer (B-WRITES). A background task refreshes them
+        # every _heavy_cache_interval seconds; _write_main reads from the
+        # cache and never blocks on DB I/O.
+        self._heavy_cache: dict = {
+            "variant_stats": [],
+            "decision_funnel": None,
+            "confidence_buckets": [],
+            "freshness_counts": [],
+            "freshness_buckets": [],
+            "scout_funnel": None,
+            "_last_refresh_at": None,
+        }
+        self._heavy_cache_interval: float = 300.0  # 5 min
+        self._heavy_cache_task: Optional[asyncio.Task] = None
+        # Phase 2: separate read-only SeulgiDB used by the heavy-query
+        # cache so cache reads never serialise with the writer connection
+        # (root cause of the 22:20 cache timeouts on the previous deploy).
+        # Opened lazily in run().
+        self._db_ro: Optional["SeulgiDB"] = None  # type: ignore[name-defined]
+        # Consecutive cache failures per query — soft-degrade rather than
+        # blank the tile if a query repeatedly fails.
+        self._heavy_cache_fail_streak: dict[str, int] = {}
 
         self._flush_now = asyncio.Event()
 
@@ -421,6 +453,10 @@ class Dashboard:
         self._mode = mode
         self._infinite_balance = (mode == "infinite")
 
+    def set_cycle_started_at(self, started_at: Optional[str]) -> None:
+        """Scope the leaderboard / funnel queries to >= started_at."""
+        self._cycle_started_at = started_at
+
     def set_simulate_total(self, total_usdc: float) -> None:
         self._simulate_total_usdc = float(total_usdc)
 
@@ -444,6 +480,27 @@ class Dashboard:
 
     async def run(self) -> None:
         """Write all dashboard files every interval_secs, or sooner on flush."""
+        # Start the heavy-query background refresher exactly once. The cache
+        # task never blocks the render loop; if it dies the render loop
+        # keeps serving stale data instead of crashing the dashboard.
+        if self._db is not None and self._heavy_cache_task is None:
+            # Phase 2: open a sibling RO connection for the cache loop so
+            # SELECTs never serialise with the writer thread.
+            if self._db_ro is None:
+                try:
+                    # Import here to avoid a circular dependency at module load.
+                    from db import SeulgiDB  # type: ignore
+                    self._db_ro = await SeulgiDB.open_ro_clone(
+                        getattr(self._db, "_path", "/data/seulgi.db")
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "[dash-cache] RO clone failed (%s) — falling back to writer conn",
+                        exc,
+                    )
+            self._heavy_cache_task = asyncio.create_task(
+                self._heavy_cache_loop()
+            )
         while True:
             try:
                 try:
@@ -458,10 +515,144 @@ class Dashboard:
                 await self._write_all()
 
             except asyncio.CancelledError:
+                if self._heavy_cache_task is not None:
+                    self._heavy_cache_task.cancel()
+                if self._db_ro is not None:
+                    try:
+                        await self._db_ro.close()
+                    except Exception:  # noqa: BLE001
+                        pass
                 await self._write_all()  # final flush
                 break
             except Exception as exc:
                 logger.warning("[dash] write error: %s", exc)
+
+    async def _heavy_cache_loop(self) -> None:
+        """Refresh _heavy_cache every _heavy_cache_interval seconds.
+
+        First refresh fires immediately so the dashboard can render real
+        data within a few seconds of boot rather than waiting 5 minutes.
+        Per-query failures are isolated: a stuck variant_stats won't blank
+        the freshness counts that returned fine.
+        """
+        while True:
+            try:
+                await self._refresh_heavy_cache()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[dash-cache] refresh loop error: %s", exc)
+            try:
+                await asyncio.sleep(self._heavy_cache_interval)
+            except asyncio.CancelledError:
+                raise
+
+    async def _refresh_heavy_cache(self) -> None:
+        """Run each heavy query and update its cache slot in-place.
+
+        Phase 2: queries run on `self._db_ro` (a separate RO aiosqlite
+        connection) so they never serialise with the writer. Each query
+        is wrapped in its own try/except + wait_for (30 s) so one slow
+        query never starves the others, and a transient failure leaves
+        the previously cached value intact rather than blanking the tile.
+        After 3 consecutive failures of the same query we log at ERROR
+        and tag the tile with "cache unavailable".
+        """
+        # Prefer the RO clone; fall back to the writer connection if the
+        # clone failed to open at boot.
+        db = self._db_ro or self._db
+        if db is None:
+            return
+        one_hour_ago = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).isoformat()
+        refreshers = [
+            ("variant_stats",
+             lambda: db.get_variant_stats(since_ts=one_hour_ago)),
+            ("decision_funnel",
+             lambda: db.get_decision_funnel(since_secs=3600)),
+            ("confidence_buckets",
+             lambda: db.get_confidence_buckets(since_secs=86400)),
+            ("freshness_counts",
+             lambda: db.get_freshness_counts(since_secs=3600)),
+            ("freshness_buckets",
+             lambda: db.get_freshness_buckets(since_secs=86400)),
+        ]
+        for key, make_coro in refreshers:
+            try:
+                self._heavy_cache[key] = await asyncio.wait_for(
+                    make_coro(), timeout=30,
+                )
+                self._heavy_cache_fail_streak[key] = 0
+            except Exception as exc:  # noqa: BLE001
+                streak = self._heavy_cache_fail_streak.get(key, 0) + 1
+                self._heavy_cache_fail_streak[key] = streak
+                level = logger.error if streak >= 3 else logger.warning
+                level(
+                    "[dash-cache] %s refresh failed (streak=%d): %s",
+                    key, streak, exc,
+                )
+        # Scout funnel is computed from a single SELECT; reuse the same
+        # cache slot so the dashboard tile and the variant block share a
+        # consistent freshness stamp.
+        try:
+            self._heavy_cache["scout_funnel"] = await asyncio.wait_for(
+                self._compute_scout_funnel(db_override=db), timeout=30,
+            )
+            self._heavy_cache_fail_streak["scout_funnel"] = 0
+        except Exception as exc:  # noqa: BLE001
+            streak = self._heavy_cache_fail_streak.get("scout_funnel", 0) + 1
+            self._heavy_cache_fail_streak["scout_funnel"] = streak
+            level = logger.error if streak >= 3 else logger.warning
+            level(
+                "[dash-cache] scout_funnel refresh failed (streak=%d): %s",
+                streak, exc,
+            )
+        self._heavy_cache["_last_refresh_at"] = datetime.now(timezone.utc)
+
+    async def _compute_scout_funnel(self, db_override=None) -> Optional[dict]:
+        """Fetch scout's trader_trace rows and tabulate the decision funnel.
+
+        Cycle-scoped query (falls back to a 1h window when the cycle start
+        isn't known) keeps the SELECT cheap on the multi-million-row trades
+        table. The pure `compute_funnel` core lives in
+        `seulgi/app/scout_funnel_core.py` so the CLI analyzer and this tile
+        share one implementation. Returns a dict with `stats`, `cutoff`,
+        `since_hours` for the renderer; or None on DB failure.
+
+        Phase 2: `db_override` lets the cache loop use the RO clone so the
+        scout funnel query doesn't serialise with the writer thread.
+        """
+        db = db_override or self._db
+        if db is None:
+            return None
+        from scout_funnel_core import compute_funnel
+        now = datetime.now(timezone.utc)
+        if self._cycle_started_at:
+            cutoff = self._cycle_started_at
+            try:
+                cutoff_dt = datetime.fromisoformat(
+                    cutoff.replace("Z", "+00:00")
+                )
+                since_hours = max((now - cutoff_dt).total_seconds() / 3600.0, 0.0)
+            except Exception:  # noqa: BLE001
+                since_hours = 0.0
+        else:
+            cutoff = (now - timedelta(hours=1)).isoformat()
+            since_hours = 1.0
+        try:
+            rows = await db.get_scout_trader_traces(
+                engine_prefix="scout", since_ts=cutoff,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[dash-cache] scout_funnel query failed: %s", exc)
+            return None
+        stats = compute_funnel(rows)
+        return {
+            "stats": stats,
+            "cutoff": cutoff,
+            "since_hours": since_hours,
+        }
 
     async def _write_all(self) -> None:
         """Rewrite all dashboard files.
@@ -473,6 +664,8 @@ class Dashboard:
         """
         writers = [
             ("main", self._write_main()),
+            ("scout_funnel", self._write_scout_funnel()),
+            ("db_health", self._write_db_health()),
             ("positions", self._write_positions()),
             ("executed", self._write_executed()),
             ("declined", self._write_declined()),
@@ -679,35 +872,23 @@ class Dashboard:
         ]
 
         # ── Cycle-8 per-decision insight blocks ──────────────────────────
-        # Each block reads from the trades table (variant_name, skip_reason,
-        # confidence_raw). All three queries are cheap (~ms on indexed cols)
-        # and surface what classify_batch already paid for.
+        # Five aggregate queries against the trades / signals tables. Live
+        # execution was a B-WRITES suspect — the 10s wait_for blocked
+        # aiosqlite's writer. Reads come from _heavy_cache, refreshed by a
+        # background task every 5 minutes (see _heavy_cache_loop).
         if self._db is not None:
-            try:
-                v_stats = await self._db.get_variant_stats()
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[dash] variant_stats query failed: %s", exc)
-                v_stats = []
-            try:
-                funnel = await self._db.get_decision_funnel(since_secs=3600)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[dash] decision_funnel query failed: %s", exc)
-                funnel = None
-            try:
-                buckets = await self._db.get_confidence_buckets(since_secs=86400)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[dash] confidence_buckets query failed: %s", exc)
-                buckets = []
-            try:
-                fresh_counts = await self._db.get_freshness_counts(since_secs=3600)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[dash] freshness_counts query failed: %s", exc)
-                fresh_counts = []
-            try:
-                fresh_buckets = await self._db.get_freshness_buckets(since_secs=86400)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[dash] freshness_buckets query failed: %s", exc)
-                fresh_buckets = []
+            cache = self._heavy_cache
+            v_stats = cache.get("variant_stats") or []
+            funnel = cache.get("decision_funnel")
+            buckets = cache.get("confidence_buckets") or []
+            fresh_counts = cache.get("freshness_counts") or []
+            fresh_buckets = cache.get("freshness_buckets") or []
+            last_refresh = cache.get("_last_refresh_at")
+            if last_refresh is not None:
+                age = int((datetime.now(timezone.utc) - last_refresh).total_seconds())
+                cache_hint = f"  (5-min cache, refreshed {age}s ago)"
+            else:
+                cache_hint = "  (5-min cache, warming up…)"
 
             # E.7.1: filter to active variants only. The lifetime leaderboard
             # is otherwise dominated by retired variants (aggressive/_lowvol
@@ -720,6 +901,7 @@ class Dashboard:
                 v_stats_view = list(v_stats)
 
             lines += ["", "── VARIANT LEADERBOARD (active engines, by ROI% on $100 pot) ────"]
+            lines.append(cache_hint)
             if not v_stats_view:
                 if self._active_variants and v_stats:
                     lines.append("  (no closed trades yet for the active engines)")
@@ -913,11 +1095,172 @@ class Dashboard:
         if last_skip:
             lines.append(f"  Last declined : [{_ts(last_skip.decided_at)}] {last_skip.skip_reason}  "
                          f"{last_skip.question[:60]}")
+        # ── Perf metrics (in-memory snapshot, last 5 minutes) ────────
+        try:
+            import metrics as _m
+            rows = _m.snapshot_recent()
+            if rows:
+                lines.append("")
+                lines.append("── PERF METRICS (rolling, ~5m in-memory) ───────────────────────")
+                lines.append(
+                    f"  {'NAME':<28} {'TAGS':<22} {'N':>6}  "
+                    f"{'p50':>6}  {'p95':>6}  {'p99':>6}  {'MAX':>6}"
+                )
+                lines.append("  " + "─" * 84)
+                for r in rows[:15]:
+                    tags_str = (r["tags"] or "").replace('"', "")[:22]
+                    if r["sum"] > 0:  # timer
+                        lines.append(
+                            f"  {r['name'][:28]:<28} {tags_str:<22} {r['count']:>6}  "
+                            f"{r['p50']:>5.0f}ms  {r['p95']:>5.0f}ms  "
+                            f"{r['p99']:>5.0f}ms  {r['max']:>5.0f}ms"
+                        )
+                    else:  # counter (count only)
+                        lines.append(
+                            f"  {r['name'][:28]:<28} {tags_str:<22} {r['count']:>6}  "
+                            f"{'—':>6}  {'—':>6}  {'—':>6}  {'—':>6}"
+                        )
+        except Exception:  # noqa: BLE001
+            pass
+
         lines.append("")
         lines.append("  See positions_open.txt · trades_executed.txt · near_miss.txt")
         lines.append("      trades_declined.txt · news_seen.txt · activity_log.txt · profile.txt")
 
         _write(self._path("dashboard.txt"), "\n".join(lines) + "\n")
+
+    async def _write_scout_funnel(self) -> None:
+        """Render the SCOUT decision funnel tile from the 5-min cache.
+
+        Reads `_heavy_cache["scout_funnel"]` (populated by
+        `_compute_scout_funnel`) and renders the Markdown report via
+        `scout_funnel_core.render_funnel_markdown`. Renders a placeholder
+        until the first refresh completes.
+        """
+        out_path = self._path("scout_funnel.txt")
+        cached = self._heavy_cache.get("scout_funnel") if self._db is not None else None
+        last_refresh = self._heavy_cache.get("_last_refresh_at")
+        if cached is None:
+            header = "# SCOUT funnel — warming up\n\n"
+            if last_refresh is None:
+                body = (
+                    "Cache is empty. The 5-min background refresh runs on "
+                    "first dashboard tick; check back shortly.\n"
+                )
+            else:
+                age = int((datetime.now(timezone.utc) - last_refresh).total_seconds())
+                body = (
+                    f"Last refresh attempt {age}s ago returned no data "
+                    "(query may have failed — see logs).\n"
+                )
+            _write(out_path, header + body)
+            return
+
+        from scout_funnel_core import render_funnel_markdown
+        text = render_funnel_markdown(
+            cached["stats"],
+            engine_prefix="scout",
+            since_hours=cached.get("since_hours", 0.0),
+            cutoff=cached.get("cutoff", ""),
+        )
+        if last_refresh is not None:
+            age = int((datetime.now(timezone.utc) - last_refresh).total_seconds())
+            text = (
+                text.rstrip("\n")
+                + f"\n\n_5-min cache, refreshed {age}s ago "
+                  f"(cycle-scoped from {cached.get('cutoff', '?')})_\n"
+            )
+        _write(out_path, text)
+
+    async def _write_db_health(self) -> None:
+        """Render DB write health tile.
+
+        Uses the synchronous in-memory snapshot so the render path never
+        queues behind a writer-bound PRAGMA. WAL frame counts come from
+        the host-side audit CLI (`db_health_audit.py`).
+        """
+        out_path = self._path("db_health.txt")
+        now = datetime.now(timezone.utc)
+        if self._db is None:
+            _write(out_path, f"# DB HEALTH — {_ts(now)}\n\n  (no DB attached)\n")
+            return
+        health = self._db.write_health_snapshot()
+
+        lines: list[str] = [f"# DB HEALTH — {_ts(now)}", ""]
+        bt = health.get("busy_timeout_ms")
+        lines.append(f"  busy_timeout_ms : {bt if bt is not None else '?'}")
+        wal_total = health.get("wal_total_frames")
+        wal_done = health.get("wal_checkpointed_frames")
+        wal_busy = health.get("wal_busy")
+        if wal_total is not None:
+            lines.append(
+                f"  WAL frames      : {wal_total} total, {wal_done} checkpointed, busy={wal_busy}"
+            )
+        if "wal_error" in health:
+            lines.append(f"  WAL error       : {health['wal_error']}")
+        lines.append("")
+
+        lines.append("## Last successful insert per table")
+        lines.append("")
+        lines.append("| table             | last_insert (UTC)   | age      |")
+        lines.append("|-------------------|---------------------|---------:|")
+        last_insert_at = health.get("last_insert_at", {})
+        for table in sorted(last_insert_at.keys()):
+            ts_iso = last_insert_at[table]
+            try:
+                t = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+                age = (now - t).total_seconds()
+                if age < 90:
+                    age_s = f"{age:>5.0f}s"
+                elif age < 3600:
+                    age_s = f"{age/60:>4.1f}m"
+                else:
+                    age_s = f"{age/3600:>4.1f}h"
+                ts_display = ts_iso[:19]
+            except Exception:  # noqa: BLE001
+                age_s = "  ?  "
+                ts_display = ts_iso[:19]
+            lines.append(f"| {table:<17} | {ts_display:<19} | {age_s:>8} |")
+        if not last_insert_at:
+            lines.append("| (no successful inserts since boot)                          |")
+        lines.append("")
+
+        lines.append("## Write counters (ok / err since boot)")
+        lines.append("")
+        lines.append("| method                       | ok        | err     |")
+        lines.append("|------------------------------|----------:|--------:|")
+        counters = health.get("counters", {})
+        for method in sorted(counters.keys()):
+            c = counters[method]
+            ok_n = c.get("ok", 0)
+            err_n = c.get("err", 0)
+            mark = " ⚠" if err_n > 0 else ""
+            lines.append(
+                f"| {method:<28} | {ok_n:>9} | {err_n:>7} |{mark}"
+            )
+        if not counters:
+            lines.append("| (no write attempts yet)                                |")
+        lines.append("")
+
+        # Cache section reads in-memory state; no extra DB query.
+        cache = self._heavy_cache
+        last_refresh = cache.get("_last_refresh_at")
+        if last_refresh is not None:
+            cache_age = int((now - last_refresh).total_seconds())
+            lines.append(
+                f"## Dashboard heavy-query cache  (last refresh {cache_age}s ago)"
+            )
+        else:
+            lines.append("## Dashboard heavy-query cache  (warming up)")
+        lines.append("")
+        for k in (
+            "variant_stats", "decision_funnel", "confidence_buckets",
+            "freshness_counts", "freshness_buckets", "scout_funnel",
+        ):
+            v = cache.get(k)
+            status = "OK" if v is not None else "(empty)"
+            lines.append(f"  {k:<22}: {status}")
+        _write(out_path, "\n".join(lines) + "\n")
 
     async def _write_positions(self) -> None:
         lines = [_header("OPEN POSITIONS")]
@@ -1304,10 +1647,19 @@ class Dashboard:
     # Phase C: rich per-trade reasoning views
     # ------------------------------------------------------------------
 
+    # trade_log.jsonl rotation cap: keep only the last N lines. Without
+    # this, append-only growth pushed the file to 85 MB / 26k lines
+    # (2026-05-21 cleanup). Closed-trade history of record lives in the
+    # `trades` table; the .jsonl is just for `tail -f` and grep-friendly
+    # recent inspection.
+    _TRADE_LOG_MAX_LINES = 5000
+
     async def _write_trade_log(self) -> None:
         """
-        Append-only JSONL of every closed trade with full reasoning context.
-        One row per close, in id order so `tail -f` shows new closes live.
+        Rolling JSONL of recent closed trades with full reasoning context.
+        Append on each tick, truncate to the last _TRADE_LOG_MAX_LINES
+        when it exceeds 1.5× the cap so `tail -f` keeps working without
+        unbounded growth.
         """
         if self._db is None:
             return
@@ -1320,14 +1672,34 @@ class Dashboard:
             return
         path = self._path("trade_log.jsonl")
         try:
-            # Append-only; never rewritten. Atomic line-by-line under POSIX
-            # writes since each line is < PIPE_BUF.
             with open(path, "a", encoding="utf-8") as f:
                 for r in rows:
                     f.write(json.dumps(r, default=str, separators=(",", ":")) + "\n")
             self._last_trade_log_id = max(r["id"] for r in rows)
         except Exception as exc:  # noqa: BLE001
             logger.warning("[dash] trade_log append failed: %s", exc)
+            return
+
+        # Rotate when file grows past 1.5× the cap. Use 1.5× hysteresis
+        # so we don't truncate-and-rewrite every single append once we
+        # cross the cap.
+        try:
+            with open(path, "rb") as f:
+                # Cheap line count via newline scan
+                n = sum(1 for _ in f)
+            if n > int(self._TRADE_LOG_MAX_LINES * 1.5):
+                with open(path, "r", encoding="utf-8") as f:
+                    tail = f.readlines()[-self._TRADE_LOG_MAX_LINES:]
+                tmp = path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(tail)
+                os.replace(tmp, path)
+                logger.info(
+                    "[dash] trade_log rotated %d → %d lines",
+                    n, self._TRADE_LOG_MAX_LINES,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[dash] trade_log rotation failed: %s", exc)
 
     async def _write_variant_compare(self) -> None:
         """Per-variant pivot: trades, wins, losses, hit-rate, sum PnL."""

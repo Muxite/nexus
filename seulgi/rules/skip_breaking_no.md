@@ -4,6 +4,7 @@ stage: post_ai
 action: skip
 direction: NO
 freshness_label: BREAKING
+engines_exclude: scout
 ---
 
 # Skip NO trades on BREAKING headlines

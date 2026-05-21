@@ -42,8 +42,8 @@ def test_fee_peak_at_p_half():
     f_mid = sim.compute_fee(shares=100, price=0.5, market_type=None, cfg=cfg).fee
     f_edge = sim.compute_fee(shares=100, price=0.05, market_type=None, cfg=cfg).fee
     assert f_mid > f_edge
-    # 100 × 0.04 × 0.5 × 0.5 = 1.00
-    assert pytest.approx(f_mid, rel=1e-6) == 1.0
+    # 100 × 0.05 × 0.5 × 0.5 = 1.25  (Polymarket General tier per Phase E.7.2 / c42f94e)
+    assert pytest.approx(f_mid, rel=1e-6) == 1.25
 
 
 def test_fee_geopolitics_zero():
