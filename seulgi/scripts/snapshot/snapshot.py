@@ -69,6 +69,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -106,6 +107,53 @@ def _sha256_file(path: Path, chunk: int = 1 << 20) -> str:
                 break
             h.update(buf)
     return h.hexdigest()
+
+
+def _git_info(repo_root: Path) -> dict[str, str]:
+    """Best-effort git provenance for the manifest. Empty dict if not a repo.
+
+    Captured so a restored snapshot can be matched against the exact code SHA
+    that produced it. `dirty=true` flags that the working tree had uncommitted
+    changes at save time — restore can warn loudly in that case.
+    """
+    def _run(args: list[str]) -> Optional[str]:
+        try:
+            r = subprocess.run(
+                args, cwd=repo_root, capture_output=True, text=True,
+                timeout=5, check=False,
+            )
+            if r.returncode == 0:
+                return r.stdout.strip()
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        return None
+
+    sha = _run(["git", "rev-parse", "HEAD"])
+    if not sha:
+        return {}
+    info: dict[str, str] = {"git_sha": sha}
+    short = _run(["git", "rev-parse", "--short", "HEAD"])
+    if short:
+        info["git_short"] = short
+    branch = _run(["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    if branch:
+        info["git_branch"] = branch
+    subject = _run(["git", "log", "-1", "--pretty=%s"])
+    if subject:
+        info["git_subject"] = subject
+    status = _run(["git", "status", "--porcelain"])
+    info["git_dirty"] = "true" if status else "false"
+    if status:
+        # short list of dirty paths; cap to keep manifest readable. Porcelain
+        # format is `XY <path>` where XY is 2-char status, so split on the
+        # first whitespace and take the second token.
+        dirty_files: list[str] = []
+        for line in status.splitlines()[:25]:
+            parts = line.split(maxsplit=1)
+            if len(parts) == 2:
+                dirty_files.append(parts[1])
+        info["git_dirty_files"] = ", ".join(dirty_files)
+    return info
 
 
 def _db_table_counts(db_path: Path) -> dict[str, int]:
@@ -208,9 +256,15 @@ def save(name: str, *, full: bool = True, overwrite: bool = False,
         "db_size_bytes": db_dst.stat().st_size,
         "row_counts": _db_table_counts(db_dst),
         "items": sorted(p.name for p in target.iterdir()),
+        "git": _git_info(REPO.parent),
     }
     (target / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"[snapshot] saved → {target}")
+    g = manifest.get("git") or {}
+    if g.get("git_sha"):
+        flag = " (dirty)" if g.get("git_dirty") == "true" else ""
+        print(f"[snapshot]   code: {g.get('git_short', g['git_sha'][:7])} "
+              f"on {g.get('git_branch', '?')}{flag}")
     print(f"[snapshot]   db: {manifest['db_size_bytes']/1e6:.1f} MB, "
           f"sha256={manifest['db_sha256'][:12]}…")
     print(f"[snapshot]   row counts: " + ", ".join(
@@ -298,6 +352,29 @@ def restore(name: str, *, reset_trading: bool = False) -> None:
 
     print(f"[restore] data/ replaced from snapshot {name!r} "
           f"(saved {manifest.get('saved_at', '?')})")
+
+    # Warn if the current working tree differs from the snapshot's code SHA.
+    # Same-SHA restores are guaranteed-compatible; cross-SHA restores can
+    # silently break (schema migrations, removed tables, etc.).
+    snap_git = manifest.get("git") or {}
+    snap_sha = snap_git.get("git_sha")
+    if snap_sha:
+        current = _git_info(REPO.parent)
+        cur_sha = current.get("git_sha")
+        if cur_sha and cur_sha != snap_sha:
+            print(
+                f"[restore] WARNING: code SHA mismatch — "
+                f"snapshot={snap_git.get('git_short', snap_sha[:7])} "
+                f"({snap_git.get('git_branch', '?')}), "
+                f"current={current.get('git_short', cur_sha[:7])} "
+                f"({current.get('git_branch', '?')}). "
+                f"Schema or behavior may have changed between these commits."
+            )
+        if snap_git.get("git_dirty") == "true":
+            print(
+                f"[restore] NOTE: snapshot was taken with a dirty working "
+                f"tree ({snap_git.get('git_dirty_files', '?')})."
+            )
 
     if reset_trading:
         cleared = _reset_trading_state(dst_db)

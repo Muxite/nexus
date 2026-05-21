@@ -434,10 +434,17 @@ markets:
 #               anthropic/claude-haiku-4-5  (reliable JSON)
 #               meta-llama/llama-3.1-8b-instruct  (free tier)
 ai:
-  # Stage-3 prediction model. Upgraded from flash-lite → flash now that the
-  # relevance gate (Stage 2) culls irrelevant markets before this call —
-  # spend the reasoning budget on survivors. Cost still cheap on OpenRouter.
-  model: "google/gemini-2.5-flash"
+  # Stage-3 prediction model. 2026-05-21: switched from gemini-2.5-flash
+  # → gemini-3.1-flash-lite-preview. OpenRouter pricing comparison:
+  #   2.5-flash      : in $0.300/M  out $2.500/M
+  #   3.1-flash-lite : in $0.250/M  out $1.500/M  ← 40% cheaper output
+  #   2.5-flash-lite : in $0.100/M  out $0.400/M  (used for relevance below)
+  # Output dominates spend (structured JSON, per-market reasoning). The
+  # 3.1-flash-lite-preview is "almost as good as 2.5 flash" per user
+  # guidance and gives ~30% overall LLM cost reduction. Relevance gate
+  # already culls bad candidates upstream so the prediction call only
+  # reasons about survivors.
+  model: "google/gemini-3.1-flash-lite-preview"
   # Cross-vendor premium fallback. Triggered when the relevance pass marks
   # ≥2 markets STRONG_YES AND freshness=BREAKING (see relevance.py).
   premium_model: "anthropic/claude-haiku-4-5"
