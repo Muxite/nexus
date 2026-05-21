@@ -346,34 +346,22 @@ class TestEngineRunnerProcess:
             assert reason == "RULE_kill_all_SKIP"
 
     @pytest.mark.asyncio
-    async def test_process_wraps_engine_gather_in_db_batch(self):
-        """Phase B coalescing: process() must enter/exit db.batch() around
-        the engine fan-out so the ~400 per-headline writes commit as ONE
-        transaction instead of 400 fsyncs."""
-        from contextlib import asynccontextmanager
+    async def test_process_records_engine_decisions_per_engine(self):
+        """process() must call record_engine_decisions once per active engine,
+        regardless of whether the gather is wrapped in db.batch().
 
+        Phase B (2026-05-21) wrapped the gather in db.batch() for one-fsync
+        coalescing, but the wrap was reverted 2026-05-21 07:10 UTC because
+        production headlined a stuck-batch hang (task #24). The test now
+        verifies the essential behaviour: every engine gets its own
+        record_engine_decisions call after the gather completes.
+        """
         e1 = _make_engine("e1")
         e2 = _make_engine("e2")
         runner = _make_runner(engines=[e1, e2], n_matches=1)
 
-        batch_events: list[str] = []
-
-        @asynccontextmanager
-        async def _tracking_batch():
-            batch_events.append("enter")
-            try:
-                yield
-            finally:
-                batch_events.append("exit")
-
-        runner._db.batch = _tracking_batch
-
         await runner.process(_make_headline())
 
-        assert batch_events == ["enter", "exit"], (
-            f"expected one enter/exit pair, got {batch_events}"
-        )
-        # Both engines' record_engine_decisions must have run inside the batch
         assert runner._db.record_engine_decisions.await_count == 2
 
 

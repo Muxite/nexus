@@ -594,26 +594,42 @@ class EngineRunner:
         # Fan out to all engines/variants concurrently. Every engine sees the
         # same signal_id, same classify_results, same prompt_meta, same
         # relevance_skips list (each variant persists its own copy).
-        # Phase B (2026-05-21): wrap the engine fan-out in db.batch() so
-        # the ~400 writes per headline (insert_trade × N + open_position
-        # × M + record_engine_decisions × engines) commit as ONE
-        # transaction = ONE fsync. The lock inside batch() serialises
-        # this against other process() coroutines so concurrent
-        # headlines don't race on BEGIN/COMMIT. HTTP/AI work above is
-        # parallel; only the write phase is serialised.
-        async with self._db.batch():
-            results: list[list[TradeDecision]] = await asyncio.gather(
-                *[
-                    self._run_engine(
-                        engine, headline, signal_id,
-                        survivors, classify_results, prompt_meta_json,
-                        pre_skips, pre_ms, relevance_skips=relevance_skips,
-                        freshness_label=freshness.label,
-                    )
-                    for engine in active_engines
-                ],
-                return_exceptions=True,
-            )
+        #
+        # 2026-05-21 07:10 UTC: Phase B (wrap the gather in db.batch())
+        # was REVERTED at the source. Symptom: the bot stopped writing
+        # any trades / engine_results from 2026-05-21T03:05 onwards
+        # (4+ hours of zero trade output across 5 container deploys).
+        # py-spy showed the aiosqlite worker thread holding a result
+        # cursor the event loop never consumed — the gather wasn't
+        # completing, leaving the batch BEGIN open indefinitely. An
+        # external Python script confirmed the SQLite writer lock was
+        # held ("cannot commit transaction - SQL statements in progress"
+        # / 10 s insert_trade timeout).
+        #
+        # The replay harness passes 500/c=16 with the batch wrap because
+        # it lacks the production bg_tasks (metrics flush, position
+        # monitor, dashboard RO clone, market refresh) — one of those
+        # interacts with the batch lock in a way only production triggers.
+        # Task #24 owns the deeper diagnosis.
+        #
+        # For now: each write commits individually. Cost ~400 fsyncs per
+        # headline instead of 1 (with WAL+synchronous=NORMAL, ~1 ms each
+        # = ~400 ms total). Acceptable for headline rate. The
+        # strict-serialize `db.batch()` is still in db.py for explicit
+        # callers (e.g. metrics flush, future reset_cycle batches), but
+        # the runner no longer wraps the gather.
+        results: list[list[TradeDecision]] = await asyncio.gather(
+            *[
+                self._run_engine(
+                    engine, headline, signal_id,
+                    survivors, classify_results, prompt_meta_json,
+                    pre_skips, pre_ms, relevance_skips=relevance_skips,
+                    freshness_label=freshness.label,
+                )
+                for engine in active_engines
+            ],
+            return_exceptions=True,
+        )
 
         for engine, engine_results in zip(active_engines, results):
             if isinstance(engine_results, BaseException):
