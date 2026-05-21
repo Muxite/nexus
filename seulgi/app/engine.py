@@ -655,6 +655,36 @@ class EngineRunner:
         if len(kept) != len(matches):
             logger.info("[runner] [hid=%s] dropped %d/%d no-price matches",
                         hid, len(matches) - len(kept), len(matches))
+
+        # Part 2.1 (2026-05-21): persist the mids we just fetched so the
+        # backtest framework has a price corpus for every matched market
+        # — not only the ones a trade actually executed against. One row
+        # per kept market per headline. Awaited (not fire-and-forget) so
+        # failures surface via the runner's done-callback and the write
+        # joins any enclosing batch correctly; the cost is one
+        # executemany of ~25 small rows = sub-ms.
+        if kept:
+            t_unix = int(time.time())
+            snaps: list[tuple] = []
+            for m in kept:
+                # Prefer YES side; fall back to NO when only NO is set.
+                # token_id may be None (e.g. when the historical row was
+                # a skip with NEUTRAL direction); condition_id is the
+                # canonical identifier for the backtest lookup.
+                if m.mid_yes is not None:
+                    snaps.append((m.condition_id, m.token_yes, "yes",
+                                  float(m.mid_yes), t_unix, "prefetch", hid))
+                elif m.mid_no is not None:
+                    snaps.append((m.condition_id, m.token_no, "no",
+                                  float(m.mid_no), t_unix, "prefetch", hid))
+            if snaps:
+                try:
+                    await self._db.insert_market_price_snaps(snaps)
+                except Exception as exc:  # noqa: BLE001
+                    # Diagnostic-only data — never block the pipeline.
+                    logger.warning(
+                        "[runner] [hid=%s] price_snap write failed: %r", hid, exc,
+                    )
         return kept
 
     async def _run_engine(

@@ -408,6 +408,26 @@ _MIGRATIONS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_metrics_name_bucket ON metrics_minutely(name, bucket_ts)",
     "CREATE INDEX IF NOT EXISTS idx_metrics_bucket ON metrics_minutely(bucket_ts)",
+    # Part 2.1 (2026-05-21): market_price_snaps — one row per matched
+    # market per headline, captured at price-prefetch time. Complements
+    # price_timeseries (which only covers executed-trade impacts) by
+    # giving the backtest framework a full corpus of "what was the
+    # market price at time T?" snapshots, including for markets the
+    # bot looked at but skipped. Foundation for Part 2 (strategy
+    # backtest framework).
+    """CREATE TABLE IF NOT EXISTS market_price_snaps (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        condition_id TEXT NOT NULL,
+        token_id     TEXT,                     -- nullable: harness / inferred prices
+        side         TEXT NOT NULL,           -- 'yes' | 'no'
+        price        REAL NOT NULL,
+        t_unix       INTEGER NOT NULL,
+        source       TEXT NOT NULL DEFAULT 'prefetch',
+        headline_id  TEXT                      -- nullable: future non-headline sources
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_mps_condition_t ON market_price_snaps(condition_id, t_unix)",
+    "CREATE INDEX IF NOT EXISTS idx_mps_t           ON market_price_snaps(t_unix)",
+    "CREATE INDEX IF NOT EXISTS idx_mps_headline    ON market_price_snaps(headline_id)",
 ]
 
 
@@ -2331,6 +2351,42 @@ class SeulgiDB:
             return None, 0
         hits = sum(1 for r in rows if (r[0] or 0.0) > 0.0)
         return hits / n, n
+
+    # ------------------------------------------------------------------
+    # Market price snapshots (Part 2.1 — backtest corpus)
+    # ------------------------------------------------------------------
+
+    async def insert_market_price_snaps(
+        self,
+        snaps: list[tuple[str, str, str, float, int, str, Optional[str]]],
+    ) -> None:
+        """Bulk-insert mid-price snapshots for matched markets.
+
+        Each tuple: (condition_id, token_id, side, price, t_unix, source,
+        headline_id). `side` is 'yes' or 'no' — the side fetched (the
+        other side is inferred via 1 − price in binary markets).
+
+        Called from `engine._prefetch_prices` after fetching mids. One
+        row per (market, headline) so the backtest framework can ask
+        "what was the price for condition X at time T?" for any market
+        the bot has ever looked at — not just markets where a trade
+        executed. Complements `price_timeseries` (executed-trade-only).
+        """
+        if not snaps:
+            return
+        async with self._write_lock():
+            try:
+                await self._conn.executemany(
+                    "INSERT INTO market_price_snaps "
+                    "(condition_id, token_id, side, price, t_unix, source, headline_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    snaps,
+                )
+                await self._commit_if_unbatched()
+                self._bump_ok("insert_market_price_snaps", "market_price_snaps")
+            except Exception as exc:
+                self._bump_err("insert_market_price_snaps", exc)
+                raise
 
     # ------------------------------------------------------------------
     # Market heat tracking
