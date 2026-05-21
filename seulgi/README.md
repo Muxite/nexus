@@ -5,6 +5,26 @@ Watches news sites → matches headlines to markets → classifies direction →
 
 ---
 
+## Where to find things
+
+| You want to know… | Look here |
+|---|---|
+| System overview / architecture | [`docs/architecture.md`](docs/architecture.md) |
+| Pipeline filter-by-filter walkthrough | [`docs/decision_funnel.md`](docs/decision_funnel.md) |
+| How we iterate (cycle methodology) | [`docs/cycle_methodology.md`](docs/cycle_methodology.md) |
+| Quant background (Kelly, edge, calibration) | [`docs/quant_guide.md`](docs/quant_guide.md) |
+| Canonical SQL queries | [`docs/queries.md`](docs/queries.md) |
+| Gotchas / pitfalls | [`docs/pitfalls.md`](docs/pitfalls.md) |
+| Catalogue of past errors + fixes | [`docs/errors_and_fixes.md`](docs/errors_and_fixes.md) |
+| **What changed today / current state of the world** | latest file in [`handoffs/`](handoffs/) |
+| Point-in-time forensic reports | [`reports/`](reports/) — dated `YYYY-MM-DD-<topic>.md` |
+| Cycle-by-cycle changelog | [`changelogs/cycles.md`](changelogs/cycles.md) |
+| Open research questions | [`questions/quant_questions.md`](questions/quant_questions.md) |
+
+Evergreen docs in `docs/` are edited freely; `handoffs/` are dated and immutable after the next one lands; `reports/` are immutable forever (write a new dated report to revise).
+
+---
+
 ## Pipeline
 
 ```
