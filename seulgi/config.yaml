@@ -481,7 +481,13 @@ relevance:
   enabled: true
   model: "google/gemini-2.5-flash-lite"
   temperature: 0.1
-  keep_scores: ["STRONG_YES", "YES"]
+  # 2026-05-21: TIGHTENED to STRONG_YES only based on 30-day forensic:
+  # STRONG_YES = +$2.05 over 100 closed trades (56.5% hit). YES =
+  # −$3.49 over 396 trades (38.4% hit). WEAK is worse. Production
+  # engines accept only STRONG_YES. Scout (research) overrides via
+  # its own relevance_keep_scores list (config below) to see the
+  # broader corpus for backtest data collection.
+  keep_scores: ["STRONG_YES"]
   max_tokens_per_market: 60
   # Phase-E E2 (2026-05-19): restored to 0.55 after the 0.0 experiment
   # showed sub-0.45 similarity trades hit 17.8% vs 0.65-0.75 at 50%.
@@ -718,6 +724,13 @@ engines:
     stop_loss:        0.05
     trailing_stop:    0.020
     min_hold_seconds: 60
+    # 2026-05-21: scout broadens the relevance gate to collect research
+    # data on markets production engines drop. Production's global
+    # default is ["STRONG_YES"] (the only profitable bucket per 30-day
+    # forensic); scout adds YES and WEAK to see ~30% of all verdicts
+    # instead of ~1%. The prediction LLM runs on the union (= scout's
+    # set) so cost is paid once for all engines.
+    relevance_keep_scores: ["STRONG_YES", "YES", "WEAK"]
     variants:
       - name: "all_signals"
 

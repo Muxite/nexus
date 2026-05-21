@@ -82,6 +82,12 @@ class Engine:
     # this — fixed-balance engines keep their pot; remaining engines split
     # the remainder of simulate_total_usdc. None → engine pools in the split.
     fixed_balance: Optional[float] = None
+    # Per-engine relevance gate override. None → fall back to global
+    # `relevance.keep_scores`. When set, only markets with a Stage-2
+    # relevance verdict in this list reach this engine's trader.evaluate.
+    # 2026-05-21: production tightens to ["STRONG_YES"] (profitable);
+    # scout broadens to ["STRONG_YES","YES","WEAK"] for research data.
+    relevance_keep_scores: Optional[list[str]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -450,19 +456,48 @@ class EngineRunner:
                     )
                 # Tag each match with its verdict so the trader can persist
                 # relevance_score / relevance_reason on every trade row.
-                kept_ids = {id(m) for m in kept}
                 for m, v in zip(survivors, verdicts):
                     m._relevance_score = v.score
                     m._relevance_reason = v.reason
-                    if id(m) not in kept_ids:
-                        relevance_skips.append((m, v))
-                # Verdicts for the matches that survived (preserve order).
+                # 2026-05-21: per-engine relevance.  Compute the UNION of
+                # all engines' keep_scores so the prediction LLM input
+                # covers every market any engine wants to evaluate.
+                # Each engine later (in _run_engine) filters survivors
+                # down to its OWN keep_scores. Production tight,
+                # scout loose — both share one prediction LLM call.
+                default_keep = set(
+                    getattr(self._relevance, "_keep_scores", None)
+                    or ("STRONG_YES", "YES")
+                )
+                union_keep: set[str] = set()
+                for engine in self._engines:
+                    eks = getattr(engine, "relevance_keep_scores", None)
+                    union_keep |= set(eks) if eks else default_keep
                 v_by_id = {id(m): v for m, v in zip(survivors, verdicts)}
-                relevance_verdicts_kept = [v_by_id[id(m)] for m in kept]
-                survivors = kept
-                logger.info("[runner] [hid=%s] relevance kept %d/%d (model=%s tokens=%s)",
-                            hid, rmeta.get("n_kept", 0), rmeta.get("n_in", 0),
-                            rmeta.get("model"), rmeta.get("tokens"))
+                survivors_union = [
+                    m for m in survivors
+                    if v_by_id[id(m)].score in union_keep
+                ]
+                # Matches outside the union are skipped by EVERY engine —
+                # record one skip row per (engine, match) so funnel
+                # attribution is preserved.
+                kept_union_ids = {id(m) for m in survivors_union}
+                relevance_skips = [
+                    (m, v_by_id[id(m)]) for m in survivors
+                    if id(m) not in kept_union_ids
+                ]
+                relevance_verdicts_kept = [
+                    v_by_id[id(m)] for m in survivors_union
+                ]
+                survivors = survivors_union
+                logger.info(
+                    "[runner] [hid=%s] relevance kept %d/%d for prediction "
+                    "(union of engine keep_scores) — global default %s, "
+                    "model=%s tokens=%s",
+                    hid, len(survivors_union), rmeta.get("n_in", 0),
+                    sorted(default_keep), rmeta.get("model"),
+                    rmeta.get("tokens"),
+                )
             except Exception as exc:
                 logger.warning("[runner] relevance error: %s — fail open", exc)
 
@@ -709,13 +744,42 @@ class EngineRunner:
         hid = getattr(headline, "headline_id", "")
         _t_engine = time.monotonic()
 
+        # ── Per-engine relevance gate (2026-05-21) ─────────────────────────
+        # process() runs the relevance LLM once and passes the UNION of
+        # every engine's keep_scores. Filter down to THIS engine's set
+        # here; dropped matches get a relevance skip row so the
+        # decision funnel still accounts for them.
+        engine_keep_scores = (
+            set(engine.relevance_keep_scores)
+            if engine.relevance_keep_scores
+            else set(
+                getattr(self._relevance, "_keep_scores", None)
+                or ("STRONG_YES", "YES")
+            )
+        )
+        rel_filtered_survivors: list[MarketMatch] = []
+        rel_filtered_classify: list[ClassifyResult] = []
+        rel_dropped_skips: list[tuple[MarketMatch, str]] = []
+        for m, cr in zip(survivors, classify_results):
+            rs = getattr(m, "_relevance_score", None)
+            if rs is None or rs in engine_keep_scores:
+                rel_filtered_survivors.append(m)
+                rel_filtered_classify.append(cr)
+            else:
+                rel_dropped_skips.append((m, f"not_relevant:{rs}"))
+        survivors = rel_filtered_survivors
+        classify_results = rel_filtered_classify
+
         # ── Per-engine scoped pre-AI gate ──────────────────────────────────
         # The shared loop in process() applied only universal rules. Rules
         # with `engines_exclude` set (today: all 7 of them, all excluding
         # scout) apply here so scout can bypass while production engines
         # keep the same behavior they had before the split. We must keep
         # survivors and classify_results aligned by index when filtering.
+        # The rel_dropped_skips above are fed in alongside pre-AI skips so
+        # one trade row lands per dropped (engine, market) pair.
         engine_pre_skips: list[tuple[MarketMatch, str]] = list(pre_skips or [])
+        engine_pre_skips.extend(rel_dropped_skips)
         engine_survivors: list[MarketMatch] = []
         engine_classify: list[ClassifyResult] = []
         parent_root = getattr(engine.trader, "_parent_engine", engine.name) or engine.name
@@ -953,6 +1017,10 @@ def build_engines(
                     variant_name=v_name, parent_engine=ec.name,
                 ),
                 fixed_balance=ec.balance_usdc,
+                # Per-engine relevance override. Inherits from EngineConfig.
+                # Variants share the parent engine's setting (no per-variant
+                # override today — variants are usually for sizing / exits).
+                relevance_keep_scores=getattr(ec, "relevance_keep_scores", None),
             ))
 
     # Carved-out strategy module (opt-in via env var). Lives in its own

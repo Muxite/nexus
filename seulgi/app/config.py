@@ -413,6 +413,14 @@ class EngineConfig:
     stop_loss_pct: Optional[float] = None
     min_entry_yes_mid: Optional[float] = None
     max_market_vol_30m: Optional[float] = None
+    # Per-engine relevance gate override. When None, the global
+    # `relevance.keep_scores` is used. When set, this engine evaluates
+    # only markets whose Stage-2 relevance verdict is in this list.
+    # Example: scout sets ["STRONG_YES", "YES", "WEAK"] to see a broader
+    # corpus while production engines stay at ["STRONG_YES"] for ROI.
+    # The prediction LLM runs on the union across engines so every
+    # engine has classify_results for its accepted markets.
+    relevance_keep_scores: Optional[list] = None  # list[str] | None
     # Optional shadow-strategy variants. When non-empty the engine spawns one
     # PaperTrader per variant; all variants share the engine's batched AI
     # call but record trades under their own variant_name. When empty the
@@ -557,6 +565,11 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=_opt_float(e.get("stop_loss_pct")),
             min_entry_yes_mid=_opt_float(e.get("min_entry_yes_mid")),
             max_market_vol_30m=_opt_float(e.get("max_market_vol_30m")),
+            relevance_keep_scores=(
+                list(e["relevance_keep_scores"])
+                if isinstance(e.get("relevance_keep_scores"), list)
+                else None
+            ),
             variants=[_build_variant(j, v) for j, v in enumerate(e.get("variants", []) or [])],
         )
         for i, e in enumerate(raw.get("engines", []))
