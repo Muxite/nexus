@@ -568,32 +568,31 @@ class SeulgiDB:
 
     @asynccontextmanager
     async def _write_lock(self):
-        """Acquire the writer serializer for an individual write.
+        """TEMPORARILY a no-op pass-through (2026-05-21 04:20 UTC).
 
-        Reentrant: when called from inside an active batch() in the SAME
-        task, skip the lock (the enclosing batch is already holding it
-        and the implicit-txn from this write joins the batch's
-        transaction). When called from outside any batch, acquire the
-        lock so this write cannot interleave with another task's batch.
+        Originally added to serialize individual writes against
+        concurrent `batch()` calls (closing the metrics-flush implicit-
+        txn race). The 200/c=12 + 500/c=16 replay harness PASSED with
+        the lock in place — but production deployment of Container
+        6/7 with the same code deadlocked: `bump_market_heat` calls
+        succeeded but every subsequent `insert_signal` blocked
+        forever (provably: external Python script `insert_signal`
+        on the production DB timed out at 10 s while the writer
+        worker thread was idle in `select()` per `py-spy dump`).
 
-        Why this exists (2026-05-21): without it, an individual insert
-        from task B (e.g. `insert_signal`) executes the INSERT, yields
-        the event loop on the `await`, and task A's `batch()` can grab
-        the asyncio.Lock and call BEGIN — which fails with "cannot
-        start a transaction within a transaction" because B's implicit
-        transaction is still open. Wrapping every write in this lock
-        ensures the implicit-txn window is fully serialized against
-        the batch BEGIN.
+        The harness doesn't reproduce the deadlock so the cause is
+        production-specific (real LLM latency / metrics flush /
+        position monitor / dashboard background tasks interacting
+        with the lock somehow). Need to investigate separately.
+
+        Falling back to pre-write-lock behavior: writes do NOT
+        serialize against concurrent `batch()`. The metrics-flush
+        race remains (every 5 min one tick may fail with `cannot
+        start a transaction`) but doesn't lose data. The B-WRITES
+        bug stays fixed because `batch()` still strictly serializes
+        on `_batch_lock`.
         """
-        if self._batch_lock is None:
-            self._batch_lock = asyncio.Lock()
-        if _in_batch_var.get():
-            # Already inside this task's batch — the enclosing async-with
-            # holds the lock; just yield.
-            yield
-            return
-        async with self._batch_lock:
-            yield
+        yield
 
     async def _commit_if_unbatched(self) -> None:
         """Helper for insert/update functions: commit only outside a batch()."""
