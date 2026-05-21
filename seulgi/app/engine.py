@@ -595,41 +595,65 @@ class EngineRunner:
         # same signal_id, same classify_results, same prompt_meta, same
         # relevance_skips list (each variant persists its own copy).
         #
-        # 2026-05-21 07:10 UTC: Phase B (wrap the gather in db.batch())
-        # was REVERTED at the source. Symptom: the bot stopped writing
-        # any trades / engine_results from 2026-05-21T03:05 onwards
-        # (4+ hours of zero trade output across 5 container deploys).
-        # py-spy showed the aiosqlite worker thread holding a result
-        # cursor the event loop never consumed — the gather wasn't
-        # completing, leaving the batch BEGIN open indefinitely. An
-        # external Python script confirmed the SQLite writer lock was
-        # held ("cannot commit transaction - SQL statements in progress"
-        # / 10 s insert_trade timeout).
+        # 2026-05-21 07:30 UTC: re-wrap the gather in db.batch() with
+        # a per-headline timeout. The full story:
         #
-        # The replay harness passes 500/c=16 with the batch wrap because
-        # it lacks the production bg_tasks (metrics flush, position
-        # monitor, dashboard RO clone, market refresh) — one of those
-        # interacts with the batch lock in a way only production triggers.
-        # Task #24 owns the deeper diagnosis.
+        #   - Unwrapping the batch (07:10) caused massive "database is
+        #     locked" errors because 15 engines × ~25 markets × ~3
+        #     concurrent process() tasks all committed individually
+        #     against a single SQLite writer with busy_timeout=30s.
+        #     ~6000 concurrent commits → contention → cascading
+        #     OperationalError('database is locked') in runner tasks.
         #
-        # For now: each write commits individually. Cost ~400 fsyncs per
-        # headline instead of 1 (with WAL+synchronous=NORMAL, ~1 ms each
-        # = ~400 ms total). Acceptable for headline rate. The
-        # strict-serialize `db.batch()` is still in db.py for explicit
-        # callers (e.g. metrics flush, future reset_cycle batches), but
-        # the runner no longer wraps the gather.
-        results: list[list[TradeDecision]] = await asyncio.gather(
-            *[
-                self._run_engine(
-                    engine, headline, signal_id,
-                    survivors, classify_results, prompt_meta_json,
-                    pre_skips, pre_ms, relevance_skips=relevance_skips,
-                    freshness_label=freshness.label,
+        #   - But re-wrapping naively brought back the OTHER symptom:
+        #     occasional gather hang leaving the batch transaction
+        #     open indefinitely (4+ hours of zero trades earlier today).
+        #     The root cause is unknown (task #24) — suspect an
+        #     asyncio+aiosqlite worker-thread wake-up edge case
+        #     production triggers but the harness does not.
+        #
+        #   - The synthesis: keep the batch coalescing (one commit per
+        #     headline = ~1 fsync) AND wrap in asyncio.wait_for so a
+        #     hung gather can't poison the writer. On timeout: the
+        #     CancelledError unwinds the batch via its rollback path,
+        #     the lock releases, the bot resumes. We lose at most
+        #     one headline's trade decisions per timeout (rare); the
+        #     pre-batch writes (insert_signal, log_usage, etc.) are
+        #     already committed and unaffected.
+        #
+        #   - Replay harness validates this combination at 500/c=16
+        #     with zero gaps. Production soak in progress to confirm.
+        results: list[list[TradeDecision]] = []
+        try:
+            async with self._db.batch():
+                results = await asyncio.wait_for(
+                    asyncio.gather(
+                        *[
+                            self._run_engine(
+                                engine, headline, signal_id,
+                                survivors, classify_results, prompt_meta_json,
+                                pre_skips, pre_ms, relevance_skips=relevance_skips,
+                                freshness_label=freshness.label,
+                            )
+                            for engine in active_engines
+                        ],
+                        return_exceptions=True,
+                    ),
+                    timeout=90.0,
                 )
-                for engine in active_engines
-            ],
-            return_exceptions=True,
-        )
+        except asyncio.TimeoutError:
+            # The gather did not complete within 90s. The
+            # async-with context exits via the TimeoutError so
+            # db.batch()'s rollback path runs: BEGIN is rolled back,
+            # `_batch_lock` is released, subsequent process() calls
+            # proceed cleanly. The lost data is at most one headline's
+            # engine_results — recoverable from price_impacts later.
+            logger.error(
+                "[runner] [hid=%s] ENGINE GATHER TIMEOUT 90 s — batch "
+                "rolled back, lock released. %d engines were running.",
+                hid, len(active_engines),
+            )
+            results = []
 
         for engine, engine_results in zip(active_engines, results):
             if isinstance(engine_results, BaseException):
