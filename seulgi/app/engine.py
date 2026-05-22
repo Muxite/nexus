@@ -592,15 +592,19 @@ class EngineRunner:
                 relevance_verdicts=relevance_verdicts_kept or None,
             )
             # ONE usage_events row per headline — tokens are shared across all
-            # variants by construction.
+            # variants by construction. A1.6: bypass rows land here too (with
+            # count=0, provider='llm_bypass') so cost dashboards show $0 burn
+            # explicitly instead of a silent gap in the usage_events stream.
             tokens_used = sum(r.tokens_used for r in classify_results)
-            if tokens_used:
+            is_bypass = bool(prompt_meta.get("bypass"))
+            if tokens_used or is_bypass:
                 await self._db.log_usage(
                     kind="ai_tokens",
                     count=float(tokens_used),
                     provider=prompt_meta.get("model"),
                     meta=json.dumps({"hid": hid, "n_markets": len(survivors),
-                                     "stage": "prediction"}),
+                                     "stage": "prediction",
+                                     **({"bypass": True} if is_bypass else {})}),
                 )
 
         prompt_meta_json = (

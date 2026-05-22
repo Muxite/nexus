@@ -122,6 +122,38 @@ logger = logging.getLogger(__name__)
 _DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 _CHAT_PATH = "/chat/completions"
 
+# A1.6 (2026-05-22): operator toggle that short-circuits the Stage-3
+# prediction LLM with a deterministic favorite-side synthetic result.
+# Set `SEULGI_BYPASS_LLM=1` to run the trade-filter pipeline at full
+# volume with $0 OpenRouter spend; trader gates (mid_band, min_edge,
+# max_positions, freshness, etc.) still apply. Default 0 = LLM enabled.
+_BYPASS_ENV_VAR = "SEULGI_BYPASS_LLM"
+_BYPASS_MODEL_TAG = "llm_bypass"
+
+
+def _bypass_enabled() -> bool:
+    """True when `SEULGI_BYPASS_LLM=1`. Read fresh each call so tests can
+    toggle the env var via monkeypatch without recreating the classifier."""
+    return os.environ.get(_BYPASS_ENV_VAR, "0") == "1"
+
+
+# Emit the startup banner exactly once per process so log volume stays
+# proportional to ensemble batches, not headlines. Reset to False in tests
+# via `ai._BYPASS_STARTUP_LOGGED = False` if you want to re-observe it.
+_BYPASS_STARTUP_LOGGED = False
+
+
+def _log_bypass_startup_once() -> None:
+    global _BYPASS_STARTUP_LOGGED
+    if _BYPASS_STARTUP_LOGGED:
+        return
+    _BYPASS_STARTUP_LOGGED = True
+    logger.info(
+        "[ai] LLM_BYPASS active — env %s=1; Stage-3 prediction will return "
+        "favorite-side synthetic results with 0 OpenRouter spend",
+        _BYPASS_ENV_VAR,
+    )
+
 _SYSTEM_MESSAGE = """\
 You are a quantitative prediction market analyst. Your job is to determine whether
 a news headline is directionally informative for Polymarket binary questions.
@@ -212,6 +244,47 @@ def _mkt_ctx_to_dict(ctx) -> Optional[dict]:
     }
 
 
+def _build_bypass_results(matches: list) -> list["ClassifyResult"]:
+    """
+    Build deterministic favorite-side synthetic ClassifyResults for the
+    `SEULGI_BYPASS_LLM=1` runtime toggle. Pure function — no I/O, no token
+    spend. Direction = favorite of `mid_yes` (NO when mid is None so the
+    direction is at least defined). Confidence/p_alpha = 0.9 / 1.0 clear
+    any plausible min_confidence / EV floors; the trader's mid_band /
+    min_edge / max_positions / freshness gates still apply.
+
+    Determinism contract: same `matches` (same `mid_yes` values) → same
+    results, byte-for-byte. The aggregator/parser is intentionally NOT
+    used here — synthesised results bypass that whole code path.
+    """
+    out: list[ClassifyResult] = []
+    for m in matches:
+        mid = getattr(m, "mid_yes", None)
+        # Favorite-side: YES when mid >= 0.5, NO otherwise. None → NO (the
+        # "favorite" is undefined; pick a stable side so the result is
+        # deterministic and the trader can still evaluate its own gates).
+        is_yes = mid is not None and mid >= 0.5
+        direction = Direction.YES if is_yes else Direction.NO
+        p_yes = 0.9 if is_yes else 0.1
+        p_no = 0.9 if not is_yes else 0.1
+        out.append(ClassifyResult(
+            direction=direction,
+            confidence=0.9,
+            reason="LLM bypass: favorite-side synthetic",
+            tokens_used=0,
+            p_yes=p_yes,
+            p_no=p_no,
+            p_neutral=0.0,
+            agreement=1.0,
+            p_alpha=1.0,
+            risk_score=0.0,
+            raw_response="",
+            votes={direction.value: 1},
+            bypass=True,
+        ))
+    return out
+
+
 def _format_freshness_block(freshness) -> str:
     """Render FreshnessResult as a single prompt block. Empty string if None."""
     if freshness is None:
@@ -285,6 +358,12 @@ class ClassifyResult:
     # the same information as `agreement` but lets the dashboard show 2/3 vs
     # 3/3 separately, and `agreement` discards which directions lost.
     votes: dict = field(default_factory=dict)
+    # A1.6 (2026-05-22): True when this result was synthesised by the
+    # `SEULGI_BYPASS_LLM=1` operator toggle instead of an OpenRouter call.
+    # The trader's pre-AI rules and post-AI gates still apply — this flag
+    # only marks "no LLM was consulted" so post-mortem queries can filter
+    # bypass rows out of any model-quality analysis.
+    bypass: bool = False
 
 
 class DirectionClassifier:
@@ -365,6 +444,38 @@ class DirectionClassifier:
         """
         if not matches:
             return [], {}
+
+        # A1.6 (2026-05-22): SEULGI_BYPASS_LLM=1 short-circuits BEFORE any
+        # OpenRouter HTTP — zero token spend, deterministic favorite-side
+        # results. Trader gates downstream still apply. Checked first so
+        # the entire prompt-building path below is skipped on bypass.
+        if _bypass_enabled():
+            _log_bypass_startup_once()
+            results = _build_bypass_results(matches)
+            logger.info(
+                "[ai] LLM_BYPASS active — synthesizing %d results", len(results),
+            )
+            prompt_meta = {
+                "model": _BYPASS_MODEL_TAG,
+                "bypass": True,
+                "n_samples": 0,
+                "samples_ok": 0,
+                "temperature": 0.0,
+                "is_republish": bool(is_republish),
+                "similar_to": (similar_to or "")[:200] if similar_to else None,
+                "source": source,
+                "freshness_label": getattr(freshness, "label", None) if freshness else None,
+                "nearest_age_secs": getattr(freshness, "nearest_age_secs", None) if freshness else None,
+                "nearest_dist": getattr(freshness, "nearest_dist", None) if freshness else None,
+                "relevance_scores": (
+                    [getattr(v, "score", None) for v in relevance_verdicts]
+                    if relevance_verdicts else None
+                ),
+                "market_context": [
+                    _mkt_ctx_to_dict(getattr(m, "_mkt_ctx", None)) for m in matches
+                ],
+            }
+            return results, prompt_meta
 
         # Freshness block replaces the legacy binary republish hint when
         # we have a labelled FreshnessResult. The legacy block stays as a

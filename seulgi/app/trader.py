@@ -715,6 +715,10 @@ class PaperTrader:
             return decision
 
         # ── AI filters ────────────────────────────────────────────────
+        # A1.6 (2026-05-22): `bypass` is True when the result was synthesised
+        # by SEULGI_BYPASS_LLM=1 instead of a real OpenRouter call. Surfaced
+        # here so post-mortem queries can filter bypass-trades out of any
+        # model-quality analysis (`json_extract(trader_trace, '$[*].bypass')`).
         trace.append({
             "step": "ai",
             "direction": result.direction.value,
@@ -722,6 +726,7 @@ class PaperTrader:
             "p_alpha": round(getattr(result, "p_alpha", 0.0), 4),
             "agreement": round(getattr(result, "agreement", 0.0), 4),
             "votes": getattr(result, "votes", {}) or {},
+            "bypass": bool(getattr(result, "bypass", False)),
         })
 
         if result.direction == Direction.NEUTRAL:
