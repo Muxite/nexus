@@ -822,3 +822,281 @@ class TestExitFeeMarketType:
         assert recorded.get("exit_fee_usdc") == pytest.approx(expected, abs=1e-9)
         # 3% rate is strictly less than the 5% default — regression guard.
         assert recorded["exit_fee_usdc"] < default
+
+
+# ---------------------------------------------------------------------------
+# A1.2 pure-function tests (no DB / HTTP / lock)
+# ---------------------------------------------------------------------------
+
+
+from trader import (  # noqa: E402
+    _evaluate_pure, _close_pure, _EntryCtx,
+)
+
+
+def _pure_cfg(**overrides):
+    """Lightweight cfg for `_evaluate_pure` — uses real attrs so the
+    `_opt_float` MagicMock guard doesn't reject everything."""
+    class C:
+        balance_usdc = 1000.0
+        max_position_usdc = 50.0
+        min_trade_usdc = 5.0
+        min_edge = 0.04
+        edge_increment = 0.12
+        position_timeout_hours = 24.0
+        max_open_positions = 20
+        max_unique_markets = 15
+        cold_position_hours = 12.0
+        infinite_balance = False
+        invert_high_conf = False
+        invert_conf_threshold = 0.85
+        rail_skip_threshold = 0.0
+        entry_rail_skip_threshold = 0.0
+        take_profit = 0.0
+        stop_loss = 0.0
+        trailing_stop = 0.0
+        min_hold_seconds = 0.0
+        spread_cost_bps = 0.0
+        min_entry_yes_mid = 0.0
+        stop_loss_pct = 0.0
+        max_market_vol_30m = 0.0
+        simulate_fees = None
+        simulate_sizing = None
+        simulate_slippage = None
+        direction_filter = ""
+        freshness_filter = ""
+        mid_yes_min = 0.0
+        mid_yes_max = 1.0
+        min_p_alpha = 0.0
+        min_ev_per_dollar = 0.0
+        mode = "paper"
+    c = C()
+    for k, v in overrides.items():
+        setattr(c, k, v)
+    return c
+
+
+def _pure_ai_cfg(min_confidence=0.45, min_agreement=0.0):
+    class AI:
+        pass
+    a = AI()
+    a.min_confidence = min_confidence
+    a.min_agreement = min_agreement
+    return a
+
+
+def _pure_ctx(cfg, ai_cfg, *, open_positions=0, unique=0, duplicate=False,
+              balance=1000.0, cluster_factor=1.0, post_ai=None,
+              freshness=None):
+    return _EntryCtx(
+        cfg=cfg, ai_cfg=ai_cfg, engine_name="balanced",
+        parent_engine="balanced", open_positions=open_positions,
+        unique_markets=unique, duplicate_position=duplicate,
+        balance=balance, cluster_factor=cluster_factor,
+        rules_post_ai_reason=post_ai, freshness_label=freshness,
+    )
+
+
+def _pure_match(mid_yes=0.45, mid_no=None, token_yes="ty1", token_no="tn1",
+                similarity=0.75, condition_id="cid1"):
+    m = MarketMatch(condition_id, "Will Fed cut?", token_yes, token_no, similarity)
+    m.mid_yes = mid_yes
+    m.mid_no = mid_no
+    return m
+
+
+class TestEvaluatePure:
+    """A1.2: pure entry decision function — no DB / HTTP / lock."""
+
+    def test_executes_ev_positive_yes_trade(self):
+        cfg = _pure_cfg()
+        ctx = _pure_ctx(cfg, _pure_ai_cfg())
+        r = ClassifyResult(Direction.YES, 0.85, "bullish")
+        out = _evaluate_pure(_pure_match(mid_yes=0.45), r, ctx)
+        assert out.action == "TRADE"
+        assert out.direction == "YES"
+        assert out.size_usdc == 50.0
+        assert out.edge_value > 0.04
+        # EV per $1 is computed against p_alpha (0 here) so EV ~ negative; the
+        # edge gate is the primary filter today.
+        assert out.skip_reason is None
+
+    def test_neutral_skips(self):
+        cfg = _pure_cfg()
+        out = _evaluate_pure(_pure_match(),
+                             ClassifyResult(Direction.NEUTRAL, 0.5, "huh"),
+                             _pure_ctx(cfg, _pure_ai_cfg()))
+        assert out.action == "SKIP"
+        assert out.skip_reason == "neutral"
+
+    def test_low_confidence_skips(self):
+        cfg = _pure_cfg()
+        out = _evaluate_pure(_pure_match(),
+                             ClassifyResult(Direction.YES, 0.30, "weak"),
+                             _pure_ctx(cfg, _pure_ai_cfg(min_confidence=0.45)))
+        assert out.action == "SKIP"
+        assert out.skip_reason.startswith("low_confidence")
+
+    def test_min_p_alpha_gate_skips(self):
+        """A1.2: min_p_alpha gates on the AI's +EV mass signal."""
+        cfg = _pure_cfg(min_p_alpha=0.5)
+        r = ClassifyResult(Direction.YES, 0.85, "bullish")
+        r.p_alpha = 0.30  # below threshold
+        out = _evaluate_pure(_pure_match(), r, _pure_ctx(cfg, _pure_ai_cfg()))
+        assert out.action == "SKIP"
+        assert out.skip_reason.startswith("low_p_alpha")
+
+    def test_min_p_alpha_gate_passes(self):
+        cfg = _pure_cfg(min_p_alpha=0.5)
+        r = ClassifyResult(Direction.YES, 0.85, "bullish")
+        r.p_alpha = 0.7
+        out = _evaluate_pure(_pure_match(), r, _pure_ctx(cfg, _pure_ai_cfg()))
+        assert out.action == "TRADE"
+
+    def test_hard_rail_skips(self):
+        cfg = _pure_cfg(entry_rail_skip_threshold=0.02)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.01),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.skip_reason.startswith("hard_rail")
+
+    def test_soft_rail_skips(self):
+        cfg = _pure_cfg(rail_skip_threshold=0.05)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.04),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.skip_reason.startswith("rail_price")
+
+    def test_min_edge_skips(self):
+        cfg = _pure_cfg(min_edge=0.20)
+        # conf 0.80 → edge = 0.072 < 0.20.
+        out = _evaluate_pure(
+            _pure_match(),
+            ClassifyResult(Direction.YES, 0.80, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.skip_reason.startswith("edge_too_small")
+
+    def test_max_positions_skips(self):
+        cfg = _pure_cfg()
+        out = _evaluate_pure(
+            _pure_match(),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg(),
+                      open_positions=cfg.max_open_positions),
+        )
+        assert out.skip_reason.startswith("max_positions")
+
+    def test_duplicate_position_skips(self):
+        cfg = _pure_cfg()
+        out = _evaluate_pure(
+            _pure_match(),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg(), duplicate=True),
+        )
+        assert out.skip_reason == "duplicate_position"
+
+    def test_max_unique_markets_skips(self):
+        cfg = _pure_cfg()
+        out = _evaluate_pure(
+            _pure_match(),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg(),
+                      unique=cfg.max_unique_markets),
+        )
+        assert out.skip_reason.startswith("max_unique_markets")
+
+    def test_variant_mid_band_skips(self):
+        cfg = _pure_cfg(mid_yes_min=0.7, mid_yes_max=0.9)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.45),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.skip_reason.startswith("variant_mid_band")
+
+    def test_direction_filter_skips(self):
+        cfg = _pure_cfg(direction_filter="NO")
+        out = _evaluate_pure(
+            _pure_match(),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.skip_reason.startswith("direction_filter")
+
+    def test_post_ai_rule_skips(self):
+        cfg = _pure_cfg()
+        out = _evaluate_pure(
+            _pure_match(),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg(), post_ai="RULE_too_hot"),
+        )
+        assert out.skip_reason == "RULE_too_hot"
+
+    def test_no_token_skips(self):
+        cfg = _pure_cfg()
+        out = _evaluate_pure(
+            _pure_match(token_yes=None, token_no=None),
+            ClassifyResult(Direction.YES, 0.85, "x"),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.skip_reason == "no_token"
+
+
+class TestClosePure:
+    """A1.2: pure close decision function."""
+
+    def _base_pos(self, **overrides):
+        opened = datetime.now(timezone.utc) - timedelta(hours=2)
+        pos = {
+            "trade_id": 1, "condition_id": "c1", "token_id": "t1",
+            "direction": "YES", "size_usdc": 50.0, "entry_price": 0.50,
+            "opened_at": opened.isoformat(), "last_price": 0.50,
+            "shares": 100.0, "p_hat": 0.55, "market_type": None,
+            "high_water_price": None,
+        }
+        pos.update(overrides)
+        return pos
+
+    def test_holds_when_healthy(self):
+        cfg = _pure_cfg(take_profit=0.05, stop_loss=0.05)
+        out = _close_pure(self._base_pos(), 0.50, cfg,
+                          datetime.now(timezone.utc))
+        assert out.action == "HOLD"
+
+    def test_win_rail_closes(self):
+        cfg = _pure_cfg()
+        out = _close_pure(self._base_pos(), 0.97, cfg,
+                          datetime.now(timezone.utc))
+        assert out.action == "CLOSE"
+        assert out.close_reason == "WIN"
+
+    def test_loss_rail_closes(self):
+        cfg = _pure_cfg()
+        out = _close_pure(self._base_pos(), 0.03, cfg,
+                          datetime.now(timezone.utc))
+        assert out.action == "CLOSE"
+        assert out.close_reason == "LOSS"
+
+    def test_sl_gate_fires(self):
+        cfg = _pure_cfg(stop_loss=0.05)
+        out = _close_pure(self._base_pos(), 0.40, cfg,
+                          datetime.now(timezone.utc))
+        assert out.close_reason == "SL"
+
+    def test_timeout_closes(self):
+        cfg = _pure_cfg(position_timeout_hours=1.0)
+        out = _close_pure(self._base_pos(), 0.52, cfg,
+                          datetime.now(timezone.utc))
+        assert out.close_reason == "TIMEOUT"
+
+    def test_returns_exit_price_for_postmortem(self):
+        """FIX-2B regression: outcome carries exit_price."""
+        cfg = _pure_cfg()
+        out = _close_pure(self._base_pos(), 0.97, cfg,
+                          datetime.now(timezone.utc))
+        assert out.exit_price == pytest.approx(0.97)

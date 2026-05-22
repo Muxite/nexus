@@ -197,6 +197,17 @@ class TradingConfig:
     freshness_filter: str = ""
     mid_yes_min: float = 0.0
     mid_yes_max: float = 1.0
+    # A1.2 (2026-05-22): explicit p_alpha floor — gates the trade on the AI's
+    # estimated P(this is +EV) signal, distinct from `min_confidence` (which
+    # historically gated on `ai.ClassifyResult.confidence`, a field that's
+    # ambiguously `p_alpha` OR `mean_p_winner` per ai.py:_aggregate_ensemble).
+    # See trader.py spec block. 0.0 disables (default — backward-compat).
+    min_p_alpha: float = 0.0
+    # A1.2 (2026-05-22, master plan 4B.2): if > 0, additionally gate the
+    # entry on the True-EV-per-$1 measure from simulate.compute_ev_{yes,no}
+    # plus a fee headroom estimate. 0.0 disables (the legacy `min_edge` gate
+    # remains the primary filter). Per-engine override allowed.
+    min_ev_per_dollar: float = 0.0
     # Round-trip trading cost in basis points of stake (1 bp = 0.01%). Default
     # 20 bps = 0.20% of stake deducted at close. Models the bid-ask spread
     # (Polymarket has no protocol fees, but you cross the spread on entry AND
