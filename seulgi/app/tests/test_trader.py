@@ -507,6 +507,124 @@ class TestMonitorPositions:
         assert trader.balance == pytest.approx(950.0 + size + expected_pnl, abs=0.01)
 
     @pytest.mark.asyncio
+    async def test_tp_gate_fee_aware_suppresses_net_loss(self):
+        """FIX-2A: TP must not fire when realized net PnL after fees would be < 0.
+
+        Reproduces 2026-05-22-trader-exit-bugs.md Bug 2.1: a 2 ¢ TP on a
+        $1.40 stake at mid 0.695 books a net loss because round-trip
+        fees absorb the gross gain. The legacy gross gate would close;
+        the fix must skip.
+        """
+        from config import SimulateFeesConfig, SimulateSlippageConfig
+        trader, db = _make_trader(balance=900.0)
+        trader._cfg.mode = "simulate"
+        # Realistic Polymarket fee model from config defaults.
+        trader._cfg.simulate_fees = SimulateFeesConfig()
+        trader._cfg.simulate_slippage = SimulateSlippageConfig()
+        trader._cfg.take_profit = 0.020          # 2 ¢ TP knob
+        trader._cfg.min_hold_seconds = 0.0       # bypass hold
+        # Small-stake position: 1.97 shares at 0.695 entry, $1.4 stake.
+        shares = 1.97
+        entry_price = 0.695
+        size_usdc = shares * entry_price + 0.026  # include the entry_fee
+        opened_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        pos = {
+            "trade_id": 42, "condition_id": "cid_fee_blind",
+            "token_id": "tok_yes_1", "direction": "YES",
+            "size_usdc": size_usdc, "entry_price": entry_price,
+            "shares": shares,
+            "opened_at": opened_at.isoformat(),
+            "last_price": entry_price, "p_hat": 0.75,
+            "market_type": None,
+        }
+        db.get_open_positions = AsyncMock(return_value=[pos])
+
+        # Current mid is 2 ¢ above entry — legacy gross gate would fire TP.
+        exit_mid = entry_price + 0.020
+        with patch("trader._fetch_mid_price", AsyncMock(return_value=exit_mid)):
+            await trader.monitor_positions()
+
+        # Net MTM = gross $0.0394 − entry_fee $0.026 − est_exit_fee ≈ $0.025
+        # ⇒ < 0; gate suppresses TP.
+        db.close_position.assert_not_called()
+        db.close_trade.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_tp_gate_fee_aware_fires_when_net_positive(self):
+        """FIX-2A: TP still fires when the move is large enough to clear fees."""
+        from config import SimulateFeesConfig, SimulateSlippageConfig
+        trader, db = _make_trader(balance=900.0)
+        trader._cfg.mode = "simulate"
+        trader._cfg.simulate_fees = SimulateFeesConfig()
+        trader._cfg.simulate_slippage = SimulateSlippageConfig()
+        trader._cfg.take_profit = 0.020
+        trader._cfg.min_hold_seconds = 0.0
+        # Larger move (10 ¢) on the same small stake produces net gain.
+        shares = 1.97
+        entry_price = 0.695
+        size_usdc = shares * entry_price + 0.026
+        opened_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        pos = {
+            "trade_id": 43, "condition_id": "cid_net_win",
+            "token_id": "tok_yes_1", "direction": "YES",
+            "size_usdc": size_usdc, "entry_price": entry_price,
+            "shares": shares,
+            "opened_at": opened_at.isoformat(),
+            "last_price": entry_price, "p_hat": 0.75,
+            "market_type": None,
+        }
+        db.get_open_positions = AsyncMock(return_value=[pos])
+
+        exit_mid = entry_price + 0.10  # well clear of round-trip fees
+        with patch("trader._fetch_mid_price", AsyncMock(return_value=exit_mid)):
+            await trader.monitor_positions()
+
+        db.close_position.assert_called_once_with(43)
+        db.close_trade.assert_called_once()
+        # close_reason kwarg should be TP
+        call_kwargs = db.close_trade.call_args.kwargs
+        assert call_kwargs.get("close_reason") == "TP"
+
+    @pytest.mark.asyncio
+    async def test_trail_gate_fee_aware_suppresses_net_loss(self):
+        """FIX-2A: TRAIL must not fire when the post-fee MTM is < 0.
+
+        HWM was high enough to arm the trail, price retreated below
+        entry on a net-of-fees basis — fix lets it fall through to
+        SL / TIMEOUT instead of locking in a fee-blind loss.
+        """
+        from config import SimulateFeesConfig, SimulateSlippageConfig
+        trader, db = _make_trader(balance=900.0)
+        trader._cfg.mode = "simulate"
+        trader._cfg.simulate_fees = SimulateFeesConfig()
+        trader._cfg.simulate_slippage = SimulateSlippageConfig()
+        trader._cfg.trailing_stop = 0.010
+        trader._cfg.min_hold_seconds = 0.0
+        shares = 1.97
+        entry_price = 0.695
+        size_usdc = shares * entry_price + 0.026
+        opened_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        # Armed HWM 3 ¢ above entry; price drifted back to entry. Gross
+        # `mtm >= 0` would have closed; net (after fees) is negative.
+        pos = {
+            "trade_id": 44, "condition_id": "cid_trail_blind",
+            "token_id": "tok_yes_1", "direction": "YES",
+            "size_usdc": size_usdc, "entry_price": entry_price,
+            "shares": shares,
+            "opened_at": opened_at.isoformat(),
+            "last_price": entry_price, "p_hat": 0.75,
+            "high_water_price": entry_price + 0.030,
+            "market_type": None,
+        }
+        db.get_open_positions = AsyncMock(return_value=[pos])
+
+        with patch("trader._fetch_mid_price", AsyncMock(return_value=entry_price)):
+            await trader.monitor_positions()
+
+        db.close_position.assert_not_called()
+        db.close_trade.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_prices_fetched_concurrently(self):
         """Price fetches for all open positions must be concurrent."""
         trader, db = _make_trader(balance=900.0)
@@ -539,3 +657,148 @@ class TestMonitorPositions:
 
         elapsed = time.monotonic() - t0
         assert elapsed < 0.04, f"Price fetches appear sequential ({elapsed:.3f}s)"
+
+
+# ---------------------------------------------------------------------------
+# FIX-1: market_type plumbing into exit-leg fee/slippage
+# ---------------------------------------------------------------------------
+
+
+class TestExitFeeMarketType:
+    """The exit-leg fee compute must use the per-category rate from the
+    market_type column, not the default rate (Polymarket "General" tier).
+
+    Regression: prior to FIX-1, trader.py passed market_type=None on every
+    exit, so geopolitics (0%) trades paid 5% and sports (3%) paid 5% on
+    the close — biasing the simulate-mode PnL versus the live tape.
+    """
+
+    def _simulate_cfg(self):
+        """Cfg with simulate-mode fees/slippage wired up (no MagicMock — the
+        sim.compute_fee path expects real dataclass attributes)."""
+        import simulate as sim  # noqa: F401 — ensure module importable
+        from config import (
+            SimulateFeesConfig,
+            SimulateSlippageConfig,
+        )
+
+        cfg = _make_cfg(balance=100.0)
+        cfg.mode = "simulate"
+        cfg.simulate_fees = SimulateFeesConfig()
+        cfg.simulate_slippage = SimulateSlippageConfig()
+        cfg.position_timeout_hours = 24.0
+        cfg.take_profit = 0.0
+        cfg.stop_loss = 0.0
+        cfg.trailing_stop = 0.0
+        cfg.min_hold_seconds = 0.0
+        return cfg
+
+    def _make_pos(self, market_type, direction="YES"):
+        opened_at = datetime.now(timezone.utc) - timedelta(hours=2)
+        # entry_price 0.50, size 5.0 → 10 shares — well above the rail
+        # bounds (0.01..0.99) so neither WIN nor LOSS branches trigger.
+        return {
+            "trade_id": 42,
+            "condition_id": "cid_fix1",
+            "token_id": "tok_yes_fix1",
+            "direction": direction,
+            "size_usdc": 5.0,
+            "entry_price": 0.50,
+            "opened_at": opened_at.isoformat(),
+            "last_price": 0.50,
+            "unrealized_pnl": 0.0,
+            "p_hat": 0.55,
+            "shares": 10.0,
+            "market_type": market_type,
+            "engine_name": "default",
+            "high_water_price": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_cold_cull_uses_geopolitics_rate(self):
+        """COLD_CULL on a geopolitics market must pay 0% taker fee
+        (rate=0.0 → only the gas drag remains)."""
+        import simulate as sim
+        trader, db = _make_trader()
+        trader._cfg = self._simulate_cfg()
+
+        pos = self._make_pos(market_type="geopolitics")
+        # Cold path requires the position to look stale-losing.
+        db.get_cold_losing_positions = AsyncMock(return_value=[pos])
+        db.get_open_positions = AsyncMock(return_value=[])
+
+        recorded = {}
+        async def _capture(trade_id, pnl, **kwargs):
+            recorded.update(kwargs)
+            recorded["pnl"] = pnl
+        db.close_trade = AsyncMock(side_effect=_capture)
+
+        exit_price = 0.40  # losing exit, off the rails
+        with patch("trader._fetch_mid_price", AsyncMock(return_value=exit_price)):
+            await trader.monitor_positions()
+
+        # Expected exit fee: shares * 0.0 * p*(1-p) = 0, plus gas drag.
+        expected = sim.compute_fee(
+            shares=10.0,
+            price=exit_price,  # slippage disabled for geopolitics
+            market_type="geopolitics",
+            cfg=trader._cfg.simulate_fees,
+        ).fee + trader._cfg.simulate_fees.gas_cost_per_trade_usdc
+        assert recorded.get("close_reason") == "COLD_CULL"
+        assert recorded.get("exit_fee_usdc") == pytest.approx(expected, abs=1e-9)
+        # Geopolitics rate is 0% — exit_fee must equal exactly the gas drag,
+        # NOT the default 0.05 rate that the pre-fix code would have applied.
+        default_rate_fee = sim.compute_fee(
+            shares=10.0, price=exit_price, market_type=None,
+            cfg=trader._cfg.simulate_fees,
+        ).fee + trader._cfg.simulate_fees.gas_cost_per_trade_usdc
+        assert recorded["exit_fee_usdc"] < default_rate_fee
+
+    @pytest.mark.asyncio
+    async def test_main_exit_uses_sports_rate(self):
+        """TIMEOUT exit on a sports market must use the sports rate (0.03),
+        not the default 0.05."""
+        import simulate as sim
+        trader, db = _make_trader()
+        trader._cfg = self._simulate_cfg()
+        trader._cfg.position_timeout_hours = 1.0  # force TIMEOUT
+
+        pos = self._make_pos(market_type="sports")
+        db.get_cold_losing_positions = AsyncMock(return_value=[])
+        db.get_open_positions = AsyncMock(return_value=[pos])
+
+        recorded = {}
+        async def _capture(trade_id, pnl, **kwargs):
+            recorded.update(kwargs)
+            recorded["pnl"] = pnl
+        db.close_trade = AsyncMock(side_effect=_capture)
+
+        exit_price = 0.55  # off the rails → walks the book branch
+        with patch("trader._fetch_mid_price", AsyncMock(return_value=exit_price)):
+            await trader.monitor_positions()
+
+        # Slippage applies to non-whitelisted categories — replicate it
+        # here so the expected fee matches the trader's effective price.
+        slip = sim.apply_slippage(
+            mid=exit_price,
+            notional_usdc=10.0 * exit_price,
+            side="NO",  # selling YES
+            market_type="sports",
+            cfg=trader._cfg.simulate_slippage,
+        )
+        expected = sim.compute_fee(
+            shares=10.0,
+            price=slip.effective_price,
+            market_type="sports",
+            cfg=trader._cfg.simulate_fees,
+        ).fee + trader._cfg.simulate_fees.gas_cost_per_trade_usdc
+        # Default-rate (buggy) fee — what the pre-fix code recorded.
+        default = sim.compute_fee(
+            shares=10.0, price=slip.effective_price, market_type=None,
+            cfg=trader._cfg.simulate_fees,
+        ).fee + trader._cfg.simulate_fees.gas_cost_per_trade_usdc
+
+        assert recorded.get("close_reason") == "TIMEOUT"
+        assert recorded.get("exit_fee_usdc") == pytest.approx(expected, abs=1e-9)
+        # 3% rate is strictly less than the 5% default — regression guard.
+        assert recorded["exit_fee_usdc"] < default

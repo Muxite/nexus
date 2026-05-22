@@ -1,6 +1,94 @@
 """
 Seulgi paper trader.
 
+## Specification (Phase 0 A0.3 — entry path; A0.4 covers exit; FIX-2A 2026-05-22 net-MTM gates)
+
+Purpose
+-------
+Per-engine paper-trading state machine: evaluate one headline against N pre-
+matched markets, gate through filters, size a stake, and (under the trader's
+own asyncio.Lock) write one `trades` row + one `positions` row per executed
+decision. Also closes open positions on stop/TP/trail/timeout signals.
+
+Public interface
+----------------
+* `PaperTrader.__init__(db, classifier, cfg, ai_cfg, engine_name, rule_engine,
+  variant_name, parent_engine)` — wires DI; no I/O.
+* `init_from_db()` — restores `_balance` (USDC bankroll *or* cumulative gain
+  under `infinite_balance`) and `_total_staked` from DB.
+* `process(headline, matches)` — single-engine entry point used by tests:
+  inserts signal row, runs pre-AI rules, calls classifier, delegates to
+  `evaluate()`. Multi-engine runner calls `evaluate()` directly.
+* `evaluate(signal_id, headline, survivors, classify_results, prompt_meta_json,
+  pre_ai_skips, relevance_skips, cluster_factor)` — main fan-out. Records skip
+  rows (pre-AI rule, relevance) and per-match decisions via `_evaluate_market`.
+* `evaluate_low_sim_skips / _ai_paused_skips / _freshness_skips` — short-
+  circuit paths that write skip rows without firing the AI.
+* `_evaluate_market(...)` — full guard chain: AI direction → min_confidence →
+  min_agreement → min_entry_yes_mid → variant filters (direction / freshness /
+  mid_yes_min/max) → market vol → post-AI rules → optional invert →
+  token/price selection → hard rail → soft rail → edge → balance/position
+  guards (under lock) → sizing → simulate fidelity → insert_trade + open_position.
+* `monitor_positions()` — exit-path (A0.4 owns the spec).
+* Properties: `balance`, `total_staked`, `infinite_balance`, `cfg`.
+
+Invariants
+----------
+* `_evaluate_market` returns a `TradeDecision`; it does **not** raise on
+  expected failures (price miss, FK error, etc.) — caller-visible errors are
+  caught and emitted as skip rows or — for `open_position` failures — logged
+  and bookkeeping rolled back (R2 contract: `trades` audit row survives even
+  if `positions` insert fails).
+* Exactly one `trades` row per (variant × match) per headline.
+* Executed trade: `size_usdc > 0` AND `skip_reason IS NULL`. Skip trade:
+  `size_usdc == 0` AND `skip_reason IS NOT NULL`. (NOTE: cycle-2 "skips go
+  to engine_results only" contract is **not** in force — see entry-bugs report.)
+* In simulate mode, `entry_fee_usdc` is the simulated taker fee + per-leg gas;
+  `shares = floor((size_usdc − fee_est) / effective_price / 0.01) * 0.01`;
+  position's `size_usdc` is the *gross* dollar debit (includes fee).
+* All balance/position-count reads + the eventual `_balance -= size` debit
+  occur under `self._lock`, preventing double-spend across concurrent
+  headline processing on one engine.
+* `cluster_factor` is applied multiplicatively to size *after* Kelly/fixed
+  sizing but *before* slippage/fee/quantization.
+* FIX-2A (2026-05-22): TP and TRAIL gates compare NET MTM (after estimated
+  round-trip fees: sunk entry_fee + est_exit_fee at the current price)
+  against the threshold — not the legacy gross probability-point delta.
+  The knobs `take_profit` / `trailing_stop` are unchanged (still price
+  points); the dollar-equivalent target is `tp * shares`. Prevents
+  fee-blind TP/TRAIL closes that historically booked net losses on small
+  stakes (2026-05-22-trader-exit-bugs.md §2.1, §8.2). SL is intentionally
+  left gross — it is a downside trigger, not a profit gate.
+
+Side effects
+------------
+* DB writes: `signals` (process only), `trades` (insert_trade — every decision),
+  `positions` (open_position — executed only), `trades.entry_fee_usdc`
+  (UPDATE after open_position in simulate mode).
+* DB reads: `count_open_positions`, `has_open_position`,
+  `count_unique_open_markets`, `get_cold_losing_positions`, `get_open_positions`.
+* HTTP: `_fetch_mid_price` (CLOB midpoint) — fallback only; prefetch happens
+  in EngineRunner.
+* Reads in-memory: `cfg` (per-engine TradingConfig), `ai_cfg.min_confidence`,
+  `ai_cfg.min_agreement`, `cfg.simulate_*` sub-configs.
+
+Failure modes
+-------------
+* `open_position` exception → logged, balance/staked rolled back; trade row
+  remains with `skip_reason IS NULL` (executed=true) but no position exists.
+* AI/price/rule errors before insert_trade → skip row with a typed
+  `skip_reason` and a `trader_trace` JSON of the guard chain.
+* `evaluate()` itself does not catch; EngineRunner wraps it in try/except.
+
+Non-goals
+---------
+* Does not run the prediction LLM (EngineRunner shares one classify_batch
+  across variants). Does not embed headlines or match markets. Does not
+  capture per-call LLM telemetry (usage_events comes from ai.py / db.py).
+  Does not write to engine_results (EngineRunner.record_engine_decisions does).
+
+(Original module overview follows.)
+
 Responsibilities:
   1. Receive a headline + list of market matches.
   2. Classify each match in parallel via the AI classifier (semaphore-limited).
@@ -193,23 +281,6 @@ class PaperTrader:
         self._last_tokens_used: int = 0     # tokens consumed by most recent process()
         self._lock = asyncio.Lock()
         self._session: Optional[aiohttp.ClientSession] = None
-        # Lessons cache: refreshed at most once per LESSON_TTL seconds, since
-        # the aggregator only runs every ~10 min.
-        self._lesson_notes: list[str] = []
-        self._lesson_cache_until: float = 0.0
-
-    async def _get_lesson_notes_cached(self) -> list[str]:
-        from time import monotonic
-        if monotonic() < self._lesson_cache_until:
-            return self._lesson_notes
-        try:
-            import lessons as _lessons
-            notes = await _lessons.load_active_notes(self._db, limit=8)
-        except Exception:  # noqa: BLE001
-            notes = []
-        self._lesson_notes = notes
-        self._lesson_cache_until = monotonic() + 60.0
-        return notes
 
     # ------------------------------------------------------------------
     # Init
@@ -327,18 +398,12 @@ class PaperTrader:
                     source_host = urlparse(site_url).netloc or None
                 except Exception:  # noqa: BLE001
                     source_host = None
-            try:
-                lesson_notes = await self._get_lesson_notes_cached()
-            except Exception:  # noqa: BLE001
-                lesson_notes = []
-
             raw = await self._classifier.classify_batch(
                 headline=headline.headline,
                 matches=survivors,
                 is_republish=is_republish,
                 similar_to=similar_to,
                 source=source_host,
-                lesson_notes=lesson_notes,
             )
             # classify_batch returns (results, prompt_meta) post-refactor. Older
             # test fixtures still return a bare list — accept both so the
@@ -900,7 +965,7 @@ class PaperTrader:
             # hoc analyzer sees full trader_trace data for what each filter
             # would or wouldn't have caught. Kelly's "negative edge → skip"
             # path would defeat this. Fixed micro-stakes via the else branch.
-            is_scout = self._engine_name.startswith("scout")
+            is_scout = "scout" in self._engine_name  # matches scout/* AND super_scout/*
             if simulate_mode and self._cfg.simulate_sizing.method == "fractional_kelly" and not is_scout:
                 # p_market = price we'd pay for the YES of the side we're
                 # buying. Direction is already resolved above; for a YES
@@ -1226,13 +1291,19 @@ class PaperTrader:
             simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
             exit_fee = 0.0
             if simulate_mode:
+                # FIX-1: plumb market_type from the position row so the
+                # per-category taker-fee rate (and slippage opt-out) applies
+                # on exit. Without this the exit leg paid the default rate
+                # on every trade — see reports/2026-05-22-trader-exit-bugs.md.
+                pos_market_type = pos.get("market_type")
                 slip = sim.apply_slippage(
                     mid=price, notional_usdc=shares * price,
                     side="NO" if pos["direction"] == "YES" else "YES",
-                    market_type=None, cfg=self._cfg.simulate_slippage,
+                    market_type=pos_market_type, cfg=self._cfg.simulate_slippage,
                 )
                 exit_price = slip.effective_price
-                fee_res = sim.compute_fee(shares, exit_price, None, self._cfg.simulate_fees)
+                fee_res = sim.compute_fee(shares, exit_price, pos_market_type,
+                                          self._cfg.simulate_fees)
                 # E.7.2: gas drag on the exit leg too.
                 gas_per_leg = (self._cfg.simulate_fees.gas_cost_per_trade_usdc
                                if getattr(self._cfg.simulate_fees, "gas_cost_per_trade_usdc", 0) else 0.0)
@@ -1321,6 +1392,41 @@ class PaperTrader:
             ts = self._cfg.trailing_stop
             min_hold = self._cfg.min_hold_seconds
 
+            # FIX-2A (2026-05-22): TP/TRAIL gates must compare NET MTM
+            # (post round-trip fees) against the threshold. The legacy
+            # `mtm >= tp` was probability-point-gross — on small stakes
+            # the ~5 ¢ round-trip fee absorbed all of a 2 ¢ TP, booking
+            # 53 TP closes and 58 TRAIL closes net-negative (per
+            # 2026-05-22-trader-exit-bugs.md Bug 2.1 / 8.2). The knobs
+            # `take_profit` / `trailing_stop` stay in price points; only
+            # the *comparison* changes.
+            #
+            #   mtm_net_estimate = mtm * shares       (gross dollars on the move)
+            #                    - entry_fee_paid     (sunk; pulled out of size_usdc)
+            #                    - est_exit_fee       (taker fee + gas at current price)
+            #
+            # The dollar-equivalent of the legacy point threshold is
+            # `tp * shares` (since the old check was per-share gross).
+            # `entry_fee_paid = size_usdc - shares * entry_price`
+            # collapses the gross-vs-net distinction without needing a
+            # `trades` JOIN to read entry_fee_usdc.
+            simulate_mode_gate = getattr(self._cfg, "mode", "paper") == "simulate"
+            est_exit_fee = 0.0
+            if simulate_mode_gate and self._cfg.simulate_fees is not None:
+                _fee_res = sim.compute_fee(
+                    shares, current_price, pos.get("market_type"),
+                    self._cfg.simulate_fees,
+                )
+                _gas = (self._cfg.simulate_fees.gas_cost_per_trade_usdc
+                        if getattr(self._cfg.simulate_fees, "gas_cost_per_trade_usdc", 0) else 0.0)
+                est_exit_fee = _fee_res.fee + _gas
+            elif not simulate_mode_gate:
+                # Paper mode: round-trip spread_cost_bps is the only fee
+                # proxy. Charge the exit leg (half of the round-trip).
+                est_exit_fee = 0.5 * size_usdc * (self._cfg.spread_cost_bps / 10000.0)
+            entry_fee_paid = max(0.0, size_usdc - shares * entry_price)
+            mtm_net_estimate = mtm * shares - entry_fee_paid - est_exit_fee
+
             # Determine close trigger. Order: hard WIN/LOSS first, then
             # technical exits once min_hold has elapsed (trailing > TP > SL),
             # then absolute timeout as backstop.
@@ -1330,14 +1436,21 @@ class PaperTrader:
                 close_reason = "WIN"
             elif current_price <= _LOSS_PRICE:
                 close_reason = "LOSS"
-            elif min_hold_met and ts > 0 and hwm_mtm >= ts and (hwm_mtm - mtm) >= ts and mtm >= 0:
-                # E10: gate TRAIL on current price being at-or-above entry.
-                # Phase A.6 saw TRAIL fire underwater (n=57, avg -$0.032) when
-                # HWM had been high enough to arm the trail but price then
-                # retreated below entry — locked in losses that often recovered.
-                # Falls through to SL/TIMEOUT instead.
+            elif (
+                min_hold_met and ts > 0
+                and hwm_mtm >= ts and (hwm_mtm - mtm) >= ts
+                and mtm_net_estimate >= 0.0
+            ):
+                # FIX-2A: gate TRAIL on NET (post-fee) MTM being >= 0,
+                # not the legacy gross `mtm >= 0`. The arm condition
+                # `hwm_mtm >= ts` and the retreat trigger `(hwm_mtm-mtm) >= ts`
+                # remain in gross price points (matches the knob units).
                 close_reason = "TRAIL"
-            elif min_hold_met and tp > 0 and mtm >= tp:
+            elif min_hold_met and tp > 0 and mtm_net_estimate >= tp * shares:
+                # FIX-2A: TP fires only when the realized net PnL (after
+                # est_exit_fee + sunk entry_fee) would clear `tp * shares`,
+                # i.e. the dollar-equivalent of the legacy per-share
+                # probability-point threshold.
                 close_reason = "TP"
             elif min_hold_met and sl > 0 and mtm <= -sl:
                 # Note: SL is gated by min_hold_met (same as TP/TRAIL) to
@@ -1377,7 +1490,11 @@ class PaperTrader:
                     proceeds = sim.settlement_payout(shares, win=False)
                 else:
                     # Early exit (TP/SL/TRAIL/TIMEOUT/TIMEOUT_BLEED): walk the book + fee.
-                    market_type = None  # no need to refetch; rate captured at entry
+                    # FIX-1: market_type comes from the JOIN in
+                    # db.get_open_positions(); without it the exit leg pays
+                    # the default fee rate on every trade and bypasses the
+                    # slippage opt-out for whitelisted categories.
+                    market_type = pos.get("market_type")
                     slip = sim.apply_slippage(
                         mid=current_price, notional_usdc=shares * current_price,
                         # selling our held side → the opposite slippage direction
