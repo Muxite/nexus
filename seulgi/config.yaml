@@ -885,11 +885,5 @@ news_memory:
 search_budget:
   brave_per_hour: 20
 
-# ── Quant plotter ────────────────────────────────────────────────────────────
-# Periodically renders matplotlib charts of price-impact stats to
-# data/dashboard/plots/*.png. Uses ALL available data — longer run = richer plot.
-plotter:
-  interval_secs: 600   # 10 minutes
-
 # ── Logging ──────────────────────────────────────────────────────────────────
 log_level: "INFO"               # DEBUG for verbose Playwright + embedding output

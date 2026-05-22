@@ -37,7 +37,6 @@ import sys
 from datetime import datetime, timezone
 
 from ai import DirectionClassifier
-from relevance import RelevanceFilter
 from config import load_config
 from dashboard import Dashboard, WatcherStatus, PositionEvent, SystemHealth
 from db import SeulgiDB
@@ -46,10 +45,8 @@ from engine import EngineRunner, build_engines
 from rules import RuleEngine
 from markets import Embedder, MarketIndex
 from impact_tracker import PriceImpactTracker
-import lessons
 import metrics
 from news_memory import NewsMemory
-from plotter import QuantPlotter
 from watcher import (
     RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher, FeedWatcher,
     SearchBudget, ScraperHealthPoller,
@@ -328,21 +325,9 @@ async def main() -> None:
         ensemble_temperature=cfg.ai.ensemble_temperature,
     )
 
-    # Stage-2 relevance gate (cycle 9). Shares the OpenRouter API key.
-    relevance_filter = RelevanceFilter(
-        api_key=api_key,
-        model=cfg.relevance.model,
-        api_base=cfg.ai.api_base,
-        temperature=cfg.relevance.temperature,
-        keep_scores=tuple(cfg.relevance.keep_scores),
-        max_tokens_per_market=cfg.relevance.max_tokens_per_market,
-        enabled=cfg.relevance.enabled,
-        min_top_similarity=cfg.relevance.min_top_similarity,
-    )
-    logger.info(
-        "[main] RelevanceFilter ready — enabled=%s model=%s keep=%s",
-        cfg.relevance.enabled, cfg.relevance.model, cfg.relevance.keep_scores,
-    )
+    # Stage-2 relevance LLM retired 2026-05-22. The deterministic
+    # similarity-floor gate inside EngineRunner.process() (configured via
+    # cfg.relevance.min_top_similarity) replaces it.
 
     # Manual-planning rules engine — shared across trading engines.
     # Rules live in /app/rules/ (baked into the image so reload-on-restart is
@@ -432,7 +417,7 @@ async def main() -> None:
         dashboard=dash, news_memory=news_memory,
         impact_tracker=impact_tracker,
         article_fetcher=article_fetcher,
-        relevance_filter=relevance_filter,
+        min_top_similarity=cfg.relevance.min_top_similarity,
         market_context_cfg=cfg.market_context,
     )
 
@@ -505,21 +490,6 @@ async def main() -> None:
 
     refresh_secs = cfg.markets.refresh_hours * 3600
 
-    # Periodic matplotlib quant plots (every 10 minutes by default).
-    # 2026-05-21: opt-out kill switch added after a SIGSEGV restart loop
-    # caught by faulthandler — backend_agg.draw_path crashing inside the
-    # default ThreadPoolExecutor on the first chart render. Until the
-    # plotter is moved to a dedicated single-thread executor (or
-    # subprocess), set SEULGI_DISABLE_PLOTTER=1 to skip task creation.
-    plotter_disabled = os.getenv("SEULGI_DISABLE_PLOTTER") == "1"
-    plotter = None if plotter_disabled else QuantPlotter(
-        db=db,
-        dashboard_dir=cfg.dashboard.data_dir,
-        interval_secs=cfg.plotter.interval_secs,
-    )
-    if plotter_disabled:
-        logger.warning("[main] plotter DISABLED via SEULGI_DISABLE_PLOTTER=1")
-
     # Scraper health poller — surfaces a single root cause when every watcher
     # is dead at once because the shared scraper is unreachable.
     scraper_poller = ScraperHealthPoller()
@@ -535,10 +505,7 @@ async def main() -> None:
             name="system-health",
         ),
         asyncio.create_task(_headline_drain_loop(queue, runner, dash), name="drain"),
-        asyncio.create_task(lessons.runner(db, interval_secs=600.0), name="lessons"),
     ]
-    if plotter is not None:
-        bg_tasks.append(asyncio.create_task(plotter.run(), name="quant-plotter"))
     for t in bg_tasks:
         t.add_done_callback(_log_task_exception)
 

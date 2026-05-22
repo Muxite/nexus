@@ -18,8 +18,8 @@ Purpose
     `price_impacts.price_t{bucket}` and derived `delta_t{bucket}`
     columns. Also backfills full minute-fidelity (-1h..+1h) windows
     into `price_timeseries` for offline analysis. Surfaces the realized
-    direction-vs-prediction signal that the post-mortem, plotter and
-    lessons aggregator consume.
+    direction-vs-prediction signal that the post-mortem and analysis
+    scripts consume.
 
 Public interface
     class PriceImpactTracker(db, dashboard_dir)
@@ -30,7 +30,7 @@ Public interface
       - await close()
     Module helpers exported to other modules:
       - _fetch_price_history_window (used by market_context.py)
-      - classify_missed_alpha       (used by plotter.py)
+      - classify_missed_alpha       (used by scripts/analysis, scripts/postmortem)
       - condition_id_short, MISSED_ALPHA_THRESH
 
 Invariants
@@ -584,7 +584,7 @@ def classify_missed_alpha(direction: str, delta_pre_60s, delta_t5m) -> str | Non
       "wrong_dir" -- pre or post move against our predicted direction
 
     Returns None if the row lacks the data needed to classify (missing direction,
-    or missing pre/post deltas). Single source of truth for plotter + dashboard.
+    or missing pre/post deltas). Single source of truth for analysis scripts.
 
     NOTE: these buckets are diagnostic — they MUST NOT be summed into PnL.
     """

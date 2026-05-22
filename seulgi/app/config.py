@@ -349,12 +349,6 @@ class DashboardConfig:
 
 
 @dataclass
-class PlotterConfig:
-    """Periodic matplotlib renderer of quant stats."""
-    interval_secs: float = 600.0   # 10 minutes
-
-
-@dataclass
 class SearchBudgetConfig:
     """Caps on expensive external API calls."""
     brave_per_hour: int = 20   # max Brave Search API calls per hour across all Twitter watchers
@@ -453,7 +447,6 @@ class Config:
     relevance: RelevanceConfig = field(default_factory=RelevanceConfig)
     market_context: MarketContextConfig = field(default_factory=MarketContextConfig)
     search_budget: SearchBudgetConfig = field(default_factory=SearchBudgetConfig)
-    plotter: PlotterConfig = field(default_factory=PlotterConfig)
     log_level: str = "INFO"
 
 
@@ -676,9 +669,6 @@ def _build_config(raw: dict) -> Config:
         ),
         search_budget=SearchBudgetConfig(
             brave_per_hour=int(sb.get("brave_per_hour", 20)),
-        ),
-        plotter=PlotterConfig(
-            interval_secs=float(raw.get("plotter", {}).get("interval_secs", 600.0)),
         ),
         log_level=str(raw.get("log_level", "INFO")),
     )
