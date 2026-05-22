@@ -331,6 +331,7 @@ rewrite, rewrite. Where it's a targeted fix, fix.
 | A1.3 | `engine.py` refactor | Target ≤ 700 lines. Stages renamed INGRESS → SIGNAL → SIM_GATE → PREDICT → FAN_OUT → WRITE. Single `[stage]` log prefix. |
 | A1.4 | `db.py` cleanup + migration | Drop `lessons`/`lesson_notes` tables (archive → `data/archive/`). Add `(engine_name, closed_at)` index on trades. Add Phase-2 tables (`position_price_snaps`; bid/ask cols on `market_price_snaps`). |
 | A1.5 | Delete `plotter.py` + `dashboard.py` cull | `rm plotter.py`; strip its config block + env. Cull dead writers; target dashboard.py ≤ 1,400 lines. |
+| A1.6 (NEW 2026-05-22) | LLM-bypass mode for cost-free volume testing | `SEULGI_BYPASS_LLM=1` env flag short-circuits `classify_batch`. Every market match gets a synthetic `ClassifyResult` (direction = YES if mid_yes ≥ 0.5 else NO, confidence = 0.9, p_alpha = 1.0). The trader's pre-AI rules + post-AI gates still apply — this tests the trade-filter pipeline at full volume with $0 LLM cost. Per user 2026-05-22: "let everything pass through the trade filter (0 llm use, all pass to markets)". |
 
 Verification (no bot run, no LLM):
 - `pytest seulgi/app/tests/ seulgi/tests/` green.
