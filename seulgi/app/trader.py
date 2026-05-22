@@ -39,10 +39,17 @@ Invariants
   caught and emitted as skip rows or — for `open_position` failures — logged
   and bookkeeping rolled back (R2 contract: `trades` audit row survives even
   if `positions` insert fails).
-* Exactly one `trades` row per (variant × match) per headline.
-* Executed trade: `size_usdc > 0` AND `skip_reason IS NULL`. Skip trade:
-  `size_usdc == 0` AND `skip_reason IS NOT NULL`. (NOTE: cycle-2 "skips go
-  to engine_results only" contract is **not** in force — see entry-bugs report.)
+* Exactly one `trades` row per (variant × match) per **executed** headline.
+* Executed trade: `size_usdc > 0` AND `skip_reason IS NULL`.
+* Skip decisions write to `engine_results` (via the runner's
+  `record_engine_decisions`) — NOT to `trades`. The cycle-2 contract is
+  now enforced inside `_record`: in DEV (`SEULGI_DEV=1`) a skip write
+  to `trades` raises `ValueError`; in PROD it is silently dropped and
+  the `db.skip_to_trades_redirected` counter is bumped (A1.4
+  2026-05-22). Historical legacy: live DB carries ~6.6M pre-A1.4 skip
+  rows in `trades`; the
+  `seulgi/scripts/db_migrations/2026_05_22_move_skip_rows.py` one-shot
+  drops them.
 * In simulate mode, `entry_fee_usdc` is the simulated taker fee + per-leg gas;
   `shares = floor((size_usdc − fee_est) / effective_price / 0.01) * 0.01`;
   position's `size_usdc` is the *gross* dollar debit (includes fee).
@@ -155,6 +162,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
@@ -166,6 +174,13 @@ from db import SeulgiDB
 from markets import MarketMatch
 from watcher import RawHeadline
 import simulate as sim  # plan §7 — fees/slippage/Kelly helpers
+
+# A1.4: lazy/defensive import — _metrics may not exist in all entry paths
+# (analysis CLIs import trader.py without app.metrics being importable).
+try:
+    import metrics as _metrics
+except Exception:  # noqa: BLE001
+    _metrics = None
 
 logger = logging.getLogger(__name__)
 
@@ -1227,7 +1242,42 @@ class PaperTrader:
         relevance verdict off `match._relevance_score` / `_relevance_reason`
         when present (runner-level handoff; absent on legacy single-trader
         paths and that's fine).
+
+        A1.4 (2026-05-22) cycle-2 contract guard
+        ----------------------------------------
+        Per cycle-2 contract every skip belongs in `engine_results` (the
+        per-engine summary table written by `record_engine_decisions`),
+        NOT in `trades` (executed attempts + closures). Historically
+        this method has been writing skip rows to `trades` — that
+        violation produced 6.6M skip rows in the live DB and bloated
+        every funnel/PnL query.
+
+        Behaviour:
+          - DEV  (env `SEULGI_DEV=1`): raise `ValueError` so the
+            violation is noisy in tests/replay.
+          - PROD (default): silently drop the write to `trades`. The
+            row is NOT duplicated to `engine_results` — the engine
+            runner already wrote the per-engine skip row there via
+            `record_engine_decisions`, so the data is preserved. Bump
+            `db.skip_to_trades_redirected` so the rate is observable.
         """
+        if decision.skip_reason is not None:
+            if _metrics is not None:
+                try:
+                    _metrics.incr(
+                        "db.skip_to_trades_redirected",
+                        tags={"reason": (decision.skip_reason or "")[:40]},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+            if os.environ.get("SEULGI_DEV") == "1":
+                raise ValueError(
+                    f"cycle-2 contract violation: skip row would be written to "
+                    f"trades (skip_reason={decision.skip_reason!r}, "
+                    f"engine={self._engine_name!r}, cond={decision.condition_id[:12]!r}). "
+                    f"Skips belong in engine_results (record_engine_decisions)."
+                )
+            return  # PROD: drop the write — engine_results already has it
         ai_reason = getattr(result, "reason", None) if result is not None else None
         ai_raw = getattr(result, "raw_response", None) if result is not None else None
         freshness_label = (

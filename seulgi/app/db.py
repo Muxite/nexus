@@ -17,24 +17,14 @@ if the column already exists (SQLite's only safe migration pattern).
 from __future__ import annotations
 
 import asyncio
-import contextvars
 import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import aiosqlite
 import numpy as np
-
-# Reentrancy flag for the write-lock: set True inside a batch() so that
-# nested write calls (insert_signal, insert_trade, etc.) running in the
-# SAME task skip the lock acquire (they're already serialized by the
-# enclosing batch). Other tasks see False and must acquire the lock.
-# contextvars is per-task — asyncio.create_task / gather copies the
-# context so child coroutines inherit the flag.
-_in_batch_var: contextvars.ContextVar[bool] = contextvars.ContextVar(
-    "seulgi_db_in_batch", default=False,
-)
 
 # Phase-0 observability: write-path counters bump into metrics + logs.
 # Import lazily/defensively because db.py is imported by scripts that
@@ -220,7 +210,7 @@ _MIGRATIONS = [
     # is computed by the trader at close time; without persisting it the
     # close_reasons dashboard cannot distinguish micro-exits (TP/SL/TRAIL)
     # from rail closes (WIN/LOSS) — they all just look like "trade closed".
-    # NULL on legacy rows; the plotter buckets them as UNKNOWN.
+    # NULL on legacy rows; analysis scripts bucket them as UNKNOWN.
     "ALTER TABLE trades ADD COLUMN close_reason TEXT",
     # Coarse classification of the market question itself, written by the
     # offline tagger (seulgi/scripts/postmortem/tag_market_types.py).
@@ -493,6 +483,18 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_trades_engine_closed ON trades(engine_name, closed_at)",
     "CREATE INDEX IF NOT EXISTS idx_trades_condition_decided ON trades(condition_id, decided_at)",
     "CREATE INDEX IF NOT EXISTS idx_market_price_snaps_t_unix ON market_price_snaps(t_unix)",
+    # A1.4 (2026-05-22): once the trader stops writing skip rows to
+    # `trades` (and the one-shot migration drains the existing 6.6M),
+    # every funnel query in `get_decision_funnel` shifts to scanning
+    # `engine_results` instead. `skip_reason` is filtered by LIKE in
+    # ~10 CASE branches; pairing it with `decided_at` (always WHERE-d
+    # on the funnel side) gives the planner a covering composite. The
+    # WHERE on skip_reason IS NOT NULL keeps the index narrow — only
+    # ~3.4M of ~3.4M rows today qualify (all engine_results
+    # `executed=0` rows carry a skip_reason), but as the executed
+    # share grows the partial filter will trim the index.
+    "CREATE INDEX IF NOT EXISTS idx_engine_results_skip_decided "
+    "ON engine_results(skip_reason, decided_at) WHERE skip_reason IS NOT NULL",
 ]
 
 
@@ -631,11 +633,6 @@ class SeulgiDB:
             except Exception:  # noqa: BLE001
                 pass
 
-            # Mark "inside batch" in THIS task's context. Child coroutines
-            # awaited inside the batch inherit the flag via contextvars,
-            # so their writes route through _write_lock's reentrant path
-            # and don't deadlock or skip commit.
-            token = _in_batch_var.set(True)
             await self._conn.execute("BEGIN")
             self._in_batch = 1
             try:
@@ -681,34 +678,32 @@ class SeulgiDB:
                 # FIX-3B: shield commit too — the symmetric cancellation
                 # window exists on the success path.
                 await asyncio.shield(self._conn.execute("COMMIT"))
-            finally:
-                _in_batch_var.reset(token)
 
     @asynccontextmanager
     async def _write_lock(self):
-        """TEMPORARILY a no-op pass-through (2026-05-21 04:20 UTC).
+        """No-op shim — kept on purpose, do not remove (cycle-2 finding).
 
-        Originally added to serialize individual writes against
-        concurrent `batch()` calls (closing the metrics-flush implicit-
-        txn race). The 200/c=12 + 500/c=16 replay harness PASSED with
-        the lock in place — but production deployment of Container
-        6/7 with the same code deadlocked: `bump_market_heat` calls
-        succeeded but every subsequent `insert_signal` blocked
-        forever (provably: external Python script `insert_signal`
-        on the production DB timed out at 10 s while the writer
-        worker thread was idle in `select()` per `py-spy dump`).
+        This context manager intentionally yields without acquiring any
+        lock. The wrapping `async with self._write_lock():` boilerplate
+        is kept across every writer method (insert_signal, insert_trade,
+        record_engine_decisions, etc.) so that re-introducing
+        serialisation in the future requires changing only this method
+        body — not 10+ call sites scattered through the file.
 
-        The harness doesn't reproduce the deadlock so the cause is
-        production-specific (real LLM latency / metrics flush /
-        position monitor / dashboard background tasks interacting
-        with the lock somehow). Need to investigate separately.
-
-        Falling back to pre-write-lock behavior: writes do NOT
-        serialize against concurrent `batch()`. The metrics-flush
-        race remains (every 5 min one tick may fail with `cannot
-        start a transaction`) but doesn't lose data. The B-WRITES
-        bug stays fixed because `batch()` still strictly serializes
-        on `_batch_lock`.
+        Why a real lock was removed (2026-05-21): an earlier version
+        serialised individual writes against concurrent `batch()`
+        callers to close a metrics-flush implicit-txn race. Replay
+        harnesses (200/c=12, 500/c=16) passed, but production hit a
+        deadlock — `bump_market_heat` succeeded while every following
+        `insert_signal` blocked forever (writer worker idle in
+        `select()` per py-spy). Cause is production-specific
+        (real LLM latency × metrics flush × position monitor ×
+        dashboard background tasks) and was not reproduced in the
+        harness. Pending root-cause; falling back to pre-lock
+        behaviour leaves the metrics-flush race in place (one tick
+        every ~5 min may fail with `cannot start a transaction`) but
+        loses no data. The B-WRITES bug stays fixed because `batch()`
+        still strictly serialises on `_batch_lock`.
         """
         yield
 
@@ -716,47 +711,6 @@ class SeulgiDB:
         """Helper for insert/update functions: commit only outside a batch()."""
         if self._in_batch == 0:
             await self._conn.commit()
-
-    @asynccontextmanager
-    async def savepoint(self, name: str = "sp"):
-        """Inner-scope SAVEPOINT — survives outer commits/rollbacks.
-
-        Phase 1 R2: trader.evaluate wraps `insert_trade + open_position`
-        in this so if open_position fails the trade audit row survives
-        rather than being silently rolled back together with the position
-        attempt. Compatible with autocommit and with `batch()`.
-        """
-        safe = "".join(c if c.isalnum() else "_" for c in name)[:32] or "sp"
-        await self._conn.execute(f"SAVEPOINT {safe}")
-        try:
-            yield
-        except BaseException as exc:
-            logger.warning(
-                "[db.savepoint:%s] rolling back due to %s: %r",
-                safe, type(exc).__name__, exc, exc_info=True,
-            )
-            if _metrics is not None:
-                try:
-                    _metrics.incr(
-                        "db.savepoint.rollback",
-                        tags={"name": safe, "exc": type(exc).__name__},
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-            try:
-                await self._conn.execute(f"ROLLBACK TO SAVEPOINT {safe}")
-            except Exception as r_exc:  # noqa: BLE001
-                logger.error(
-                    "[db.savepoint:%s] ROLLBACK TO raised: %r",
-                    safe, r_exc, exc_info=True,
-                )
-            try:
-                await self._conn.execute(f"RELEASE SAVEPOINT {safe}")
-            except Exception:  # noqa: BLE001
-                pass
-            raise
-        else:
-            await self._conn.execute(f"RELEASE SAVEPOINT {safe}")
 
     # ------------------------------------------------------------------
     # Phase-0 observability helpers
@@ -1523,7 +1477,7 @@ class SeulgiDB:
         """Close the current cycle and open a new one. No data deletion.
 
         After this returns, `get_engine_gain_and_staked(since_ts=...)` and the
-        plotter / dashboard / trade-examples sampler all narrow to the new
+        dashboard / trade-examples sampler all narrow to the new
         cycle's window. Historical trades stay in the DB for tracing.
         """
         now = _now_iso()
@@ -2330,7 +2284,7 @@ class SeulgiDB:
         earliest matching trade.decided_at / closed_at / realized_pnl /
         engine_name for that headline+token (when we *acted* and *exited*).
 
-        Used by the plotter to draw example trade charts. Most recent first.
+        Used by offline analysis scripts to draw example trade charts. Most recent first.
         """
         async with self._conn.execute(
             """
