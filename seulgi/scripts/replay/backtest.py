@@ -43,6 +43,7 @@ from typing import Optional
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SEULGI = os.path.normpath(os.path.join(_HERE, "..", ".."))
 sys.path.insert(0, os.path.join(_SEULGI, "app"))
+sys.path.insert(0, os.path.join(_SEULGI, "scripts", "analysis"))
 
 from ai import ClassifyResult, Direction  # noqa: E402
 from config import load_config  # noqa: E402
@@ -368,16 +369,25 @@ def _build_engine_cfg(base_cfg, engine_name: str):
     return trading, ai
 
 
-def _to_classify_result(d: _Decision) -> ClassifyResult:
+def _to_classify_result(d: _Decision, calibrator=None) -> ClassifyResult:
     """Synthesise ClassifyResult from engine_results oracle. `confidence` is
-    treated as `p_alpha` (ai.py docstring: alias since cycle-7)."""
+    treated as `p_alpha` (ai.py docstring: alias since cycle-7).
+
+    A3.2: if `calibrator` is provided (callable `(c, direction) -> c'`),
+    the raw confidence is rewritten BEFORE _evaluate_pure runs. This
+    means both the `min_confidence` gate and `_compute_edge` see the
+    calibrated value — same semantics planned for Phase 4B.1 production
+    calibration."""
     try:
         direction = Direction(d.direction)
     except ValueError:
         direction = Direction.NEUTRAL
+    conf = d.confidence
+    if calibrator is not None and direction != Direction.NEUTRAL:
+        conf = float(calibrator(d.confidence, direction.value))
     return ClassifyResult(
-        direction=direction, confidence=d.confidence, reason="replay",
-        tokens_used=0, p_alpha=d.confidence, agreement=1.0,
+        direction=direction, confidence=conf, reason="replay",
+        tokens_used=0, p_alpha=conf, agreement=1.0,
         votes={direction.value: 1},
     )
 
@@ -455,7 +465,7 @@ def _record_skip(rec: dict, skips: list, d: _Decision, reason: str,
 
 
 def _simulate(cfg, decisions, market_index: dict, tape: _PriceTape,
-              freshness: dict, log_every: int = 5000,
+              freshness: dict, log_every: int = 5000, calibrator=None,
               ) -> tuple[list, list, dict]:
     """Walk decisions in time order; re-evaluate per engine; emit a
     _TradeRow on TRADE. Per-engine open-position / duplicate state is
@@ -484,7 +494,7 @@ def _simulate(cfg, decisions, market_index: dict, tape: _PriceTape,
         st["unique"] = {p["condition_id"] for p in st["open"]}
 
         match = _to_market_match(d)
-        result = _to_classify_result(d)
+        result = _to_classify_result(d, calibrator=calibrator)
         ctx = _EntryCtx(
             cfg=trading, ai_cfg=ai_cfg,
             engine_name=d.engine_name,
@@ -699,8 +709,15 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
                    help="Tolerance window for nearest exit price.")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    p.add_argument("--calibration", action="store_true",
-                   help="Enable calibration overlay (TODO: Phase 4B.1).")
+    p.add_argument("--calibration", default="none",
+                   choices=("none", "platt", "isotonic"),
+                   help="Apply offline calibration curve to confidence "
+                        "BEFORE _evaluate_pure runs (A3.2 prototype; "
+                        "production module lives in Phase 4B.1).")
+    p.add_argument("--calibration-curve", default=None,
+                   help="Path to calibration.json from "
+                        "scripts.analysis.calibration_prototype --out. "
+                        "Required when --calibration != none.")
     p.add_argument("--include-neutral", action="store_true",
                    help="Also walk rows with direction='NEUTRAL' (pre-AI "
                    "skips). Off by default — those have no LLM oracle.")
@@ -711,11 +728,18 @@ def main(argv: Optional[list] = None) -> int:
     args = _parse_args(argv)
     logging.basicConfig(level=getattr(logging, args.log_level),
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    if args.calibration:
-        raise SystemExit(
-            "--calibration is not yet implemented (Phase 4B.1 not shipped); "
-            "remove the flag to run the uncalibrated backtest."
-        )
+    calibrator = None
+    if args.calibration != "none":
+        if not args.calibration_curve:
+            raise SystemExit(
+                "--calibration {platt,isotonic} requires "
+                "--calibration-curve PATH (a JSON file written by "
+                "`python3 -m scripts.analysis.calibration_prototype --out`)."
+            )
+        from calibration_prototype import load_calibrator  # noqa: E402
+        calibrator = load_calibrator(args.calibration_curve, args.calibration)
+        logger.info("[backtest] calibration=%s curve=%s",
+                    args.calibration, args.calibration_curve)
 
     source_db = args.source_db or os.path.join(_SEULGI, "data", "seulgi.db")
     variant_cfg_path = args.variant_config or os.path.join(_SEULGI, "config.yaml")
@@ -762,7 +786,8 @@ def main(argv: Optional[list] = None) -> int:
                 n_walked, len(hids))
 
     tape = _PriceTape(con, epsilon_s=args.epsilon_secs)
-    trades, skips, stats = _simulate(cfg, decisions, market_index, tape, freshness)
+    trades, skips, stats = _simulate(cfg, decisions, market_index, tape,
+                                     freshness, calibrator=calibrator)
 
     n_skipped_by_reason: dict = {}
     for rec in stats["per_engine"].values():
@@ -807,7 +832,8 @@ def main(argv: Optional[list] = None) -> int:
         "max_headlines": args.max_headlines,
         "epsilon_secs": args.epsilon_secs,
         "run_seconds": run_seconds,
-        "calibration": False,
+        "calibration": args.calibration,
+        "calibration_curve_path": args.calibration_curve,
     }
 
     fmt = _write_trades(trades, out_root)
