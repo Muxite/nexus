@@ -27,6 +27,72 @@ Usage in main.py:
     # then pass `dash` through the pipeline and call record_*() everywhere
 """
 
+# ---------------------------------------------------------------------------
+# Specification (Phase 0 A0.7 — 2026-05-22)
+# ---------------------------------------------------------------------------
+#
+# Purpose
+#   Periodic snapshot writer for `data/dashboard/*.txt` (and two .jsonl files)
+#   consumed by the operator (cat / less / tail) and a handful of analysis
+#   scripts. Pull-based: no caller subscribes — files are atomically replaced
+#   every `interval_secs` (default 30s). Event-driven flush is allowed: high-
+#   priority record_*() calls set `_flush_now` so the loop wakes early.
+#
+# Public interface
+#   class Dashboard(data_dir, interval_secs, db=None)
+#     • async run()                            — background entrypoint (one per
+#                                                process; spawn from main.py).
+#     • record_news / record_ai / record_trace / record_trade /
+#       record_position_closed / record_signal_journal                  — push events.
+#     • set_balance / set_open_positions / set_engine_summary /
+#       set_system_health / set_watcher_status / set_quant_stats /
+#       set_usage / set_engine_staked / set_infinite_balance / set_mode /
+#       set_cycle_started_at / set_simulate_total / set_ai_paused /
+#       set_market_index / register_engines                              — push state.
+#   Helpers consumed externally: none. Dataclasses NewsEvent/AIEvent/
+#   TradeEvent/PositionEvent/ClosedEvent/WatcherStatus/SystemHealth are
+#   imported by main.py and engine.py to construct payloads for set_*.
+#
+# Invariants
+#   • Every output file is written atomically via `_write()` (tempfile + os.replace).
+#   • Heavy DB aggregates (variant_stats, decision_funnel, confidence_buckets,
+#     freshness_counts, freshness_buckets, scout_funnel) are pulled from
+#     `_heavy_cache` only; the render path never blocks on DB I/O. Cache is
+#     refreshed by `_heavy_cache_loop` every `_heavy_cache_interval` (300s)
+#     against a read-only SeulgiDB clone (`_db_ro`) so SELECTs never serialise
+#     with the writer connection (cycle-2 B-WRITES fix).
+#   • `_write_all()` uses `asyncio.gather(return_exceptions=True)`: one tile's
+#     failure never cancels its peers.
+#   • `trade_log.jsonl` is append-only with hysteretic truncation at
+#     1.5 × _TRADE_LOG_MAX_LINES → _TRADE_LOG_MAX_LINES (rolling tail).
+#   • Ring buffers (`_news`, `_ai`, `_executed`, `_declined`, `_near_miss`,
+#     `_closed`) are bounded by `_MAX_BUFFER`; `_activity` by `_MAX_ACTIVITY`.
+#
+# Side effects
+#   • File writes to `<data_dir>/*.txt` and `<data_dir>/*.jsonl` only.
+#   • DB reads only (writer connection for `_write_db_health` snapshot,
+#     RO clone for the cache loop, writer for the headline_journal /
+#     trade_log / wins-losses / variant_compare per-tick queries).
+#   • No network I/O. No process spawns.
+#
+# Failure modes
+#   • Stale heavy cache: tiles emit "(5-min cache, warming up…)" or include
+#     an age stamp; consecutive failures bump per-key streak and degrade to
+#     "(empty)" rather than blank the entire main file.
+#   • Per-writer DB query failure: logged at WARN, that tile keeps its prior
+#     content (no rewrite this tick).
+#   • Atomic-write failure: logged at WARN, .tmp cleaned up, peer files
+#     unaffected.
+#
+# Non-goals
+#   • Alerting / notification (lives in `notify.py`).
+#   • Plotting (matplotlib PNGs) — handled by `plotter.py`, currently
+#     disabled via `SEULGI_DISABLE_PLOTTER=1`; flagged for deletion in Phase 1.
+#   • Business logic (trade gating, sizing, fees). Dashboard is read-only.
+#   • Per-tick price_impact.txt / profile.txt — written by impact_tracker.py
+#     and profiler.py respectively, not this module.
+# ---------------------------------------------------------------------------
+
 from __future__ import annotations
 
 import asyncio

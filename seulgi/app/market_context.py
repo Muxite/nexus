@@ -8,14 +8,35 @@ diagnose later whether losses concentrate in noisy markets (markets
 too volatile for our SL) vs spread evenly across vol (AI direction
 errors).
 
-Token discipline: only the scalars ever leave this module — never the
-raw price array. ~70 tokens per market in the prompt regardless of
-window length.
+## Specification
 
-Reuses `impact_tracker._fetch_price_history_window` so there's no new
-HTTP code path. Fail-open: any fetch error → `_mkt_ctx = None`, the
-prompt block is silently skipped for that market, the trade still
-happens.
+Purpose
+    Per-market pre-headline rolling stats (vol / drift / mean / lo /
+    hi / current / n_samples over a 30-min CLOB mid window). Threaded
+    into ai.py's prediction prompt and persisted on the trade row via
+    `prompt_meta.mkt_ctx`. Drives vol-bucket diagnostics.
+
+Public interface
+    @dataclass MarketContext(vol, mean, lo, hi, current, drift, n_samples)
+    async fetch_context_for_matches(session, matches, window_secs=1800,
+        cache=None) -> dict   # attaches `_mkt_ctx` to each match in
+                              # place (matches `_relevance_score` /
+                              # `_freshness_label` handoff).
+    format_market_context_block(matches) -> str    # "" when empty.
+    context_dict(ctx) -> Optional[dict]            # JSON for prompt_meta.
+
+Invariants / side effects
+    - Stats require ≥ 2 raw samples; else MarketContext is None.
+    - Raw price array never escapes the module — only the 7 scalars.
+    - 30s TTL cache keyed by token_id (variants share one CLOB fetch).
+    - HTTP via `impact_tracker._fetch_price_history_window`; no new
+      code path. No DB writes here (ai.py persists into prompt_meta).
+
+Failure modes & non-goals
+    - Fail-open: any fetch/parse error → `_mkt_ctx = None`; prompt
+      block silently skipped; the trade still happens.
+    - NOT a live monitor or snapshot writer (Phase 2 A2.2 will add a
+      per-position continuous tape in impact_tracker.py).
 """
 from __future__ import annotations
 

@@ -34,6 +34,81 @@ Any unspecified field falls back to the global `trading:` defaults.
 
 If no `engines:` section exists, a single default engine named "default" is
 created from the global `trading:` config.
+
+## Specification
+**Purpose.** Pipeline orchestrator from headline ingress to per-engine trader
+fan-out: embed → freshness assess → market match → mid-price prefetch → pre-AI
+rule gate → low-sim short-circuit → deterministic sim-gate (Stage 2) → market
+context → prediction LLM (Stage 3) → fan out classify results to every active
+engine concurrently → trader.evaluate → record decisions.
+
+**Public interface.**
+- `Engine` dataclass — bundles `name`, `trader` (PaperTrader), `fixed_balance`,
+  legacy `relevance_keep_scores` (DEAD, see Failure modes).
+- `EngineRunner(engines, index, embedder, db, classifier, ...)` — fan-out hub.
+  - `await runner.process(headline)` — single-headline pipeline entry point.
+  - `await runner.monitor_positions()` — drives every engine's exit path.
+  - `await runner.close()` — closes shared aiohttp price session.
+  - `runner.engines` property — engine list.
+- `build_engines(cfg, db, classifier, rule_engine=None) -> list[Engine]` —
+  factory (YAML engines + variants, optional aggressive_core, MULTI_CORE env).
+
+**Invariants.**
+1. Exactly one `signals` row per non-trivially-rejected headline (after the
+   pre-match drops: embed-fail / no-match / all-no-price).
+2. Every engine in `active_engines` produces ≥1 `engine_results` row (or a
+   documented skip-row via `evaluate_*_skips`). Inactive (E.5b-paused)
+   engines produce nothing on the path; they appear in `_paused_engines`.
+3. `_batched_gather` MUST complete within 90 s (`wait_for` safety belt at
+   `process:608`). On timeout, the batch's `__aexit__` rolls back via the
+   shielded path; no half-applied state remains.
+4. `classify_batch` is called at most once per headline — every variant in
+   `active_engines` shares the same `classify_results`.
+5. Stage 2 = deterministic similarity floor (`min_top_similarity`, default
+   0.45 in constructor, 0.50 in production config). No LLM since 2026-05-22.
+6. Per-token mid-price cache TTL = 10 s; market-context cache TTL = 30 s
+   (inside `market_context`); engine hit-rate cache TTL = 300 s.
+
+**Side effects.**
+- DB writes: `signals` (1× / headline), `engine_results` (1×/engine/decision
+  via `db.record_engine_decisions`), `usage_events` (Stage-3 token totals,
+  1×/headline), `market_price_snaps` (1×/kept-match), `markets_heat`
+  (bumped via `db.bump_market_heat`); indirect writes via `trader.evaluate`
+  → `trades`, `positions`, `balances`.
+- DB reads: `db.get_engine_rolling_hit_rate` (E.5b pause check, cached).
+- External I/O: CLOB mid-price fetch (shared aiohttp session), market-context
+  CLOB endpoint, embedder (run-in-executor), classifier (LLM via OpenRouter),
+  optional article body fetch (fire-and-forget task).
+- Dashboard hooks: balances, signal-journal, trades, traces, AI-paused flag.
+
+**Failure modes.**
+- Embed error: log, drop headline (no signal row written).
+- `news_memory.assess` exception: silently downgrades to default
+  `FreshnessResult(label="BREAKING")` — fail-open. Boundary smell: BREAKING
+  bypasses every short-circuit, so a broken NewsMemory escalates token cost.
+- `find_matches` empty / all-no-price: log, return (no signal row).
+- `_engine_should_pause` DB read failure: returns False (engine stays active).
+- `_run_engine` `trader.evaluate` crash: caught per-engine; sets `decisions=[]`
+  so one bad variant doesn't poison the shared aiosqlite connection.
+- `_batched_gather` cancellation (e.g. wait_for timeout): `db.batch()`'s
+  shielded rollback releases the lock; lose at most one headline's decisions.
+- Classifier parse-failure: handled inside `ai.classify_batch` (returns
+  NEUTRAL ClassifyResults); engine treats them as normal survivors.
+- The hour-gate (`SEULGI_DISABLE_HOUR_GATE`) silently drops UTC 23/00/01
+  headlines before any DB write.
+
+**Non-goals.**
+- Does NOT size trades, compute edge, write `trades` rows, or close
+  positions — that's `trader.py`.
+- Does NOT call the LLM directly — `ai.DirectionClassifier.classify_batch`.
+- Does NOT fetch the gamma-API market index or maintain embeddings —
+  `markets.py`.
+- Does NOT decide freshness labels — `news_memory.NewsMemory.assess`.
+- Does NOT poll OpenRouter budget — `budget.py` (when wired; budget short-
+  circuit not in this module today).
+- Does NOT persist `decision_inputs` / `llm_parse_failures` (Phase 5
+  capture hooks were drafted in handoff 2026-05-22-v2 but are not wired
+  into this file as of 2026-05-22).
 """
 
 from __future__ import annotations
@@ -59,6 +134,16 @@ from trader import PaperTrader, TradeDecision, _fetch_mid_price
 from watcher import RawHeadline
 
 logger = logging.getLogger(__name__)
+
+
+# Lightweight verdict carrier — replaces the retired RelevanceVerdict
+# dataclass from relevance.py. Carries the sim-gate pass/fail decision so
+# trader._record can write a coherent relevance_score column.
+@dataclass
+class _SimVerdict:
+    keep: bool
+    score: str   # "SIM_PASS" | "SIM_FAIL"
+    reason: str
 
 
 # ---------------------------------------------------------------------------
@@ -116,8 +201,8 @@ class EngineRunner:
         news_memory=None,     # Optional[NewsMemory] — avoids circular import
         impact_tracker=None,  # Optional[PriceImpactTracker] — avoids circular import
         article_fetcher=None, # Optional[ArticleFetcher] — fire-and-forget body capture
-        relevance_filter=None,  # Optional[RelevanceFilter] — Stage-2 cheap gate
         market_context_cfg=None,  # Optional[MarketContextConfig] — Stage-3 input
+        min_top_similarity: float = 0.45,  # deterministic sim-gate floor
     ) -> None:
         self._engines = engines
         self._index = index
@@ -129,7 +214,7 @@ class EngineRunner:
         self._news_memory = news_memory
         self._impact_tracker = impact_tracker
         self._article_fetcher = article_fetcher
-        self._relevance = relevance_filter
+        self._min_top_similarity = float(min_top_similarity)
         self._mkt_ctx_cfg = market_context_cfg
         # token_id → (MarketContext|None, fetched_at_unix). Shared across
         # variants; 30s TTL is applied inside market_context.fetch_*.
@@ -141,10 +226,6 @@ class EngineRunner:
         # token_id → (price_or_None, monotonic_expiry_secs)
         self._price_cache: dict[str, tuple[Optional[float], float]] = {}
         self._price_cache_ttl: float = 10.0   # seconds
-        # Lessons cache (hoisted from PaperTrader): one fetch per ~60s shared
-        # across all engines/variants. The aggregator only runs every ~10m.
-        self._lesson_notes: list[str] = []
-        self._lesson_cache_until: float = 0.0
         # plan §3 — simulate mode: pause LLM calls when no engine has free
         # capital. Determined from the engines' cfg.is_simulate() (engines all
         # share the same global trading mode in main.py).
@@ -217,19 +298,6 @@ class EngineRunner:
                 except Exception:  # noqa: BLE001
                     pass
         return paused
-
-    async def _get_lesson_notes_cached(self) -> list[str]:
-        from time import monotonic
-        if monotonic() < self._lesson_cache_until:
-            return self._lesson_notes
-        try:
-            import lessons as _lessons
-            notes = await _lessons.load_active_notes(self._db, limit=8)
-        except Exception:  # noqa: BLE001
-            notes = []
-        self._lesson_notes = notes
-        self._lesson_cache_until = monotonic() + 60.0
-        return notes
 
     def _get_price_session(self) -> aiohttp.ClientSession:
         if self._price_session is None or self._price_session.closed:
@@ -399,12 +467,9 @@ class EngineRunner:
 
         # ── Low-similarity short-circuit (cycle-13 token reduction) ─────────
         # If even the best embedding match scores below the relevance
-        # threshold, skip Stage 2 entirely — the cheap LLM cull would
-        # spend tokens to almost certainly say NO. Per-variant skip rows
-        # tag the bypass so the funnel reflects it.
-        min_top_sim = getattr(getattr(self._relevance, "_min_top_similarity", None), "real", None)
-        if min_top_sim is None:
-            min_top_sim = getattr(self._relevance, "_min_top_similarity", 0.0) or 0.0
+        # threshold, short-circuit — the headline isn't about any market.
+        # Per-variant skip rows tag the bypass so the funnel reflects it.
+        min_top_sim = self._min_top_similarity
         if survivors and min_top_sim > 0:
             max_sim = max(getattr(m, "similarity", 0.0) for m in survivors)
             if max_sim < min_top_sim:
@@ -427,7 +492,14 @@ class EngineRunner:
                 )
                 return
 
-        # ── Stage 2: relevance gate (cycle 9, cheap LLM cull) ───────────────
+        # ── Stage 2: deterministic similarity gate (2026-05-22) ─────────────
+        # Replaces the relevance LLM (gemini-2.5-flash-lite) which was in
+        # a continuous parse-failure → fail-open storm: ~$5/day in tokens
+        # and filtered nothing. Per-market matches below the similarity
+        # floor are dropped here and tagged SIM_FAIL so trader._record
+        # writes a coherent relevance_score column. Per-engine
+        # `relevance_keep_scores` is no longer honoured — every engine
+        # sees the same survivor set.
         source_host: Optional[str] = None
         if headline.site_url:
             try:
@@ -437,69 +509,31 @@ class EngineRunner:
 
         relevance_skips: list = []
         relevance_verdicts_kept: list = []
-        if self._relevance is not None and survivors:
-            try:
-                kept, verdicts, rmeta = await self._relevance.filter(
-                    headline=headline.headline,
-                    matches=survivors,
-                    freshness=freshness,
-                    source=source_host,
-                )
-                if rmeta.get("tokens"):
-                    await self._db.log_usage(
-                        kind="ai_tokens",
-                        count=float(rmeta["tokens"]),
-                        provider=rmeta.get("model"),
-                        meta=json.dumps({"hid": hid, "stage": "relevance",
-                                         "n_in": rmeta.get("n_in"),
-                                         "n_kept": rmeta.get("n_kept")}),
-                    )
-                # Tag each match with its verdict so the trader can persist
-                # relevance_score / relevance_reason on every trade row.
-                for m, v in zip(survivors, verdicts):
-                    m._relevance_score = v.score
+        if survivors:
+            sim_floor = float(self._min_top_similarity)
+            survivors_kept: list[MarketMatch] = []
+            verdicts_kept: list[_SimVerdict] = []
+            for m in survivors:
+                if (m.similarity or 0.0) >= sim_floor:
+                    v = _SimVerdict(keep=True, score="SIM_PASS",
+                                    reason=f"sim={m.similarity:.3f}")
+                    m._relevance_score = "SIM_PASS"
                     m._relevance_reason = v.reason
-                # 2026-05-21: per-engine relevance.  Compute the UNION of
-                # all engines' keep_scores so the prediction LLM input
-                # covers every market any engine wants to evaluate.
-                # Each engine later (in _run_engine) filters survivors
-                # down to its OWN keep_scores. Production tight,
-                # scout loose — both share one prediction LLM call.
-                default_keep = set(
-                    getattr(self._relevance, "_keep_scores", None)
-                    or ("STRONG_YES", "YES")
-                )
-                union_keep: set[str] = set()
-                for engine in self._engines:
-                    eks = getattr(engine, "relevance_keep_scores", None)
-                    union_keep |= set(eks) if eks else default_keep
-                v_by_id = {id(m): v for m, v in zip(survivors, verdicts)}
-                survivors_union = [
-                    m for m in survivors
-                    if v_by_id[id(m)].score in union_keep
-                ]
-                # Matches outside the union are skipped by EVERY engine —
-                # record one skip row per (engine, match) so funnel
-                # attribution is preserved.
-                kept_union_ids = {id(m) for m in survivors_union}
-                relevance_skips = [
-                    (m, v_by_id[id(m)]) for m in survivors
-                    if id(m) not in kept_union_ids
-                ]
-                relevance_verdicts_kept = [
-                    v_by_id[id(m)] for m in survivors_union
-                ]
-                survivors = survivors_union
-                logger.info(
-                    "[runner] [hid=%s] relevance kept %d/%d for prediction "
-                    "(union of engine keep_scores) — global default %s, "
-                    "model=%s tokens=%s",
-                    hid, len(survivors_union), rmeta.get("n_in", 0),
-                    sorted(default_keep), rmeta.get("model"),
-                    rmeta.get("tokens"),
-                )
-            except Exception as exc:
-                logger.warning("[runner] relevance error: %s — fail open", exc)
+                    survivors_kept.append(m)
+                    verdicts_kept.append(v)
+                else:
+                    v = _SimVerdict(keep=False, score="SIM_FAIL",
+                                    reason=f"sim={m.similarity:.3f}<{sim_floor:.2f}")
+                    m._relevance_score = "SIM_FAIL"
+                    m._relevance_reason = v.reason
+                    relevance_skips.append((m, v))
+            relevance_verdicts_kept = verdicts_kept
+            n_in = len(survivors_kept) + len(relevance_skips)
+            survivors = survivors_kept
+            logger.info(
+                "[runner] [hid=%s] sim-gate kept %d/%d (floor=%.2f)",
+                hid, len(survivors_kept), n_in, sim_floor,
+            )
 
         # ── Cycle-11: pre-headline market context (parallel CLOB fetch) ─
         # Run AFTER relevance gate so only kept markets pay the network
@@ -526,11 +560,6 @@ class EngineRunner:
                 logger.warning("[runner] market_context error: %s — proceeding without", exc)
 
         # ── Stage 3: prediction (existing classify_batch, now with freshness) ─
-        try:
-            lesson_notes = await self._get_lesson_notes_cached()
-        except Exception:  # noqa: BLE001
-            lesson_notes = []
-
         classify_results: list[ClassifyResult] = []
         prompt_meta: dict = {}
         # plan §3 — simulate mode: short-circuit if every engine is fully
@@ -559,7 +588,6 @@ class EngineRunner:
                 is_republish=is_republish,
                 similar_to=similar_to,
                 source=source_host,
-                lesson_notes=lesson_notes,
                 freshness=freshness,
                 relevance_verdicts=relevance_verdicts_kept or None,
             )
@@ -790,31 +818,13 @@ class EngineRunner:
         hid = getattr(headline, "headline_id", "")
         _t_engine = time.monotonic()
 
-        # ── Per-engine relevance gate (2026-05-21) ─────────────────────────
-        # process() runs the relevance LLM once and passes the UNION of
-        # every engine's keep_scores. Filter down to THIS engine's set
-        # here; dropped matches get a relevance skip row so the
-        # decision funnel still accounts for them.
-        engine_keep_scores = (
-            set(engine.relevance_keep_scores)
-            if engine.relevance_keep_scores
-            else set(
-                getattr(self._relevance, "_keep_scores", None)
-                or ("STRONG_YES", "YES")
-            )
-        )
-        rel_filtered_survivors: list[MarketMatch] = []
-        rel_filtered_classify: list[ClassifyResult] = []
+        # ── Per-engine relevance gate retired 2026-05-22 ────────────────────
+        # The LLM relevance verdict (STRONG_YES/YES/WEAK/NO) is gone; the
+        # deterministic sim-gate in process() yields SIM_PASS for every
+        # survivor reaching this point, so per-engine `relevance_keep_scores`
+        # no longer has anything to filter on. Field is preserved on
+        # EngineConfig for YAML compatibility but ignored here.
         rel_dropped_skips: list[tuple[MarketMatch, str]] = []
-        for m, cr in zip(survivors, classify_results):
-            rs = getattr(m, "_relevance_score", None)
-            if rs is None or rs in engine_keep_scores:
-                rel_filtered_survivors.append(m)
-                rel_filtered_classify.append(cr)
-            else:
-                rel_dropped_skips.append((m, f"not_relevant:{rs}"))
-        survivors = rel_filtered_survivors
-        classify_results = rel_filtered_classify
 
         # ── Per-engine scoped pre-AI gate ──────────────────────────────────
         # The shared loop in process() applied only universal rules. Rules

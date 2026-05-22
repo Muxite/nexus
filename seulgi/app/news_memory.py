@@ -1,32 +1,54 @@
 """
-Semantic news deduplication using ChromaDB.
+Semantic news deduplication + freshness assessment using ChromaDB.
 
-Maintains a persistent vector store of every headline seen. When a new headline
-arrives, it is checked against near-neighbours. If a similar headline has already
-been seen (cosine distance < threshold), the new headline is marked as a republish.
+## Specification
+**Purpose.** Persistent semantic vector store of every headline seen;
+produces a `FreshnessResult` (BREAKING / EVOLVING / REHASH /
+STALE_RETURN) by nearest-neighbour cosine distance + age. Drives
+engine.process Stage 2/3 short-circuits and Stage-3 prior-coverage
+context.
 
-The AI classifier receives this context and can choose to return NEUTRAL for
-republishes, preventing the system from acting on stale news.
+**Public interface.**
+  - `FreshnessLabel`, `FreshnessResult` (dataclass — nearest_dist,
+    nearest_age_secs, similar_to, recent_context list).
+  - `NewsMemory(path, embedder, threshold, fresh_dist_threshold,
+    rehash_age_secs, stale_age_secs, recent_context_window_secs,
+    recent_context_n, short_circuit_labels)`.
+  - `assess(headline, emb, site_url, article_url) -> FreshnessResult`
+    — sole consumer at engine.py:357.
+  - `check(...)` back-compat shim; `size`, `close()`.
+  - `_short_circuit_labels` read by engine.py:425 via getattr.
 
-Collection: "headlines"
-Distance:   cosine (HNSW)
-Capacity:   ~500k documents (ChromaDB handles this via HNSW index)
+**Invariants.**
+  - Decision table (d = cosine dist, a = age):
+      d > fresh_dist_threshold              → BREAKING
+      threshold ≤ d ≤ fresh_dist_threshold  → EVOLVING if a<rehash
+                                              else BREAKING
+      d < threshold                          → REHASH if a<rehash;
+                                               STALE_RETURN if a≥stale;
+                                               else EVOLVING
+  - REHASH is NOT persisted (would self-anchor and degrade signal).
+  - All HNSW reads + writes serialised through `self._lock`; safe
+    from `run_in_executor`.
 
-Thread safety: check() is synchronous and serialises writes via a threading.Lock.
-               It is safe to call from asyncio.run_in_executor().
+**Side effects.**
+  - `chromadb.PersistentClient` at `path` (default `/data/news_chroma`),
+    collection `headlines` with `hnsw:space=cosine`.
+  - Writes one row per non-REHASH assess() call.
 
-Usage:
-    memory = NewsMemory(
-        path="/data/news_chroma",
-        embedder=embedder,       # reuse seulgi's existing Embedder instance
-        threshold=0.12,          # cosine distance; 0.12 ≈ cosine sim 0.88
-    )
-    is_republish, similar_to = memory.check(
-        headline="Fed raises rates by 25bp",
-        embedding=vec,
-        site_url="https://reuters.com",
-        article_url="https://reuters.com/article/123",
-    )
+**Failure modes.**
+  - chromadb missing → `_enabled=False`, assess returns default
+    BREAKING (fail-open).
+  - HNSW on-disk corruption (2026-05-21 dual-container write race) →
+    `_init` logs + disables dedup. NO AUTOMATIC RECOVERY today
+    (master plan C.3, pending); operator renames the dir manually.
+  - Per-call query/add exceptions logged at DEBUG; assess returns
+    default BREAKING.
+
+**Non-goals.**
+  - Article-body dedup — headline only.
+  - Backfill from `signals.headline` (pending C.3 `rebuild_from_db`).
+  - Source/domain trust scoring.
 """
 
 from __future__ import annotations

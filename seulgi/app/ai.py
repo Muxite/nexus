@@ -29,6 +29,79 @@ Config (config.yaml → ai section):
 OpenRouter API reference: https://openrouter.ai/docs
 """
 
+# ## Specification ──────────────────────────────────────────────────────────────
+# Purpose:
+#     OpenRouter chat-completion client + Stage-3 ensemble direction
+#     classifier. Given a headline + a list of candidate Polymarket
+#     questions (already culled by similarity/relevance), emits a
+#     per-market probability tuple (p_yes, p_no, p_neutral, p_alpha,
+#     risk) plus an aggregated direction + confidence. Stage 2
+#     (relevance LLM) was retired 2026-05-22; this is now the only
+#     remote LLM call in the hot path.
+#
+# Public interface:
+#     DirectionClassifier(api_key, model, premium_model=None,
+#                         premium_sim_threshold=0.70,
+#                         ensemble_samples=3, ensemble_temperature=0.5)
+#       .classify_batch(headline, matches, *, is_republish, similar_to,
+#                       source, freshness, relevance_verdicts)
+#           -> (list[ClassifyResult], prompt_meta: dict)
+#       .classify(headline, question, …) -> ClassifyResult  # legacy fallback
+#       .close()  # closes the aiohttp session
+#     Module helpers: `_BATCH_PROMPT_TEMPLATE`, `_parse_one`,
+#     `_parse_batch_response`, `_aggregate_ensemble`,
+#     `_format_freshness_block`, `_mkt_ctx_to_dict`.
+#
+# Invariants:
+#   - Ensemble = N=ensemble_samples parallel calls at
+#     ensemble_temperature; aggregated per-market by mean(p_yes/p_no/
+#     p_neutral/p_alpha/risk) and majority-vote on the per-sample
+#     argmax direction. Ties resolve to NEUTRAL.
+#   - `agreement` = max_votes / N (1/N → no signal; 1.0 → unanimous).
+#   - `confidence` = `p_alpha` when the model emitted it (cycle-7
+#     contract); else falls back to mean(P[winning_direction]).
+#     KNOWN AMBIGUITY (A0.3): the trader's `2·conf − 1` edge rescale
+#     reads `confidence`, so the production edge silently switches
+#     semantics between samples that emit p_alpha and ones that don't.
+#     `agreement` is NOT folded into `confidence` despite the docstring
+#     at `_aggregate_ensemble` claiming it is. Phase 1 must pick one.
+#   - If ALL N samples fail to parse, the classifier falls back to
+#     per-market single-call classify(); if those also fail, every
+#     market gets NEUTRAL with confidence=0.0 ("api_error"/"parse_error").
+#     classify_batch never raises to the caller.
+#   - Distributions are L1-normalised to 1.0 in `_parse_one` before
+#     argmax; legacy `{direction, confidence}` responses synthesise a
+#     plausible distribution so downstream aggregation still works.
+#
+# Side effects:
+#   - HTTPS POSTs to OpenRouter `/chat/completions` (one per ensemble
+#     sample; semaphore = max(max_concurrent, 2·ensemble_samples)).
+#   - No DB writes from this module. The caller (engine.py) writes:
+#       * `usage_events` (kind='ai_tokens', stage='prediction'),
+#       * `llm_parse_failures` rows (fire-and-forget, raw response
+#         capped to ~4KB) when `_parse_batch_response` returns None,
+#       * `llm_calls` rows — NOT YET WIRED (master plan A2.1).
+#
+# Failure modes:
+#   - HTTP 429 → exponential backoff up to 3 attempts, then None.
+#   - HTTP 5xx / other → logged + None on first failure (no retry).
+#   - HTTP 402 (insufficient credits) → currently SWALLOWED as a
+#     generic non-200 (no special surface); the OpenRouter budget
+#     poller is the only mechanism that notices and toggles
+#     `data/budget_paused.flag` (engine.py reads, ai.py does not).
+#   - aiohttp timeout (30s) / connection error → logged + None, no retry.
+#   - JSON parse error (truncation at max_tokens, prose preamble,
+#     trailing punctuation in `reason`, schema regression to legacy
+#     {direction,confidence}) → batch returns None, falls back to
+#     per-market path; all-failed batches log a single warning.
+#
+# Non-goals:
+#   - Pre-AI rules (engine.py / rules.py).
+#   - Trade sizing, gating, Kelly, fees (trader.py / simulate.py).
+#   - OpenRouter credit polling / budget enforcement (budget.py).
+#   - Persisting decision telemetry (engine.py owns decision_inputs).
+# ───────────────────────────────────────────────────────────────────────────────
+
 from __future__ import annotations
 
 import asyncio
@@ -277,9 +350,8 @@ class DirectionClassifier:
         is_republish: bool = False,
         similar_to: Optional[str] = None,
         source: Optional[str] = None,
-        lesson_notes: Optional[list[str]] = None,
         freshness=None,                          # FreshnessResult | None
-        relevance_verdicts: Optional[list] = None,  # list[RelevanceVerdict] aligned to matches
+        relevance_verdicts: Optional[list] = None,  # list[_SimVerdict] aligned to matches
     ) -> tuple[list[ClassifyResult], dict]:
         """
         Classify a headline against ALL matching markets in a single API call.
@@ -306,17 +378,12 @@ class DirectionClassifier:
                 if is_republish and similar_to else ""
             )
         source_block = f"Source: {source}\n" if source else ""
-        # Lessons inject "treat as NEUTRAL" advisories into every prompt.
-        # The current lesson set was seeded 2026-05-18 from the broken-
-        # MTM-accounting era ("Conf >=0.85 was 100% no-signal in last cycle;
-        # treat as NEUTRAL ..."), and is currently driving 100% NEUTRAL output
-        # post-M1-prompt-revert. Env-gate the block so we can disable it
-        # cleanly during the drought-diagnosis window without mutating the DB.
-        if lesson_notes and not os.getenv("SEULGI__LESSONS_DISABLE"):
-            lesson_lines = "\n".join(f"  - {n}" for n in lesson_notes[:8])
-            lessons_block = f"Recent lessons (apply to confidence + direction):\n{lesson_lines}\n"
-        else:
-            lessons_block = ""
+        # Lessons system retired 2026-05-22 — the seeded "treat as NEUTRAL"
+        # advisories were biasing every output toward NEUTRAL while
+        # providing no empirical lift. The template still references
+        # {lessons_block} so we pass an empty string to keep the format()
+        # call happy.
+        lessons_block = ""
 
         # Build the numbered question block. mid_yes is the YES-token mid,
         # which is what "current likelihood of YES" maps to in [0,1].
@@ -420,7 +487,6 @@ class DirectionClassifier:
             "is_republish": bool(is_republish),
             "similar_to": (similar_to or "")[:200] if similar_to else None,
             "source": source,
-            "lessons_used": list(lesson_notes)[:8] if lesson_notes else [],
             "freshness_label": getattr(freshness, "label", None) if freshness else None,
             "nearest_age_secs": getattr(freshness, "nearest_age_secs", None) if freshness else None,
             "nearest_dist": getattr(freshness, "nearest_dist", None) if freshness else None,

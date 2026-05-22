@@ -6,6 +6,69 @@ quantization, fractional Kelly sizing. Kept dependency-free so the audit
 script and tests can import them without spinning up a trader.
 
 See plan §7 for the design and §7.5 for the integration notes.
+
+## Specification
+
+Purpose:
+    Pure microstructure layer the simulate-mode trader composes on every
+    entry, exit, and resolution leg. Plain-float inputs + dataclass configs;
+    no DB, network, or clock access.
+
+Public interface:
+    clamp_price(p) -> float: restrict to [PRICE_MIN=0.01, PRICE_MAX=0.99].
+    is_at_rail(p) -> bool: True iff p saturates either rail.
+    fee_rate_for(market_type, cfg) -> float: category lookup, falls back
+        to cfg.default_rate for None / unknown keys.
+    apply_slippage(mid, notional_usdc, side, market_type, cfg)
+        -> SlippageResult(mid, walk, effective_price, applied):
+        walk price AGAINST trader; YES buys up, NO buys down; disabled
+        below disable_below_usdc or for whitelisted categories.
+    compute_fee(shares, price, market_type, cfg)
+        -> FeeResult: fee = max(min_fee_usdc, shares*rate*p*(1-p));
+        zero when disabled, shares<=0, or rate==0.
+    quantize_shares(size_usdc, fill_price, fee_estimate=0.0) -> float:
+        floor to SHARE_INCREMENT=0.01 after reserving fee_estimate.
+    fractional_kelly(bankroll, p_true, p_market, max_position, cfg)
+        -> KellyResult: stake under fractional Kelly with bankroll-pct
+        + min-stake guards; skip_reason ∈ {kelly_at_rail,
+        kelly_negative_edge, kelly_below_min, None}.
+    settlement_payout(shares, win) -> float: $1/share if win else $0.
+
+Invariants:
+    - clamp_price(p) ∈ [PRICE_MIN, PRICE_MAX] for any finite real p.
+    - fee_rate_for never raises (KeyError-free dict lookup).
+    - apply_slippage: effective_price ∈ [PRICE_MIN, PRICE_MAX]; walk >= 0
+      (magnitude — sign applied per side); applied=False ⇒ walk == 0.0.
+    - compute_fee: fee >= 0 for non-negative inputs; fee == 0 when
+      rate == 0 or shares <= 0 or cfg.enabled is False.
+    - quantize_shares: non-negative multiple of SHARE_INCREMENT; never
+      exceeds (size_usdc - fee_estimate) / fill_price.
+    - fractional_kelly: stake_usdc <= min(bankroll * max_bankroll_pct,
+      max_position_usdc, bankroll); stake==0 iff skip_reason set.
+
+Side effects:
+    None. No I/O, no global mutation.
+
+Failure modes (silent unless noted):
+    - clamp_price(NaN) -> PRICE_MAX (NaN comparison quirk).
+    - is_at_rail(NaN) -> False.
+    - apply_slippage(side=None) raises AttributeError.
+    - apply_slippage(side != "YES") behaves as NO.
+    - apply_slippage at rail: walk>0, applied=True, but effective_price
+      clamps back to mid — the walk is fictional.
+    - compute_fee(price=NaN) routes through clamp to PRICE_MAX.
+    - compute_fee(rate==0) bypasses the min_fee_usdc floor.
+    - quantize_shares(fill_price<=0) clamps to 0.01 and inflates shares.
+    - quantize_shares(fee_estimate>size_usdc) returns 0.0.
+    - fractional_kelly(p_true=NaN) propagates NaN, may return stake>0.
+    - settlement_payout(shares<0, win=True) returns shares (negative).
+
+Non-goals:
+    - No exchange / DB / clock access; wire via trader.py.
+    - No input validation (NaN/None/negative) — callers must guard.
+    - Gas drag, maker rebates, settlement tax, and spread_cost_bps all
+      live in trader.py; this module exposes config but does not apply
+      them.
 """
 
 from __future__ import annotations
@@ -13,6 +76,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from typing import Optional
+
+
+def _is_finite(*values: float) -> bool:
+    """Return True only if every value is a finite float (rejects NaN/inf)."""
+    return all(isinstance(v, (int, float)) and math.isfinite(v) for v in values)
 
 from config import (
     SimulateFeesConfig,
@@ -172,6 +240,8 @@ def fractional_kelly(
     p_market — current market-implied probability for that same outcome
                (i.e. the price we'd pay per share for the YES of our side)
     """
+    if not _is_finite(p_true, p_market, bankroll_usdc, max_position_usdc):
+        return KellyResult(0.0, 0.0, 0.0, 0.0, "kelly_nan_input")
     p_market = clamp_price(p_market)
     p_true = max(0.0, min(1.0, p_true))
     # b = payout/stake - 1 = (1 / p_market) - 1

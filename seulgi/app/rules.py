@@ -1,6 +1,57 @@
 """
 Manual-planning rules engine.
 
+## Specification (Phase 0 A0.10, 2026-05-22)
+
+Purpose
+    Parse markdown rule files in `seulgi/rules/*.md` into structured `Rule`
+    objects with pre-AI and post-AI predicates, applied per-engine via
+    `engines_exclude` allow-listing. Lets us A/B a single rule against a
+    subset of the engine population without forking the engine itself.
+
+Public interface
+    - `Rule` (dataclass): one compiled rule, exposed via `RuleEngine.rules`.
+    - `RuleEngine(rules_dir)`: loads + reloads `*.md` rules.
+    - `RuleEngine.gate_pre_ai_universal(...)`: rules with no engines_exclude;
+      called once per headline before per-engine fan-out.
+    - `RuleEngine.gate_pre_ai_scoped(..., engine_root)`: rules whose
+      `engines_exclude` is non-empty; called once per engine inside
+      `_run_engine`.
+    - `RuleEngine.gate_pre_ai(...)`: wrapper, kept for legacy `trader.py`.
+    - `RuleEngine.gate_post_ai(..., engine_root, direction, confidence)`.
+    Each gate returns `Rule.skip_reason()` (`RULE_<name>_SKIP`) on first
+    matching rule, else `None`.
+
+Invariants
+    - A rule fires iff (rule.enabled AND every declared predicate is true)
+      AND (engine_root NOT in rule.engines_exclude).
+    - Predicates compose via logical AND; an undeclared predicate is a
+      tautology (matches everything).
+    - Empty `engines_exclude` => rule applies to every engine.
+    - First matching rule wins; later rules are not evaluated.
+
+Side effects
+    - Filesystem read on `__init__` / `reload()` (synchronous, sorted).
+    - No DB writes, no network. Pure CPU + disk.
+
+Failure modes (logged warning + rule skipped, never raised)
+    - Missing `name` in frontmatter.
+    - Invalid `market_type` or `question_rx` regex.
+    - Unknown `stage` (defaults to `pre_ai`).
+    - Unresolved engine names in `engines_exclude` are NOT validated here —
+      they're inert (no engine matches => rule never excluded), audited
+      offline (see `reports/2026-05-22-rules-audit.md`).
+    - Missing frontmatter block: file silently ignored.
+
+Non-goals
+    - Rule revalidation / staleness checks (Phase 5 G.1 cadence).
+    - Rule mining from `decision_inputs` (Phase 4E.1 statistical scoring).
+    - `has_exceptions: true` AI-gated hybrid path (reserved; currently no-op).
+    - Quarterly purge of RETIRED rules (master plan G.6).
+
+────────────────────────────────────────────────────────────────────────────
+Original design notes follow below.
+
 A simple, deterministic predicate engine that gates trades based on
 user-curated heuristics in `seulgi/rules/*.md`. Each rule file has YAML-ish
 frontmatter declaring the conditions under which the rule fires, plus a

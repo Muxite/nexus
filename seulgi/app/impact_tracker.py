@@ -9,35 +9,64 @@ hypothesis:
     "Does critical news move Polymarket odds in a predictable direction
      within minutes, and can we profit by acting before the market adjusts?"
 
-Usage
-─────
-    tracker = PriceImpactTracker(db, session)
-    await tracker.start()                 # background polling loop
+## Specification
 
-    # When a significant match is found:
-    await tracker.record(
-        headline_id="abc123def456",
-        headline="Fed cuts rates by 25bp",
-        site_url="https://apnews.com",
-        condition_id="0x...",
-        question="Will the Fed cut rates in 2025?",
-        token_id="71321...",
-        direction="YES",
-        ai_confidence=0.82,
-        similarity=0.74,
-        source="news",
-    )
+Purpose
+    Background diagnostic monitor that anchors a price-impact row to
+    every *significant headline/market match* (NOT every trade), then
+    polls CLOB midpoints at +1m/+5m/+15m/+30m/+60m to fill
+    `price_impacts.price_t{bucket}` and derived `delta_t{bucket}`
+    columns. Also backfills full minute-fidelity (-1h..+1h) windows
+    into `price_timeseries` for offline analysis. Surfaces the realized
+    direction-vs-prediction signal that the post-mortem, plotter and
+    lessons aggregator consume.
 
-Dashboard output
-────────────────
-  data/dashboard/price_impact.txt — sorted by absolute 5m delta, last 100 rows
+Public interface
+    class PriceImpactTracker(db, dashboard_dir)
+      - await start()       # spawns _poll_loop / _dashboard_loop /
+                            #          _timeseries_backfill_loop
+      - await record(...)   # called fire-and-forget by engine.py for
+                            #          each survivor decision
+      - await close()
+    Module helpers exported to other modules:
+      - _fetch_price_history_window (used by market_context.py)
+      - classify_missed_alpha       (used by plotter.py)
+      - condition_id_short, MISSED_ALPHA_THRESH
 
-Significance filter
-───────────────────
-Only headlines meeting ALL of:
-  - AI confidence ≥ MIN_CONFIDENCE  (default 0.50)
-  - similarity    ≥ MIN_SIMILARITY  (default 0.55)
-are tracked. This avoids polluting the dataset with noise.
+Invariants
+    - One row per (headline_id × condition_id × direction) match
+      created in `record()`. Bucket columns are upserted in place by
+      `update_price_impact_snapshot`; never duplicated.
+    - Anchor is headline-detection time, NOT trade-open time. A row
+      exists for matches that never executed a trade.
+    - Significance gate: ai_confidence ≥ MIN_CONFIDENCE (0.50) AND
+      similarity ≥ MIN_SIMILARITY (0.55). Sub-threshold matches are
+      silently dropped.
+    - `timeseries_backfilled_at` is monotone: a row is backfilled at
+      most once even when CLOB returns empty.
+
+Side effects
+    - HTTP GET to clob.polymarket.com (/midpoint, /prices-history).
+    - DB writes: INSERT price_impacts, UPDATE price_impacts (bucket
+      cols + timeseries flag), batch INSERT price_timeseries.
+    - DB reads: get_pending_price_impacts, get_impacts_needing_timeseries,
+      get_price_impact_stats.
+    - File write: `<dashboard_dir>/price_impact.txt` every 60s.
+
+Failure modes
+    - HTTP timeout / non-200 → price recorded as None; row stays
+      "pending" until the next poll cycle.
+    - History fetch empty → row marked backfilled to avoid retry loop.
+    - Market closes before +60m → late buckets stay NULL; pending set
+      drops the row once price_t60m is filled (or never on dead tokens).
+    - aiohttp session loss → recreated on next `_get_session()`.
+
+Non-goals
+    - NOT trade execution (trader.py) or live position monitoring
+      (trader.monitor_positions @ 60s via main._position_monitor_loop).
+    - NOT book-depth analysis (Phase 4A.3 will add it).
+    - NOT on the critical path of `trader.evaluate`; all writes are
+      fire-and-forget via `asyncio.create_task` from engine.py.
 """
 
 from __future__ import annotations

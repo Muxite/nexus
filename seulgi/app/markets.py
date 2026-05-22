@@ -1,19 +1,65 @@
 """
 Market index for Seulgi.
 
-Responsibilities:
-  1. Fetch all open Polymarket markets from the Gamma REST API.
-  2. Embed each market question with all-MiniLM-L6-v2.
-  3. Persist markets + embeddings to SQLite.
-  4. Maintain an in-memory cosine similarity index (numpy matrix).
-  5. Expose find_matches(headline_embedding) → list of top-K markets.
+## Specification
+**Purpose.** Polymarket gamma-api adapter + SBERT-based MarketIndex with
+cosine-similarity lookup for headline → market matching. Single source of
+truth for the open-market universe; sole entry point for news→market
+similarity scoring.
 
-The index is rebuilt every `refresh_hours` hours so new markets are picked up
-without a restart. Embedding is the only slow step; it runs in a thread
-executor to avoid blocking the event loop.
+**Public interface.**
+  - `Market`, `MarketMatch` dataclasses.
+  - `Embedder` (sentence-transformers wrapper; load once, share with
+    `news_memory.NewsMemory`).
+  - `MarketIndex.refresh()` — fetch+embed+persist+rebuild matrix.
+  - `MarketIndex.load_from_db()` — boot path; rebuilds matrix from
+    persisted embeddings (no network).
+  - `MarketIndex.load_heat_from_db()` — populates the `match_count` heat
+    dict used for the cosine boost.
+  - `MarketIndex.find_matches(query_embedding) -> list[MarketMatch]` —
+    sole consumer surface (engine.process at engine.py:380).
+  - Module-level `_fetch_gamma_markets`, `_fetch_gamma_markets_capped`,
+    `_parse_market` — used directly only by `refresh()` today.
 
-Similarity search is a simple matrix dot-product (O(N * dim)); at typical
-Polymarket scale (~2000 markets, dim=384) this takes <5ms.
+**Invariants.**
+  - `find_matches` returns ≤ `cfg.markets.top_k` results, every result has
+    `similarity >= cfg.markets.similarity_threshold`, sorted by score
+    descending (stable).
+  - Heat boost is additive at most +0.05 (capped) and is applied BEFORE
+    the threshold filter and BEFORE the argsort — so it can change which
+    markets clear the threshold and the order they land in.
+  - `self._matrix.shape == (len(self._markets), 384)`; rows align by
+    index with `self._markets`.
+  - On `refresh()`, markets not in the fresh fetch are marked
+    `closed_at=now`; on `upsert_market` they're reopened
+    (`closed_at = NULL`). `load_from_db` filters `closed_at IS NULL`.
+
+**Side effects.**
+  - HTTP GET to `https://gamma-api.polymarket.com/markets` (paged 100/req).
+  - Loads `sentence-transformers/all-MiniLM-L6-v2` (~80MB, ~2s first run)
+    on first `embed()` call.
+  - Writes to `markets` table (`upsert_market`, `mark_markets_closed`,
+    `prune_closed_markets` — closed > 30d hard-deleted).
+  - Reads `markets.match_count` (heat). Bumped externally by
+    `db.bump_market_heat` in engine.process.
+
+**Failure modes.**
+  - Gamma API 422 on offset ≥ 10100 (universe ceiling) is silently
+    caught in `_fetch_gamma_markets` and treated as end-of-pagination —
+    the index caps out at ~10.1k markets. There is no Kalshi/Predictit
+    fallback today (Phase 4E.3).
+  - Empty refresh keeps the previous in-memory matrix (log "no valid
+    markets — keeping old index"); does NOT touch DB closed_at.
+  - Network/timeout from gamma is logged as a warning and ends
+    pagination early; partial fetches may incorrectly mark markets
+    closed.
+
+**Non-goals.**
+  - Per-market quality scoring (volume/liquidity/spread gates) — Phase 4E.3.
+  - Concept-link or tag-based routing — NOT IMPLEMENTED (Phase 4D.2 / 4E.2).
+  - Market discovery beyond polymarket (kalshi, predictit) — Phase 4E.3.
+  - Re-embedding after model swap — embeddings are written once per
+    refresh from whatever model `Embedder._MODEL_NAME` is set to.
 """
 
 from __future__ import annotations
