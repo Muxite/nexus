@@ -254,7 +254,14 @@ class PaperTrader(Trader):
             # Cash back: stake + realized (positive or negative)
             self._cash += size_usdc + realized
             await self._db.close_position(trade_id)
-            await self._db.close_trade(trade_id, realized, close_reason=close_reason)
+            # FIX-2B (2026-05-22): persist exit_price + entry_price_at_close
+            # so postmortems can reconcile realized_pnl from the trades row
+            # alone (positions row is deleted by close_position above).
+            await self._db.close_trade(
+                trade_id, realized, close_reason=close_reason,
+                exit_price=fill_price,
+                entry_price_at_close=entry_price,
+            )
 
         self._bus.emit(
             engine_name=self._cfg.engine_name, phase="exit", name="closed",

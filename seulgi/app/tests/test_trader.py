@@ -507,6 +507,26 @@ class TestMonitorPositions:
         assert trader.balance == pytest.approx(950.0 + size + expected_pnl, abs=0.01)
 
     @pytest.mark.asyncio
+    async def test_close_persists_exit_price_and_entry_price(self):
+        """FIX-2B: close_trade must receive exit_price + entry_price_at_close
+        on every close path so postmortems can reconcile from trades alone.
+        """
+        trader, db = _make_trader(balance=950.0)
+        # Force a WIN close at mid 0.97 (paper mode default).
+        position = self._make_position(price=0.97, age_hours=1.0, direction="YES")
+        db.get_open_positions = AsyncMock(return_value=[position])
+        captured = {}
+        db.close_trade = AsyncMock(side_effect=lambda *a, **kw: captured.update(kw) or captured.setdefault("_args", a))
+
+        with patch("trader._fetch_mid_price", AsyncMock(return_value=0.97)):
+            await trader.monitor_positions()
+
+        # exit_price falls through from the polled mid in paper mode.
+        assert captured.get("exit_price") == pytest.approx(0.97)
+        assert captured.get("entry_price_at_close") == pytest.approx(position["entry_price"])
+        assert captured.get("close_reason") == "WIN"
+
+    @pytest.mark.asyncio
     async def test_tp_gate_fee_aware_suppresses_net_loss(self):
         """FIX-2A: TP must not fire when realized net PnL after fees would be < 0.
 

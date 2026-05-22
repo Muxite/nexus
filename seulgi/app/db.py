@@ -1133,27 +1133,35 @@ class SeulgiDB:
         close_reason: Optional[str] = None,
         entry_fee_usdc: Optional[float] = None,
         exit_fee_usdc: Optional[float] = None,
+        exit_price: Optional[float] = None,
+        entry_price_at_close: Optional[float] = None,
     ) -> None:
         """Record the outcome of a closed position on the trade row.
 
         `entry_fee_usdc` / `exit_fee_usdc` are populated only under simulate
         mode's fidelity layer (plan §7.2). Left NULL otherwise.
+
+        FIX-2B (2026-05-22): `exit_price` (the effective fill price the
+        close was settled at — slipped mid for early exits; $1/$0 for
+        settlement rails) and `entry_price_at_close` (the position's
+        entry_price the close was computed against; sanity-check
+        anchor) are now persisted on every close path. Backfilled to
+        NULL on pre-migration rows — see scripts/db_migrations/
+        2026_05_22_add_exit_price.py. NULL-tolerant via COALESCE so
+        legacy callers (e.g. aggressive_core paper_trader) still work.
         """
-        if entry_fee_usdc is not None or exit_fee_usdc is not None:
-            await self._conn.execute(
-                """UPDATE trades SET realized_pnl = ?, closed_at = ?,
-                                     close_reason = ?,
-                                     entry_fee_usdc = COALESCE(?, entry_fee_usdc),
-                                     exit_fee_usdc  = ?
-                   WHERE id = ?""",
-                (realized_pnl, _now_iso(), close_reason,
-                 entry_fee_usdc, exit_fee_usdc, trade_id),
-            )
-        else:
-            await self._conn.execute(
-                "UPDATE trades SET realized_pnl = ?, closed_at = ?, close_reason = ? WHERE id = ?",
-                (realized_pnl, _now_iso(), close_reason, trade_id),
-            )
+        await self._conn.execute(
+            """UPDATE trades SET realized_pnl = ?, closed_at = ?,
+                                 close_reason = ?,
+                                 entry_fee_usdc       = COALESCE(?, entry_fee_usdc),
+                                 exit_fee_usdc        = COALESCE(?, exit_fee_usdc),
+                                 exit_price           = COALESCE(?, exit_price),
+                                 entry_price_at_close = COALESCE(?, entry_price_at_close)
+               WHERE id = ?""",
+            (realized_pnl, _now_iso(), close_reason,
+             entry_fee_usdc, exit_fee_usdc,
+             exit_price, entry_price_at_close, trade_id),
+        )
         await self._commit_if_unbatched()
 
     async def recent_trades(self, limit: int = 20) -> list[dict]:

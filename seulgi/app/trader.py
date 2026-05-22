@@ -1,7 +1,7 @@
 """
 Seulgi paper trader.
 
-## Specification (Phase 0 A0.3 — entry path; A0.4 covers exit; FIX-2A 2026-05-22 net-MTM gates)
+## Specification (Phase 0 A0.3 — entry path; A0.4 covers exit; FIX-2A 2026-05-22 net-MTM gates; FIX-2B 2026-05-22 exit_price persisted)
 
 Purpose
 -------
@@ -59,6 +59,14 @@ Invariants
   fee-blind TP/TRAIL closes that historically booked net losses on small
   stakes (2026-05-22-trader-exit-bugs.md §2.1, §8.2). SL is intentionally
   left gross — it is a downside trigger, not a profit gate.
+* FIX-2B (2026-05-22): every `close_trade(...)` call (COLD_CULL, main
+  early-exit, settlement RESOLVE_*) now passes `exit_price=` (the
+  effective fill price the close settled at — slipped mid, or $1/$0
+  for settlement rails) and `entry_price_at_close=pos["entry_price"]`
+  (sanity anchor). Before this, `positions` was deleted on close and
+  the realized exit price was unreconstructible from `trades` alone
+  (2026-05-22-trader-exit-bugs.md §5.1). Backfill: NULL on
+  pre-migration rows.
 
 Side effects
 ------------
@@ -1290,6 +1298,10 @@ class PaperTrader:
             gross = (price - pos["entry_price"]) * shares
             simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
             exit_fee = 0.0
+            # FIX-2B (2026-05-22): default the persisted exit_price to
+            # the polled mid; simulate mode overrides with the slipped
+            # effective_price below.
+            exit_price_realized = price
             if simulate_mode:
                 # FIX-1: plumb market_type from the position row so the
                 # per-category taker-fee rate (and slippage opt-out) applies
@@ -1302,6 +1314,7 @@ class PaperTrader:
                     market_type=pos_market_type, cfg=self._cfg.simulate_slippage,
                 )
                 exit_price = slip.effective_price
+                exit_price_realized = exit_price  # FIX-2B: persist the slipped fill price
                 fee_res = sim.compute_fee(shares, exit_price, pos_market_type,
                                           self._cfg.simulate_fees)
                 # E.7.2: gas drag on the exit leg too.
@@ -1325,6 +1338,8 @@ class PaperTrader:
                 await self._db.close_trade(
                     pos["trade_id"], pnl, close_reason="COLD_CULL",
                     exit_fee_usdc=(exit_fee if simulate_mode else None),
+                    exit_price=exit_price_realized,           # FIX-2B
+                    entry_price_at_close=pos["entry_price"],  # FIX-2B sanity anchor
                 )
             logger.info(
                 "[trader] COLD_CULL %s %s  exit=%.3f  pnl=%.2f",
@@ -1476,6 +1491,11 @@ class PaperTrader:
             # spread_cost_bps round-trip drag.
             simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
             exit_fee = 0.0
+            # FIX-2B (2026-05-22): default exit_price to the polled mid
+            # so the close_trade write always lands a value. The
+            # simulate branches below override to the slipped fill or
+            # the settlement rail ($1/$0).
+            exit_price = current_price
             if simulate_mode:
                 # WIN/LOSS price-rails in simulate mode mean the market has
                 # effectively resolved — settle at $1/$0 per share with no
@@ -1534,6 +1554,8 @@ class PaperTrader:
                 await self._db.close_trade(
                     trade_id, realized_pnl, close_reason=close_reason,
                     exit_fee_usdc=(exit_fee if simulate_mode else None),
+                    exit_price=exit_price,                  # FIX-2B
+                    entry_price_at_close=entry_price,       # FIX-2B sanity anchor
                 )
 
             sign = "+" if realized_pnl >= 0 else ""
