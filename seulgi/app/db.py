@@ -294,30 +294,24 @@ _MIGRATIONS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_usage_ts   ON usage_events(ts)",
     "CREATE INDEX IF NOT EXISTS idx_usage_kind ON usage_events(kind)",
-    # Continuous-reinforcement lessons table. Filled by the lessons aggregator
-    # (app/lessons.py) every N minutes from classified price_impacts. Active
-    # rows are injected into the AI batch prompt and (optionally) consulted by
-    # the trader for soft gates. rule_key is the canonical (source × market_type
-    # × conf_bucket) tuple as a string so we can UPSERT cheaply.
-    """CREATE TABLE IF NOT EXISTS lessons (
-        rule_key      TEXT PRIMARY KEY,
-        source        TEXT,
-        market_type   TEXT,
-        conf_bucket   TEXT,
-        support_n     INTEGER NOT NULL DEFAULT 0,
-        captured_n    INTEGER NOT NULL DEFAULT 0,
-        no_signal_n   INTEGER NOT NULL DEFAULT 0,
-        wrong_dir_n   INTEGER NOT NULL DEFAULT 0,
-        ic            REAL,
-        capture_rate  REAL,
-        action        TEXT,            -- 'note' | 'downweight' | 'skip' | 'invert'
-        note          TEXT,            -- one-line lesson for the AI prompt
-        seeded        INTEGER DEFAULT 0,  -- 1 if seeded from postmortem (no empirical support)
-        active        INTEGER NOT NULL DEFAULT 0,
-        updated_at    TEXT NOT NULL
-    )""",
-    "CREATE INDEX IF NOT EXISTS idx_lessons_active ON lessons(active)",
-    "CREATE INDEX IF NOT EXISTS idx_lessons_action ON lessons(action)",
+    # A1.4 (2026-05-22): drop the dead `lessons` table.
+    #
+    # History: `lessons` carried continuous-reinforcement notes injected
+    # into the AI prompt. Writer (`app/lessons.py`) was deleted in
+    # cycle-4; live DB shows 0 rows since cycle-3 retirement. Only stale
+    # reader is `scripts/analysis/sample_classify.py`, which gracefully
+    # no-ops on an empty result set and continues to work after the
+    # drop.
+    #
+    # `lesson_notes` was never a table — it's a Python variable name in
+    # the same script. Drop it defensively in case an older DB carries
+    # a stray table by that name (no harm if absent).
+    #
+    # Both DROPs are IF EXISTS → idempotent. Schema archive lives at
+    # `data/archive/lessons_2026_05_22.sql` (CREATE TABLE statements
+    # only — table is empty, no row export needed).
+    "DROP TABLE IF EXISTS lessons",
+    "DROP TABLE IF EXISTS lesson_notes",
     # Per-watcher health: persist content hash + churn so the watcher can
     # short-circuit identical fetches and adapt its polling interval across
     # restarts. Filled by SiteWatcher; read by the dashboard.
