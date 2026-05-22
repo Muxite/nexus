@@ -1,114 +1,58 @@
-"""
-Seulgi engine registry — multi-engine paper trading framework.
+"""Seulgi engine registry — multi-engine paper trading orchestrator.
 
-Multiple engines can run concurrently on the same headline stream and market
-data, each with a different rule set. Their results are recorded independently
-so you can compare strategies side-by-side.
-
-Each engine is just a PaperTrader with a named config profile. The Engine
-dataclass bundles the name, config, and trader together. The EngineRunner
-fans out each incoming headline to all registered engines in parallel.
-
-Result comparison lives in the `engine_results` DB table (one row per
-engine×trade decision) and is written to data/dashboard/engine_comparison.txt
-by the dashboard.
-
-Defining engines
-─────────────────
-Add entries under the `engines:` key in config.yaml:
-
-    engines:
-      - name: "aggressive"
-        min_edge: 0.03
-        edge_increment: 0.15
-        max_position_usdc: 150.0
-        min_confidence: 0.40
-
-      - name: "conservative"
-        min_edge: 0.08
-        edge_increment: 0.10
-        max_position_usdc: 50.0
-        min_confidence: 0.60
-
-Any unspecified field falls back to the global `trading:` defaults.
-
-If no `engines:` section exists, a single default engine named "default" is
-created from the global `trading:` config.
+Each engine is a PaperTrader with a named config profile. `EngineRunner`
+fans every headline out to all registered engines in parallel. Engines are
+declared under `engines:` in config.yaml; empty → one "default".
 
 ## Specification
-**Purpose.** Pipeline orchestrator from headline ingress to per-engine trader
-fan-out: embed → freshness assess → market match → mid-price prefetch → pre-AI
-rule gate → low-sim short-circuit → deterministic sim-gate (Stage 2) → market
-context → prediction LLM (Stage 3) → fan out classify results to every active
-engine concurrently → trader.evaluate → record decisions.
+**Purpose.** Pipeline orchestrator: ingress → signal → sim-gate → market
+context → predict (LLM) → fan-out → batched write.
 
 **Public interface.**
-- `Engine` dataclass — bundles `name`, `trader` (PaperTrader), `fixed_balance`,
-  legacy `relevance_keep_scores` (DEAD, see Failure modes).
-- `EngineRunner(engines, index, embedder, db, classifier, ...)` — fan-out hub.
-  - `await runner.process(headline)` — single-headline pipeline entry point.
-  - `await runner.monitor_positions()` — drives every engine's exit path.
-  - `await runner.close()` — closes shared aiohttp price session.
-  - `runner.engines` property — engine list.
+- `Engine(name, trader, fixed_balance=None)` — dataclass adapter.
+- `EngineRunner(engines, index, embedder, db, classifier, …)`:
+  `process(headline)`, `monitor_all_positions()`, `close()`, `engines`.
 - `build_engines(cfg, db, classifier, rule_engine=None) -> list[Engine]` —
-  factory (YAML engines + variants, optional aggressive_core, MULTI_CORE env).
+  YAML engines + variants + optional `AGGRESSIVE_CORE_ENABLE=1` core.
+
+**Pipeline stages.** Each log line starts with `[STAGE]`:
+- `[INGRESS]` — hour gate, embed, freshness, match, mid-prefetch, heat.
+- `[SIGNAL]` — `insert_signal`, freshness short-circuit, universal pre-AI.
+- `[SIM_GATE]` — low-sim short-circuit + per-match SIM_PASS/SIM_FAIL.
+- `[MARKET_CONTEXT]` — parallel CLOB pre-headline snapshot.
+- `[PREDICT]` — `classify_batch` (LLM or `SEULGI_BYPASS_LLM`).
+- `[FAN_OUT]` — `gather` under `db.batch()` with 90 s `wait_for`; scoped
+  rules + `trader.evaluate` + `record_engine_decisions` live here.
+- `[WRITE]` — implicit `db.batch()` `__aexit__` commit at FAN_OUT end.
+- `[BG]` — fire-and-forget tasks bound to `_bg_tasks` so the GC can't reap.
 
 **Invariants.**
-1. Exactly one `signals` row per non-trivially-rejected headline (after the
-   pre-match drops: embed-fail / no-match / all-no-price).
-2. Every engine in `active_engines` produces ≥1 `engine_results` row (or a
-   documented skip-row via `evaluate_*_skips`). Inactive (E.5b-paused)
-   engines produce nothing on the path; they appear in `_paused_engines`.
-3. `_batched_gather` MUST complete within 90 s (`wait_for` safety belt at
-   `process:608`). On timeout, the batch's `__aexit__` rolls back via the
-   shielded path; no half-applied state remains.
-4. `classify_batch` is called at most once per headline — every variant in
-   `active_engines` shares the same `classify_results`.
-5. Stage 2 = deterministic similarity floor (`min_top_similarity`, default
-   0.45 in constructor, 0.50 in production config). No LLM since 2026-05-22.
-6. Per-token mid-price cache TTL = 10 s; market-context cache TTL = 30 s
-   (inside `market_context`); engine hit-rate cache TTL = 300 s.
+1. Exactly one `signals` row per non-short-circuited headline.
+2. Each active engine gets exactly one `record_engine_decisions` call per
+   headline (decisions list may be empty on per-engine crash).
+3. `classify_batch` is called at most once per headline; results shared.
+4. `_batched_gather` MUST complete within 90 s; on timeout the `db.batch()`
+   `__aexit__` rolls back via the shielded path.
+5. Sim-gate is deterministic (similarity floor); no LLM since 2026-05-22.
 
-**Side effects.**
-- DB writes: `signals` (1× / headline), `engine_results` (1×/engine/decision
-  via `db.record_engine_decisions`), `usage_events` (Stage-3 token totals,
-  1×/headline), `market_price_snaps` (1×/kept-match), `markets_heat`
-  (bumped via `db.bump_market_heat`); indirect writes via `trader.evaluate`
-  → `trades`, `positions`, `balances`.
-- DB reads: `db.get_engine_rolling_hit_rate` (E.5b pause check, cached).
-- External I/O: CLOB mid-price fetch (shared aiohttp session), market-context
-  CLOB endpoint, embedder (run-in-executor), classifier (LLM via OpenRouter),
-  optional article body fetch (fire-and-forget task).
-- Dashboard hooks: balances, signal-journal, trades, traces, AI-paused flag.
+**Side effects.** DB writes: `signals`, `engine_results`, `usage_events`,
+`market_price_snaps`, `markets_heat`; indirect via `trader.evaluate` →
+`trades`, `positions`, `balances`. DB reads: `get_engine_rolling_hit_rate`.
+External I/O: CLOB mid + context, embedder, classifier, article body.
 
-**Failure modes.**
-- Embed error: log, drop headline (no signal row written).
-- `news_memory.assess` exception: silently downgrades to default
-  `FreshnessResult(label="BREAKING")` — fail-open. Boundary smell: BREAKING
-  bypasses every short-circuit, so a broken NewsMemory escalates token cost.
-- `find_matches` empty / all-no-price: log, return (no signal row).
-- `_engine_should_pause` DB read failure: returns False (engine stays active).
-- `_run_engine` `trader.evaluate` crash: caught per-engine; sets `decisions=[]`
-  so one bad variant doesn't poison the shared aiosqlite connection.
-- `_batched_gather` cancellation (e.g. wait_for timeout): `db.batch()`'s
-  shielded rollback releases the lock; lose at most one headline's decisions.
-- Classifier parse-failure: handled inside `ai.classify_batch` (returns
-  NEUTRAL ClassifyResults); engine treats them as normal survivors.
-- The hour-gate (`SEULGI_DISABLE_HOUR_GATE`) silently drops UTC 23/00/01
-  headlines before any DB write.
+**Failure modes.** Embed error: drop. `news_memory.assess`: fail-open to
+BREAKING. `find_matches` empty / all-no-price: drop. `_engine_should_pause`
+DB fail: engine stays active. Per-engine `evaluate` crash: decisions=[].
+90 s timeout: batch rollback, lose ≤ 1 headline. Hour gate: silent drop
+hours 23/00/01 UTC (`SEULGI_DISABLE_HOUR_GATE=1` disables).
 
-**Non-goals.**
-- Does NOT size trades, compute edge, write `trades` rows, or close
-  positions — that's `trader.py`.
-- Does NOT call the LLM directly — `ai.DirectionClassifier.classify_batch`.
-- Does NOT fetch the gamma-API market index or maintain embeddings —
-  `markets.py`.
-- Does NOT decide freshness labels — `news_memory.NewsMemory.assess`.
-- Does NOT poll OpenRouter budget — `budget.py` (when wired; budget short-
-  circuit not in this module today).
-- Does NOT persist `decision_inputs` / `llm_parse_failures` (Phase 5
-  capture hooks were drafted in handoff 2026-05-22-v2 but are not wired
-  into this file as of 2026-05-22).
+**Non-goals.** Does NOT size trades / compute edge / write trades / close
+positions (`trader.py`), call the LLM (`ai.py`), maintain market embeddings
+(`markets.py`), or decide freshness labels (`news_memory.py`).
+
+## Notes
+- TODO(Phase 4A.1): capital check belongs at INGRESS stage 0a (before embed
+  + match). Today only [PREDICT] AI-paused gates capital.
 """
 
 from __future__ import annotations
@@ -119,7 +63,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -136,143 +80,122 @@ from watcher import RawHeadline
 logger = logging.getLogger(__name__)
 
 
-# Lightweight verdict carrier — replaces the retired RelevanceVerdict
-# dataclass from relevance.py. Carries the sim-gate pass/fail decision so
-# trader._record can write a coherent relevance_score column.
+# Verdict carrier for the deterministic sim-gate. ai.py reads `.score` +
+# `.reason` for SIM_PASS/SIM_FAIL provenance in the prediction prompt;
+# trader._record reads them to write the `relevance_score` column.
 @dataclass
 class _SimVerdict:
-    keep: bool
     score: str   # "SIM_PASS" | "SIM_FAIL"
     reason: str
 
 
-# ---------------------------------------------------------------------------
-# Engine dataclass
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class Engine:
-    """
-    One trading engine — a named PaperTrader with its own rule set.
-
-    Multiple engines share the same classifier, market index, and DB
-    connection but maintain separate balances and position tables
-    (via the `engine_name` column).
-    """
+    """A named PaperTrader. Engines share classifier + market index but
+    keep separate balances/positions via `engine_name`."""
     name: str
     trader: PaperTrader
-    # Set to the parent EngineConfig.balance_usdc when YAML explicitly
-    # specifies a per-engine pot. main.py's simulate-mode split respects
-    # this — fixed-balance engines keep their pot; remaining engines split
-    # the remainder of simulate_total_usdc. None → engine pools in the split.
+    # Per-engine pot (None → engine pools in simulate-mode split). main.py
+    # respects this; fixed-balance engines keep their pot.
     fixed_balance: Optional[float] = None
-    # Per-engine relevance gate override. None → fall back to global
-    # `relevance.keep_scores`. When set, only markets with a Stage-2
-    # relevance verdict in this list reach this engine's trader.evaluate.
-    # 2026-05-21: production tightens to ["STRONG_YES"] (profitable);
-    # scout broadens to ["STRONG_YES","YES","WEAK"] for research data.
-    relevance_keep_scores: Optional[list[str]] = None
 
 
-# ---------------------------------------------------------------------------
-# EngineRunner
-# ---------------------------------------------------------------------------
+async def _gather_or_cancel(*coros, label: str):
+    """`asyncio.gather(..., return_exceptions=True)` with CancelledError
+    re-raised so parent `wait_for`/shutdown semantics survive. Real
+    exceptions are logged (`label` for traceability) and returned in-place.
+    """
+    results = await asyncio.gather(*coros, return_exceptions=True)
+    for r in results:
+        if isinstance(r, asyncio.CancelledError):
+            raise r
+    for r in results:
+        if isinstance(r, BaseException):
+            logger.warning("[FAN_OUT] %s sub-task error: %r", label, r)
+    return results
 
 
 class EngineRunner:
-    """
-    Fans out each headline to all registered engines concurrently.
-
-    Usage:
-        runner = EngineRunner(engines, index, embedder, db, dashboard)
-        await runner.process(headline)
-    """
+    """Fans every headline out to all registered engines concurrently. See
+    the module docstring for the per-stage contract."""
 
     def __init__(
-        self,
-        engines: list[Engine],
-        index: MarketIndex,
-        embedder: Embedder,
-        db: SeulgiDB,
-        classifier: DirectionClassifier,
-        rule_engine=None,     # Optional[RuleEngine] — shared across all variants
-        dashboard=None,       # Optional[Dashboard] — avoids circular import
-        news_memory=None,     # Optional[NewsMemory] — avoids circular import
-        impact_tracker=None,  # Optional[PriceImpactTracker] — avoids circular import
-        article_fetcher=None, # Optional[ArticleFetcher] — fire-and-forget body capture
-        market_context_cfg=None,  # Optional[MarketContextConfig] — Stage-3 input
-        min_top_similarity: float = 0.45,  # deterministic sim-gate floor
+        self, engines: list[Engine], index: MarketIndex, embedder: Embedder,
+        db: SeulgiDB, classifier: DirectionClassifier,
+        rule_engine=None, dashboard=None, news_memory=None,
+        impact_tracker=None, article_fetcher=None, market_context_cfg=None,
+        min_top_similarity: float = 0.45,
     ) -> None:
-        self._engines = engines
-        self._index = index
-        self._embedder = embedder
-        self._db = db
-        self._classifier = classifier
-        self._rules = rule_engine
+        self._engines, self._index, self._embedder = engines, index, embedder
+        self._db, self._classifier, self._rules = db, classifier, rule_engine
         self._dashboard = dashboard
         self._news_memory = news_memory
         self._impact_tracker = impact_tracker
         self._article_fetcher = article_fetcher
         self._min_top_similarity = float(min_top_similarity)
         self._mkt_ctx_cfg = market_context_cfg
-        # token_id → (MarketContext|None, fetched_at_unix). Shared across
-        # variants; 30s TTL is applied inside market_context.fetch_*.
-        self._mkt_ctx_cache: dict = {}
-        # Single shared aiohttp session for parallel price prefetches
+        self._mkt_ctx_cache: dict = {}  # 30s TTL inside market_context.fetch_*
         self._price_session: Optional[aiohttp.ClientSession] = None
-        # Mid-price TTL cache shared across headlines — cuts CLOB API traffic
-        # dramatically when a burst of headlines hits the same markets.
-        # token_id → (price_or_None, monotonic_expiry_secs)
+        # token_id → (price|None, monotonic_expiry); 10 s burst-traffic shield.
         self._price_cache: dict[str, tuple[Optional[float], float]] = {}
-        self._price_cache_ttl: float = 10.0   # seconds
-        # plan §3 — simulate mode: pause LLM calls when no engine has free
-        # capital. Determined from the engines' cfg.is_simulate() (engines all
-        # share the same global trading mode in main.py).
+        self._price_cache_ttl: float = 10.0
+        # Held refs for fire-and-forget tasks — without this set, the GC can
+        # reap an in-flight asyncio.create_task() mid-run.
+        self._bg_tasks: set[asyncio.Task] = set()
+        # plan §3 — simulate mode pauses LLM when no engine has free capital.
         self._simulate_mode: bool = bool(
-            engines and getattr(engines[0].trader.cfg, "mode", "paper") == "simulate"
-        )
+            engines and getattr(engines[0].trader.cfg, "mode", "paper") == "simulate")
         self._ai_paused: bool = False
-        # E.5b variant rolling hit-rate pause: cache (rate, n, expiry_monotonic)
-        # per engine_name. Refreshed every 300s; engines with last-50 hit-rate
-        # below 12% are skipped at dispatch time. Requires n >= 25 to engage
-        # so brand-new variants aren't paused on noise.
+        # E.5b: engines with last-50 hit-rate below floor are skipped at
+        # dispatch (n >= min_n so brand-new variants aren't paused on noise).
         self._hit_rate_cache: dict[str, tuple[float, int, float]] = {}
-        self._hit_rate_ttl_secs: float = 300.0
-        self._hit_rate_floor: float = 0.12
-        self._hit_rate_min_n: int = 25
+        self._hit_rate_ttl_secs, self._hit_rate_floor = 300.0, 0.12
+        self._hit_rate_min_n = 25
         self._paused_engines: set[str] = set()
 
-    async def _engine_should_pause(self, engine_name: str) -> bool:
-        """E.5b: True if engine's last-50 hit-rate is below the floor (n>=min_n)."""
+    def _spawn_bg(self, coro, *, name: str) -> None:
+        """Create a background task and hold a strong reference until done.
+        Prevents GC-collection of orphaned tasks; surfaces unhandled exceptions.
+        """
+        task = asyncio.create_task(coro, name=name)
+        self._bg_tasks.add(task)
+
+        def _on_done(t: asyncio.Task) -> None:
+            self._bg_tasks.discard(t)
+            if t.cancelled():
+                return
+            exc = t.exception()
+            if exc is not None:
+                logger.warning("[BG] task %s failed: %r", name, exc)
+
+        task.add_done_callback(_on_done)
+
+    async def _engine_should_pause(self, name: str) -> bool:
+        """E.5b: True if engine's last-50 hit-rate is below the floor."""
         from time import monotonic
         now = monotonic()
-        cached = self._hit_rate_cache.get(engine_name)
+        cached = self._hit_rate_cache.get(name)
         if cached is None or cached[2] < now:
             try:
-                rate, n = await self._db.get_engine_rolling_hit_rate(engine_name, 50)
+                rate, n = await self._db.get_engine_rolling_hit_rate(name, 50)
             except Exception:  # noqa: BLE001
                 return False
             rate_val = rate if rate is not None else 1.0  # unknown → don't pause
-            self._hit_rate_cache[engine_name] = (rate_val, n, now + self._hit_rate_ttl_secs)
-        rate_val, n, _ = self._hit_rate_cache[engine_name]
+            self._hit_rate_cache[name] = (rate_val, n, now + self._hit_rate_ttl_secs)
+        rate_val, n, _ = self._hit_rate_cache[name]
         paused = (n >= self._hit_rate_min_n and rate_val < self._hit_rate_floor)
-        if paused and engine_name not in self._paused_engines:
-            self._paused_engines.add(engine_name)
-            logger.info(
-                "[runner] E.5b PAUSE engine '%s' — rolling-%d hit_rate=%.1f%% < %.0f%% floor",
-                engine_name, n, rate_val * 100, self._hit_rate_floor * 100,
-            )
-        elif (not paused) and engine_name in self._paused_engines:
-            self._paused_engines.discard(engine_name)
-            logger.info(
-                "[runner] E.5b RESUME engine '%s' — rolling-%d hit_rate=%.1f%% >= floor",
-                engine_name, n, rate_val * 100,
-            )
+        if paused and name not in self._paused_engines:
+            self._paused_engines.add(name)
+            logger.info("[FAN_OUT] E.5b PAUSE '%s' — rolling-%d hit_rate=%.1f%% < %.0f%%",
+                        name, n, rate_val * 100, self._hit_rate_floor * 100)
+        elif (not paused) and name in self._paused_engines:
+            self._paused_engines.discard(name)
+            logger.info("[FAN_OUT] E.5b RESUME '%s' — rolling-%d hit_rate=%.1f%%",
+                        name, n, rate_val * 100)
         return paused
 
     def _ai_should_pause(self) -> bool:
-        """plan §3 — every active simulate engine is fully staked? Skip the LLM."""
+        """plan §3 — every active simulate engine fully staked? Skip the LLM."""
         if not self._simulate_mode:
             return False
         for e in self._engines:
@@ -282,21 +205,18 @@ class EngineRunner:
         return True
 
     def _update_ai_pause_state(self) -> bool:
-        """Recompute the pause flag, log on edges, notify dashboard. Returns paused."""
+        """Recompute the pause flag, log on edges, notify dashboard."""
         paused = self._ai_should_pause()
         if paused != self._ai_paused:
             self._ai_paused = paused
             logger.info(
-                "[runner] simulate AI %s — global free=%.2f across %d engines",
+                "[PREDICT] simulate AI %s — global free=%.2f across %d engines",
                 "paused (no free capital)" if paused else "resumed",
-                sum(e.trader.balance for e in self._engines),
-                len(self._engines),
+                sum(e.trader.balance for e in self._engines), len(self._engines),
             )
             if self._dashboard is not None:
-                try:
-                    self._dashboard.set_ai_paused(paused)
-                except Exception:  # noqa: BLE001
-                    pass
+                try: self._dashboard.set_ai_paused(paused)
+                except Exception: pass  # noqa: BLE001, E701
         return paused
 
     def _get_price_session(self) -> aiohttp.ClientSession:
@@ -309,416 +229,277 @@ class EngineRunner:
             await self._price_session.close()
 
     async def process(self, headline: RawHeadline) -> None:
-        """
-        Embed headline, check for republish, find matches, fan out to engines.
-        """
+        """Embed → freshness → match → sim-gate → predict → fan-out."""
         _t0 = time.monotonic()
         hid = getattr(headline, "headline_id", "")
-        # Phase-E E11 (2026-05-19): UTC hour dead-zone pause. Forensic of
-        # 190 organic closes showed hours 23/00/01 UTC produced 28 trades
-        # at 0/0/28% hit and −$1.83 combined. Disable via env var
-        # SEULGI_DISABLE_HOUR_GATE=1 if a future regime warrants reopening.
+
+        # ── INGRESS ──────────────────────────────────────────────────────
+        # TODO(Phase 4A.1): capital check belongs HERE (stage 0a) — BEFORE
+        # embed + match. Today [PREDICT] AI-paused is the only capital gate.
+        # Phase-E E11: drop UTC hours 23/00/01 (`SEULGI_DISABLE_HOUR_GATE=1`).
         if os.getenv("SEULGI_DISABLE_HOUR_GATE") != "1":
-            _hour_utc = datetime.now(timezone.utc).hour
-            if _hour_utc in (23, 0, 1):
-                logger.debug("[runner] [hid=%s] hour_gate: skipping (UTC %02d)", hid, _hour_utc)
+            h = datetime.now(timezone.utc).hour
+            if h in (23, 0, 1):
+                logger.debug("[INGRESS] [hid=%s] hour_gate skip (UTC %02d)", hid, h)
                 return
-        # Fire-and-forget article body capture — runs in parallel with the rest
-        # of the pipeline; never blocks the trade decision. Data collection
-        # only (lands in headline_articles for later analysis / re-classification).
         if self._article_fetcher is not None and getattr(headline, "article_url", None):
-            asyncio.create_task(
+            self._spawn_bg(
                 self._article_fetcher.fetch_and_store(
-                    headline_id=hid,
-                    article_url=headline.article_url,
-                    site_url=headline.site_url,
-                ),
+                    headline_id=hid, article_url=headline.article_url,
+                    site_url=headline.site_url),
                 name=f"article_fetch:{hid}",
             )
-        loop = asyncio.get_event_loop()
         try:
-            embedding = await loop.run_in_executor(
-                None, self._embedder.embed, headline.headline
-            )
+            embedding = await asyncio.get_event_loop().run_in_executor(
+                None, self._embedder.embed, headline.headline)
         except Exception as exc:
-            logger.warning("[runner] [hid=%s] embed error: %s", hid, exc)
+            logger.warning("[INGRESS] [hid=%s] embed error: %s", hid, exc)
             return
-
-        # ── Stage 0: freshness assessment (cycle 9) ─────────────────────────
-        # Replaces the binary republish check with a labelled freshness
-        # signal + top-N prior-coverage context. The label drives the
-        # REHASH short-circuit below and feeds Stages 2/3.
-        from news_memory import FreshnessResult  # local import — avoid cycles
-        freshness: FreshnessResult = FreshnessResult(label="BREAKING")
-        if self._news_memory is not None:
-            try:
-                freshness = await loop.run_in_executor(
-                    None,
-                    self._news_memory.assess,
-                    headline.headline,
-                    embedding,
-                    headline.site_url,
-                    headline.article_url,
-                )
-                logger.info(
-                    "[runner] [hid=%s] freshness=%s dist=%.3f age=%ss",
-                    hid, freshness.label,
-                    freshness.nearest_dist or 0.0,
-                    int(freshness.nearest_age_secs or 0),
-                )
-            except Exception as exc:
-                logger.debug("[runner] news_memory.assess error: %s", exc)
-
-        # Stash on headline so downstream code (impact tracker, trader) can read.
-        is_republish = freshness.is_republish
-        similar_to = freshness.similar_to
-        headline._is_republish = is_republish
-        headline._similar_to = similar_to
+        freshness = await self._assess_freshness(headline, embedding, hid)
+        # Mirror freshness on the headline so downstream can read it.
+        headline._is_republish = freshness.is_republish
+        headline._similar_to = freshness.similar_to
         headline._freshness_label = freshness.label
         headline._nearest_age_secs = freshness.nearest_age_secs
-
         matches = self._index.find_matches(embedding)
         if not matches:
-            logger.debug("[runner] [hid=%s] no matches: %s", hid, headline.headline[:80])
+            logger.debug("[INGRESS] [hid=%s] no matches: %s", hid, headline.headline[:80])
             return
-
-        # Bump heat scores for matched markets — awaited so it joins the
-        # outer db.batch() in process() instead of escaping into its own
-        # transaction (Phase B coalescing).
         await self._db.bump_market_heat([m.condition_id for m in matches])
-
-        # ── Parallel mid-price prefetch ─────────────────────────────────────
-        # Fetch every match's YES and NO mid price in ONE gather. Drops matches
-        # where neither token has a price (almost always a closed market) BEFORE
-        # the AI sees them, saving tokens and producing meaningful AI input.
         matches = await self._prefetch_prices(matches, hid)
         if not matches:
-            logger.info("[runner] [hid=%s] all matches dropped (no_price) — likely stale tokens",
-                        hid)
+            logger.info("[INGRESS] [hid=%s] all matches dropped (no_price)", hid)
             return
-
-        source = headline.source
         logger.info(
-            "[runner] [hid=%s] '%s' matched %d markets (freshness=%s) — dispatching to %d engines",
-            hid, headline.headline[:60], len(matches), freshness.label, len(self._engines),
+            "[INGRESS] [hid=%s] '%s' matched %d markets (freshness=%s) — "
+            "dispatching to %d engines", hid, headline.headline[:60],
+            len(matches), freshness.label, len(self._engines),
         )
 
-        # ── Signal insert (shared across all variants) ──────────────────────
-        # Freshness label + nearest-age land on the signal row so reporting
-        # can join trades→signals on freshness without parsing trade rows.
+        # ── SIGNAL ───────────────────────────────────────────────────────
         signal_id = await self._db.insert_signal(
-            site_url=headline.site_url,
-            headline=headline.headline,
+            site_url=headline.site_url, headline=headline.headline,
             headline_id=getattr(headline, "headline_id", None),
             freshness_label=freshness.label,
             nearest_age_secs=freshness.nearest_age_secs,
         )
-
-        # ── Freshness short-circuit (cycle-13 generalised) ──────────────────
-        # Configurable list of freshness labels that bypass Stage 2 + Stage 3
-        # entirely. REHASH was the original cycle-9 entry. STALE_RETURN added
-        # after the per-label win/loss report showed it lost −$138.64 over
-        # 26 closed trades — paying LLM tokens to lose money is the worst
-        # quadrant of the cost/benefit grid.
-        sc_labels = []
-        if self._news_memory is not None:
-            sc_labels = getattr(self._news_memory, "_short_circuit_labels", []) or []
+        sc_labels = (getattr(self._news_memory, "_short_circuit_labels", []) or []
+                     if self._news_memory is not None else [])
         if freshness.label in sc_labels:
-            logger.info(
-                "[runner] [hid=%s] %s short-circuit — %d variants × %d matches skipped",
-                hid, freshness.label, len(self._engines), len(matches),
-            )
-            await asyncio.gather(
-                *[
-                    engine.trader.evaluate_freshness_skips(
-                        signal_id, headline, matches,
-                        freshness_label=freshness.label,
-                        nearest_age_secs=freshness.nearest_age_secs,
-                    )
-                    for engine in self._engines
-                ],
-                return_exceptions=True,
-            )
+            logger.info("[SIGNAL] [hid=%s] %s short-circuit — %d×%d skipped",
+                        hid, freshness.label, len(self._engines), len(matches))
+            await _gather_or_cancel(*[
+                e.trader.evaluate_freshness_skips(
+                    signal_id, headline, matches,
+                    freshness_label=freshness.label,
+                    nearest_age_secs=freshness.nearest_age_secs,
+                ) for e in self._engines], label="freshness_skip")
             return
-
-        # ── Pre-AI rule gate (two-tier: universal here, scoped per-engine) ──
-        # Shared pass runs only "universal" rules (those with empty
-        # `engines_exclude`). Rules that opt some engine out via
-        # `engines_exclude: <name>` defer to per-engine evaluation inside
-        # `_run_engine`, so scout can bypass them while production engines
-        # still apply them. The shared pass keeps the optimization for
-        # truly-universal rules; today's 7 scout-excluding rules all run
-        # in the per-engine pass.
+        # Universal pre-AI rules; scoped rules run per-engine in _run_engine.
         pre_skips: list[tuple[MarketMatch, str]] = []
         survivors: list[MarketMatch] = []
-        if self._rules is not None:
+        if self._rules is None:
+            survivors = list(matches)
+        else:
             for m in matches:
-                reason = self._rules.gate_pre_ai_universal(
+                r = self._rules.gate_pre_ai_universal(
                     market_type=m.market_type, mid_price=m.mid_yes,
-                    freshness_label=freshness.label,
-                    question=m.question,
-                )
-                if reason is None:
+                    freshness_label=freshness.label, question=m.question)
+                if r is None:
                     survivors.append(m)
                 else:
-                    pre_skips.append((m, reason))
-        else:
-            survivors = list(matches)
+                    pre_skips.append((m, r))
 
-        # ── Low-similarity short-circuit (cycle-13 token reduction) ─────────
-        # If even the best embedding match scores below the relevance
-        # threshold, short-circuit — the headline isn't about any market.
-        # Per-variant skip rows tag the bypass so the funnel reflects it.
-        min_top_sim = self._min_top_similarity
-        if survivors and min_top_sim > 0:
+        # ── SIM_GATE ─────────────────────────────────────────────────────
+        if survivors and self._min_top_similarity > 0:
             max_sim = max(getattr(m, "similarity", 0.0) for m in survivors)
-            if max_sim < min_top_sim:
+            if max_sim < self._min_top_similarity:
                 logger.info(
-                    "[runner] [hid=%s] low_similarity short-circuit "
-                    "(max_sim=%.3f < %.2f) — %d variants × %d matches skipped",
-                    hid, max_sim, min_top_sim,
-                    len(self._engines), len(survivors),
+                    "[SIM_GATE] [hid=%s] low_similarity short-circuit "
+                    "(max_sim=%.3f < %.2f) — %d×%d skipped", hid, max_sim,
+                    self._min_top_similarity, len(self._engines), len(survivors),
                 )
                 reason = f"low_similarity:{max_sim:.3f}"
-                await asyncio.gather(
-                    *[
-                        engine.trader.evaluate_low_sim_skips(
-                            signal_id, headline, survivors, reason=reason,
-                            max_sim=max_sim,
-                        )
-                        for engine in self._engines
-                    ],
-                    return_exceptions=True,
-                )
+                await _gather_or_cancel(*[
+                    e.trader.evaluate_low_sim_skips(
+                        signal_id, headline, survivors, reason=reason,
+                        max_sim=max_sim,
+                    ) for e in self._engines], label="low_sim_skip")
                 return
 
-        # ── Stage 2: deterministic similarity gate (2026-05-22) ─────────────
-        # Replaces the relevance LLM (gemini-2.5-flash-lite) which was in
-        # a continuous parse-failure → fail-open storm: ~$5/day in tokens
-        # and filtered nothing. Per-market matches below the similarity
-        # floor are dropped here and tagged SIM_FAIL so trader._record
-        # writes a coherent relevance_score column. Per-engine
-        # `relevance_keep_scores` is no longer honoured — every engine
-        # sees the same survivor set.
         source_host: Optional[str] = None
         if headline.site_url:
             try:
                 source_host = urlparse(headline.site_url).netloc or None
             except Exception:  # noqa: BLE001
-                source_host = None
+                pass
+        survivors, relevance_skips, rv_kept = self._sim_gate_split(survivors, hid)
 
-        relevance_skips: list = []
-        relevance_verdicts_kept: list = []
-        if survivors:
-            sim_floor = float(self._min_top_similarity)
-            survivors_kept: list[MarketMatch] = []
-            verdicts_kept: list[_SimVerdict] = []
-            for m in survivors:
-                if (m.similarity or 0.0) >= sim_floor:
-                    v = _SimVerdict(keep=True, score="SIM_PASS",
-                                    reason=f"sim={m.similarity:.3f}")
-                    m._relevance_score = "SIM_PASS"
-                    m._relevance_reason = v.reason
-                    survivors_kept.append(m)
-                    verdicts_kept.append(v)
-                else:
-                    v = _SimVerdict(keep=False, score="SIM_FAIL",
-                                    reason=f"sim={m.similarity:.3f}<{sim_floor:.2f}")
-                    m._relevance_score = "SIM_FAIL"
-                    m._relevance_reason = v.reason
-                    relevance_skips.append((m, v))
-            relevance_verdicts_kept = verdicts_kept
-            n_in = len(survivors_kept) + len(relevance_skips)
-            survivors = survivors_kept
-            logger.info(
-                "[runner] [hid=%s] sim-gate kept %d/%d (floor=%.2f)",
-                hid, len(survivors_kept), n_in, sim_floor,
-            )
+        # ── MARKET_CONTEXT ───────────────────────────────────────────────
+        await self._fetch_market_context(survivors, hid)
 
-        # ── Cycle-11: pre-headline market context (parallel CLOB fetch) ─
-        # Run AFTER relevance gate so only kept markets pay the network
-        # cost. Stashes `_mkt_ctx` on each survivor; ai.py reads it for
-        # the prompt block and trader.py persists it on trade rows.
-        mctx_cfg = self._mkt_ctx_cfg
-        window_secs = mctx_cfg.window_secs if mctx_cfg else 1800
-        mctx_enabled = mctx_cfg.enabled if mctx_cfg else True
-        if mctx_enabled and survivors:
-            try:
-                from market_context import fetch_context_for_matches
-                mctx_session = self._get_price_session()
-                mctx_meta = await fetch_context_for_matches(
-                    mctx_session, survivors,
-                    window_secs=window_secs,
-                    cache=self._mkt_ctx_cache,
-                )
-                logger.info(
-                    "[runner] [hid=%s] market_context: %d/%d fetched in %dms",
-                    hid, mctx_meta["n_fetched"], mctx_meta["n_in"],
-                    int(mctx_meta["elapsed_ms"]),
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[runner] market_context error: %s — proceeding without", exc)
-
-        # ── Stage 3: prediction (existing classify_batch, now with freshness) ─
-        classify_results: list[ClassifyResult] = []
-        prompt_meta: dict = {}
-        # plan §3 — simulate mode: short-circuit if every engine is fully
-        # staked. No LLM call, but persist skip rows per engine × match so
-        # the decision funnel still sees the headline.
+        # ── PREDICT ──────────────────────────────────────────────────────
         if survivors and self._update_ai_pause_state():
-            logger.info(
-                "[runner] [hid=%s] ai_paused_no_capital short-circuit — "
-                "%d variants × %d matches skipped",
-                hid, len(self._engines), len(survivors),
-            )
-            await asyncio.gather(
-                *[
-                    engine.trader.evaluate_ai_paused_skips(
-                        signal_id, headline, survivors,
-                    )
-                    for engine in self._engines
-                ],
-                return_exceptions=True,
-            )
+            logger.info("[PREDICT] [hid=%s] ai_paused_no_capital — %d×%d skipped",
+                        hid, len(self._engines), len(survivors))
+            await _gather_or_cancel(*[
+                e.trader.evaluate_ai_paused_skips(signal_id, headline, survivors)
+                for e in self._engines], label="ai_paused_skip")
             return
-        if survivors:
-            classify_results, prompt_meta = await self._classifier.classify_batch(
-                headline=headline.headline,
-                matches=survivors,
-                is_republish=is_republish,
-                similar_to=similar_to,
-                source=source_host,
-                freshness=freshness,
-                relevance_verdicts=relevance_verdicts_kept or None,
-            )
-            # ONE usage_events row per headline — tokens are shared across all
-            # variants by construction. A1.6: bypass rows land here too (with
-            # count=0, provider='llm_bypass') so cost dashboards show $0 burn
-            # explicitly instead of a silent gap in the usage_events stream.
-            tokens_used = sum(r.tokens_used for r in classify_results)
-            is_bypass = bool(prompt_meta.get("bypass"))
-            if tokens_used or is_bypass:
-                await self._db.log_usage(
-                    kind="ai_tokens",
-                    count=float(tokens_used),
-                    provider=prompt_meta.get("model"),
-                    meta=json.dumps({"hid": hid, "n_markets": len(survivors),
-                                     "stage": "prediction",
-                                     **({"bypass": True} if is_bypass else {})}),
-                )
 
+        classify_results, prompt_meta = await self._predict(
+            headline, survivors, freshness, source_host, rv_kept, hid,
+        )
         prompt_meta_json = (
             json.dumps(prompt_meta, separators=(",", ":")) if prompt_meta else None
         )
-
-        # Embed + dedup + match time — passed in; AI call time is measured per-engine
         pre_ms = (time.monotonic() - _t0) * 1000.0
+        active_engines = [e for e in self._engines  # E.5b rolling hit-rate guard
+                          if not await self._engine_should_pause(e.name)]
 
-        # E.5b: skip engines paused by the rolling hit-rate guard. Computed
-        # once per headline (cache hides the DB cost). Paused engines log on
-        # state transition only, never per-headline.
-        active_engines: list[Engine] = []
-        for engine in self._engines:
-            if await self._engine_should_pause(engine.name):
-                continue
-            active_engines.append(engine)
-
-        # Fan out to all engines/variants concurrently. Every engine sees the
-        # same signal_id, same classify_results, same prompt_meta, same
-        # relevance_skips list (each variant persists its own copy).
-        #
-        # 2026-05-21 07:30 UTC: re-wrap the gather in db.batch() with
-        # a per-headline timeout. The full story:
-        #
-        #   - Unwrapping the batch (07:10) caused massive "database is
-        #     locked" errors because 15 engines × ~25 markets × ~3
-        #     concurrent process() tasks all committed individually
-        #     against a single SQLite writer with busy_timeout=30s.
-        #     ~6000 concurrent commits → contention → cascading
-        #     OperationalError('database is locked') in runner tasks.
-        #
-        #   - But re-wrapping naively brought back the OTHER symptom:
-        #     occasional gather hang leaving the batch transaction
-        #     open indefinitely (4+ hours of zero trades earlier today).
-        #     The root cause is unknown (task #24) — suspect an
-        #     asyncio+aiosqlite worker-thread wake-up edge case
-        #     production triggers but the harness does not.
-        #
-        #   - The synthesis: keep the batch coalescing (one commit per
-        #     headline = ~1 fsync) AND wrap in asyncio.wait_for so a
-        #     hung gather can't poison the writer. On timeout: the
-        #     CancelledError unwinds the batch via its rollback path,
-        #     the lock releases, the bot resumes. We lose at most
-        #     one headline's trade decisions per timeout (rare); the
-        #     pre-batch writes (insert_signal, log_usage, etc.) are
-        #     already committed and unaffected.
-        #
-        #   - Replay harness validates this combination at 500/c=16
-        #     with zero gaps. Production soak in progress to confirm.
-        # 2026-05-21 08:50 UTC: timeout MUST be OUTSIDE the batch context
-        # manager, not inside. Earlier the wait_for was nested inside
-        # `async with db.batch():` — but `async with` calls __aenter__
-        # which awaits the lock and runs BEGIN BEFORE the body. If
-        # that __aenter__ hangs (the actual production failure mode —
-        # aiosqlite worker thread stuck holding a cursor result the
-        # event loop never woke for), the timeout inside the body
-        # never runs because we never enter the body. With the
-        # timeout wrapping the whole async-with, a hang in __aenter__
-        # IS caught: asyncio.wait_for cancels the awaiting
-        # coroutine, which triggers __aexit__ via the cancellation
-        # path → rollback → lock release.
+        # ── FAN_OUT ──────────────────────────────────────────────────────
+        # db.batch() coalesces fsyncs; the 90 s outer wait_for wraps the whole
+        # async-with so a hang in __aenter__ (cycle-2 prod failure mode) is
+        # still cancelable. See reports/2026-05-22-bugs-cycle2.md §1.
         async def _batched_gather():
             async with self._db.batch():
-                return await asyncio.gather(
-                    *[
-                        self._run_engine(
-                            engine, headline, signal_id,
-                            survivors, classify_results, prompt_meta_json,
-                            pre_skips, pre_ms, relevance_skips=relevance_skips,
-                            freshness_label=freshness.label,
-                        )
-                        for engine in active_engines
-                    ],
-                    return_exceptions=True,
-                )
+                return await _gather_or_cancel(*[
+                    self._run_engine(
+                        engine, headline, signal_id, survivors,
+                        classify_results, prompt_meta_json,
+                        pre_skips, pre_ms, relevance_skips=relevance_skips,
+                        freshness_label=freshness.label,
+                    ) for engine in active_engines], label="run_engine")
 
         results: list[list[TradeDecision]] = []
         try:
             results = await asyncio.wait_for(_batched_gather(), timeout=90.0)
         except asyncio.TimeoutError:
             logger.error(
-                "[runner] [hid=%s] ENGINE GATHER TIMEOUT 90 s — batch "
-                "cancelled, lock released via __aexit__. %d engines "
-                "were running.", hid, len(active_engines),
+                "[FAN_OUT] [hid=%s] gather TIMEOUT 90s — batch cancelled, lock "
+                "released via __aexit__. %d engines were running.",
+                hid, len(active_engines),
             )
             results = []
 
-        for engine, engine_results in zip(active_engines, results):
-            if isinstance(engine_results, BaseException):
-                logger.warning("[runner] engine '%s' error: %s", engine.name, engine_results)
+        for engine, eng_results in zip(active_engines, results):
+            if isinstance(eng_results, BaseException):
+                logger.warning("[FAN_OUT] engine '%s' error: %s",
+                               engine.name, eng_results)
                 continue
-            executed = [d for d in engine_results if d.executed]
+            executed = [d for d in eng_results if d.executed]
             if executed:
                 logger.info(
-                    "[runner] engine '%s' executed %d/%d trades  balance=%.2f",
-                    engine.name, len(executed), len(engine_results),
+                    "[FAN_OUT] engine '%s' executed %d/%d trades  balance=%.2f",
+                    engine.name, len(executed), len(eng_results),
                     engine.trader.balance,
                 )
+
+    async def _assess_freshness(self, headline: RawHeadline, embedding, hid: str):
+        from news_memory import FreshnessResult  # local — avoid import cycle
+        if self._news_memory is None:
+            return FreshnessResult(label="BREAKING")
+        try:
+            freshness = await asyncio.get_event_loop().run_in_executor(
+                None, self._news_memory.assess, headline.headline,
+                embedding, headline.site_url, headline.article_url,
+            )
+            logger.info(
+                "[INGRESS] [hid=%s] freshness=%s dist=%.3f age=%ss",
+                hid, freshness.label, freshness.nearest_dist or 0.0,
+                int(freshness.nearest_age_secs or 0),
+            )
+            return freshness
+        except Exception as exc:
+            logger.debug("[INGRESS] news_memory.assess error: %s", exc)
+            return FreshnessResult(label="BREAKING")
+
+    def _sim_gate_split(
+        self, survivors: list[MarketMatch], hid: str,
+    ) -> tuple[list[MarketMatch], list, list[_SimVerdict]]:
+        """Per-match deterministic SIM_PASS / SIM_FAIL bucketing."""
+        if not survivors:
+            return [], [], []
+        sim_floor = float(self._min_top_similarity)
+        kept: list[MarketMatch] = []
+        kept_v: list[_SimVerdict] = []
+        skipped: list = []
+        for m in survivors:
+            sim = m.similarity or 0.0
+            if sim >= sim_floor:
+                v = _SimVerdict("SIM_PASS", f"sim={sim:.3f}")
+                kept.append(m); kept_v.append(v)
+            else:
+                v = _SimVerdict("SIM_FAIL", f"sim={sim:.3f}<{sim_floor:.2f}")
+                skipped.append((m, v))
+            m._relevance_score, m._relevance_reason = v.score, v.reason
+        logger.info("[SIM_GATE] [hid=%s] kept %d/%d (floor=%.2f)",
+                    hid, len(kept), len(kept) + len(skipped), sim_floor)
+        return kept, skipped, kept_v
+
+    async def _fetch_market_context(
+        self, survivors: list[MarketMatch], hid: str,
+    ) -> None:
+        """Parallel CLOB pre-headline snapshot (only kept markets pay)."""
+        cfg = self._mkt_ctx_cfg
+        if not survivors or (cfg is not None and not cfg.enabled):
+            return
+        try:
+            from market_context import fetch_context_for_matches
+            meta = await fetch_context_for_matches(
+                self._get_price_session(), survivors,
+                window_secs=(cfg.window_secs if cfg else 1800),
+                cache=self._mkt_ctx_cache,
+            )
+            logger.info("[MARKET_CONTEXT] [hid=%s] %d/%d fetched in %dms",
+                        hid, meta["n_fetched"], meta["n_in"],
+                        int(meta["elapsed_ms"]))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[MARKET_CONTEXT] error: %s — proceeding without", exc)
+
+    async def _predict(
+        self, headline: RawHeadline, survivors: list[MarketMatch],
+        freshness, source_host: Optional[str],
+        relevance_verdicts_kept: list[_SimVerdict], hid: str,
+    ) -> tuple[list[ClassifyResult], dict]:
+        """LLM ensemble (or SEULGI_BYPASS_LLM synthetic) + token logging."""
+        if not survivors:
+            return [], {}
+        results, meta = await self._classifier.classify_batch(
+            headline=headline.headline, matches=survivors,
+            is_republish=freshness.is_republish, similar_to=freshness.similar_to,
+            source=source_host, freshness=freshness,
+            relevance_verdicts=relevance_verdicts_kept or None,
+        )
+        # ONE usage_events row per headline; A1.6 bypass logs count=0 so cost
+        # dashboards show $0 burn explicitly (not a silent gap).
+        tokens = sum(r.tokens_used for r in results)
+        bypass = bool(meta.get("bypass"))
+        if tokens or bypass:
+            await self._db.log_usage(
+                kind="ai_tokens", count=float(tokens),
+                provider=meta.get("model"),
+                meta=json.dumps({"hid": hid, "n_markets": len(survivors),
+                                 "stage": "prediction",
+                                 **({"bypass": True} if bypass else {})}),
+            )
+        return results, meta
+
+    @staticmethod
+    def _assign_mid(m: MarketMatch, side: str, price: Optional[float]) -> None:
+        """Set mid_yes/mid_no from one fetched side via binary symmetry."""
+        other = (1.0 - price) if price is not None else None
+        if side == "yes":
+            m.mid_yes, m.mid_no = price, other
+        else:
+            m.mid_no, m.mid_yes = price, other
 
     async def _prefetch_prices(
         self, matches: list[MarketMatch], hid: str
     ) -> list[MarketMatch]:
-        """
-        Fetch ONE side per match in parallel (preferring YES). Derive the other
-        side via binary-market symmetry: mid_no ≈ 1 − mid_yes. This halves
-        CLOB API calls vs fetching both sides while staying within ~1¢ of true
-        mid (well below typical spread + our trading thresholds).
-
-        Mutates each MarketMatch with the prices. Returns the subset where at
-        least one side has a price (drops fully-stale markets).
-
-        A 10-second TTL cache further reduces traffic during burst events
-        (multiple headlines hitting the same hot market within seconds).
+        """Fetch ONE side per match in parallel (preferring YES). Derive the
+        other via binary-market symmetry: mid_no ≈ 1 − mid_yes. Halves CLOB
+        calls; stays within ~1¢ of true mid. 10s TTL cache cuts burst traffic.
         """
         session = self._get_price_session()
         now_mono = time.monotonic()
@@ -727,167 +508,86 @@ class EngineRunner:
             self._price_cache.pop(k, None)
 
         tasks: list = []
-        index_map: list[tuple[int, str]] = []  # (match_idx, side_fetched: "yes"|"no")
+        index_map: list[tuple[int, str]] = []  # (match_idx, side_fetched)
         for i, m in enumerate(matches):
-            # Prefer YES (one canonical side per market). Fall back to NO if
-            # this market has no YES token.
             side = "yes" if m.token_yes else ("no" if m.token_no else None)
             if side is None:
                 continue
             token = m.token_yes if side == "yes" else m.token_no
             cached = self._price_cache.get(token)
             if cached is not None:
-                price = cached[0]
-                if side == "yes":
-                    m.mid_yes = price
-                    m.mid_no = (1.0 - price) if price is not None else None
-                else:
-                    m.mid_no = price
-                    m.mid_yes = (1.0 - price) if price is not None else None
+                self._assign_mid(m, side, cached[0])
                 continue
             tasks.append(_fetch_mid_price(session, token))
             index_map.append((i, side))
 
         if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            raw = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in raw:
+                if isinstance(r, asyncio.CancelledError):
+                    raise r
             exp_at = time.monotonic() + self._price_cache_ttl
-            for (i, side), value in zip(index_map, results):
+            for (i, side), value in zip(index_map, raw):
                 price = value if isinstance(value, float) else None
                 m = matches[i]
                 token = m.token_yes if side == "yes" else m.token_no
                 if token is not None:
                     self._price_cache[token] = (price, exp_at)
-                if side == "yes":
-                    m.mid_yes = price
-                    m.mid_no = (1.0 - price) if price is not None else None
-                else:
-                    m.mid_no = price
-                    m.mid_yes = (1.0 - price) if price is not None else None
+                self._assign_mid(m, side, price)
 
         kept = [m for m in matches if m.mid_yes is not None or m.mid_no is not None]
         if len(kept) != len(matches):
-            logger.info("[runner] [hid=%s] dropped %d/%d no-price matches",
+            logger.info("[INGRESS] [hid=%s] dropped %d/%d no-price matches",
                         hid, len(matches) - len(kept), len(matches))
-
-        # Part 2.1 (2026-05-21): persist the mids we just fetched so the
-        # backtest framework has a price corpus for every matched market
-        # — not only the ones a trade actually executed against. One row
-        # per kept market per headline. Awaited (not fire-and-forget) so
-        # failures surface via the runner's done-callback and the write
-        # joins any enclosing batch correctly; the cost is one
-        # executemany of ~25 small rows = sub-ms.
+        # Persist mids so backtest has a price corpus for every matched
+        # market (not only ones that traded). Awaited so writes join any
+        # enclosing batch.
         if kept:
             t_unix = int(time.time())
-            snaps: list[tuple] = []
-            for m in kept:
-                # Prefer YES side; fall back to NO when only NO is set.
-                # token_id may be None (e.g. when the historical row was
-                # a skip with NEUTRAL direction); condition_id is the
-                # canonical identifier for the backtest lookup.
-                if m.mid_yes is not None:
-                    snaps.append((m.condition_id, m.token_yes, "yes",
-                                  float(m.mid_yes), t_unix, "prefetch", hid))
-                elif m.mid_no is not None:
-                    snaps.append((m.condition_id, m.token_no, "no",
-                                  float(m.mid_no), t_unix, "prefetch", hid))
-            if snaps:
-                try:
-                    await self._db.insert_market_price_snaps(snaps)
-                except Exception as exc:  # noqa: BLE001
-                    # Diagnostic-only data — never block the pipeline.
-                    logger.warning(
-                        "[runner] [hid=%s] price_snap write failed: %r", hid, exc,
-                    )
+            snaps = [
+                ((m.condition_id, m.token_yes, "yes", float(m.mid_yes),
+                  t_unix, "prefetch", hid) if m.mid_yes is not None else
+                 (m.condition_id, m.token_no, "no", float(m.mid_no),
+                  t_unix, "prefetch", hid))
+                for m in kept
+            ]
+            try:
+                await self._db.insert_market_price_snaps(snaps)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[INGRESS] [hid=%s] price_snap write failed: %r",
+                               hid, exc)
         return kept
 
     async def _run_engine(
-        self,
-        engine: Engine,
-        headline: RawHeadline,
-        signal_id: int,
-        survivors: list[MarketMatch],
-        classify_results: list[ClassifyResult],
+        self, engine: Engine, headline: RawHeadline, signal_id: int,
+        survivors: list[MarketMatch], classify_results: list[ClassifyResult],
         prompt_meta_json: Optional[str],
         pre_skips: list[tuple[MarketMatch, str]],
-        pre_ms: float = 0.0,
-        relevance_skips: Optional[list] = None,
+        pre_ms: float = 0.0, relevance_skips: Optional[list] = None,
         freshness_label: Optional[str] = None,
     ) -> list[TradeDecision]:
-        """
-        Run one engine/variant on the pre-classified matches.
-
-        Total signal latency = pre_ms (embed + dedup + similarity + shared AI
-        call) + the variant's own per-match guard evaluation time.
-        """
+        """Run one engine. Catches `evaluate` crashes so one bad variant
+        doesn't contaminate the shared aiosqlite connection."""
         hid = getattr(headline, "headline_id", "")
         _t_engine = time.monotonic()
-
-        # ── Per-engine relevance gate retired 2026-05-22 ────────────────────
-        # The LLM relevance verdict (STRONG_YES/YES/WEAK/NO) is gone; the
-        # deterministic sim-gate in process() yields SIM_PASS for every
-        # survivor reaching this point, so per-engine `relevance_keep_scores`
-        # no longer has anything to filter on. Field is preserved on
-        # EngineConfig for YAML compatibility but ignored here.
-        rel_dropped_skips: list[tuple[MarketMatch, str]] = []
-
-        # ── Per-engine scoped pre-AI gate ──────────────────────────────────
-        # The shared loop in process() applied only universal rules. Rules
-        # with `engines_exclude` set (today: all 7 of them, all excluding
-        # scout) apply here so scout can bypass while production engines
-        # keep the same behavior they had before the split. We must keep
-        # survivors and classify_results aligned by index when filtering.
-        # The rel_dropped_skips above are fed in alongside pre-AI skips so
-        # one trade row lands per dropped (engine, market) pair.
-        engine_pre_skips: list[tuple[MarketMatch, str]] = list(pre_skips or [])
-        engine_pre_skips.extend(rel_dropped_skips)
-        engine_survivors: list[MarketMatch] = []
-        engine_classify: list[ClassifyResult] = []
-        parent_root = getattr(engine.trader, "_parent_engine", engine.name) or engine.name
-        if self._rules is not None:
-            for m, cr in zip(survivors, classify_results):
-                scoped_reason = self._rules.gate_pre_ai_scoped(
-                    market_type=m.market_type, mid_price=m.mid_yes,
-                    engine_root=parent_root,
-                    freshness_label=freshness_label,
-                    question=m.question,
-                )
-                if scoped_reason is None:
-                    engine_survivors.append(m)
-                    engine_classify.append(cr)
-                else:
-                    engine_pre_skips.append((m, scoped_reason))
-        else:
-            engine_survivors = list(survivors)
-            engine_classify = list(classify_results)
-
-        # E8 cluster-size sizing: N = number of markets surviving the
-        # pre-AI gate for this engine. The factor is per-engine now (scout's
-        # broader survivor set scales its own sizing, not production's).
-        n_cluster = max(len(engine_survivors), 1)
+        # Per-engine scoped pre-AI gate (rules with non-empty engines_exclude).
+        eng_survivors, eng_classify, eng_skips = self._apply_scoped_rules(
+            engine, survivors, classify_results, pre_skips, freshness_label,
+        )
+        # E8 cluster-size sizing: N = pre-AI gate survivors for this engine.
+        n_cluster = max(len(eng_survivors), 1)
         cluster_factor = 1.0 / math.sqrt(n_cluster) if n_cluster > 1 else 1.0
-        # Tier 3 (2026-05-20): the batch() wrap had a concurrency bug —
-        # 15 engines call this concurrently on one shared aiosqlite conn;
-        # multiple `outer == True` reads stage interleaved BEGIN/COMMITs
-        # and silently roll back trader.evaluate's inserts. Reverted.
-        # WAL+synchronous=NORMAL already make per-insert commits cheap
-        # (~0.5 ms each); ~30 commits per engine per headline = ~15 ms.
-        # R3 Phase 1: wrap evaluate + record so one engine crashing doesn't
-        # contaminate the shared aiosqlite connection for the other 14
-        # engines fanning out in parallel. The decisions list is reset to
-        # [] on failure so the rest of this method (impact tracking,
-        # dashboard event hooks) becomes a no-op for the failed engine.
         try:
             decisions = await engine.trader.evaluate(
-                signal_id, headline, engine_survivors, engine_classify,
-                prompt_meta_json, pre_ai_skips=engine_pre_skips,
-                relevance_skips=relevance_skips,
-                cluster_factor=cluster_factor,
+                signal_id, headline, eng_survivors, eng_classify,
+                prompt_meta_json, pre_ai_skips=eng_skips,
+                relevance_skips=relevance_skips, cluster_factor=cluster_factor,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[runner] [hid=%s] engine '%s' evaluate crashed: %r",
-                hid, engine.name, exc, exc_info=True,
-            )
+            logger.warning("[FAN_OUT] [hid=%s] engine '%s' evaluate crashed: %r",
+                           hid, engine.name, exc, exc_info=True)
             decisions = []
         total_latency_ms = pre_ms + (time.monotonic() - _t_engine) * 1000.0
         try:
@@ -895,102 +595,114 @@ class EngineRunner:
                 engine.name, decisions, headline_id=hid,
                 signal_latency_ms=total_latency_ms,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "[runner] [hid=%s] engine '%s' record_engine_decisions failed: %r",
-                hid, engine.name, exc, exc_info=True,
-            )
+            logger.warning("[FAN_OUT] [hid=%s] engine '%s' record failed: %r",
+                           hid, engine.name, exc, exc_info=True)
 
-        # Reconstruct the matches set for impact tracking (survivors only —
-        # pre-AI skips never get a token assignment for the impact row).
-        # Price-impact tracking — only from first engine to avoid duplicate rows
         if self._impact_tracker is not None and engine == self._engines[0]:
-            is_republish = getattr(headline, "_is_republish", False)
-            source = headline.source
-            if not is_republish:
-                for d in decisions:
-                    # Pick the token for the AI's predicted direction
-                    match_for_d = next(
-                        (m for m in survivors if m.condition_id == d.condition_id), None
-                    )
-                    token_id = None
-                    if match_for_d:
-                        token_id = (
-                            match_for_d.token_yes if d.direction.value == "YES"
-                            else match_for_d.token_no
-                        )
-                    if token_id and d.direction.value in ("YES", "NO"):
-                        asyncio.create_task(self._impact_tracker.record(
-                            headline_id=hid,
-                            headline=headline.headline,
-                            site_url=headline.site_url,
-                            condition_id=d.condition_id,
-                            question=d.question,
-                            token_id=token_id,
-                            direction=d.direction.value,
-                            ai_confidence=d.confidence,
-                            similarity=d.similarity,
-                            source=source,
-                        ))
-
+            self._track_impacts(headline, decisions, survivors, hid)
         if self._dashboard:
-            for d in decisions:
-                if d.direction.value != "NEUTRAL":
-                    if d.executed:
-                        outcome = f"TRADED ${d.size_usdc:.0f} @ {d.mid_price:.3f}  edge={d.edge:+.4f}"
-                    else:
-                        outcome = f"SKIP  {d.skip_reason or 'unknown'}"
-                    self._dashboard.record_signal_journal(
-                        headline=headline.headline,
-                        market=d.question,
-                        direction=d.direction.value,
-                        confidence=d.confidence,
-                        similarity=d.similarity,
-                        engine_name=engine.name,
-                        outcome=outcome,
-                        headline_id=hid,
-                    )
+            self._publish_dashboard(engine, headline, decisions, hid)
+        return decisions
 
-            for d in decisions:
-                outcome = (
-                    f"TRADE ${d.size_usdc:.0f}" if d.executed
-                    else f"SKIP {d.skip_reason or ''}"
-                )
-                self._dashboard.record_trade(
-                    condition_id=d.condition_id,
-                    question=d.question,
-                    headline=headline.headline,
-                    site_url=headline.site_url,
-                    direction=d.direction.value,
-                    confidence=d.confidence,
-                    similarity=d.similarity,
-                    p_hat=d.p_hat,
-                    mid_price=d.mid_price,
-                    size_usdc=d.size_usdc,
-                    skip_reason=d.skip_reason,
-                    engine_name=engine.name,
-                    headline_id=hid,
-                )
-                self._dashboard.record_trace(
-                    headline_id=hid,
-                    site=headline.site_url,
-                    headline=headline.headline,
-                    market=d.question,
-                    direction=d.direction.value,
-                    confidence=d.confidence,
-                    outcome=f"[{engine.name}] {outcome}",
-                )
-            self._dashboard.set_balance(
-                engine.name, engine.trader.balance
+    def _apply_scoped_rules(
+        self, engine: Engine, survivors: list[MarketMatch],
+        classify_results: list[ClassifyResult],
+        pre_skips: list[tuple[MarketMatch, str]],
+        freshness_label: Optional[str],
+    ) -> tuple[list[MarketMatch], list[ClassifyResult],
+               list[tuple[MarketMatch, str]]]:
+        """Apply rules with `engines_exclude` set, scoped to engine.parent_root."""
+        eng_skips: list[tuple[MarketMatch, str]] = list(pre_skips or [])
+        if self._rules is None:
+            return list(survivors), list(classify_results), eng_skips
+        kept_m: list[MarketMatch] = []
+        kept_c: list[ClassifyResult] = []
+        parent = (getattr(engine.trader, "_parent_engine", engine.name)
+                  or engine.name)
+        for m, cr in zip(survivors, classify_results):
+            reason = self._rules.gate_pre_ai_scoped(
+                market_type=m.market_type, mid_price=m.mid_yes,
+                engine_root=parent, freshness_label=freshness_label,
+                question=m.question)
+            if reason is None:
+                kept_m.append(m); kept_c.append(cr)
+            else:
+                eng_skips.append((m, reason))
+        return kept_m, kept_c, eng_skips
+
+    def _track_impacts(
+        self, headline: RawHeadline, decisions: list[TradeDecision],
+        survivors: list[MarketMatch], hid: str,
+    ) -> None:
+        """Fire one impact-tracker task per directional decision (BG-tagged)."""
+        if getattr(headline, "_is_republish", False):
+            return
+        by_cid = {m.condition_id: m for m in survivors}
+        for d in decisions:
+            if d.direction.value not in ("YES", "NO"):
+                continue
+            m = by_cid.get(d.condition_id)
+            if m is None:
+                continue
+            token_id = m.token_yes if d.direction.value == "YES" else m.token_no
+            if not token_id:
+                continue
+            self._spawn_bg(
+                self._impact_tracker.record(
+                    headline_id=hid, headline=headline.headline,
+                    site_url=headline.site_url, condition_id=d.condition_id,
+                    question=d.question, token_id=token_id,
+                    direction=d.direction.value, ai_confidence=d.confidence,
+                    similarity=d.similarity, source=headline.source,
+                ),
+                name=f"impact:{hid}:{d.condition_id}",
             )
 
-        return decisions
+    def _publish_dashboard(
+        self, engine: Engine, headline: RawHeadline,
+        decisions: list[TradeDecision], hid: str,
+    ) -> None:
+        """Push per-decision rows to the dashboard's in-memory buffers."""
+        d_name = engine.name
+        for d in decisions:
+            if d.direction.value != "NEUTRAL":
+                if d.executed:
+                    j_outcome = (f"TRADED ${d.size_usdc:.0f} @ {d.mid_price:.3f}  "
+                                 f"edge={d.edge:+.4f}")
+                else:
+                    j_outcome = f"SKIP  {d.skip_reason or 'unknown'}"
+                self._dashboard.record_signal_journal(
+                    headline=headline.headline, market=d.question,
+                    direction=d.direction.value, confidence=d.confidence,
+                    similarity=d.similarity, engine_name=d_name,
+                    outcome=j_outcome, headline_id=hid,
+                )
+            t_outcome = (f"TRADE ${d.size_usdc:.0f}" if d.executed
+                         else f"SKIP {d.skip_reason or ''}")
+            self._dashboard.record_trade(
+                condition_id=d.condition_id, question=d.question,
+                headline=headline.headline, site_url=headline.site_url,
+                direction=d.direction.value, confidence=d.confidence,
+                similarity=d.similarity, p_hat=d.p_hat,
+                mid_price=d.mid_price, size_usdc=d.size_usdc,
+                skip_reason=d.skip_reason, engine_name=d_name, headline_id=hid,
+            )
+            self._dashboard.record_trace(
+                headline_id=hid, site=headline.site_url,
+                headline=headline.headline, market=d.question,
+                direction=d.direction.value, confidence=d.confidence,
+                outcome=f"[{d_name}] {t_outcome}",
+            )
+        self._dashboard.set_balance(d_name, engine.trader.balance)
 
     async def monitor_all_positions(self) -> None:
         """Run position monitor for all engines concurrently."""
-        await asyncio.gather(
+        await _gather_or_cancel(
             *[engine.trader.monitor_positions() for engine in self._engines],
-            return_exceptions=True,
+            label="monitor_positions",
         )
 
     @property
@@ -998,154 +710,87 @@ class EngineRunner:
         return self._engines
 
 
-# ---------------------------------------------------------------------------
-# Factory
-# ---------------------------------------------------------------------------
+def _make_engine(name: str, *, db, classifier, trading, ai, rule_engine,
+                 parent: str, balance: Optional[float] = None) -> Engine:
+    return Engine(
+        name=name,
+        trader=PaperTrader(
+            db=db, classifier=classifier, cfg=trading, ai_cfg=ai,
+            engine_name=name, rule_engine=rule_engine,
+            variant_name=name, parent_engine=parent,
+        ),
+        fixed_balance=balance,
+    )
 
 
-def build_engines(
-    cfg,                       # Config
-    db: SeulgiDB,
-    classifier: DirectionClassifier,
-    rule_engine=None,          # Optional[RuleEngine] — shared across engines
-) -> list[Engine]:
-    """
-    Build the list of engines (and variants) from config.
-
-    Each engine entry in cfg.engines may declare a list of `variants` that
-    inherit the engine's overrides and add further overrides. Each variant
-    materialises as its own Engine row with a composite name
-    `<engine>/<variant>`; trades land under that name and a separate
-    `variant_name` column on `trades` mirrors it. All variants of one engine
-    share the same batched AI call (made once at the runner level).
-
-    If cfg.engines is empty, a single "default" engine is created from
-    cfg.trading.
-
-    All engines share the same `rule_engine` — rules are user-curated trade
-    gates that apply uniformly.
+def build_engines(cfg, db: SeulgiDB, classifier: DirectionClassifier,
+                  rule_engine=None) -> list[Engine]:
+    """Build engines + variants from cfg. Empty cfg.engines → one "default".
+    AGGRESSIVE_CORE_ENABLE=1 appends the carved-out aggressive_core strategy.
     """
     engine_cfgs = getattr(cfg, "engines", [])
-
     if not engine_cfgs:
-        return [Engine(
-            name="default",
-            trader=PaperTrader(
-                db=db, classifier=classifier, cfg=cfg.trading, ai_cfg=cfg.ai,
-                engine_name="default", rule_engine=rule_engine,
-                variant_name="default", parent_engine="default",
-            ),
-        )]
+        return [_make_engine("default", db=db, classifier=classifier,
+                             trading=cfg.trading, ai=cfg.ai,
+                             rule_engine=rule_engine, parent="default")]
 
     engines: list[Engine] = []
-    if os.getenv("LEGACY_ENGINES_DISABLE") == "1":
-        logger.info("[engine] LEGACY_ENGINES_DISABLE=1 — skipping all YAML-declared engines/variants")
-        engine_cfgs = []
-    # Multi-variant CoreStrategy pipeline: every surviving variant runs
-    # through the friction-aware framework. Mutually exclusive with the
-    # legacy fan-out and the single-strategy AGGRESSIVE_CORE_ENABLE path.
-    if os.getenv("MULTI_CORE_ENABLE") == "1":
-        try:
-            try:
-                from strategies.aggressive_core.factory import build_all_variants  # container
-            except ImportError:
-                from app.strategies.aggressive_core.factory import build_all_variants  # type: ignore[no-redef]
-            multi_engines, _strats, _bus = build_all_variants(db=db)
-            logger.info("[engine] MULTI_CORE_ENABLE=1 — built %d CoreStrategy variants", len(multi_engines))
-            return multi_engines
-        except Exception as exc:  # noqa: BLE001
-            logger.error("[engine] MULTI_CORE_ENABLE failed: %s — falling back to YAML engines", exc)
     for ec in engine_cfgs:
         base_trading = _merge_trading_cfg(cfg.trading, ec)
         base_ai = _merge_ai_cfg(cfg.ai, ec)
-
-        variants = getattr(ec, "variants", None) or [None]
-        for variant in variants:
+        for variant in (getattr(ec, "variants", None) or [None]):
             if variant is None:
-                v_trading = base_trading
-                v_ai = base_ai
-                v_name = ec.name
+                v_trading, v_ai, v_name = base_trading, base_ai, ec.name
             else:
                 v_trading = _merge_trading_cfg(base_trading, variant)
                 v_ai = _merge_ai_cfg(base_ai, variant)
                 v_name = f"{ec.name}/{variant.name}"
-            engines.append(Engine(
-                name=v_name,
-                trader=PaperTrader(
-                    db=db, classifier=classifier, cfg=v_trading, ai_cfg=v_ai,
-                    engine_name=v_name, rule_engine=rule_engine,
-                    variant_name=v_name, parent_engine=ec.name,
-                ),
-                fixed_balance=ec.balance_usdc,
-                # Per-engine relevance override. Inherits from EngineConfig.
-                # Variants share the parent engine's setting (no per-variant
-                # override today — variants are usually for sizing / exits).
-                relevance_keep_scores=getattr(ec, "relevance_keep_scores", None),
+            engines.append(_make_engine(
+                v_name, db=db, classifier=classifier, trading=v_trading,
+                ai=v_ai, rule_engine=rule_engine, parent=ec.name,
+                balance=ec.balance_usdc,
             ))
 
-    # Carved-out strategy module (opt-in via env var). Lives in its own
-    # package so it owns its Trader ABC + guards + exits; here we only
-    # append a same-shaped Engine adapter to the legacy fan-out.
+    # Carved-out strategy module — opt-in via AGGRESSIVE_CORE_ENABLE=1.
     try:
         try:
-            from strategies.aggressive_core.factory import maybe_append    # container path
+            from strategies.aggressive_core.factory import maybe_append    # container
         except ImportError:
             from app.strategies.aggressive_core.factory import maybe_append  # type: ignore[no-redef]
-        added = maybe_append(engines, db=db)
-        if added[0] is not None:
-            logger.info("[engine] aggressive_core engine appended")
+        if maybe_append(engines, db=db)[0] is not None:
+            logger.info("[FAN_OUT] aggressive_core engine appended")
     except Exception as exc:  # noqa: BLE001
-        logger.warning("[engine] aggressive_core registration failed: %s", exc)
+        logger.warning("[FAN_OUT] aggressive_core registration failed: %s", exc)
 
-    logger.info("[engine] built %d engines: %s", len(engines), [e.name for e in engines])
+    logger.info("[FAN_OUT] built %d engines: %s",
+                len(engines), [e.name for e in engines])
     return engines
 
 
-def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
-    """Apply per-engine overrides on top of the global trading config.
-    None values in override mean 'use the base value'.
-    """
-    def _pick(attr, default):
-        v = getattr(override, attr, None)
-        return v if v is not None else default
+# Fields whose `None` override means 'inherit base'. Everything else
+# (max_unique_markets, cold_position_hours, infinite_balance, mode) is a
+# global-only flag and propagates from base unchanged.
+_OVERRIDABLE_TRADING_FIELDS = (
+    "balance_usdc", "max_position_usdc", "min_trade_usdc", "min_edge",
+    "edge_increment", "position_timeout_hours", "max_open_positions",
+    "take_profit", "stop_loss", "trailing_stop", "min_hold_seconds",
+    "rail_skip_threshold", "entry_rail_skip_threshold",
+    "invert_high_conf", "invert_conf_threshold", "spread_cost_bps",
+    "stop_loss_pct", "min_entry_yes_mid", "max_market_vol_30m",
+    "direction_filter", "freshness_filter", "mid_yes_min", "mid_yes_max",
+)
 
-    return TradingConfig(
-        balance_usdc=_pick("balance_usdc", base.balance_usdc),
-        max_position_usdc=_pick("max_position_usdc", base.max_position_usdc),
-        min_trade_usdc=_pick("min_trade_usdc", base.min_trade_usdc),
-        min_edge=_pick("min_edge", base.min_edge),
-        edge_increment=_pick("edge_increment", base.edge_increment),
-        position_timeout_hours=_pick("position_timeout_hours", base.position_timeout_hours),
-        max_open_positions=_pick("max_open_positions", base.max_open_positions),
-        max_unique_markets=base.max_unique_markets,
-        cold_position_hours=base.cold_position_hours,
-        take_profit=_pick("take_profit", base.take_profit),
-        stop_loss=_pick("stop_loss", base.stop_loss),
-        trailing_stop=_pick("trailing_stop", base.trailing_stop),
-        min_hold_seconds=_pick("min_hold_seconds", base.min_hold_seconds),
-        infinite_balance=base.infinite_balance,   # propagate global flag to every engine
-        mode=base.mode,
-        rail_skip_threshold=_pick("rail_skip_threshold", base.rail_skip_threshold),
-        entry_rail_skip_threshold=_pick("entry_rail_skip_threshold", base.entry_rail_skip_threshold),
-        invert_high_conf=_pick("invert_high_conf", base.invert_high_conf),
-        invert_conf_threshold=_pick("invert_conf_threshold", base.invert_conf_threshold),
-        spread_cost_bps=_pick("spread_cost_bps", base.spread_cost_bps),
-        stop_loss_pct=_pick("stop_loss_pct", base.stop_loss_pct),
-        min_entry_yes_mid=_pick("min_entry_yes_mid", base.min_entry_yes_mid),
-        max_market_vol_30m=_pick("max_market_vol_30m", base.max_market_vol_30m),
-        # M4 variant-level filters — strings default to "" (no filter); floats
-        # to the base value (which is 0.0 / 1.0 = "no filter").
-        direction_filter=_pick("direction_filter", base.direction_filter),
-        freshness_filter=_pick("freshness_filter", base.freshness_filter),
-        mid_yes_min=_pick("mid_yes_min", base.mid_yes_min),
-        mid_yes_max=_pick("mid_yes_max", base.mid_yes_max),
-    )
+
+def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
+    """Apply per-engine overrides on top of base. None ⇒ inherit base."""
+    from dataclasses import replace
+    updates = {a: v for a in _OVERRIDABLE_TRADING_FIELDS
+               if (v := getattr(override, a, None)) is not None}
+    return replace(base, **updates)
 
 
 def _merge_ai_cfg(base: AIConfig, override) -> AIConfig:
-    """Return a copy of base AIConfig with per-engine min_confidence override applied."""
+    """Copy base AIConfig with per-engine min_confidence override applied."""
     from dataclasses import replace
     min_conf = getattr(override, "min_confidence", None)
-    if min_conf is not None:
-        return replace(base, min_confidence=min_conf)
-    return base
+    return replace(base, min_confidence=min_conf) if min_conf is not None else base
