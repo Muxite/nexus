@@ -105,6 +105,38 @@ _BUCKETS = [
 
 _POLL_INTERVAL = 30   # check pending rows every 30 s
 
+# A2.2 (2026-05-22): trade-anchored continuous price tape. Distinct
+# from `_BUCKETS` above (which is shared with the headline-anchored
+# price_impacts row and must NOT grow — adding +4h would add a bogus
+# +4h column to every legacy row). Each tuple is
+# (t_minutes_since_entry, seconds_after_open) — minutes is the
+# canonical column label written into position_price_snaps; seconds is
+# used by the loop to decide "is this offset due yet?". Order matters:
+# the loop fills shortest-first, so a late-starting position writes
+# 5m before 15m, etc. Coalesced per-token fetch (see _coalesce_token)
+# de-dupes when two positions share the same condition's token.
+_POSITION_BUCKETS: list[tuple[int, int]] = [
+    (5,   300),
+    (15,  900),
+    (30,  1800),
+    (60,  3600),
+    (240, 14400),
+]
+# Slowest checkpoint defines the loop's retention horizon: a position
+# stops being "due" for new snaps `_MAX_OFFSET_S` after open.
+_MAX_OFFSET_S = _POSITION_BUCKETS[-1][1]
+# Tick cadence for `_position_snap_loop`. 60s is fine: the shortest
+# offset (5m) is 300s, so a once-per-minute sweep can never miss a
+# checkpoint by more than ~60s (well below the headline-impact 30s
+# poll's noise floor). The poll is still cheap because per-token
+# fetches are coalesced and capped by the semaphore below.
+_POSITION_SNAP_POLL_INTERVAL = 60
+# Bound concurrent CLOB calls when multiple positions become due in
+# the same sweep (e.g. after a long write-lock stall or a startup
+# reload of many open positions). 10 mirrors the master-plan §A2.2
+# recommendation in the A0.11 extension plan.
+_POSITION_SNAP_CONCURRENCY = 10
+
 
 async def _fetch_price(session: aiohttp.ClientSession, token_id: str) -> Optional[float]:
     url = _CLOB_PRICE_URL.format(token_id=token_id)
@@ -118,6 +150,25 @@ async def _fetch_price(session: aiohttp.ClientSession, token_id: str) -> Optiona
     except Exception as exc:
         logger.debug("[impact] price fetch failed %s: %s", token_id[:12], exc)
         return None
+
+
+async def _fetch_bbo(
+    session: aiohttp.ClientSession, token_id: str
+) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Fetch (mid, bid, ask, book_depth_usdc) for one CLOB token.
+
+    A2.2 placeholder: the /midpoint endpoint used by the rest of the
+    bot returns only `mid`, so today we degrade gracefully — `bid`,
+    `ask`, and `book_depth_usdc` come back as None and the snap row
+    captures mid only. Phase 4A.3 will swap this helper for a /book
+    parser that fills the BBO columns; the schema is already in place
+    so no migration coordination is needed at that point. Returns
+    (None, None, None, None) on any HTTP / parse error so the caller
+    can treat "no BBO" as a non-event (the loop simply skips the
+    write rather than blocking the rest of the sweep).
+    """
+    mid = await _fetch_price(session, token_id)
+    return (mid, None, None, None)
 
 
 async def _fetch_pre_move(
@@ -307,6 +358,13 @@ class PriceImpactTracker:
         asyncio.create_task(self._poll_loop())
         asyncio.create_task(self._dashboard_loop())
         asyncio.create_task(self._timeseries_backfill_loop())
+        # A2.2: trade-anchored continuous price tape. Sibling loop so
+        # the headline-anchored `_poll_loop` doesn't get burdened with
+        # the +4h horizon (its rows close at +60m). Crash recovery is
+        # implicit: the open-positions table is the source of truth,
+        # and INSERT OR IGNORE on (trade_id, t_minutes_since_entry)
+        # means we never double-write a checkpoint on resume.
+        asyncio.create_task(self._position_snap_loop())
 
     async def _poll_loop(self) -> None:
         """Periodically fill in time-bucket price snapshots."""
@@ -355,6 +413,146 @@ class PriceImpactTracker:
             done_ids = {r["id"] for r in pending_rows if r.get("price_t60m") is not None}
             for rid in done_ids:
                 self._pending.pop(rid, None)
+
+    # ------------------------------------------------------------------
+    # A2.2: Trade-anchored continuous price tape (`position_price_snaps`)
+    # ------------------------------------------------------------------
+
+    async def _position_snap_loop(self) -> None:
+        """Periodically write `position_price_snaps` for every open position.
+
+        Tick cadence: `_POSITION_SNAP_POLL_INTERVAL` (60s). On each tick:
+          1. Load all open positions from DB (source of truth — survives
+             restarts; no in-memory pending set needed).
+          2. For each position × bucket in `_POSITION_BUCKETS`, decide
+             whether the offset is due (age >= offset_s).
+          3. Coalesce per-token CLOB fetches so two positions sharing
+             one condition_id's token only fetch once per sweep.
+          4. INSERT OR IGNORE — the UNIQUE(trade_id,
+             t_minutes_since_entry) constraint makes the write
+             idempotent. On crash mid-sweep, the next tick picks up
+             unfilled checkpoints automatically.
+
+        Fetches are bounded by `_POSITION_SNAP_CONCURRENCY` so a sweep
+        with many newly-due positions can't blow up the CLOB rate
+        limit. The position_price_snaps rows survive position close —
+        Phase-5 replay reads them by trade_id.
+        """
+        # Brief warm-up so the rest of `start()` can finish wiring.
+        await asyncio.sleep(5)
+        while self._running:
+            try:
+                await self._run_position_snap_sweep()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[impact] position-snap sweep error: %s", exc)
+            await asyncio.sleep(_POSITION_SNAP_POLL_INTERVAL)
+
+    async def _run_position_snap_sweep(self) -> None:
+        """One pass of the position-snap loop.
+
+        Split out so tests can drive a deterministic single sweep
+        without spinning the outer `while self._running` loop. The
+        loop body intentionally does no DB writes when no checkpoint
+        is due — the only DB read per sweep is `get_open_positions()`.
+        """
+        positions = await self._db.get_open_positions()
+        if not positions:
+            return
+
+        now = time.time()
+        # (trade_id, token_id, side, t_minutes_since_entry, t_unix, age_s)
+        due: list[tuple[int, str, str, int, int, float]] = []
+        for pos in positions:
+            token_id = pos.get("token_id")
+            if not token_id:
+                continue
+            trade_id = pos.get("trade_id")
+            if trade_id is None:
+                continue
+            opened_at = pos.get("opened_at")
+            if not opened_at:
+                continue
+            try:
+                opened_dt = datetime.fromisoformat(opened_at)
+                if opened_dt.tzinfo is None:
+                    opened_dt = opened_dt.replace(tzinfo=timezone.utc)
+                opened_unix = opened_dt.timestamp()
+            except Exception:  # noqa: BLE001
+                continue
+            age_s = now - opened_unix
+            # Skip positions that are too old to have any new checkpoint
+            # left to fill (cuts the per-sweep work as the open book ages).
+            if age_s > _MAX_OFFSET_S + 60:
+                continue
+            # Side label matches the trade's direction so analysis joins
+            # don't have to look up trades.direction separately.
+            side = (pos.get("direction") or "").upper()
+            for t_min, offset_s in _POSITION_BUCKETS:
+                if age_s >= offset_s:
+                    # `t_unix` is the moment the checkpoint comes due,
+                    # NOT now() — keeps the column aligned across sweeps
+                    # so a late write still reflects the intended offset.
+                    snap_unix = int(opened_unix + offset_s)
+                    due.append((trade_id, token_id, side, t_min, snap_unix, age_s))
+
+        if not due:
+            return
+
+        # Coalesce per-token fetches: many positions can share the same
+        # token (e.g. duplicate engines on the same market) — pay the
+        # CLOB call once and share the price across all consumers.
+        session = self._get_session()
+        sem = asyncio.Semaphore(_POSITION_SNAP_CONCURRENCY)
+        token_tasks: dict[str, asyncio.Task] = {}
+
+        async def _fetch_one(tok: str):
+            async with sem:
+                return await _fetch_bbo(session, tok)
+
+        for _, token_id, _, _, _, _ in due:
+            if token_id not in token_tasks:
+                token_tasks[token_id] = asyncio.create_task(_fetch_one(token_id))
+
+        # Await fetches; each token's result is shared across due rows.
+        results: dict[str, tuple] = {}
+        for token_id, task in token_tasks.items():
+            try:
+                results[token_id] = await task
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("[impact] bbo fetch failed %s: %s",
+                             token_id[:12], exc)
+                results[token_id] = (None, None, None, None)
+
+        # Write rows. INSERT OR IGNORE keeps repeated checkpoints safe;
+        # we still bump the writer counter on every call so observability
+        # surfaces "loop ran" even on idempotent no-ops.
+        for trade_id, token_id, side, t_min, snap_unix, _ in due:
+            mid, bid, ask, depth = results.get(
+                token_id, (None, None, None, None)
+            )
+            if mid is None:
+                # No price → no row. The next sweep retries.
+                continue
+            try:
+                await self._db.insert_position_price_snap(
+                    trade_id=trade_id,
+                    token_id=token_id,
+                    side=side,
+                    t_unix=snap_unix,
+                    t_minutes_since_entry=t_min,
+                    price=float(mid),
+                    bid=bid,
+                    ask=ask,
+                    book_depth_usdc=depth,
+                    source="monitor",
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[impact] position snap write failed trade=%s t_min=%d: %s",
+                    trade_id, t_min, exc,
+                )
 
     async def _dashboard_loop(self) -> None:
         """Write price_impact.txt every 60 s."""

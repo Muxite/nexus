@@ -470,6 +470,10 @@ class EngineRunner:
             is_republish=freshness.is_republish, similar_to=freshness.similar_to,
             source=source_host, freshness=freshness,
             relevance_verdicts=relevance_verdicts_kept or None,
+            # A2.1 (2026-05-22): correlate `llm_calls` rows with the
+            # headline that triggered them. Additive kwarg — older test
+            # paths that don't set this still work (headline_id stays NULL).
+            headline_id=hid,
         )
         # ONE usage_events row per headline; A1.6 bypass logs count=0 so cost
         # dashboards show $0 burn explicitly (not a silent gap).
@@ -542,13 +546,23 @@ class EngineRunner:
         # Persist mids so backtest has a price corpus for every matched
         # market (not only ones that traded). Awaited so writes join any
         # enclosing batch.
+        #
+        # A2.2 (2026-05-22): widened to the 10-tuple shape so the
+        # bid/ask/book_depth_usdc columns added by the matching
+        # migration are populated. The CLOB /midpoint endpoint used by
+        # `_fetch_mid_price` does NOT return BBO separately today —
+        # Phase 4A.3 (decoupled book state) will add a /book parser and
+        # backfill these columns. Left NULL until then; the schema is
+        # ready so Phase 4D.1 (spread+depth filter) can light up
+        # without another migration.
         if kept:
             t_unix = int(time.time())
             snaps = [
                 ((m.condition_id, m.token_yes, "yes", float(m.mid_yes),
-                  t_unix, "prefetch", hid) if m.mid_yes is not None else
+                  t_unix, "prefetch", hid, None, None, None)
+                 if m.mid_yes is not None else
                  (m.condition_id, m.token_no, "no", float(m.mid_no),
-                  t_unix, "prefetch", hid))
+                  t_unix, "prefetch", hid, None, None, None))
                 for m in kept
             ]
             try:

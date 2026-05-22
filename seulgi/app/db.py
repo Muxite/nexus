@@ -495,6 +495,44 @@ _MIGRATIONS = [
     # share grows the partial filter will trim the index.
     "CREATE INDEX IF NOT EXISTS idx_engine_results_skip_decided "
     "ON engine_results(skip_reason, decided_at) WHERE skip_reason IS NOT NULL",
+    # A2.2 (2026-05-22): BBO capture on market_price_snaps. Today the
+    # table holds mid-only (one fetched side per match at ingress). The
+    # CLOB /midpoint endpoint doesn't return bid/ask separately, so the
+    # current writer leaves these NULL — Phase 4A.3 will add the actual
+    # /book parser. The columns are added now so the schema is stable
+    # for Phase 4D.1 (spread+depth filter) and the new
+    # `position_price_snaps` writer can share the same fetch helper
+    # without a follow-up migration.
+    "ALTER TABLE market_price_snaps ADD COLUMN bid REAL",
+    "ALTER TABLE market_price_snaps ADD COLUMN ask REAL",
+    "ALTER TABLE market_price_snaps ADD COLUMN book_depth_usdc REAL",
+    # A2.2 (2026-05-22): trade-anchored continuous price tape. Sibling to
+    # `price_impacts` (headline-anchored, mid-only) but keyed by trade_id
+    # and the open-time offsets (+5m / +15m / +30m / +1h / +4h).
+    # `t_minutes_since_entry` is the canonical bucket label; the
+    # (trade_id, t_minutes_since_entry) UNIQUE constraint backs INSERT
+    # OR IGNORE idempotency for the snap loop. `source` discriminates
+    # writes from the snap loop vs. backfills (e.g. a Phase-4 BBO
+    # refetch). Per master-plan §A2.2 + the A0.11 extension plan —
+    # foundation for the Phase-5 replay harness and Phase-4 filters.
+    """CREATE TABLE IF NOT EXISTS position_price_snaps (
+        id                       INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id                 INTEGER NOT NULL,
+        token_id                 TEXT NOT NULL,
+        side                     TEXT NOT NULL,
+        t_unix                   INTEGER NOT NULL,
+        t_minutes_since_entry    INTEGER NOT NULL,
+        price                    REAL NOT NULL,
+        bid                      REAL,
+        ask                      REAL,
+        book_depth_usdc          REAL,
+        source                   TEXT NOT NULL,
+        UNIQUE(trade_id, t_minutes_since_entry)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_position_price_snaps_trade "
+    "ON position_price_snaps(trade_id)",
+    "CREATE INDEX IF NOT EXISTS idx_position_price_snaps_t_unix "
+    "ON position_price_snaps(t_unix)",
 ]
 
 
@@ -2442,13 +2480,19 @@ class SeulgiDB:
 
     async def insert_market_price_snaps(
         self,
-        snaps: list[tuple[str, str, str, float, int, str, Optional[str]]],
+        snaps: list[tuple],
     ) -> None:
         """Bulk-insert mid-price snapshots for matched markets.
 
-        Each tuple: (condition_id, token_id, side, price, t_unix, source,
-        headline_id). `side` is 'yes' or 'no' — the side fetched (the
-        other side is inferred via 1 − price in binary markets).
+        Each tuple is either the legacy 7-tuple (mid-only):
+            (condition_id, token_id, side, price, t_unix, source, headline_id)
+        or the A2.2 10-tuple (BBO-capable; bid/ask/book_depth_usdc may
+        be None when the CLOB endpoint doesn't return them):
+            (condition_id, token_id, side, price, t_unix, source,
+             headline_id, bid, ask, book_depth_usdc)
+
+        `side` is 'yes' or 'no' — the side fetched (the other side is
+        inferred via 1 − price in binary markets).
 
         Called from `engine._prefetch_prices` after fetching mids. One
         row per (market, headline) so the backtest framework can ask
@@ -2458,19 +2502,95 @@ class SeulgiDB:
         """
         if not snaps:
             return
+        # Normalise to the 10-tuple shape so both schemas keep working
+        # while A2.2 callers roll out — pads bid/ask/book_depth with
+        # None for legacy 7-tuple inputs.
+        normalised: list[tuple] = []
+        for row in snaps:
+            if len(row) == 7:
+                normalised.append(tuple(row) + (None, None, None))
+            else:
+                normalised.append(tuple(row))
         async with self._write_lock():
             try:
                 await self._conn.executemany(
                     "INSERT INTO market_price_snaps "
-                    "(condition_id, token_id, side, price, t_unix, source, headline_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    snaps,
+                    "(condition_id, token_id, side, price, t_unix, source, headline_id, "
+                    "bid, ask, book_depth_usdc) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    normalised,
                 )
                 await self._commit_if_unbatched()
                 self._bump_ok("insert_market_price_snaps", "market_price_snaps")
             except Exception as exc:
                 self._bump_err("insert_market_price_snaps", exc)
                 raise
+
+    # ------------------------------------------------------------------
+    # Position price snapshots (A2.2 — trade-anchored continuous tape)
+    # ------------------------------------------------------------------
+
+    async def insert_position_price_snap(
+        self,
+        trade_id: int,
+        token_id: str,
+        side: str,
+        t_unix: int,
+        t_minutes_since_entry: int,
+        price: float,
+        bid: Optional[float] = None,
+        ask: Optional[float] = None,
+        book_depth_usdc: Optional[float] = None,
+        source: str = "monitor",
+    ) -> None:
+        """Insert a trade-anchored price snapshot.
+
+        Idempotent on (trade_id, t_minutes_since_entry) via the UNIQUE
+        constraint + INSERT OR IGNORE. Safe to call twice — the second
+        write is a no-op. Bumps `insert_position_price_snap` counter on
+        the first write; counter remains stable on the idempotent retry
+        (sqlite INSERT OR IGNORE doesn't surface row-conflict as an
+        exception, so this looks like a successful write to the writer
+        even when the row already existed — that's the intended shape:
+        the caller wants "best-effort, never throw").
+
+        Called from `impact_tracker._position_snap_loop`, once per due
+        offset (5/15/30/60/240 minutes after open). `source` is one of:
+            'monitor'      — live snap loop write
+            'bbo_refetch'  — Phase 4A.3 BBO refetch at execute-time
+            'backfill'     — offline fill from CLOB history
+        """
+        async with self._write_lock():
+            try:
+                await self._conn.execute(
+                    "INSERT OR IGNORE INTO position_price_snaps "
+                    "(trade_id, token_id, side, t_unix, t_minutes_since_entry, "
+                    " price, bid, ask, book_depth_usdc, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (trade_id, token_id, side, t_unix, t_minutes_since_entry,
+                     price, bid, ask, book_depth_usdc, source),
+                )
+                await self._commit_if_unbatched()
+                self._bump_ok("insert_position_price_snap", "position_price_snaps")
+            except Exception as exc:
+                self._bump_err("insert_position_price_snap", exc)
+                raise
+
+    async def get_position_price_snaps(
+        self, trade_id: int
+    ) -> list[dict]:
+        """Return all snaps for one trade, ordered by t_minutes_since_entry.
+
+        Used by tests + the future replay harness to read back the tape.
+        """
+        async with self._conn.execute(
+            "SELECT * FROM position_price_snaps "
+            "WHERE trade_id = ? "
+            "ORDER BY t_minutes_since_entry ASC",
+            (trade_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Market heat tracking
