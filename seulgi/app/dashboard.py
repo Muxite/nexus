@@ -2,16 +2,22 @@
 Seulgi dashboard — writes human-readable status files to data/.
 
 Files written (in priority order):
-  data/dashboard.txt       — MAIN: balance, open positions, last events, uptime
-  data/positions_open.txt  — every live position with entry price and unrealized PnL
-  data/trades_executed.txt — last 50 executed paper trades
-  data/trades_declined.txt — last 50 declined trade decisions with reason
-  data/near_miss.txt       — trades with positive edge that just missed our threshold
-  data/news_seen.txt       — last 50 raw headlines detected across all sites
-  data/ai_decisions.txt    — last 50 AI classify calls (YES/NO/NEUTRAL + confidence)
-  data/watcher_status.txt  — per-site watcher health (last seen, failures, reachable)
-  data/market_index.txt    — market index stats (count, last refresh, top questions)
-  data/activity_log.txt    — append-only rolling event log (most recent events first)
+  data/dashboard.txt        — MAIN: balance, open positions, last events, uptime
+  data/scout_funnel.txt     — SCOUT decision funnel tile (5-min cached)
+  data/db_health.txt        — write health snapshot (last insert per table, counters)
+  data/positions_open.txt   — every live position with entry price and unrealized PnL
+  data/trades_executed.txt  — last 50 executed paper trades
+  data/trades_declined.txt  — last 50 declined trade decisions with reason
+  data/near_miss.txt        — trades with positive edge that just missed our threshold
+  data/news_seen.txt        — last 50 raw headlines detected across all sites
+  data/watcher_status.txt   — per-site watcher health (last seen, failures, reachable)
+  data/engine_comparison.txt — per-engine summary + skip reasons
+  data/signal_journal.txt   — non-NEUTRAL AI decisions with outcomes (newest first)
+  data/quant_stats.txt      — prediction accuracy + signal latency
+  data/usage.txt            — AI tokens + Brave Search lifetime + 24h totals
+  data/activity_log.txt     — append-only rolling event log (most recent events first)
+  data/trace_log.txt        — end-to-end trace (hid → site → headline → AI → outcome)
+  data/variant_compare.txt  — per-variant pivot (trades, wins, hit-rate, sum PnL)
 
 All files are written atomically via write-to-.tmp-then-rename so readers always
 see a complete file even while Seulgi is updating it.
@@ -28,14 +34,14 @@ Usage in main.py:
 """
 
 # ---------------------------------------------------------------------------
-# Specification (Phase 0 A0.7 — 2026-05-22)
+# Specification (Phase 1 A1.5 — 2026-05-22)
 # ---------------------------------------------------------------------------
 #
 # Purpose
-#   Periodic snapshot writer for `data/dashboard/*.txt` (and two .jsonl files)
-#   consumed by the operator (cat / less / tail) and a handful of analysis
-#   scripts. Pull-based: no caller subscribes — files are atomically replaced
-#   every `interval_secs` (default 30s). Event-driven flush is allowed: high-
+#   Periodic snapshot writer for `data/dashboard/*.txt` consumed by the
+#   operator (cat / less / tail) and a handful of analysis scripts. Pull-
+#   based: no caller subscribes — files are atomically replaced every
+#   `interval_secs` (default 30s). Event-driven flush is allowed: high-
 #   priority record_*() calls set `_flush_now` so the loop wakes early.
 #
 # Public interface
@@ -48,10 +54,10 @@ Usage in main.py:
 #       set_system_health / set_watcher_status / set_quant_stats /
 #       set_usage / set_engine_staked / set_infinite_balance / set_mode /
 #       set_cycle_started_at / set_simulate_total / set_ai_paused /
-#       set_market_index / register_engines                              — push state.
-#   Helpers consumed externally: none. Dataclasses NewsEvent/AIEvent/
-#   TradeEvent/PositionEvent/ClosedEvent/WatcherStatus/SystemHealth are
-#   imported by main.py and engine.py to construct payloads for set_*.
+#       register_engines                                                — push state.
+#   Helpers consumed externally: none. Dataclasses NewsEvent/TradeEvent/
+#   PositionEvent/ClosedEvent/WatcherStatus/SystemHealth are imported by
+#   main.py and engine.py to construct payloads for set_*.
 #
 # Invariants
 #   • Every output file is written atomically via `_write()` (tempfile + os.replace).
@@ -63,16 +69,14 @@ Usage in main.py:
 #     with the writer connection (cycle-2 B-WRITES fix).
 #   • `_write_all()` uses `asyncio.gather(return_exceptions=True)`: one tile's
 #     failure never cancels its peers.
-#   • `trade_log.jsonl` is append-only with hysteretic truncation at
-#     1.5 × _TRADE_LOG_MAX_LINES → _TRADE_LOG_MAX_LINES (rolling tail).
-#   • Ring buffers (`_news`, `_ai`, `_executed`, `_declined`, `_near_miss`,
+#   • Ring buffers (`_news`, `_executed`, `_declined`, `_near_miss`,
 #     `_closed`) are bounded by `_MAX_BUFFER`; `_activity` by `_MAX_ACTIVITY`.
 #
 # Side effects
-#   • File writes to `<data_dir>/*.txt` and `<data_dir>/*.jsonl` only.
+#   • File writes to `<data_dir>/*.txt` only.
 #   • DB reads only (writer connection for `_write_db_health` snapshot,
-#     RO clone for the cache loop, writer for the headline_journal /
-#     trade_log / wins-losses / variant_compare per-tick queries).
+#     RO clone for the cache loop, writer for the variant_compare per-tick
+#     query).
 #   • No network I/O. No process spawns.
 #
 # Failure modes
@@ -86,8 +90,7 @@ Usage in main.py:
 #
 # Non-goals
 #   • Alerting / notification (lives in `notify.py`).
-#   • Plotting (matplotlib PNGs) — handled by `plotter.py`, currently
-#     disabled via `SEULGI_DISABLE_PLOTTER=1`; flagged for deletion in Phase 1.
+#   • Plotting (matplotlib PNGs) — removed in Phase 1 A1.5 (2026-05-22).
 #   • Business logic (trade gating, sizing, fees). Dashboard is read-only.
 #   • Per-tick price_impact.txt / profile.txt — written by impact_tracker.py
 #     and profiler.py respectively, not this module.
@@ -97,7 +100,6 @@ from __future__ import annotations
 
 import asyncio
 import collections
-import json
 import logging
 import os
 import time
@@ -124,16 +126,6 @@ class NewsEvent:
     article_url: str
     detected_at: datetime
     headline_id: str = ""
-
-
-@dataclass
-class AIEvent:
-    headline: str
-    question: str
-    direction: str          # YES / NO / NEUTRAL
-    confidence: float
-    reason: str
-    decided_at: datetime
 
 
 @dataclass
@@ -223,12 +215,10 @@ class Dashboard:
         self._dir = data_dir
         self._interval = interval_secs
         self._db = db                         # Optional[SeulgiDB] for new views
-        self._last_trade_log_id: int = 0      # cursor into closed trades for trade_log.jsonl
         self._started_at = datetime.now(timezone.utc)
 
         # Ring buffers
         self._news: collections.deque[NewsEvent] = collections.deque(maxlen=_MAX_BUFFER)
-        self._ai: collections.deque[AIEvent] = collections.deque(maxlen=_MAX_BUFFER)
         self._executed: collections.deque[TradeEvent] = collections.deque(maxlen=_MAX_BUFFER)
         self._declined: collections.deque[TradeEvent] = collections.deque(maxlen=_MAX_BUFFER)
         self._near_miss: collections.deque[TradeEvent] = collections.deque(maxlen=_MAX_BUFFER)
@@ -240,8 +230,6 @@ class Dashboard:
         self._open_positions: list[PositionEvent] = []
         self._watcher_statuses: dict[str, WatcherStatus] = {}
         self._system_health: SystemHealth = SystemHealth()
-        self._market_count: int = 0
-        self._market_last_refresh: Optional[datetime] = None
         # Per-engine balances: engine_name → balance
         self._engine_balances: dict[str, float] = {}
         self._total_realized_pnl: float = 0.0
@@ -333,8 +321,10 @@ class Dashboard:
     def record_ai(
         self, headline: str, question: str, direction: str, confidence: float, reason: str
     ) -> None:
+        # NB: `question` and `reason` are still accepted for API stability
+        # (engine/main pass them) but only the activity_log line is emitted
+        # since the dedicated ai_decisions.txt writer was culled in A1.5.
         now = datetime.now(timezone.utc)
-        self._ai.appendleft(AIEvent(headline, question, direction, confidence, reason, now))
         self._activity.appendleft(
             f"[{_ts(now)}] AI    {direction} {confidence:.0%}  {headline[:80]}"
         )
@@ -533,13 +523,6 @@ class Dashboard:
         self._ai_paused = paused
         self._ai_paused_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
-    def set_market_index(self, count: int) -> None:
-        self._market_count = count
-        self._market_last_refresh = datetime.now(timezone.utc)
-        self._activity.appendleft(
-            f"[{_ts(self._market_last_refresh)}] MKTIDX refreshed — {count} markets"
-        )
-
     # ------------------------------------------------------------------
     # Background loop
     # ------------------------------------------------------------------
@@ -737,20 +720,14 @@ class Dashboard:
             ("declined", self._write_declined()),
             ("near_miss", self._write_near_miss()),
             ("news", self._write_news()),
-            ("ai", self._write_ai()),
             ("watcher_status", self._write_watcher_status()),
-            ("market_index", self._write_market_index()),
             ("engine_comparison", self._write_engine_comparison()),
             ("activity_log", self._write_activity_log()),
             ("trace_log", self._write_trace_log()),
             ("signal_journal", self._write_signal_journal()),
             ("quant_stats", self._write_quant_stats()),
             ("usage", self._write_usage()),
-            ("trade_log", self._write_trade_log()),
             ("variant_compare", self._write_variant_compare()),
-            ("wins_losses", self._write_wins_losses()),
-            ("headline_journal", self._write_headline_journal()),
-            ("headline_winners", self._write_headline_winners()),
         ]
         results = await asyncio.gather(
             *[coro for _, coro in writers], return_exceptions=True,
@@ -1104,10 +1081,6 @@ class Dashboard:
 
         lines += [
             "",
-            "── MARKET INDEX ────────────────────────────────────────────────",
-            f"  Markets tracked : {self._market_count}",
-            f"  Last refresh    : {_ts(self._market_last_refresh) if self._market_last_refresh else 'never'}",
-            "",
             "── SYSTEM HEALTH ───────────────────────────────────────────────",
         ]
         sh = self._system_health
@@ -1394,23 +1367,6 @@ class Dashboard:
                 lines.append("")
         _write(self._path("news_seen.txt"), "\n".join(lines) + "\n")
 
-    async def _write_ai(self) -> None:
-        lines = [_header("AI DECISIONS  (most recent first)")]
-        if not self._ai:
-            lines.append("  (no AI calls yet)")
-        else:
-            _DIR_SYMBOL = {"YES": "▲", "NO": "▼", "NEUTRAL": "─"}
-            for ev in self._ai:
-                sym = _DIR_SYMBOL.get(ev.direction, "?")
-                lines.append(
-                    f"  [{_ts(ev.decided_at)}] {sym} {ev.direction:<8} {ev.confidence:.0%}  "
-                    f"{ev.reason[:60]}"
-                )
-                lines.append(f"    Headline : {ev.headline[:95]}")
-                lines.append(f"    Question : {ev.question[:95]}")
-                lines.append("")
-        _write(self._path("ai_decisions.txt"), "\n".join(lines) + "\n")
-
     async def _write_watcher_status(self) -> None:
         lines = [_header("WATCHER STATUS")]
         if not self._watcher_statuses:
@@ -1430,16 +1386,6 @@ class Dashboard:
                     lines.append(f"    Brave budget   : {ws.budget_used}/{ws.budget_limit} calls/hr  ({pct}%)")
                 lines.append("")
         _write(self._path("watcher_status.txt"), "\n".join(lines) + "\n")
-
-    async def _write_market_index(self) -> None:
-        lines = [_header("MARKET INDEX")]
-        lines.append(f"  Markets in index : {self._market_count}")
-        lines.append(f"  Last refresh     : {_ts(self._market_last_refresh) if self._market_last_refresh else 'never'}")
-        lines.append("")
-        lines.append("  The market index is built from Polymarket's Gamma API.")
-        lines.append("  Each market's question text is embedded with sentence-transformers.")
-        lines.append("  Headlines are matched against the index by cosine similarity.")
-        _write(self._path("market_index.txt"), "\n".join(lines) + "\n")
 
     async def _write_engine_comparison(self) -> None:
         lines = [
@@ -1512,7 +1458,7 @@ class Dashboard:
         _write(self._path("signal_journal.txt"), "\n".join(lines) + "\n")
 
     async def _write_quant_stats(self) -> None:
-        lines = [_header("QUANT STATS  — bring to quant meeting")]
+        lines = [_header("QUANT STATS  — prediction accuracy + signal latency")]
         if not self._quant_stats:
             lines.append("  (no data yet — run for at least 1 hour to collect price impacts)")
             _write(self._path("quant_stats.txt"), "\n".join(lines) + "\n")
@@ -1521,111 +1467,34 @@ class Dashboard:
         impact = self._quant_stats.get("impact", [])
         impact_24h = self._quant_stats.get("impact_24h", [])
         lat = self._quant_stats.get("latency", {})
-        calibration = self._quant_stats.get("calibration", [])
-        ic_pairs = self._quant_stats.get("ic_pairs", [])
-        source_stats = self._quant_stats.get("source_stats", [])
-        alpha_decay = self._quant_stats.get("alpha_decay", [])
 
-        # ── 1. PREDICTION ACCURACY with Wilson CI + 24h rolling column ───────
+        # ── PREDICTION ACCURACY (lifetime + 24h rolling) ─────────────────────
+        # IC / calibration / source / alpha-decay tiles were removed in A1.5
+        # (zero in-process consumers; better fit for offline analysis scripts
+        # that can run heavier joins against the price_impacts table).
         lines.append("")
         lines.append("  PREDICTION ACCURACY  (did price move in predicted direction within 5m?)")
         lines.append(
-            f"  {'DIR':<4} {'N':>5} {'PREC':>7}  {'95% CI':>16}  "
+            f"  {'DIR':<4} {'N':>5} {'PREC':>7}  "
             f"{'AVG Δ5m':>9} {'AVG|Δ5m|':>9}   {'24h N':>6} {'24h PREC':>9}"
         )
-        lines.append("  " + "─" * 84)
+        lines.append("  " + "─" * 66)
         by_dir_24h = {r["direction"]: r for r in impact_24h}
         for row in impact:
             n = row["n"] or 0
             hits = row["hits"] or 0
             prec = hits / n if n else 0.0
-            lo, hi = _wilson_ci(hits, n)
             avg_d = row["avg_delta_t5m"] or 0.0
             avg_abs = row["avg_abs_delta_t5m"] or 0.0
             r24 = by_dir_24h.get(row["direction"], {})
             n24 = r24.get("n") or 0
             prec24 = (r24.get("hits") or 0) / n24 if n24 else 0.0
-            ci_str = f"{lo:.1%}–{hi:.1%}"
-            sig = " ✓" if n >= 30 and lo > 0.50 else ""
             lines.append(
-                f"  {row['direction']:<4} {n:>5} {prec:>6.1%}  {ci_str:>16}  "
-                f"{avg_d:>+8.4f} {avg_abs:>8.4f}   {n24:>6} {prec24:>8.1%}{sig}"
+                f"  {row['direction']:<4} {n:>5} {prec:>6.1%}  "
+                f"{avg_d:>+8.4f} {avg_abs:>8.4f}   {n24:>6} {prec24:>8.1%}"
             )
-        lines.append("")
-        lines.append("  ✓ = lower CI bound > 50% with N ≥ 30  (statistically significant alpha)")
 
-        # ── 2. INFORMATION COEFFICIENT ──────────────────────────────────────
-        if ic_pairs:
-            xs = [p[0] for p in ic_pairs]
-            ys = [p[1] for p in ic_pairs]
-            ic = _pearson(xs, ys)
-            lines.append("")
-            lines.append("  INFORMATION COEFFICIENT  (Pearson correlation: signed_confidence vs Δ5m)")
-            lines.append(f"    IC = {ic:+.4f}   N = {len(ic_pairs)}")
-            if abs(ic) >= 0.10:
-                lines.append("    Interpretation: STRONG signal (|IC| ≥ 0.10).")
-            elif abs(ic) >= 0.05:
-                lines.append("    Interpretation: useful alpha (0.05 ≤ |IC| < 0.10).")
-            else:
-                lines.append("    Interpretation: weak / noise (|IC| < 0.05).")
-
-        # ── 3. CALIBRATION CURVE ────────────────────────────────────────────
-        if calibration:
-            lines.append("")
-            lines.append("  CALIBRATION  (does conf=0.7 → 70% hit rate?)")
-            lines.append(f"  {'CONF':<5} {'N':>5}  {'HIT RATE':>9}  {'AVG|Δ5m|':>10}")
-            lines.append("  " + "─" * 38)
-            for row in calibration:
-                n = row["n"] or 0
-                hits = row["hits"] or 0
-                rate = hits / n if n else 0.0
-                avg_abs = row["avg_abs_delta"] or 0.0
-                lines.append(
-                    f"  {row['conf_bucket']:<5.1f} {n:>5}  {rate:>8.1%}  {avg_abs:>9.4f}"
-                )
-            lines.append("  Monotonically rising = model is well-calibrated.")
-            lines.append("  Flat line = overconfident; threshold tuning may help.")
-
-        # ── 4. SOURCE STRATIFICATION ────────────────────────────────────────
-        if source_stats:
-            lines.append("")
-            lines.append("  BY SOURCE  (news vs twitter vs truth_social)")
-            lines.append(
-                f"  {'SOURCE':<14} {'N':>5}  {'HIT RATE':>9}  {'AVG|Δ5m|':>10}  {'AVG CONF':>9}"
-            )
-            lines.append("  " + "─" * 60)
-            for row in source_stats:
-                n = row["n"] or 0
-                hits = row["hits"] or 0
-                rate = hits / n if n else 0.0
-                avg_abs = row["avg_abs_delta"] or 0.0
-                avg_conf = row["avg_confidence"] or 0.0
-                lines.append(
-                    f"  {row['source']:<14} {n:>5}  {rate:>8.1%}  "
-                    f"{avg_abs:>9.4f}  {avg_conf:>8.1%}"
-                )
-
-        # ── 5. ALPHA DECAY ──────────────────────────────────────────────────
-        if alpha_decay:
-            lines.append("")
-            lines.append("  ALPHA DECAY  (hit rate at each time bucket; rows where 60m is filled)")
-            lines.append(
-                f"  {'DIR':<4} {'N':>5}  {'1m':>6} {'5m':>6} {'15m':>6} {'30m':>6} {'60m':>6}"
-            )
-            lines.append("  " + "─" * 46)
-            for row in alpha_decay:
-                lines.append(
-                    f"  {row['direction']:<4} {row['n']:>5}  "
-                    f"{(row['hit_t1m']  or 0):>5.1%} "
-                    f"{(row['hit_t5m']  or 0):>5.1%} "
-                    f"{(row['hit_t15m'] or 0):>5.1%} "
-                    f"{(row['hit_t30m'] or 0):>5.1%} "
-                    f"{(row['hit_t60m'] or 0):>5.1%}"
-                )
-            lines.append("  hit(1m) > hit(60m) → alpha decays fast → speed matters.")
-            lines.append("  hit(60m) > hit(1m) → market digests slowly → wide entry window.")
-
-        # ── 6. SIGNAL LATENCY ───────────────────────────────────────────────
+        # ── SIGNAL LATENCY ──────────────────────────────────────────────────
         lines.append("")
         lines.append("  SIGNAL LATENCY  (headline detection → trade decision, includes AI call)")
         n_lat = lat.get("n") or 0
@@ -1634,9 +1503,6 @@ class Dashboard:
             lines.append(f"    Average : {lat.get('avg_ms') or 0:.0f} ms")
             lines.append(f"    Min     : {lat.get('min_ms') or 0:.0f} ms")
             lines.append(f"    Max     : {lat.get('max_ms') or 0:.0f} ms")
-            lines.append("")
-            lines.append("    Target: < 5000ms (5s) headline-to-trade.")
-            lines.append("    Even at 30s we beat human traders — FPGAs are sub-1ms.")
         else:
             lines.append("    (no latency data yet)")
 
@@ -1713,60 +1579,6 @@ class Dashboard:
     # Phase C: rich per-trade reasoning views
     # ------------------------------------------------------------------
 
-    # trade_log.jsonl rotation cap: keep only the last N lines. Without
-    # this, append-only growth pushed the file to 85 MB / 26k lines
-    # (2026-05-21 cleanup). Closed-trade history of record lives in the
-    # `trades` table; the .jsonl is just for `tail -f` and grep-friendly
-    # recent inspection.
-    _TRADE_LOG_MAX_LINES = 5000
-
-    async def _write_trade_log(self) -> None:
-        """
-        Rolling JSONL of recent closed trades with full reasoning context.
-        Append on each tick, truncate to the last _TRADE_LOG_MAX_LINES
-        when it exceeds 1.5× the cap so `tail -f` keeps working without
-        unbounded growth.
-        """
-        if self._db is None:
-            return
-        try:
-            rows = await self._db.get_closed_trades_since(self._last_trade_log_id)
-        except Exception as exc:
-            logger.warning("[dash] trade_log query failed: %s", exc)
-            return
-        if not rows:
-            return
-        path = self._path("trade_log.jsonl")
-        try:
-            with open(path, "a", encoding="utf-8") as f:
-                for r in rows:
-                    f.write(json.dumps(r, default=str, separators=(",", ":")) + "\n")
-            self._last_trade_log_id = max(r["id"] for r in rows)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[dash] trade_log append failed: %s", exc)
-            return
-
-        # Rotate when file grows past 1.5× the cap. Use 1.5× hysteresis
-        # so we don't truncate-and-rewrite every single append once we
-        # cross the cap.
-        try:
-            with open(path, "rb") as f:
-                # Cheap line count via newline scan
-                n = sum(1 for _ in f)
-            if n > int(self._TRADE_LOG_MAX_LINES * 1.5):
-                with open(path, "r", encoding="utf-8") as f:
-                    tail = f.readlines()[-self._TRADE_LOG_MAX_LINES:]
-                tmp = path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as f:
-                    f.writelines(tail)
-                os.replace(tmp, path)
-                logger.info(
-                    "[dash] trade_log rotated %d → %d lines",
-                    n, self._TRADE_LOG_MAX_LINES,
-                )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[dash] trade_log rotation failed: %s", exc)
-
     async def _write_variant_compare(self) -> None:
         """Per-variant pivot: trades, wins, losses, hit-rate, sum PnL."""
         if self._db is None:
@@ -1803,89 +1615,6 @@ class Dashboard:
                 )
         _write(self._path("variant_compare.txt"), "\n".join(lines) + "\n")
 
-    async def _write_wins_losses(self) -> None:
-        """Top winners and losers with full reasoning context."""
-        if self._db is None:
-            return
-        try:
-            wins, losses = await self._db.get_top_wins_losses(limit=50)
-        except Exception as exc:
-            logger.warning("[dash] wins/losses query failed: %s", exc)
-            return
-        for path, label, rows in (
-            ("wins.txt",   "TOP WINS",   wins),
-            ("losses.txt", "TOP LOSSES", losses),
-        ):
-            lines = [_header(f"{label}  (top 50 by realized PnL)"), ""]
-            if not rows:
-                lines.append("  (none yet)")
-            else:
-                for r in rows:
-                    inv = " [INV]" if (r.get("inverted") or 0) else ""
-                    mid_y = r.get("mid_yes")
-                    mid_n = r.get("mid_no")
-                    mid_y_s = f"{mid_y:.3f}" if mid_y is not None else "  —  "
-                    mid_n_s = f"{mid_n:.3f}" if mid_n is not None else "  —  "
-                    lines.append(
-                        f"  PnL={r['realized_pnl']:>+8.3f}  [{r['variant']}]{inv}  "
-                        f"{r['direction']} ${r['size_usdc']:.0f} "
-                        f"@ {r['entry_price']:.3f}  edge={r['signed_edge']:+.4f}  "
-                        f"conf={r['confidence']:.0%}  agree={(r.get('agreement') or 0):.2f}  "
-                        f"close={r.get('close_reason') or '?'}"
-                    )
-                    lines.append(f"    yes/no rails  : {mid_y_s} / {mid_n_s}")
-                    lines.append(f"    Market   : {(r.get('question') or '')[:95]}")
-                    if r.get("ai_reason"):
-                        lines.append(f"    AI says  : {r['ai_reason'][:120]}")
-                    lines.append("")
-            _write(self._path(path), "\n".join(lines) + "\n")
-
-    async def _write_headline_journal(self) -> None:
-        """One JSONL line per headline + linked trades + price context."""
-        if self._db is None:
-            return
-        try:
-            rows = await self._db.get_headline_summary(limit=500)
-        except Exception as exc:
-            logger.warning("[dash] headline_summary query failed: %s", exc)
-            return
-        path = self._path("headline_journal.jsonl")
-        try:
-            with open(path, "w", encoding="utf-8") as f:
-                for r in rows:
-                    f.write(json.dumps(r, default=str, separators=(",", ":")) + "\n")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("[dash] headline_journal write failed: %s", exc)
-
-    async def _write_headline_winners(self) -> None:
-        """Group by headline; show headlines where ≥2 variants traded, ranked by sum PnL."""
-        if self._db is None:
-            return
-        try:
-            rows = await self._db.get_headline_winners(limit=40, min_variants=2)
-        except Exception as exc:
-            logger.warning("[dash] headline_winners query failed: %s", exc)
-            return
-        lines = [
-            _header("HEADLINE WINNERS  (≥2 variants traded; sum PnL desc)"),
-            "  Headlines where the signal was robust across multiple strategy variants.",
-            "  Single-variant flukes are filtered out.",
-            "",
-        ]
-        if not rows:
-            lines.append("  (no multi-variant trades yet — give it more time)")
-        else:
-            for r in rows:
-                lines.append(
-                    f"  Σ PnL={r['sum_pnl']:>+8.3f}  variants={r['n_variants']}  "
-                    f"wins={r['n_wins']}  losses={r['n_losses']}  "
-                    f"at {(r['detected_at'] or '')[:19]}"
-                )
-                lines.append(f"    {(r.get('headline') or '')[:110]}")
-                lines.append(f"    {_short(r.get('site_url') or '')}  hid={(r.get('headline_id') or '')[:8]}")
-                lines.append("")
-        _write(self._path("headline_winners.txt"), "\n".join(lines) + "\n")
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
@@ -1897,35 +1626,6 @@ class Dashboard:
 # ---------------------------------------------------------------------------
 # File/format utilities
 # ---------------------------------------------------------------------------
-
-
-def _wilson_ci(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
-    """
-    95% Wilson confidence interval for a binomial proportion.
-
-    Returns (low, high). Stable for small N (unlike the normal-approximation CI).
-    """
-    if n == 0:
-        return 0.0, 1.0
-    p = hits / n
-    denom = 1.0 + z * z / n
-    centre = (p + z * z / (2 * n)) / denom
-    margin = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
-    return max(0.0, centre - margin), min(1.0, centre + margin)
-
-
-def _pearson(xs: list[float], ys: list[float]) -> float:
-    """Pearson correlation. Pure stdlib — no numpy/scipy."""
-    n = len(xs)
-    if n < 2:
-        return 0.0
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    sx2 = sum((x - mx) ** 2 for x in xs)
-    sy2 = sum((y - my) ** 2 for y in ys)
-    den = (sx2 * sy2) ** 0.5
-    return num / den if den else 0.0
 
 
 def _ts(dt) -> str:

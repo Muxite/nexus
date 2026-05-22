@@ -77,7 +77,6 @@ async def _market_refresh_loop(
             if index.needs_refresh:
                 count = await index.refresh()
                 await index.load_heat_from_db()
-                dash.set_market_index(count)
                 logger.info("[main] market refresh: %d markets", count)
         except asyncio.CancelledError:
             break
@@ -131,13 +130,11 @@ async def _position_monitor_loop(
             skips = await db.get_engine_skip_reasons()
             dash.set_engine_summary(summary, skips)
 
-            # Quant stats refresh — all-time + 24h + calibration + IC + source + decay
+            # Quant stats refresh — prediction accuracy lifetime + 24h.
+            # A1.5 dropped calibration / IC / source / alpha-decay tiles;
+            # those queries belong in off-line scripts now.
             quant = await db.get_quant_stats()
             quant["impact_24h"] = (await db.get_quant_stats(since_hours=24.0))["impact"]
-            quant["calibration"] = await db.get_calibration_curve()
-            quant["ic_pairs"] = await db.get_ic_pairs()
-            quant["source_stats"] = await db.get_source_stats()
-            quant["alpha_decay"] = await db.get_alpha_decay()
             dash.set_quant_stats(quant)
 
             # External usage (AI tokens + Brave searches)
@@ -301,14 +298,10 @@ async def main() -> None:
         try:
             count = await index.refresh()
             await index.load_heat_from_db()  # refresh may have added new markets
-            dash.set_market_index(count)
             logger.info("[main] market index ready: %d markets", count)
         except Exception as exc:
             logger.warning("[main] market refresh failed: %s — cached=%d", exc, cached)
-            if cached:
-                dash.set_market_index(cached)
     else:
-        dash.set_market_index(cached)
         logger.info("[main] market index loaded from DB: %d markets", cached)
 
     # AI classifier (shared across all engines)
