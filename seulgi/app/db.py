@@ -379,6 +379,15 @@ _MIGRATIONS = [
     # script can re-derive realized_pnl independently.
     "ALTER TABLE trades ADD COLUMN entry_fee_usdc REAL",
     "ALTER TABLE trades ADD COLUMN exit_fee_usdc  REAL",
+    # FIX-2B (2026-05-22): persist the actual exit fill price and the
+    # entry_price the close was computed against. Once close_position
+    # deletes the positions row, these are the only DB anchors that
+    # let an audit/postmortem reconcile realized_pnl independently.
+    # The explicit one-shot migration runnable against the live DB is
+    # seulgi/scripts/db_migrations/2026_05_22_add_exit_price.py; these
+    # two ALTERs keep fresh DBs (tests, replay) in sync.
+    "ALTER TABLE trades ADD COLUMN exit_price           REAL",
+    "ALTER TABLE trades ADD COLUMN entry_price_at_close REAL",
     # Tier 2 (2026-05-20 perf) — see plan-file: DB + program perf.
     # Dashboard queries (variant_stats, decision_funnel, freshness_buckets,
     # confidence_buckets) all WHERE decided_at >= ?. Without these indexes
@@ -1205,13 +1214,30 @@ class SeulgiDB:
                 raise
 
     async def get_open_positions(self, engine_name: Optional[str] = None) -> list[dict]:
-        """Return open positions, optionally filtered to one engine."""
+        """Return open positions, optionally filtered to one engine.
+
+        Joins to `markets` so callers see the market_type alongside the
+        position fields — the exit-leg fee/slippage compute needs it to
+        look up the per-category rate (FIX-1, plan §exit-fee plumbing).
+        """
         if engine_name is None:
-            async with self._conn.execute("SELECT * FROM positions") as cur:
+            async with self._conn.execute(
+                """
+                SELECT p.*, m.market_type AS market_type
+                  FROM positions p
+                  LEFT JOIN markets m ON p.condition_id = m.condition_id
+                """
+            ) as cur:
                 rows = await cur.fetchall()
         else:
             async with self._conn.execute(
-                "SELECT * FROM positions WHERE engine_name = ?", (engine_name,)
+                """
+                SELECT p.*, m.market_type AS market_type
+                  FROM positions p
+                  LEFT JOIN markets m ON p.condition_id = m.condition_id
+                 WHERE p.engine_name = ?
+                """,
+                (engine_name,),
             ) as cur:
                 rows = await cur.fetchall()
         return [dict(row) for row in rows]
@@ -2432,7 +2458,8 @@ class SeulgiDB:
         """Return losing positions in markets that haven't matched any headline recently."""
         sql = """
             SELECT p.trade_id, p.condition_id, p.token_id, p.direction,
-                   p.size_usdc, p.entry_price, p.unrealized_pnl, p.engine_name
+                   p.size_usdc, p.entry_price, p.unrealized_pnl, p.engine_name,
+                   p.shares, m.market_type
             FROM positions p
             LEFT JOIN markets m ON p.condition_id = m.condition_id
             WHERE p.unrealized_pnl < 0
