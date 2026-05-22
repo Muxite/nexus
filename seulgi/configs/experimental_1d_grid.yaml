@@ -1,0 +1,247 @@
+# ── A3.3 — experimental 1-D variant grid ─────────────────────────────────────
+# Phase 3, Agent A3.3 (master plan §D.6). Strict 1-D mutants from a fixed
+# baseline so per-knob attribution stays clean. Each variant changes
+# EXACTLY ONE knob vs `balanced/conf40_tp025_sl045`; everything else
+# matches the production baseline.
+#
+# Baseline: balanced/conf40_tp025_sl045
+#   min_confidence    = 0.40
+#   take_profit       = 0.025
+#   stop_loss         = 0.045
+#   trailing_stop     = 0.012
+#   min_edge          = 0.03         (parent inherits)
+#   min_hold_seconds  = 300          (parent inherits)
+#   mid_yes_min       = 0.0          (global default)
+#   mid_yes_max       = 1.0          (global default)
+#   max_position_usdc = 100.0
+#   max_open_positions = 20
+#
+# ── Harness constraint ──────────────────────────────────────────────────────
+# `scripts.replay.backtest` walks the historical `engine_results` rows,
+# keyed by `engine_name`. Only variants that exist in the live config get
+# rows in the historical table. New variant names (e.g. `1d/conf35`)
+# would never be walked because they have zero historical rows.
+#
+# Workaround: repurpose existing historical variant names as carriers
+# for the 1-D mutants. All balanced/* variants share the SAME LLM oracle
+# rows per headline (verified: identical direction/confidence/p_hat/mid
+# across all balanced/* engine_results for the same headline_id), so
+# substituting trader rules is equivalent to running a fresh 1-D mutant
+# against the same decision stream.
+#
+# Mapping: semantic role → historical name (mutation noted on the row)
+#   BASELINE             → conf40_tp025_sl045          (anchor, untouched)
+#   1d/conf35            → loose_confidence_035        min_conf 0.40→0.35
+#   1d/conf50            → conf50_tp025_sl045          min_conf 0.40→0.50
+#   1d/tp020             → conf40_tp025_sl045_yes_only TP        0.025→0.020
+#   1d/sl030             → conf40_tp025_sl045_evolving SL        0.045→0.030
+#   1d/mid060            → loose_mid_band_058          mid_yes_min 0.0→0.60
+#   1d/min_edge_002      → conf40_tp025_sl045_mid075   min_edge  0.03→0.02
+#   1d/min_edge_005      → conf40_tp020_sl030_lowvol_resurrected
+#                                                      min_edge  0.03→0.05
+#
+# `1d/sim040 (min_top_similarity)` was DROPPED from the grid: the backtest
+# harness re-runs `_evaluate_pure` + `_close_pure` only — it never re-runs
+# the Stage-2 relevance gate where `min_top_similarity` is enforced.
+# Swapped to `1d/min_edge_005` so we have a symmetric pair on the
+# edge-floor knob (002 / 005 brackets the 0.03 baseline).
+#
+# Plus scout + super_scout (research engines kept for attribution context).
+# Everything else from the production config has been dropped.
+
+# Watched sites / feeds / socials — backtest walks historical
+# engine_results, so ingestion config is irrelevant. Empty stanzas
+# satisfy the loader.
+watched_sites: []
+feeds: []
+social_accounts: []
+
+# Market index defaults — backtest doesn't refresh; needed for loader sanity.
+markets:
+  refresh_hours: 4
+  similarity_threshold: 0.55
+  top_k: 25
+  max_tracked_markets: 20000
+
+# AI baseline (engine-level min_confidence overrides this per variant).
+ai:
+  model: "google/gemini-2.5-flash"
+  premium_model: "anthropic/claude-haiku-4-5"
+  premium_sim_threshold: 0.70
+  premium_trigger_breaking_strong: true
+  api_key: ""
+  api_base: "https://openrouter.ai/api/v1"
+  ensemble_samples: 3
+  ensemble_temperature: 0.5
+  min_agreement: 0.66
+  min_confidence: 0.40
+
+market_context:
+  enabled: true
+  window_secs: 1800
+  cache_ttl_secs: 30
+
+relevance:
+  enabled: true
+  model: "google/gemini-2.5-flash-lite"
+  temperature: 0.1
+  keep_scores: ["STRONG_YES"]
+  max_tokens_per_market: 60
+  min_top_similarity: 0.30
+
+trading:
+  balance_usdc: 1000.0
+  max_position_usdc: 100.0
+  min_trade_usdc: 5.0
+  min_edge: 0.04
+  edge_increment: 0.12
+  position_timeout_hours: 24
+  max_open_positions: 20
+  max_unique_markets: 15
+  cold_position_hours: 4.0
+  infinite_balance: false
+  mode: "simulate"
+  simulate_total_usdc: 1100.0
+  simulate_min_trade_usdc: 1.0
+  rail_skip_threshold: 0.05
+  entry_rail_skip_threshold: 0.02
+  spread_cost_bps: 20.0
+
+# ── Engines ──────────────────────────────────────────────────────────────────
+engines:
+  - name: "balanced"
+    min_edge: 0.03
+    edge_increment: 0.12
+    max_position_usdc: 100.0
+    min_confidence: 0.40
+    max_open_positions: 20
+    take_profit:      0.020
+    stop_loss:        0.030
+    trailing_stop:    0.010
+    min_hold_seconds: 300
+    variants:
+
+      # ── BASELINE — pinned anchor for every 1-D comparison ───────────
+      - name: "conf40_tp025_sl045"
+        take_profit:   0.025
+        stop_loss:     0.045
+        trailing_stop: 0.012
+
+      # ── 1d/conf35 — min_confidence 0.40 → 0.35 ──────────────────────
+      # Carried by historical name `loose_confidence_035`.
+      - name: "loose_confidence_035"
+        min_confidence: 0.35
+        take_profit:   0.025
+        stop_loss:     0.045
+        trailing_stop: 0.012
+
+      # ── 1d/conf50 — min_confidence 0.40 → 0.50 ──────────────────────
+      # Carried by historical name `conf50_tp025_sl045`.
+      - name: "conf50_tp025_sl045"
+        min_confidence: 0.50
+        take_profit:   0.025
+        stop_loss:     0.045
+        trailing_stop: 0.012
+
+      # ── 1d/tp020 — take_profit 0.025 → 0.020 ────────────────────────
+      # Carried by historical name `conf40_tp025_sl045_yes_only`
+      # (direction_filter intentionally NOT inherited from prod).
+      - name: "conf40_tp025_sl045_yes_only"
+        take_profit:   0.020
+        stop_loss:     0.045
+        trailing_stop: 0.012
+
+      # ── 1d/sl030 — stop_loss 0.045 → 0.030 ──────────────────────────
+      # Carried by historical name `conf40_tp025_sl045_evolving`
+      # (freshness_filter intentionally NOT inherited from prod).
+      - name: "conf40_tp025_sl045_evolving"
+        take_profit:   0.025
+        stop_loss:     0.030
+        trailing_stop: 0.012
+
+      # ── 1d/mid060 — mid_yes_min 0.0 → 0.60 ──────────────────────────
+      # Carried by historical name `loose_mid_band_058`.
+      - name: "loose_mid_band_058"
+        take_profit:   0.025
+        stop_loss:     0.045
+        trailing_stop: 0.012
+        mid_yes_min:   0.60
+        mid_yes_max:   1.0
+
+      # ── 1d/min_edge_002 — min_edge 0.03 → 0.02 ──────────────────────
+      # Carried by historical name `conf40_tp025_sl045_mid075`
+      # (mid_yes_min/max intentionally NOT inherited from prod).
+      - name: "conf40_tp025_sl045_mid075"
+        min_edge:      0.02
+        take_profit:   0.025
+        stop_loss:     0.045
+        trailing_stop: 0.012
+
+      # ── 1d/min_edge_005 — min_edge 0.03 → 0.05 ──────────────────────
+      # Carried by historical name `conf40_tp020_sl030_lowvol_resurrected`
+      # (max_market_vol_30m intentionally NOT inherited from prod).
+      - name: "conf40_tp020_sl030_lowvol_resurrected"
+        min_edge:      0.05
+        take_profit:   0.025
+        stop_loss:     0.045
+        trailing_stop: 0.012
+
+  # ── SCOUT — research engine (kept for attribution context) ───────────
+  - name: "scout"
+    balance_usdc: 50.0
+    min_edge: -10.0
+    edge_increment: 0.12
+    max_position_usdc: 1.0
+    min_trade_usdc: 0.5     # below the global $5 min so micro-stake fires
+    min_confidence: 0.0
+    max_open_positions: 50
+    take_profit:      0.05
+    stop_loss:        0.05
+    trailing_stop:    0.020
+    min_hold_seconds: 60
+    relevance_keep_scores: ["STRONG_YES", "YES", "WEAK"]
+    variants:
+      - name: "all_signals"
+
+  # ── SUPER_SCOUT — loosest-of-everything research engine ──────────────
+  - name: "super_scout"
+    balance_usdc: 50.0
+    min_edge: -10.0
+    edge_increment: 0.12
+    max_position_usdc: 0.05
+    min_trade_usdc: 0.01    # let the $0.05 micro-stake survive the gate
+    min_confidence: 0.0
+    max_open_positions: 500
+    take_profit:      0.05
+    stop_loss:        0.05
+    trailing_stop:    0.02
+    min_hold_seconds: 60
+    mid_yes_min: 0.0
+    mid_yes_max: 1.0
+    min_entry_yes_mid: 0.0
+    max_market_vol_30m: 0.0
+    rail_skip_threshold: 0.0
+    entry_rail_skip_threshold: 0.0
+    spread_cost_bps: 0.0
+    invert_high_conf: false
+    relevance_keep_scores: ["STRONG_YES", "YES", "WEAK", "NO"]
+    variants:
+      - name: "all_signals"
+
+db:
+  path: "/data/seulgi.db"
+dashboard:
+  data_dir: "/data/dashboard"
+  interval_secs: 30
+news_memory:
+  path: "/data/news_chroma"
+  dedup_distance_threshold: 0.12
+  fresh_dist_threshold: 0.30
+  rehash_age_secs: 21600
+  stale_age_secs: 86400
+  recent_context_window_secs: 86400
+  recent_context_n: 3
+  short_circuit_labels: []
+search_budget:
+  brave_per_hour: 20
+log_level: "INFO"
