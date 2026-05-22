@@ -21,19 +21,28 @@ from db import SeulgiDB
 
 @pytest.mark.asyncio
 async def test_batch_coalesces_writes_into_single_commit():
-    """N inserts inside one batch must produce exactly 1 COMMIT."""
+    """N inserts inside one batch must produce exactly 1 COMMIT.
+
+    Post FIX-3B (2026-05-22, cycle-2 Layer C re-ship): the connection
+    is opened with isolation_level=None, so `aiosqlite.commit()` is a
+    no-op. batch() bracket now uses explicit `execute("BEGIN")` /
+    `execute("COMMIT")` (shielded from cancellation). We instrument
+    `_conn.execute` to count COMMIT statements instead of `.commit()`
+    calls.
+    """
     db = SeulgiDB(":memory:")
     await db.connect()
     try:
         commit_count = 0
-        real_commit = db._conn.commit
+        real_execute = db._conn.execute
 
-        async def _counting_commit():
+        async def _counting_execute(sql, *args, **kwargs):
             nonlocal commit_count
-            commit_count += 1
-            await real_commit()
+            if isinstance(sql, str) and sql.strip().upper() == "COMMIT":
+                commit_count += 1
+            return await real_execute(sql, *args, **kwargs)
 
-        db._conn.commit = _counting_commit
+        db._conn.execute = _counting_execute
 
         async with db.batch():
             await db.insert_signal(
@@ -50,7 +59,7 @@ async def test_batch_coalesces_writes_into_single_commit():
             )
 
         assert commit_count == 1, (
-            f"expected 1 commit for 3 inserts inside batch(), got {commit_count}"
+            f"expected 1 COMMIT for 3 inserts inside batch(), got {commit_count}"
         )
     finally:
         await db.close()

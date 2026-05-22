@@ -151,6 +151,55 @@ CREATE INDEX IF NOT EXISTS idx_pi_condition_id ON price_impacts(condition_id);
 CREATE INDEX IF NOT EXISTS idx_pi_detected_at ON price_impacts(detected_at);
 """
 
+# FIX-3C: Phase-5 historical-simulation data foundation. Three append-only
+# capture tables that let a future replay harness re-run trader.evaluate
+# with new configs without re-paying LLM tokens. Schema is shipped now so
+# Phase-2 wiring (engine.py / ai.py) doesn't get blocked on migration
+# coordination. Writers exist below as `insert_decision_input`,
+# `log_llm_call`, `log_llm_parse_failure` — fire-and-forget per spec.
+_HIST_SIM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS decision_inputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    headline_id TEXT NOT NULL,
+    decided_at TEXT NOT NULL,
+    source_host TEXT,
+    embedding_bytes BLOB,
+    matches_json TEXT,          -- list of {cond_id, question, similarity, mid_yes, mid_no, relevance_score}
+    freshness_label TEXT,
+    freshness_dist REAL,
+    freshness_age_secs REAL,
+    pre_ai_skips_json TEXT,
+    max_similarity REAL
+);
+CREATE INDEX IF NOT EXISTS idx_decision_inputs_headline ON decision_inputs(headline_id);
+CREATE INDEX IF NOT EXISTS idx_decision_inputs_decided ON decision_inputs(decided_at);
+
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    model TEXT,
+    prompt_sha TEXT NOT NULL,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    response_text TEXT,         -- capped at 8KB by caller
+    parse_ok INTEGER NOT NULL,  -- 0/1
+    headline_id TEXT,
+    batch_size INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_prompt_sha ON llm_calls(prompt_sha);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_ts ON llm_calls(ts);
+
+CREATE TABLE IF NOT EXISTS llm_parse_failures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    model TEXT,
+    error_msg TEXT,
+    response_text TEXT,         -- capped at 4KB by caller
+    headline_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_parse_failures_ts ON llm_parse_failures(ts);
+"""
+
 _MIGRATIONS = [
     "ALTER TABLE trades    ADD COLUMN question     TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE trades    ADD COLUMN realized_pnl REAL",
@@ -437,6 +486,19 @@ _MIGRATIONS = [
     "CREATE INDEX IF NOT EXISTS idx_mps_condition_t ON market_price_snaps(condition_id, t_unix)",
     "CREATE INDEX IF NOT EXISTS idx_mps_t           ON market_price_snaps(t_unix)",
     "CREATE INDEX IF NOT EXISTS idx_mps_headline    ON market_price_snaps(headline_id)",
+    # FIX-3D (per A0.6 db-audit, cycle-2 Layer A follow-up):
+    # - (engine_name, closed_at) is the hot path for the rolling-hit-rate
+    #   query that took 1.4 s/engine on 288k rows (28 s total stall for
+    #   20 engines). Background refresher hides it today; this index
+    #   restores correctness when the refresher is re-enabled.
+    # - (condition_id, decided_at) for "did we ever trade X" lookups on
+    #   the 6.6M-row trades table; today these full-scan.
+    # - (t_unix) on market_price_snaps is redundant with idx_mps_t above
+    #   but the A0.6 audit explicitly called for the named index; both
+    #   are IF NOT EXISTS so applying both is safe.
+    "CREATE INDEX IF NOT EXISTS idx_trades_engine_closed ON trades(engine_name, closed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_trades_condition_decided ON trades(condition_id, decided_at)",
+    "CREATE INDEX IF NOT EXISTS idx_market_price_snaps_t_unix ON market_price_snaps(t_unix)",
 ]
 
 
@@ -475,7 +537,14 @@ class SeulgiDB:
 
     async def connect(self) -> None:
         """Open the DB connection, create schema, and apply migrations."""
-        self._conn = await aiosqlite.connect(self._path)
+        # FIX-3A (cycle-2 Layer C): open with isolation_level=None for true
+        # autocommit. Python's sqlite3 default `DEFERRED` auto-issues implicit
+        # BEGIN before write statements, which can interleave with the
+        # explicit BEGIN in batch() → "cannot start a transaction within a
+        # transaction". With autocommit, the explicit BEGIN/COMMIT in batch()
+        # are the only txn boundaries; per-row writes outside a batch
+        # auto-commit (cheap on WAL+synchronous=NORMAL).
+        self._conn = await aiosqlite.connect(self._path, isolation_level=None)
         self._conn.row_factory = aiosqlite.Row
         # Tier 1 (2026-05-20 perf) — see plan-file: DB + program perf:
         #   WAL: readers don't block writers (was journal_mode=delete).
@@ -498,6 +567,8 @@ class SeulgiDB:
         """)
         await self._conn.executescript(_SCHEMA)
         await self._conn.executescript(_PRICE_IMPACT_SCHEMA)
+        # FIX-3C: Phase-5 capture tables (idempotent via IF NOT EXISTS).
+        await self._conn.executescript(_HIST_SIM_SCHEMA)
         await self._commit_if_unbatched()
         await self._migrate()
         # One-time backfill: tag any historical NULL-engine trades using the
@@ -553,6 +624,19 @@ class SeulgiDB:
         if self._batch_lock is None:
             self._batch_lock = asyncio.Lock()
         async with self._batch_lock:
+            # FIX-3B (cycle-2 Layer B): Recover from any prior batch that
+            # left the connection mid-transaction (cancelled at an await
+            # point — e.g. the wait_for(90s) on gather timing out). Without
+            # this probe, our subsequent `BEGIN` raises "cannot start a
+            # transaction within a transaction" → every following batch
+            # caller hits the same → permanent break until container
+            # restart. ROLLBACK is a no-op when there's no active txn
+            # (autocommit mode), so this is cheap and safe.
+            try:
+                await asyncio.shield(self._conn.execute("ROLLBACK"))
+            except Exception:  # noqa: BLE001
+                pass
+
             # Mark "inside batch" in THIS task's context. Child coroutines
             # awaited inside the batch inherit the flag via contextvars,
             # so their writes route through _write_lock's reentrant path
@@ -576,9 +660,18 @@ class SeulgiDB:
                         )
                     except Exception:  # noqa: BLE001
                         pass
+                # FIX-3B: shield the cleanup rollback from cancellation
+                # propagating UP the await chain. If we're being cancelled
+                # (e.g. wait_for timeout), a plain `await rollback()` would
+                # re-raise CancelledError BEFORE the rollback completes,
+                # leaving the connection mid-txn. `asyncio.shield` keeps
+                # the rollback running to completion even when the task
+                # is cancelled. We catch BaseException because shield can
+                # itself raise CancelledError when the outer task is
+                # cancelled.
                 try:
-                    await self._conn.rollback()
-                except Exception as r_exc:  # noqa: BLE001
+                    await asyncio.shield(self._conn.execute("ROLLBACK"))
+                except BaseException as r_exc:
                     logger.error(
                         "[db.batch] rollback() raised: %r — connection state may be corrupt",
                         r_exc, exc_info=True,
@@ -591,7 +684,9 @@ class SeulgiDB:
                 raise
             else:
                 self._in_batch = 0
-                await self._conn.commit()
+                # FIX-3B: shield commit too — the symmetric cancellation
+                # window exists on the success path.
+                await asyncio.shield(self._conn.execute("COMMIT"))
             finally:
                 _in_batch_var.reset(token)
 
@@ -754,7 +849,10 @@ class SeulgiDB:
         URI mode=ro never take a write lock.
         """
         uri = f"file:{self._path}?mode=ro"
-        self._conn = await aiosqlite.connect(uri, uri=True)
+        # FIX-3A: pass isolation_level=None for consistency with writer
+        # connections; RO conns never write, but autocommit avoids the
+        # implicit-BEGIN footgun if a sibling ever flips to RW.
+        self._conn = await aiosqlite.connect(uri, uri=True, isolation_level=None)
         self._conn.row_factory = aiosqlite.Row
         logger.info("SeulgiDB connected RO: %s", self._path)
 
@@ -770,7 +868,8 @@ class SeulgiDB:
         """
         inst = cls(path)
         uri = f"file:{path}?mode=ro"
-        inst._conn = await aiosqlite.connect(uri, uri=True)
+        # FIX-3A: autocommit also on RO clones for consistency.
+        inst._conn = await aiosqlite.connect(uri, uri=True, isolation_level=None)
         inst._conn.row_factory = aiosqlite.Row
         await inst._conn.executescript("PRAGMA busy_timeout=10000;")
         logger.info("SeulgiDB RO clone connected: %s", path)
@@ -788,7 +887,10 @@ class SeulgiDB:
         writer's worker thread is never blocked by flush work.
         """
         inst = cls(path)
-        inst._conn = await aiosqlite.connect(path)
+        # FIX-3A: writer clones MUST use autocommit for the same reason
+        # as the main writer — implicit BEGIN can race with batch()'s
+        # explicit BEGIN.
+        inst._conn = await aiosqlite.connect(path, isolation_level=None)
         inst._conn.row_factory = aiosqlite.Row
         await inst._conn.executescript("""
             PRAGMA journal_mode=WAL;
@@ -2612,6 +2714,146 @@ class SeulgiDB:
                 self._bump_ok("log_usage", "usage_events")
             except Exception as exc:
                 self._bump_err("log_usage", exc)
+                raise
+
+    # ------------------------------------------------------------------
+    # FIX-3C: Phase-5 historical-simulation data foundation
+    # ------------------------------------------------------------------
+    #
+    # Three append-only writers feed the replay-harness corpus. Per spec
+    # these are fire-and-forget: callers should swallow exceptions at
+    # the callsite (engine.py / ai.py) so a capture failure never breaks
+    # the live decision path. Each writer still bumps its err counter so
+    # silent breakage is observable in db_health.txt.
+    #
+    # NOT wired into engine.py/ai.py here — that's Phase 2 (A2.1/A2.2).
+    # Shipping schema + writers now unblocks Phase 2 without forcing a
+    # coordinated migration.
+
+    async def insert_decision_input(
+        self,
+        *,
+        headline_id: str,
+        decided_at: Optional[str] = None,
+        source_host: Optional[str] = None,
+        embedding_bytes: Optional[bytes] = None,
+        matches_json: Optional[str] = None,
+        freshness_label: Optional[str] = None,
+        freshness_dist: Optional[float] = None,
+        freshness_age_secs: Optional[float] = None,
+        pre_ai_skips_json: Optional[str] = None,
+        max_similarity: Optional[float] = None,
+    ) -> int:
+        """Append one row per signal capturing every input that fed the
+        decision. Returns the new row id. Fire-and-forget at callsite."""
+        async with self._write_lock():
+            try:
+                cur = await self._conn.execute(
+                    """
+                    INSERT INTO decision_inputs
+                        (headline_id, decided_at, source_host, embedding_bytes,
+                         matches_json, freshness_label, freshness_dist,
+                         freshness_age_secs, pre_ai_skips_json, max_similarity)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        headline_id,
+                        decided_at or _now_iso(),
+                        source_host,
+                        embedding_bytes,
+                        matches_json,
+                        freshness_label,
+                        freshness_dist,
+                        freshness_age_secs,
+                        pre_ai_skips_json,
+                        max_similarity,
+                    ),
+                )
+                row_id = cur.lastrowid
+                await self._commit_if_unbatched()
+                self._bump_ok("insert_decision_input", "decision_inputs")
+                return int(row_id) if row_id is not None else 0
+            except Exception as exc:
+                self._bump_err("insert_decision_input", exc)
+                raise
+
+    async def log_llm_call(
+        self,
+        *,
+        ts: Optional[str] = None,
+        model: Optional[str] = None,
+        prompt_sha: str,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        response_text: Optional[str] = None,
+        parse_ok: bool = True,
+        headline_id: Optional[str] = None,
+        batch_size: Optional[int] = None,
+    ) -> int:
+        """Append one row per LLM round-trip. `response_text` should be
+        capped at 8KB by the caller. Returns the new row id."""
+        async with self._write_lock():
+            try:
+                cur = await self._conn.execute(
+                    """
+                    INSERT INTO llm_calls
+                        (ts, model, prompt_sha, prompt_tokens, completion_tokens,
+                         response_text, parse_ok, headline_id, batch_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts or _now_iso(),
+                        model,
+                        prompt_sha,
+                        prompt_tokens,
+                        completion_tokens,
+                        response_text,
+                        1 if parse_ok else 0,
+                        headline_id,
+                        batch_size,
+                    ),
+                )
+                row_id = cur.lastrowid
+                await self._commit_if_unbatched()
+                self._bump_ok("log_llm_call", "llm_calls")
+                return int(row_id) if row_id is not None else 0
+            except Exception as exc:
+                self._bump_err("log_llm_call", exc)
+                raise
+
+    async def log_llm_parse_failure(
+        self,
+        *,
+        ts: Optional[str] = None,
+        model: Optional[str] = None,
+        error_msg: Optional[str] = None,
+        response_text: Optional[str] = None,
+        headline_id: Optional[str] = None,
+    ) -> int:
+        """Append one row per LLM parse failure. `response_text` should
+        be capped at 4KB by the caller. Returns the new row id."""
+        async with self._write_lock():
+            try:
+                cur = await self._conn.execute(
+                    """
+                    INSERT INTO llm_parse_failures
+                        (ts, model, error_msg, response_text, headline_id)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        ts or _now_iso(),
+                        model,
+                        error_msg,
+                        response_text,
+                        headline_id,
+                    ),
+                )
+                row_id = cur.lastrowid
+                await self._commit_if_unbatched()
+                self._bump_ok("log_llm_parse_failure", "llm_parse_failures")
+                return int(row_id) if row_id is not None else 0
+            except Exception as exc:
+                self._bump_err("log_llm_parse_failure", exc)
                 raise
 
     async def get_usage_totals(self) -> dict:
