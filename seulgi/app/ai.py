@@ -76,11 +76,17 @@ OpenRouter API reference: https://openrouter.ai/docs
 # Side effects:
 #   - HTTPS POSTs to OpenRouter `/chat/completions` (one per ensemble
 #     sample; semaphore = max(max_concurrent, 2·ensemble_samples)).
-#   - No DB writes from this module. The caller (engine.py) writes:
-#       * `usage_events` (kind='ai_tokens', stage='prediction'),
-#       * `llm_parse_failures` rows (fire-and-forget, raw response
-#         capped to ~4KB) when `_parse_batch_response` returns None,
-#       * `llm_calls` rows — NOT YET WIRED (master plan A2.1).
+#   - DB writes (A2.1, 2026-05-22) — when `db` was passed to
+#     `DirectionClassifier(...)`, classify_batch logs ONE row per
+#     ensemble sample to `llm_calls` (parse_ok=0/1, response_text
+#     capped at 8KB) plus a paired `llm_parse_failures` row on parse
+#     errors. Writes are awaited synchronously before classify_batch
+#     returns so ordering is deterministic for replay tooling. Errors
+#     are swallowed so the trading path is never blocked by logging.
+#     SEULGI_BYPASS_LLM=1 short-circuits BEFORE any logging — no LLM
+#     call happened, no `llm_calls` row written.
+#   - The caller (engine.py) still writes:
+#       * `usage_events` (kind='ai_tokens', stage='prediction').
 #
 # Failure modes:
 #   - HTTP 429 → exponential backoff up to 3 attempts, then None.
@@ -105,6 +111,8 @@ OpenRouter API reference: https://openrouter.ai/docs
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
+import hashlib
 import json
 import logging
 import os
@@ -121,6 +129,34 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 _CHAT_PATH = "/chat/completions"
+
+# A2.1 (2026-05-22): cap for `llm_calls.response_text` writes. Chosen to
+# match the schema comment in db.py while keeping per-call row size bounded.
+# Responses longer than the cap get truncated with the `[...truncated]`
+# suffix preserved verbatim so post-hoc tooling can detect truncation.
+_LLM_CALL_RESPONSE_CAP = 8 * 1024
+_LLM_CALL_TRUNC_SUFFIX = "[...truncated]"
+
+# A2.1 cap for `llm_parse_failures.response_text` — schema says ~4KB.
+_LLM_PARSE_FAILURE_RESPONSE_CAP = 4 * 1024
+
+
+def _truncate_response(text: str, cap: int) -> str:
+    """Cap text at `cap` bytes, preserving the truncation suffix verbatim.
+
+    Operates on string length (not byte length) because sqlite stores
+    TEXT as UTF-8 and our prompts/responses are ASCII-dominant; this is
+    a 1:1 approximation for the common case and stays cheap for the hot
+    path. If text is already within cap, returns it unchanged.
+    """
+    if text is None:
+        return ""
+    if len(text) <= cap:
+        return text
+    head = cap - len(_LLM_CALL_TRUNC_SUFFIX)
+    if head < 0:  # cap is so small the suffix wouldn't fit — emit just the suffix
+        return _LLM_CALL_TRUNC_SUFFIX[:cap]
+    return text[:head] + _LLM_CALL_TRUNC_SUFFIX
 
 # A1.6 (2026-05-22): operator toggle that short-circuits the Stage-3
 # prediction LLM with a deterministic favorite-side synthetic result.
@@ -391,6 +427,7 @@ class DirectionClassifier:
         premium_sim_threshold: float = 0.70,
         ensemble_samples: int = 3,
         ensemble_temperature: float = 0.5,
+        db=None,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -406,6 +443,12 @@ class DirectionClassifier:
         # direction. ensemble_samples=1 falls back to legacy behaviour.
         self._ensemble_samples = max(1, ensemble_samples)
         self._ensemble_temperature = ensemble_temperature
+        # A2.1 (2026-05-22): optional `db` for capturing every LLM round-trip
+        # to `llm_calls`. None disables logging entirely so tests / scripts
+        # that don't need it can stay decoupled from a real DB. Writes are
+        # wrapped in try/except so a logging failure NEVER blocks the trade
+        # path — fire-and-forget semantics with synchronous ordering.
+        self._db = db
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -431,6 +474,7 @@ class DirectionClassifier:
         source: Optional[str] = None,
         freshness=None,                          # FreshnessResult | None
         relevance_verdicts: Optional[list] = None,  # list[_SimVerdict] aligned to matches
+        headline_id: Optional[str] = None,       # A2.1 — for llm_calls correlation
     ) -> tuple[list[ClassifyResult], dict]:
         """
         Classify a headline against ALL matching markets in a single API call.
@@ -570,6 +614,13 @@ class DirectionClassifier:
                 "response_format": {"type": "json_object"},
             }
 
+        # A2.1: SHA-256 of the full user prompt — stable content-addressable
+        # key for replay/cache lookup. The system message + body envelope are
+        # constants by model, so hashing the user prompt is sufficient. We
+        # compute it once per batch (same prompt across N ensemble samples).
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        request_ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
+
         sample_responses = await asyncio.gather(
             *[self._call_api(_build_body()) for _ in range(N)],
             return_exceptions=False,
@@ -577,18 +628,48 @@ class DirectionClassifier:
 
         # Parse each sample. Drop ones that errored or failed to parse — if
         # we're left with zero, fall back to per-market on a single sample.
+        # A2.1: log every sample (success OR parse-failure) to `llm_calls`,
+        # and additionally write a `llm_parse_failures` row on parse errors.
+        # Logging never raises into the trade path (wrapped in try/except).
         per_sample_results: list[list[ClassifyResult]] = []
         per_sample_raws: list[list[str]] = []
         total_tokens = 0
         for data in sample_responses:
             if data is None:
+                # HTTP-level failure (non-200 or exception); _call_api already
+                # logged. No usage block to mine, no response_text to persist —
+                # skip the llm_calls write so a row only ever exists for
+                # round-trips that actually completed.
                 continue
             parsed = _parse_batch_response(data, len(matches))
-            if parsed is None:
+            parse_ok = parsed is not None
+            response_text_raw = _extract_text(data)
+            usage = data.get("usage", {}) or {}
+            await self._log_llm_call_safe(
+                ts=request_ts,
+                model=model,
+                prompt_sha=prompt_sha,
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                response_text=response_text_raw,
+                parse_ok=parse_ok,
+                headline_id=headline_id,
+                batch_size=len(matches),
+            )
+            if not parse_ok:
+                # Paired write: failure-mode analysis table. Carries the
+                # error context that `llm_calls` (replay-focused) doesn't.
+                await self._log_llm_parse_failure_safe(
+                    ts=request_ts,
+                    model=model,
+                    error_msg="batch_parse_failed",
+                    response_text=response_text_raw,
+                    headline_id=headline_id,
+                )
                 continue
             per_sample_results.append(parsed[0])
             per_sample_raws.append(parsed[1])
-            total_tokens += int(data.get("usage", {}).get("total_tokens", 0))
+            total_tokens += int(usage.get("total_tokens", 0))
 
         prompt_meta = {
             "model": model,
@@ -686,6 +767,71 @@ class DirectionClassifier:
     # ------------------------------------------------------------------
     # Shared HTTP helper
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # A2.1: capture helpers — fire-and-forget by spec, but awaited
+    # synchronously inside classify_batch so row ordering is deterministic
+    # for replay tooling. The try/except keeps a logging failure from ever
+    # blocking the trade path.
+    # ------------------------------------------------------------------
+
+    async def _log_llm_call_safe(
+        self,
+        *,
+        ts: str,
+        model: str,
+        prompt_sha: str,
+        prompt_tokens,
+        completion_tokens,
+        response_text: str,
+        parse_ok: bool,
+        headline_id: Optional[str],
+        batch_size: int,
+    ) -> None:
+        """Best-effort `db.log_llm_call` wrapper. No-op when db wasn't
+        supplied to the constructor. Errors are logged and swallowed."""
+        if self._db is None:
+            return
+        try:
+            await self._db.log_llm_call(
+                ts=ts,
+                model=model,
+                prompt_sha=prompt_sha,
+                prompt_tokens=(int(prompt_tokens) if prompt_tokens is not None else None),
+                completion_tokens=(int(completion_tokens) if completion_tokens is not None else None),
+                response_text=_truncate_response(response_text or "", _LLM_CALL_RESPONSE_CAP),
+                parse_ok=parse_ok,
+                headline_id=headline_id,
+                batch_size=batch_size,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ai] log_llm_call failed (non-fatal): %r", exc)
+
+    async def _log_llm_parse_failure_safe(
+        self,
+        *,
+        ts: str,
+        model: str,
+        error_msg: str,
+        response_text: str,
+        headline_id: Optional[str],
+    ) -> None:
+        """Best-effort `db.log_llm_parse_failure` wrapper. No-op when db
+        wasn't supplied. Errors are logged and swallowed."""
+        if self._db is None:
+            return
+        try:
+            await self._db.log_llm_parse_failure(
+                ts=ts,
+                model=model,
+                error_msg=error_msg,
+                response_text=_truncate_response(
+                    response_text or "", _LLM_PARSE_FAILURE_RESPONSE_CAP,
+                ),
+                headline_id=headline_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[ai] log_llm_parse_failure failed (non-fatal): %r", exc)
 
     async def _call_api(self, body: dict) -> Optional[dict]:
         """POST to OpenRouter, retry up to 3× on 429. Returns None on failure."""

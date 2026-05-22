@@ -316,6 +316,9 @@ async def main() -> None:
         premium_sim_threshold=cfg.ai.premium_sim_threshold,
         ensemble_samples=cfg.ai.ensemble_samples,
         ensemble_temperature=cfg.ai.ensemble_temperature,
+        # A2.1 (2026-05-22): hand the classifier a DB ref so it can log
+        # every LLM round-trip to `llm_calls` for replay/cache lookup.
+        db=db,
     )
 
     # Stage-2 relevance LLM retired 2026-05-22. The deterministic
