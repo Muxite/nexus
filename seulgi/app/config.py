@@ -276,7 +276,13 @@ class SimulateSlippageConfig:
     enabled: bool = True
     bps_per_dollar: float = 2.0       # entry walks 2 bps for every $1 notional
     max_price_move: float = 0.02      # cap so micro-cap markets stay sane
-    disable_below_usdc: float = 5.0   # microtrades — assume top-of-book fill
+    # A1.1 (2026-05-22): lowered 5.0 → 0.50. The old threshold disabled
+    # slippage for 100/100 sampled trades (size_usdc < $5 was the norm
+    # under fractional kelly + super_scout micro-stakes), so the fidelity
+    # layer was a NO-OP in production. 0.50 keeps super_scout's $0.05
+    # micro-stakes skipping (walk < 0.0001, below tick) but lets ≥$0.50
+    # trades finally see the bps drag they were supposed to.
+    disable_below_usdc: float = 0.50
     disable_for_categories: list = field(default_factory=lambda: ["geopolitics"])
 
 
@@ -291,6 +297,10 @@ class SimulateSizingConfig:
     kelly_fraction: float = 0.25
     max_bankroll_pct: float = 0.05
     min_stake_usdc: float = 1.0
+    # 4B.3: hard cap on the kelly multiplier itself (and bankroll pct).
+    # Applied at call-time so an unsafe per-engine kelly_fraction knob
+    # cannot blow up sizing.
+    max_fractional_kelly_cap: float = 0.10
 
 
 @dataclass
@@ -713,6 +723,8 @@ def _load_simulate_sizing(raw: Optional[dict]) -> SimulateSizingConfig:
         kelly_fraction=float(raw.get("kelly_fraction", base.kelly_fraction)),
         max_bankroll_pct=float(raw.get("max_bankroll_pct", base.max_bankroll_pct)),
         min_stake_usdc=float(raw.get("min_stake_usdc", base.min_stake_usdc)),
+        max_fractional_kelly_cap=float(raw.get(
+            "max_fractional_kelly_cap", base.max_fractional_kelly_cap)),
     )
 
 
