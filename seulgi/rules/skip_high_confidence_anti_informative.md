@@ -3,7 +3,7 @@ name: high_confidence_anti_informative
 stage: post_ai
 action: skip
 confidence_min: 0.75
-engines_exclude: inverted_highconf
+engines_exclude: inverted_highconf, super_scout
 ---
 
 <!-- M2 (2026-05-19): engines_exclude added so the rule no longer

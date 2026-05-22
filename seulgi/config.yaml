@@ -544,7 +544,12 @@ trading:
   # 2026-05-20: bumped to 1450 so scout's fixed $50 pot sits OUTSIDE the
   # 14-engine production split (14 × $100 = $1400 still flows to real
   # engines). Restore to 1400.0 if scout is retired.
-  simulate_total_usdc: 1450.0
+  # 2026-05-22: bumped 1450 → 1600 for the master-plan-Part-8 expansion:
+  #   - super_scout fixed $50 pot (loosest-of-everything research engine)
+  #   - loose_relevance_yes new top-level production engine, $100 pot
+  # Total: 14 production × $100 + scout $50 + super_scout $50
+  #        + loose_relevance_yes $100 = $1600.
+  simulate_total_usdc: 1600.0
   simulate_min_trade_usdc: 1.0
   # Soft rail-skip: reject trades when the entry-side mid is within this
   # distance of 0/1. 6h backtest: 99% of p≥0.95 entries were no_signal — the
@@ -662,6 +667,42 @@ engines:
         stop_loss:      0.045
         trailing_stop:  0.012
 
+      # ── 2026-05-22 loosen-one-knob variants (master plan Part 8) ─────
+      # Each variant relaxes EXACTLY one filter vs the conf40_tp025_sl045
+      # parent so per-filter PnL attribution stays clean in
+      # data/dashboard/variant_compare.txt. Token cost stays flat:
+      # classify_batch + relevance are shared per-headline across
+      # variants. See plans/do-the-next-task-rustling-seahorse.md.
+      - name: "loose_confidence_035"
+        # Loosens AI confidence floor 0.40 → 0.35. The new prediction
+        # model (gemini-2.5-flash post-revert) has a slightly different
+        # confidence distribution; this catches the 0.35-0.40 band.
+        min_confidence: 0.35
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
+      - name: "loose_mid_band_058"
+        # Loosens the mid-price floor: enters in 0.58-0.65 (which the
+        # RULE_mid_below_065 pre-AI rule currently blocks for production).
+        # That rule was the 3rd biggest skip class today; super_scout
+        # opts out of it entirely — this variant tests the 0.58-0.65
+        # slice in isolation with normal production stake size.
+        min_confidence: 0.40
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
+        mid_yes_min:    0.58
+        mid_yes_max:    0.85
+      - name: "loose_rail_floor_001"
+        # Loosens the hard-rail floor 0.02 → 0.01. Lets entries near 0.99
+        # or 0.01 through; tests whether the bid-ask spread really
+        # exceeds SL=0.045 at that range under the wide-exit set.
+        min_confidence: 0.40
+        take_profit:    0.025
+        stop_loss:      0.045
+        trailing_stop:  0.012
+        entry_rail_skip_threshold: 0.01
+
   # conservative engine removed in cycle 4 — prior postmortem showed −$88.46 PnL
   # (lowest of all engines); dropping it gives a cleaner three-engine comparison
   # (aggressive vs balanced vs inverted_highconf).
@@ -745,6 +786,66 @@ engines:
     # instead of ~1%. The prediction LLM runs on the union (= scout's
     # set) so cost is paid once for all engines.
     relevance_keep_scores: ["STRONG_YES", "YES", "WEAK"]
+    variants:
+      - name: "all_signals"
+
+  # ── LOOSE_RELEVANCE_YES — production-flavoured engine, relevance loosened
+  # Same risk model as balanced (own $100 pot, conf 0.40, wide TP/SL exits)
+  # but broadens the Stage-2 keep_scores to admit YES verdicts alongside
+  # STRONG_YES. The 30-day forensic that put production on STRONG_YES-only
+  # had n=396 YES trades (−$3.49); this engine continues to test that
+  # bucket with current data + the reverted gemini-2.5-flash model so we
+  # have a fresh sample. relevance_keep_scores is an engine-level field
+  # (cannot be set per-variant) — that's why this is a separate engine
+  # rather than a balanced variant.
+  - name: "loose_relevance_yes"
+    min_edge: 0.03
+    edge_increment: 0.12
+    max_position_usdc: 100.0
+    min_confidence: 0.40
+    max_open_positions: 20
+    take_profit:      0.025
+    stop_loss:        0.045
+    trailing_stop:    0.012
+    min_hold_seconds: 300
+    relevance_keep_scores: ["STRONG_YES", "YES"]
+    variants:
+      - name: "default"
+
+  # ── SUPER_SCOUT — master plan Part 8 shipped 2026-05-22 ──────────────────
+  # Loosest-possible engine: union of the loosest tunable value from every
+  # other engine + opts out of every pre-AI / post-AI rule via the rule
+  # frontmatter (engines_exclude). Every plausible signal lands as a $0.05
+  # micro-stake trade row; the scout_funnel report attributes filter cost
+  # per gate. AI tokens stay flat — classify_batch + the union-of-keep_scores
+  # relevance pass run once per headline and feed all engines.
+  #
+  # Capital model: own $50 pot, $0.05/stake, tight TP/SL (0.05/0.05) so
+  # capital cycles via fills rather than 24h timeouts (user choice
+  # 2026-05-22). Tradeoff: we measure "did mid move ±5% within hold"
+  # rather than the natural signal horizon — acceptable for filter
+  # attribution, not for absolute alpha measurement.
+  - name: "super_scout"
+    balance_usdc: 50.0
+    min_edge: -10.0             # admit any signal incl. negative-edge
+    edge_increment: 0.12
+    max_position_usdc: 0.05     # $0.05 micro-stake; recycles via TP/SL
+    min_confidence: 0.0         # admit any non-NEUTRAL LLM verdict
+    max_open_positions: 500     # data breadth over capital discipline
+    take_profit:      0.05
+    stop_loss:        0.05
+    trailing_stop:    0.02
+    min_hold_seconds: 60
+    # Every per-engine filter disabled (or set to its loosest value):
+    mid_yes_min: 0.0
+    mid_yes_max: 1.0
+    min_entry_yes_mid: 0.0
+    max_market_vol_30m: 0.0
+    rail_skip_threshold: 0.0
+    entry_rail_skip_threshold: 0.0
+    spread_cost_bps: 0.0
+    invert_high_conf: false
+    relevance_keep_scores: ["STRONG_YES", "YES", "WEAK", "NO"]
     variants:
       - name: "all_signals"
 

@@ -3,6 +3,7 @@ name: weather
 stage: pre_ai
 action: skip
 market_type: ^weather$
+engines_exclude: super_scout
 ---
 
 # Skip weather markets

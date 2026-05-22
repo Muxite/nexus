@@ -3,6 +3,7 @@ name: sports
 stage: pre_ai
 action: skip
 market_type: ^sports$
+engines_exclude: super_scout
 ---
 
 # Skip sports markets
