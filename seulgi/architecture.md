@@ -5,14 +5,21 @@
 > **Discipline.** Every PR that changes module behavior MUST update this
 > file in the same commit. Owner: whichever agent last touched the module.
 
-- **Last updated:** 2026-05-22 (cycle-4 EOD)
+- **Last updated:** 2026-05-22 23:35 UTC (after Phase 3)
 - **Synthesized from:** the 12 Phase-0 reports under
-  `seulgi/reports/2026-05-22-*.md`, the 11 in-file `## Specification`
-  blocks, the live `data/seulgi.db` (8.1 GB), `data/dashboard/dashboard.txt`
-  (snapshot 18:01:07 UTC), `seulgi/config.yaml`, and
-  `git log` through `510aa6c`.
-- **Status:** First populated by Phase 0 A0.13. Phase 1 (sim+trader
-  rebuild) has not started.
+  `seulgi/reports/2026-05-22-*.md`, in-file `## Specification`
+  blocks, live `data/seulgi.db`, `data/dashboard/dashboard.txt`,
+  `seulgi/config.yaml`, and `git log`.
+- **Status:** Phase 0 ✅, Phase 1 ✅, Phase 2 ✅, Phase 3 ✅ (sim correctness
+  confirmed; data gap blocks variant validation). Phase 4 GO with conditions.
+- **Parallel sibling: `irene/`** — knowledge-graph rebuild started in a
+  separate session on 2026-05-22. Shares the reusable surface
+  (`simulate.py`, pure trader functions, db schema, `backtest.py`,
+  `calibration_prototype.py`, `impact_tracker.py`). Diverges on
+  matching: irene replaces `markets.py:find_matches` + `news_memory.py`'s
+  cosine/HNSW with a knowledge graph. Merge point is Phase 4E.2 — the
+  backtest harness compares the cosine, cross-encoder, learned-MLP, and
+  knowledge-graph matchers offline before any live promotion.
 
 ---
 

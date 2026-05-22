@@ -1,5 +1,33 @@
 # Master plan — Aggressive offline rebuild → reimagined → profitability
 
+> **Parallel sibling project: `irene` (2026-05-22).** A separate session
+> is building **`irene/`** — a rebuild of seulgi using a **dynamic
+> knowledge graph** for news→market matching instead of SBERT cosine
+> similarity. Same goal (profit on Polymarket from news), different
+> matching theory. **Code reuse + merges are expected**:
+>
+> - **Reusable as-is** (domain-agnostic): `simulate.py` (Polymarket
+>   mechanics — fees, slippage, Kelly, EV math), the pure
+>   `_evaluate_pure`/`_close_pure` extracted from `trader.py`,
+>   `calibration_prototype.py` (Platt + isotonic),
+>   `scripts/replay/backtest.py` + `diff_variants.py`, `db.py` schema
+>   (trades, position_price_snaps, llm_calls, decision_inputs,
+>   market_price_snaps with bid/ask), `impact_tracker.py` (continuous
+>   tape).
+> - **NOT reusable for irene** (cosine-specific): `markets.py:find_matches`
+>   (SBERT bi-encoder), the embedding pipeline, `news_memory.py`'s
+>   chromadb HNSW. Irene will plug a graph-based matcher in here.
+> - **Merge point**: Phase 4E.2 ("News→market matching beyond cosine")
+>   already plans cross-encoder + learned MLP + topic-routing. Irene's
+>   knowledge-graph matcher is a fourth strategy in this slot. The
+>   backtest harness compares all four offline.
+> - **Coordination rule**: changes to the reusable surface (simulate,
+>   trader pure functions, db.py schema, backtest.py) must be reviewed
+>   with irene's session in mind. If irene wants a different signature,
+>   shim during transition; don't fork.
+
+
+
 ## Context
 
 Cycle-2/3 fixed the write blocker; cycle-4's cleanup already removed
@@ -201,6 +229,22 @@ plumbing or stale snapshot data.
 isolation_level=None + shielded rollback ship, ANY return of LLM volume
 re-triggers the write blocker. FIX-3 is non-negotiable before Phase 1
 or any soak.
+
+### Phase 3 findings (2026-05-22) — sim correctness confirmed, data gap blocks variant validation
+
+A3.4 paper-accuracy audit on 501 closed trades: **5/6 substantive checks at 100% pass**, only EXIT_LOGIC at 98.40% (8 historical pre-FIX-2A TRAIL closes — already fixed in code, won't repeat). SLIPPAGE_FIT 99.20% fail is a stale audit-script default (5.0 → 0.50 cleanup needed). **The rebuilt sim/trader code is correct.**
+
+A3.1 baseline backtest **could NOT verify the ±10% exit criterion** — `market_price_snaps` capture only began 2026-05-21, so the 4-day historical window has 0 overlapping trades. Per the snap-covered slice (117 backtest trades vs 1 historical), no per-engine 1:1 comparison is statistically meaningful. **This is a data limitation, not a sim regression.**
+
+A3.2 calibration prototype: **strong signal** — Brier −35-55%, IC flips from −0.194 (anti-informative!) → +0.16 (above the 0.05 useful-signal bar). However, calibration applied alone COLLAPSES production (every engine emits zero trades because legacy `min_edge` was implicitly tuned against uncalibrated overconfident scores). **Phase 4B.1 must ship together with 4B.2 (true EV) + re-tuned thresholds, or the trader goes silent.**
+
+A3.3 1-D variant grid: all 7 balanced-tier 1-D mutants produced **byte-identical** results to baseline in the current bypass regime (conf=0.9, mid 0.65-0.85, edge ≈ 0.15 every trade — no knob straddles any threshold). **NO-GO on grid promotion.** Need broader confidence distribution (Phase 4E.4 prompt rework) + capital efficient stake-size envelope before mutants reveal themselves.
+
+**Phase 4 entry verdict**: GO with conditions.
+- Sim correctness (A3.4): confirmed.
+- Per-engine ±10% (A3.1): unverifiable until ≥ 7 days of new-capture data accumulate. Will re-verify continuously as Phase 4 progresses.
+- Calibration is valuable (A3.2) but must bundle with EV formula + threshold tune.
+- Variant grid is real (A3.3) but inert under bypass — defer until LLM is back ON with broader signal distribution.
 
 ### Phase 0 batch-3 findings (2026-05-22) — more doc/code gaps
 
