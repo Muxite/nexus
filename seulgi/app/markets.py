@@ -120,6 +120,28 @@ class MarketMatch:
     # (e.g. "interest_rates"). NULL for cosine-only matches. Persisted on
     # `engine_results.tag` so per-tag counterfactuals can attribute PnL.
     tag: Optional[str] = None
+    # Phase 4D.1 (2026-05-23): per-match top-of-book snapshot populated in
+    # `EngineRunner._prefetch_prices` from `impact_tracker.fetch_bbo`. NULL
+    # when the CLOB /book endpoint timed out or returned no levels. The
+    # trader's spread+depth liquidity filter (replacing the legacy
+    # hardcoded `hour_gate` 23/00/01 UTC skip) consults these — NULL
+    # values are a NO-OP so a CLOB hiccup never blinds the gate.
+    bid: Optional[float] = None
+    ask: Optional[float] = None
+    book_depth_usdc: Optional[float] = None     # top-5 ask-side notional
+    spread_bps: Optional[float] = None          # (ask - bid) / mid * 10000
+    # A4E.2 (2026-05-23): cumulative weighted contribution from non-cosine
+    # matchers (cross-encoder, learned MLP, knowledge-graph). 0.0 when no
+    # matcher fired or none was opted-in (default). `similarity` is left
+    # untouched so any caller reading `match.similarity` still gets the
+    # raw cosine; the augmented sort key is `similarity + extra_score`.
+    extra_score: float = 0.0
+    # A4E.2: convenience alias exposing A4D.2's `tag` field — reads more
+    # naturally on the matcher-side API surface ("the match was routed in
+    # via tag X" vs. "the match has tag X").
+    @property
+    def tag_routed(self) -> Optional[str]:
+        return self.tag
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +464,8 @@ class MarketIndex:
         self,
         query_embedding: np.ndarray,
         headline: Optional[str] = None,
+        matchers: Optional[list] = None,
+        matcher_weights: Optional[list[float]] = None,
     ) -> list[MarketMatch]:
         """
         Find the top-K markets most similar to the given embedding.
@@ -458,6 +482,16 @@ class MarketIndex:
         (after the cosine pass). Tag-routed matches are marked with their
         triggering tag in `MarketMatch.tag`. Cosine matches keep `tag=None`.
         The total result is still capped at `cfg.markets.top_k`.
+
+        A4E.2 matcher rerank (2026-05-23): when `matchers` is non-empty,
+        each matcher's `rerank_sync(headline, headline_emb, candidates)`
+        contributes `extra_score`; the per-matcher contribution is
+        multiplied by `matcher_weights[i]` (default 1.0) and summed onto
+        `MarketMatch.extra_score`. Results are re-sorted by
+        `similarity + extra_score` descending. Raw `similarity` (cosine)
+        is preserved untouched so downstream callers reading it still
+        get the bi-encoder value. Pluggable: irene's knowledge-graph
+        matcher slots in on this same kwarg.
         """
         if self._matrix is None or len(self._markets) == 0:
             return []
@@ -551,5 +585,65 @@ class MarketIndex:
                                 tag=matched_tag,
                             ))
                             added += 1
+
+        # ── A4E.2 matcher rerank ─────────────────────────────────────────
+        # Each matcher contributes a 0..1 `extra_score`; weighted sum is
+        # added to MarketMatch.extra_score, then the list is resorted by
+        # `similarity + extra_score`. Cosine `similarity` stays untouched.
+        # Matcher failures are isolated: an exception in one matcher
+        # leaves the cosine result intact.
+        if matchers and results:
+            # Attach market_embedding for matchers that need it (e.g.
+            # LearnedMLPMatcher). cond_id → row-index in self._matrix.
+            cid_to_idx = {m.condition_id: i for i, m in enumerate(self._markets)}
+            for r in results:
+                idx_i = cid_to_idx.get(r.condition_id)
+                if idx_i is not None and self._matrix is not None:
+                    # Cheap attribute attach — MarketMatch is a regular
+                    # dataclass, not frozen. Matchers read this off the
+                    # candidate; consumers ignore it.
+                    setattr(r, "market_embedding",
+                            np.asarray(self._matrix[idx_i], dtype=np.float32))
+            headline_emb_list = (
+                query_embedding.tolist()
+                if isinstance(query_embedding, np.ndarray)
+                else list(query_embedding)
+            )
+            weights = list(matcher_weights or [])
+            for m_idx, matcher in enumerate(matchers):
+                w = weights[m_idx] if m_idx < len(weights) else 1.0
+                rerank_fn = getattr(matcher, "rerank_sync", None)
+                if rerank_fn is None:
+                    # Async-only Protocol implementation (e.g. irene's
+                    # KG matcher pre-merge). Skip safely; the engine-side
+                    # async wrapper handles those. Cosine result is intact.
+                    logger.debug(
+                        "find_matches: matcher %s has no rerank_sync — "
+                        "skipping (engine-side async path will rerank).",
+                        type(matcher).__name__,
+                    )
+                    continue
+                try:
+                    ms_list = rerank_fn(headline or "", headline_emb_list, results)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "find_matches: matcher %s raised %s — skipping",
+                        type(matcher).__name__, exc,
+                    )
+                    continue
+                if len(ms_list) != len(results):
+                    logger.warning(
+                        "find_matches: matcher %s returned %d scores for "
+                        "%d candidates — skipping",
+                        type(matcher).__name__, len(ms_list), len(results),
+                    )
+                    continue
+                for r, ms in zip(results, ms_list):
+                    r.extra_score = float(r.extra_score) + float(
+                        max(0.0, min(1.0, ms.extra_score)) * w)
+            # Re-sort by augmented score; stable so equal scores keep
+            # their original cosine order.
+            results.sort(
+                key=lambda r: (r.similarity + r.extra_score), reverse=True)
 
         return results

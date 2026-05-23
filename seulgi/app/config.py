@@ -201,6 +201,20 @@ class TradingConfig:
     # out of markets that bounce wider than the SL can survive.
     # 0.0 disables (default). Per-engine override allowed.
     max_market_vol_30m: float = 0.0
+    # Phase 4D.1 (2026-05-23) — dynamic liquidity filter replacing the
+    # retired hardcoded UTC 23/00/01 `hour_gate`. The trader refuses
+    # entries when the per-match top-of-book is too thin OR the spread
+    # is too wide; both are populated from `impact_tracker.fetch_bbo`
+    # at INGRESS and stamped on MarketMatch.{spread_bps, book_depth_usdc}.
+    # None knob ⇒ that side of the filter is OFF. NULL match field
+    # (CLOB /book endpoint failed) ⇒ the filter is a NO-OP, the trade
+    # proceeds — we never block on missing book data. Per-engine
+    # override allowed via `_OVERRIDABLE_TRADING_FIELDS` in engine.py.
+    #
+    # Defaults: 200 bps = 2% spread (Polymarket typical = 1-5%);
+    # $50 top-5 ask depth covers ~10x our $5 min_trade_usdc.
+    max_spread_bps: Optional[float] = 200.0
+    min_book_depth_usdc: Optional[float] = 50.0
     # Invert direction when AI is highly confident in a non-rail market.
     # Empirically conf ≥ 0.85 is anti-informative (IC < 0). Off by default;
     # opt-in per engine as a shadow strategy.
@@ -268,6 +282,19 @@ class TradingConfig:
     simulate_fees: "SimulateFeesConfig" = field(default_factory=lambda: SimulateFeesConfig())
     simulate_slippage: "SimulateSlippageConfig" = field(default_factory=lambda: SimulateSlippageConfig())
     simulate_sizing: "SimulateSizingConfig" = field(default_factory=lambda: SimulateSizingConfig())
+    # A4D.3 (2026-05-23): position scaling — replace the binary
+    # `duplicate_position` lockout with a delta-add path. When ON, a
+    # reinforcing headline that arrives while the engine already holds
+    # size on `(condition_id, engine)` opens an ADDITIONAL trade row at
+    # `delta = max(0, kelly_size − current_exposure)`. When OFF, the legacy
+    # binary lockout (any open size → skip "duplicate_position") fires.
+    # Per-engine override allowed via `EngineConfig.position_scaling_enabled`.
+    position_scaling_enabled: bool = True
+    # A4D.3: hard cap on TOTAL `size_usdc` exposure summed across all legs
+    # for a single `(condition_id, engine)` key. Delta-adds that would
+    # exceed this skip with `duplicate_position:at_max_exposure_cap`. 0.0
+    # disables the cap. Per-engine override allowed.
+    max_exposure_per_condition_usdc: float = 100.0
 
     def is_simulate(self) -> bool:
         return self.mode == "simulate"
@@ -422,6 +449,38 @@ class TaggerConfig:
 
 
 @dataclass
+class CrossEncoderMatcherConfig:
+    """A4E.2 cross-encoder reranker. Default OFF — opting in loads the
+    sentence-transformers cross-encoder (~50 MB model download on first
+    use). Fired only on bi-encoder cosine ∈ [band_low, band_high]."""
+    enabled: bool = False
+    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    band_low: float = 0.3
+    band_high: float = 0.55
+    weight: float = 0.3
+
+
+@dataclass
+class LearnedMLPMatcherConfig:
+    """A4E.2 numpy MLP trained on closed-trade labels (realized_pnl > 0).
+    Default OFF — opting in fits on boot and refreshes every
+    `refresh_days` days. Pure numpy, no torch dep."""
+    enabled: bool = False
+    refresh_days: int = 7
+    min_train_samples: int = 30
+    weight: float = 0.2
+
+
+@dataclass
+class MatchersConfig:
+    """A4E.2 pluggable news→market matcher slot. Both default OFF; raw
+    cosine behaviour is preserved when neither is enabled. A sibling
+    `knowledge_graph` field lands when irene's matcher merges in."""
+    cross_encoder: CrossEncoderMatcherConfig = field(default_factory=CrossEncoderMatcherConfig)
+    learned_mlp: LearnedMLPMatcherConfig = field(default_factory=LearnedMLPMatcherConfig)
+
+
+@dataclass
 class SearchBudgetConfig:
     """Caps on expensive external API calls."""
     brave_per_hour: int = 20   # max Brave Search API calls per hour across all Twitter watchers
@@ -459,6 +518,11 @@ class VariantConfig:
     stop_loss_pct: Optional[float] = None
     min_entry_yes_mid: Optional[float] = None
     max_market_vol_30m: Optional[float] = None
+    # Phase 4D.1 (2026-05-23) per-variant overrides for the spread+depth
+    # liquidity gate. None ⇒ inherit base; a numeric value (incl. 0.0
+    # for "permissive max_spread_bps" or "no min_depth") replaces it.
+    max_spread_bps: Optional[float] = None
+    min_book_depth_usdc: Optional[float] = None
     # M4 variant-level filters
     direction_filter: Optional[str] = None
     freshness_filter: Optional[str] = None
@@ -470,6 +534,9 @@ class VariantConfig:
     use_true_ev_formula: Optional[bool] = None
     # A4B.2 per-variant override of the EV-per-$1 floor.
     min_ev_per_dollar: Optional[float] = None
+    # A4D.3 per-variant overrides for position scaling.
+    position_scaling_enabled: Optional[bool] = None
+    max_exposure_per_condition_usdc: Optional[float] = None
 
 
 @dataclass
@@ -496,6 +563,10 @@ class EngineConfig:
     stop_loss_pct: Optional[float] = None
     min_entry_yes_mid: Optional[float] = None
     max_market_vol_30m: Optional[float] = None
+    # Phase 4D.1 (2026-05-23) per-engine overrides for the spread+depth
+    # liquidity gate. None ⇒ inherit base.
+    max_spread_bps: Optional[float] = None
+    min_book_depth_usdc: Optional[float] = None
     # A4A.2 JIT-pricing tolerance override (bps; relative to snapshot mid).
     jit_tolerance_bps: Optional[float] = None
     # A4B.2 per-engine escape hatch back to the legacy edge formula.
@@ -507,6 +578,12 @@ class EngineConfig:
     # simulate_sizing is rebuilt with this cap; when None, the global value
     # is used. Example: scout/all_signals=0.02, balanced/*=0.10 (default).
     kelly_cap_override: Optional[float] = None
+    # A4D.3 (2026-05-23): per-engine override of the position-scaling switch
+    # and the max-exposure-per-condition cap. None falls through to the
+    # global `trading.position_scaling_enabled` /
+    # `trading.max_exposure_per_condition_usdc`.
+    position_scaling_enabled: Optional[bool] = None
+    max_exposure_per_condition_usdc: Optional[float] = None
     # Per-engine relevance gate override. When None, the global
     # `relevance.keep_scores` is used. When set, this engine evaluates
     # only markets whose Stage-2 relevance verdict is in this list.
@@ -539,6 +616,7 @@ class Config:
     search_budget: SearchBudgetConfig = field(default_factory=SearchBudgetConfig)
     tagger: TaggerConfig = field(default_factory=TaggerConfig)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    matchers: MatchersConfig = field(default_factory=MatchersConfig)
     # A4E.5 counterfactual sampling. Stored as the raw dict so we don't
     # impose a circular dep (counterfactual.py imports config indirectly
     # via runtime wiring). EngineRunner builds the actual sampler from
@@ -605,6 +683,7 @@ def _build_config(raw: dict) -> Config:
     sb = raw.get("search_budget", {})
     tg = raw.get("tagger", {})
     dsc = raw.get("discovery", {})
+    mtc = raw.get("matchers", {}) or {}
 
     social_cfgs = [
         SocialAccount(
@@ -639,6 +718,9 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=_opt_float(v.get("stop_loss_pct")),
             min_entry_yes_mid=_opt_float(v.get("min_entry_yes_mid")),
             max_market_vol_30m=_opt_float(v.get("max_market_vol_30m")),
+            # Phase 4D.1 per-variant overrides for the liquidity gate.
+            max_spread_bps=_opt_float(v.get("max_spread_bps")),
+            min_book_depth_usdc=_opt_float(v.get("min_book_depth_usdc")),
             direction_filter=v.get("direction_filter"),
             freshness_filter=v.get("freshness_filter"),
             mid_yes_min=_opt_float(v.get("mid_yes_min")),
@@ -673,6 +755,9 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=_opt_float(e.get("stop_loss_pct")),
             min_entry_yes_mid=_opt_float(e.get("min_entry_yes_mid")),
             max_market_vol_30m=_opt_float(e.get("max_market_vol_30m")),
+            # Phase 4D.1 per-engine overrides for the liquidity gate.
+            max_spread_bps=_opt_float(e.get("max_spread_bps")),
+            min_book_depth_usdc=_opt_float(e.get("min_book_depth_usdc")),
             jit_tolerance_bps=_opt_float(e.get("jit_tolerance_bps")),
             kelly_cap_override=_opt_float(e.get("kelly_cap_override")),
             use_true_ev_formula=(
@@ -770,11 +855,27 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=float(t.get("stop_loss_pct", 0.0)),
             min_entry_yes_mid=float(t.get("min_entry_yes_mid", 0.0)),
             max_market_vol_30m=float(t.get("max_market_vol_30m", 0.0)),
+            # Phase 4D.1 (2026-05-23) — dynamic liquidity filter knobs.
+            # Distinguish "key missing" (use dataclass default 200/50.0)
+            # from "key present with explicit null" (operator disabled the
+            # gate). `key in dict` is the unambiguous signal.
+            max_spread_bps=(
+                _opt_float(t["max_spread_bps"])
+                if "max_spread_bps" in t else 200.0
+            ),
+            min_book_depth_usdc=(
+                _opt_float(t["min_book_depth_usdc"])
+                if "min_book_depth_usdc" in t else 50.0
+            ),
             jit_tolerance_bps=float(t.get("jit_tolerance_bps", 50.0)),
             min_ev_per_dollar=float(t.get("min_ev_per_dollar", 0.0)),
             use_true_ev_formula=bool(t.get("use_true_ev_formula", True)),
             simulate_total_usdc=float(t.get("simulate_total_usdc", 50.0)),
             simulate_min_trade_usdc=float(t.get("simulate_min_trade_usdc", 1.0)),
+            position_scaling_enabled=bool(t.get("position_scaling_enabled", True)),
+            max_exposure_per_condition_usdc=float(
+                t.get("max_exposure_per_condition_usdc", 100.0)
+            ),
             simulate_fees=_load_simulate_fees(t.get("simulate_fees") or t.get("simulate", {}).get("fee_model")),
             simulate_slippage=_load_simulate_slippage(t.get("simulate_slippage") or t.get("simulate", {}).get("slippage")),
             simulate_sizing=_load_simulate_sizing(t.get("simulate_sizing") or t.get("simulate", {}).get("sizing")),
@@ -798,6 +899,22 @@ def _build_config(raw: dict) -> Config:
             min_quality=float(dsc.get("min_quality", 0.3)),
             kalshi_enabled=bool(dsc.get("kalshi_enabled", True)),
             predictit_enabled=bool(dsc.get("predictit_enabled", True)),
+        ),
+        matchers=MatchersConfig(
+            cross_encoder=CrossEncoderMatcherConfig(
+                enabled=bool((mtc.get("cross_encoder") or {}).get("enabled", False)),
+                model_name=str((mtc.get("cross_encoder") or {}).get(
+                    "model_name", "cross-encoder/ms-marco-MiniLM-L-6-v2")),
+                band_low=float((mtc.get("cross_encoder") or {}).get("band_low", 0.3)),
+                band_high=float((mtc.get("cross_encoder") or {}).get("band_high", 0.55)),
+                weight=float((mtc.get("cross_encoder") or {}).get("weight", 0.3)),
+            ),
+            learned_mlp=LearnedMLPMatcherConfig(
+                enabled=bool((mtc.get("learned_mlp") or {}).get("enabled", False)),
+                refresh_days=int((mtc.get("learned_mlp") or {}).get("refresh_days", 7)),
+                min_train_samples=int((mtc.get("learned_mlp") or {}).get("min_train_samples", 30)),
+                weight=float((mtc.get("learned_mlp") or {}).get("weight", 0.2)),
+            ),
         ),
         counterfactual=raw.get("counterfactual", {}) or {},
         log_level=str(raw.get("log_level", "INFO")),

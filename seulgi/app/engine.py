@@ -16,10 +16,16 @@ context → predict (LLM) → fan-out → batched write.
   YAML engines + variants + optional `AGGRESSIVE_CORE_ENABLE=1` core.
 
 **Pipeline stages.** Each log line starts with `[STAGE]`:
-- `[INGRESS]` — hour gate → **stage 0a capital floor** (Phase 4A.1) →
-  embed → freshness → match → mid-prefetch → heat. Stage 0a is a
-  zero-cost short-circuit: if NO engine has `balance >= min_trade_usdc`,
-  return before any LLM / embed / chromadb / CLOB / DB-insert work.
+- `[INGRESS]` — **stage 0a capital floor** (Phase 4A.1) → embed → freshness →
+  match → mid-prefetch → heat. Stage 0a is a zero-cost short-circuit:
+  if NO engine has `balance >= min_trade_usdc`, return before any
+  LLM / embed / chromadb / CLOB / DB-insert work.
+  Phase 4D.1 (2026-05-23): the legacy hardcoded `hour_gate`
+  (UTC 23/00/01 silent drop) is **retired**. Late-night breaking news
+  is no longer blinded at INGRESS; liquidity is gated dynamically at
+  `trader._evaluate_pure` via `max_spread_bps` + `min_book_depth_usdc`.
+  `SEULGI_DISABLE_HOUR_GATE` is accepted as a no-op for backward
+  compatibility.
 - `[SIGNAL]` — `insert_signal`, freshness short-circuit, universal pre-AI.
 - `[SIM_GATE]` — low-sim short-circuit + per-match SIM_PASS/SIM_FAIL.
 - `[MARKET_CONTEXT]` — parallel CLOB pre-headline snapshot.
@@ -46,8 +52,9 @@ External I/O: CLOB mid + context, embedder, classifier, article body.
 **Failure modes.** Embed error: drop. `news_memory.assess`: fail-open to
 BREAKING. `find_matches` empty / all-no-price: drop. `_engine_should_pause`
 DB fail: engine stays active. Per-engine `evaluate` crash: decisions=[].
-90 s timeout: batch rollback, lose ≤ 1 headline. Hour gate: silent drop
-hours 23/00/01 UTC (`SEULGI_DISABLE_HOUR_GATE=1` disables).
+90 s timeout: batch rollback, lose ≤ 1 headline. (Hour gate retired in
+Phase 4D.1 — see INGRESS notes; the spread+depth filter at
+`trader._evaluate_pure` now owns liquidity gating.)
 
 **Non-goals.** Does NOT size trades / compute edge / write trades / close
 positions (`trader.py`), call the LLM (`ai.py`), maintain market embeddings
@@ -139,6 +146,8 @@ class EngineRunner:
         impact_tracker=None, article_fetcher=None, market_context_cfg=None,
         min_top_similarity: float = 0.45,
         telemetry=None,
+        matchers: Optional[list] = None,
+        matcher_weights: Optional[list[float]] = None,
     ) -> None:
         self._engines, self._index, self._embedder = engines, index, embedder
         self._db, self._classifier, self._rules = db, classifier, rule_engine
@@ -148,6 +157,10 @@ class EngineRunner:
         self._article_fetcher = article_fetcher
         self._min_top_similarity = float(min_top_similarity)
         self._mkt_ctx_cfg = market_context_cfg
+        # A4E.2: optional pluggable matchers passed through to
+        # `MarketIndex.find_matches`. Default None → cosine-only.
+        self._matchers = list(matchers or [])
+        self._matcher_weights = list(matcher_weights or [])
         # A4C.2: optional async telemetry queue. A4C.1's FastPath uses
         # this to offload engine_results / decision_inputs / llm_calls /
         # trades writes off the trade-critical path. None = legacy
@@ -319,12 +332,11 @@ class EngineRunner:
         hid = getattr(headline, "headline_id", "")
 
         # ── INGRESS ──────────────────────────────────────────────────────
-        # Phase-E E11: drop UTC hours 23/00/01 (`SEULGI_DISABLE_HOUR_GATE=1`).
-        if os.getenv("SEULGI_DISABLE_HOUR_GATE") != "1":
-            h = datetime.now(timezone.utc).hour
-            if h in (23, 0, 1):
-                logger.debug("[INGRESS] [hid=%s] hour_gate skip (UTC %02d)", hid, h)
-                return
+        # Phase 4D.1 (2026-05-23): hour_gate retired. The legacy hardcoded
+        # UTC 23/00/01 silent drop has been replaced by the dynamic
+        # spread+depth liquidity filter at trader._evaluate_pure. The
+        # `SEULGI_DISABLE_HOUR_GATE` env var is accepted as a no-op for
+        # operator scripts that still set it; remove after a 1-week soak.
         # Stage 0a (Phase 4A.1, 2026-05-23): capital floor — short-circuit
         # BEFORE embed/freshness/match/CLOB/DB writes when NO engine can
         # afford a trade. The [PREDICT] _update_ai_pause_state gate below
@@ -366,7 +378,11 @@ class EngineRunner:
         headline._similar_to = freshness.similar_to
         headline._freshness_label = freshness.label
         headline._nearest_age_secs = freshness.nearest_age_secs
-        matches = self._index.find_matches(embedding, headline=headline.headline)
+        matches = self._index.find_matches(
+            embedding, headline=headline.headline,
+            matchers=self._matchers or None,
+            matcher_weights=self._matcher_weights or None,
+        )
         if not matches:
             logger.debug("[INGRESS] [hid=%s] no matches: %s", hid, headline.headline[:80])
             return
@@ -704,6 +720,12 @@ class EngineRunner:
         # market (not only ones that traded). Awaited so writes join any
         # enclosing batch. A4A.3 fills bid/ask/book_depth_usdc when the
         # CLOB /book endpoint returned data; otherwise NULL.
+        #
+        # Phase 4D.1 (2026-05-23): in addition to the DB snap, we now
+        # *also* populate MarketMatch.bid/ask/book_depth_usdc/spread_bps
+        # so trader._evaluate_pure can run its spread+depth liquidity
+        # filter without an extra DB round-trip. NULL values mean the
+        # CLOB /book endpoint failed; the filter degrades to a NO-OP.
         if kept:
             t_unix = int(time.time())
             snaps: list[tuple] = []
@@ -716,6 +738,18 @@ class EngineRunner:
                 bid = br.bid if br is not None else None
                 ask = br.ask if br is not None else None
                 depth = br.book_depth_usdc_top5 if br is not None else None
+                # Phase 4D.1: stamp BBO state onto the MarketMatch so the
+                # trader's liquidity gate sees it. spread_bps is derived
+                # from bid/ask + price (mid); when either side is NULL we
+                # leave spread_bps=None so the gate no-ops.
+                m.bid = bid
+                m.ask = ask
+                m.book_depth_usdc = depth
+                if bid is not None and ask is not None and price > 0:
+                    try:
+                        m.spread_bps = (ask - bid) / price * 10_000.0
+                    except (TypeError, ZeroDivisionError):
+                        m.spread_bps = None
                 snaps.append((m.condition_id, tok, side, price,
                               t_unix, "prefetch", hid, bid, ask, depth))
             try:
@@ -975,6 +1009,10 @@ _OVERRIDABLE_TRADING_FIELDS = (
     "direction_filter", "freshness_filter", "mid_yes_min", "mid_yes_max",
     # A4B.2 — true-EV formula toggle + per-engine EV floor.
     "use_true_ev_formula", "min_ev_per_dollar",
+    # A4D.3 — position-scaling toggle + per-condition exposure cap.
+    "position_scaling_enabled", "max_exposure_per_condition_usdc",
+    # A4D.1 (2026-05-23) — dynamic liquidity filter replacing hour_gate.
+    "max_spread_bps", "min_book_depth_usdc",
 )
 
 

@@ -1372,6 +1372,27 @@ class Dashboard:
         )
         lines.append("")
 
+        # Phase 4D.1 (2026-05-23) — spread+depth liquidity gate counters.
+        # Replaces the retired hardcoded UTC 23/00/01 hour_gate. Pulled from
+        # the in-memory metrics snapshot (rolling ~5m); no extra DB query.
+        try:
+            import metrics as _m
+            rows = _m.snapshot_recent()
+            spread_skips = sum(r["count"] for r in rows
+                               if r["name"] == "trader.spread_skips")
+            depth_skips = sum(r["count"] for r in rows
+                              if r["name"] == "trader.depth_skips")
+            lines.append("## Liquidity gate (rolling ~5m) [Phase 4D.1]")
+            lines.append("")
+            lines.append(
+                f"  spread_skips : {spread_skips}  "
+                f"depth_skips : {depth_skips}  "
+                "(replaces retired hour_gate)"
+            )
+            lines.append("")
+        except Exception:  # noqa: BLE001
+            pass
+
         # A4A.2: JIT pricing + IOC outcome tile. Reads in-memory metrics
         # snapshot (rolling ~5m); no extra DB query.
         try:
@@ -1398,6 +1419,26 @@ class Dashboard:
                 lines.append(
                     f"  avg_delta_bps : {avg_delta:+.2f}  "
                     f"(snapshot → live drift)"
+                )
+                lines.append("")
+        except Exception:  # noqa: BLE001
+            pass
+
+        # A4D.3 — position scaling: delta-adds + at-cap blocks. Tile is
+        # suppressed when scaling has not fired in the last 5m.
+        try:
+            import metrics as _m
+            ps_rows = [r for r in _m.snapshot_recent()
+                       if r["name"].startswith("trader.position_scale")]
+            if ps_rows:
+                deltas = sum(r["count"] for r in ps_rows
+                             if r["name"] == "trader.position_scale_delta_adds")
+                at_cap = sum(r["count"] for r in ps_rows
+                             if r["name"] == "trader.position_scale_at_cap")
+                lines.append("## Position scaling (rolling ~5m)")
+                lines.append("")
+                lines.append(
+                    f"  delta_adds : {deltas}  at_cap : {at_cap}"
                 )
                 lines.append("")
         except Exception:  # noqa: BLE001

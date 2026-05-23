@@ -65,6 +65,10 @@ from markets import MarketMatch
 from watcher import RawHeadline
 import simulate as sim
 import execution as _execution
+# A4E.1 composite scoring (default OFF — gate fires only when
+# cfg.composite_score_floor > 0). Module-level `score_features` returns 0.5
+# until a scorer is registered with `set_default_scorer`.
+from scoring import build_features as _build_features, score_features as _score_features
 
 # Defensive — analysis CLIs import trader.py without app.metrics.
 try:
@@ -168,6 +172,10 @@ class _EntryCtx:
     cf_sampler: Optional[object] = None
     headline_id: Optional[str] = None
     condition_id: Optional[str] = None
+    # A4D.3: total `size_usdc` already held on `(condition_id, engine)`.
+    # When `cfg.position_scaling_enabled` is True, the duplicate-position
+    # gate uses this to compute the delta-add instead of locking out.
+    current_exposure: float = 0.0
 
 async def _fetch_mid_price(
     session: aiohttp.ClientSession, token_id: str
@@ -482,6 +490,32 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
     if rail_thr > 0:
         trace.append({"step": "rail_skip", "pass": True, "mid": round(mid_price, 4)})
 
+    # Phase 4D.1 (2026-05-23) — dynamic spread + book-depth liquidity gate.
+    # Replaces the legacy hardcoded UTC 23/00/01 `hour_gate`. Either knob
+    # being None disables that side of the filter; missing per-match BBO
+    # data (CLOB /book endpoint failed) is treated as a NO-OP so a
+    # transient outage never blinds the gate. See engine._prefetch_prices
+    # for population, markets.MarketMatch for fields, master plan §4D.1.
+    max_spread = getattr(cfg, "max_spread_bps", None)
+    if max_spread is not None and match.spread_bps is not None:
+        spread_step = {"step": "spread_bps", "value": round(match.spread_bps, 2),
+                       "threshold": max_spread}
+        if match.spread_bps > max_spread:
+            _bump_metric("trader.spread_skips")
+            return _skip(f"spread_too_wide:{match.spread_bps:.0f}bps",
+                         step={**spread_step, "pass": False})
+        trace.append({**spread_step, "pass": True})
+    min_depth = getattr(cfg, "min_book_depth_usdc", None)
+    if min_depth is not None and match.book_depth_usdc is not None:
+        depth_step = {"step": "book_depth_usdc",
+                      "value": round(match.book_depth_usdc, 2),
+                      "threshold": min_depth}
+        if match.book_depth_usdc < min_depth:
+            _bump_metric("trader.depth_skips")
+            return _skip(f"book_depth_too_thin:${match.book_depth_usdc:.2f}",
+                         step={**depth_step, "pass": False})
+        trace.append({**depth_step, "pass": True})
+
     # Legacy edge is still computed for back-compat (persisted on
     # `trades.signed_edge` and in `trader_trace` so dashboards & postmortems
     # stay readable). When `use_true_ev_formula=True` (default), the gate is
@@ -553,7 +587,14 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
                      step={"step": "max_positions", "pass": False,
                            "value": ctx.open_positions,
                            "threshold": cfg.max_open_positions})
-    if ctx.duplicate_position:
+    # A4D.3 — position scaling. The binary lockout only fires when
+    # `cfg.position_scaling_enabled` is False (operator opt-out). Otherwise
+    # we let sizing run and a delta-vs-current_exposure gate downstream
+    # decides whether the reinforcing trade is large enough to fire.
+    position_scaling_enabled = bool(
+        getattr(cfg, "position_scaling_enabled", True)
+    )
+    if ctx.duplicate_position and not position_scaling_enabled:
         if not _maybe_bypass("duplicate_position"):
             return _skip("duplicate_position",
                          step={"step": "duplicate_position", "pass": False})
@@ -599,6 +640,62 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
                       "size_usdc": round(size, 4)})
         if size < cfg.min_trade_usdc:
             return _skip(f"cluster_size_too_small:{size:.2f}")
+
+    # A4D.3 — position scaling. When the engine already holds size on
+    # `(cond_id, engine)` and scaling is enabled, the new trade is
+    # interpreted as "target total exposure on this condition" and
+    # downsized to the DELTA needed to reach it. Hard cap from
+    # `cfg.max_exposure_per_condition_usdc` truncates the delta further.
+    if position_scaling_enabled and ctx.current_exposure > 0.0:
+        # Hard cap. 0.0 disables. If the cap is non-zero AND we're already
+        # at-or-above it, refuse. Otherwise truncate the kelly target.
+        max_exposure = float(
+            getattr(cfg, "max_exposure_per_condition_usdc", 0.0) or 0.0
+        )
+        if max_exposure > 0.0 and ctx.current_exposure >= max_exposure:
+            _bump_metric("trader.position_scale_at_cap")
+            return _skip(
+                "duplicate_position:at_max_exposure_cap",
+                step={"step": "position_scale", "pass": False,
+                      "current_exposure": round(ctx.current_exposure, 4),
+                      "max_exposure": round(max_exposure, 4)},
+            )
+        # Kelly returned a TARGET (`size`) for total exposure on this side.
+        if size <= ctx.current_exposure:
+            return _skip(
+                "duplicate_position:exposure_already_at_or_above_optimal",
+                step={"step": "position_scale", "pass": False,
+                      "kelly_size": round(size, 4),
+                      "current_exposure": round(ctx.current_exposure, 4)},
+            )
+        delta_size = size - ctx.current_exposure
+        # Truncate the delta to keep total exposure under the cap.
+        if max_exposure > 0.0:
+            remaining_room = max_exposure - ctx.current_exposure
+            if delta_size > remaining_room:
+                delta_size = remaining_room
+        # Use the SAME min-trade floor that the non-scaling sizing path
+        # uses. In simulate mode `simulate_min_trade_usdc` is the leg
+        # floor; in paper mode `min_trade_usdc` is the comparable knob.
+        min_delta = float(
+            getattr(cfg, "simulate_min_trade_usdc",
+                    getattr(cfg, "min_trade_usdc", 0.0)) or 0.0
+        )
+        if delta_size < min_delta:
+            return _skip(
+                "duplicate_position:delta_below_min_trade",
+                step={"step": "position_scale", "pass": False,
+                      "kelly_size": round(size, 4),
+                      "current_exposure": round(ctx.current_exposure, 4),
+                      "delta_size": round(delta_size, 4),
+                      "min_delta": round(min_delta, 4)},
+            )
+        size = delta_size
+        _bump_metric("trader.position_scale_delta_adds")
+        trace.append({"step": "position_scale", "pass": True,
+                      "kelly_size": round(size + ctx.current_exposure, 4),
+                      "current_exposure": round(ctx.current_exposure, 4),
+                      "delta_size": round(delta_size, 4)})
 
     entry_fee = 0.0
     shares_held: Optional[float] = None
@@ -661,15 +758,29 @@ def _cold_cull_outcome(pos: dict, price: float, cfg) -> CloseOutcome:
         realized_pnl=realized_pnl, proceeds=proceeds,
     )
 
-def _close_pure(pos: dict, current_price: float, cfg, now: datetime) -> CloseOutcome:
+def _close_pure(pos: dict, current_price: float, cfg, now: datetime,
+                *, weighted_entry_price: Optional[float] = None) -> CloseOutcome:
     """Pure exit-decision. FIX-2A: TP/TRAIL compare NET MTM (after sunk
     entry_fee + est_exit_fee); SL stays gross. FIX-2B: returns `exit_price`
     so postmortems reconcile from `trades` alone. FIX-1: `market_type` from
     the position row plumbs into `apply_slippage`/`compute_fee`.
+
+    A4D.3 (2026-05-23): `weighted_entry_price` (optional) — when the engine
+    holds 2+ legs on the same `(condition_id, engine)`, the monitor loop
+    computes the share-weighted mean entry across legs and passes it here.
+    The TP / SL / TRAIL gate then evaluates against the BASKET's
+    cost basis (so any one leg can't trip an SL while the basket as a
+    whole is still profitable). Per-leg realized PnL math still uses
+    the leg's own `entry_price` — only the gate logic uses the weighted
+    average. When `weighted_entry_price` is None the legacy single-leg
+    semantics fire unchanged.
     """
     size_usdc = pos["size_usdc"]
     entry_price = pos["entry_price"]
     direction = pos["direction"]
+    # Gate basis — basket-weighted if supplied, else per-leg.
+    gate_entry = (weighted_entry_price
+                  if weighted_entry_price is not None else entry_price)
     prev_hwm = pos.get("high_water_price")
     opened_at = datetime.fromisoformat(pos["opened_at"])
     if opened_at.tzinfo is None:
@@ -677,17 +788,20 @@ def _close_pure(pos: dict, current_price: float, cfg, now: datetime) -> CloseOut
     age_secs = (now - opened_at).total_seconds()
     persisted = pos.get("shares")
     shares = persisted if persisted else (size_usdc / entry_price)
+    # PnL uses leg's own entry. Gate uses the basket-weighted entry.
     unrealized = (current_price - entry_price) * shares
     local_hwm = max(current_price, prev_hwm if prev_hwm is not None else current_price)
-    mtm = current_price - entry_price
-    hwm_mtm = local_hwm - entry_price
+    mtm = current_price - gate_entry
+    hwm_mtm = local_hwm - gate_entry
     tp = cfg.take_profit
-    sl = max(cfg.stop_loss, cfg.stop_loss_pct * entry_price)
+    sl = max(cfg.stop_loss, cfg.stop_loss_pct * gate_entry)
     ts = cfg.trailing_stop
     min_hold = cfg.min_hold_seconds
     timeout_secs = cfg.position_timeout_hours * 3600
     min_hold_met = (min_hold <= 0) or (age_secs >= min_hold)
-    # FIX-2A net MTM estimate.
+    # FIX-2A net MTM estimate. Per-leg shares × the gate's MTM (so a
+    # multi-leg basket compares cleanly against the same TP/SL thresholds
+    # the single-leg branch uses).
     est_exit_fee = _est_exit_fee(shares, current_price, pos.get("market_type"), cfg)
     entry_fee_paid = max(0.0, size_usdc - shares * entry_price)
     mtm_net = mtm * shares - entry_fee_paid - est_exit_fee
@@ -1027,9 +1141,19 @@ class PaperTrader:
                 entry_price_at_close=pos["entry_price"],
             )
             # Phase 4C.1: keep in-memory state in sync on close.
+            # A4D.3 — multi-leg buckets: drop ONE leg by trade_id so the
+            # remaining legs survive. Legacy single-leg semantics fall out
+            # naturally (the bucket becomes empty and the key is deleted).
             if self._fastpath is not None:
                 eng = pos.get("engine_name") or self._engine_name
-                await self._fastpath.state.remove(pos["condition_id"], eng)
+                tid = pos.get("trade_id")
+                if tid is not None:
+                    await self._fastpath.state.remove_by_trade_id(
+                        pos["condition_id"], eng, tid,
+                    )
+                else:
+                    # Legacy fallback — drop the whole bucket.
+                    await self._fastpath.state.remove(pos["condition_id"], eng)
 
     async def _evaluate_market(
         self, session: aiohttp.ClientSession, signal_id: int,
@@ -1061,6 +1185,7 @@ class PaperTrader:
             # Phase 4C.1: when FastPath is attached, duplicate /
             # count / unique-market checks read in-memory state instead
             # of hitting the DB on the hot path.
+            current_exposure = 0.0
             if self._fastpath is not None:
                 open_n = await self._fastpath.state.count(
                     engine_name=self._engine_name)
@@ -1068,6 +1193,11 @@ class PaperTrader:
                     engine_name=self._engine_name)
                 dup = await self._fastpath.state.has(
                     match.condition_id, self._engine_name)
+                # A4D.3 — current total exposure on (cond_id, engine).
+                if dup:
+                    current_exposure = await self._fastpath.state.exposure(
+                        match.condition_id, self._engine_name,
+                    )
             else:
                 open_n = await self._db.count_open_positions(
                     engine_name=self._engine_name)
@@ -1075,6 +1205,17 @@ class PaperTrader:
                     engine_name=self._engine_name)
                 dup = await self._db.has_open_position(
                     match.condition_id, engine_name=self._engine_name)
+                # A4D.3 — DB-path exposure. Falls back to 0.0 when the
+                # DB layer doesn't expose `sum_open_size_usdc` (legacy
+                # tests / older DB shims keep working).
+                if dup and hasattr(self._db, "sum_open_size_usdc"):
+                    try:
+                        current_exposure = await self._db.sum_open_size_usdc(
+                            match.condition_id,
+                            engine_name=self._engine_name,
+                        )
+                    except Exception:  # noqa: BLE001
+                        current_exposure = 0.0
             ctx = _EntryCtx(
                 cfg=self._cfg, ai_cfg=self._ai_cfg,
                 engine_name=self._engine_name, parent_engine=self._parent_engine,
@@ -1087,6 +1228,7 @@ class PaperTrader:
                 cf_sampler=self._cf_sampler,
                 headline_id=getattr(headline, "headline_id", None),
                 condition_id=match.condition_id,
+                current_exposure=float(current_exposure or 0.0),
             )
             outcome = _evaluate_pure(match, result, ctx)
             decision = _outcome_to_decision(outcome, match, result)
@@ -1333,10 +1475,39 @@ class PaperTrader:
             *[_fetch_mid_price(session, pos["token_id"]) for pos in positions]
         )
 
+        # A4D.3: when 2+ legs share `(condition_id, engine)` the basket's
+        # share-weighted entry drives TP / SL / TRAIL — any single leg
+        # tripping its own SL on a basket that's still profitable would
+        # leak edge. Single-leg buckets keep the legacy per-leg basis
+        # (weighted = None → `_close_pure` falls through unchanged).
+        weighted_by_key: dict[tuple[str, str], Optional[float]] = {}
+        groups: dict[tuple[str, str], list[dict]] = {}
+        for pos in positions:
+            key = (pos["condition_id"],
+                   pos.get("engine_name") or self._engine_name)
+            groups.setdefault(key, []).append(pos)
+        for key, legs in groups.items():
+            if len(legs) <= 1:
+                weighted_by_key[key] = None
+                continue
+            total_shares = sum(float(p.get("shares") or 0.0) for p in legs)
+            if total_shares <= 0.0:
+                weighted_by_key[key] = None
+                continue
+            weighted_by_key[key] = sum(
+                float(p["entry_price"]) * float(p.get("shares") or 0.0)
+                for p in legs
+            ) / total_shares
+
         for pos, current_price in zip(positions, prices):
             if current_price is None:
                 continue
-            outcome = _close_pure(pos, current_price, self._cfg, now)
+            key = (pos["condition_id"],
+                   pos.get("engine_name") or self._engine_name)
+            outcome = _close_pure(
+                pos, current_price, self._cfg, now,
+                weighted_entry_price=weighted_by_key.get(key),
+            )
             await self._db.update_position_price(
                 pos["trade_id"], current_price,
                 outcome.unrealized_pnl,

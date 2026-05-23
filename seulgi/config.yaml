@@ -581,6 +581,14 @@ trading:
   # exceeds aggressive's SL=0.015, so SL fires on spread movement before
   # any signal arrives. Keep this small.
   entry_rail_skip_threshold: 0.02
+  # ── Phase 4D.1 (2026-05-23): dynamic spread+depth liquidity gate ─────
+  # Replaces the retired hardcoded `hour_gate` (UTC 23/00/01 silent drop).
+  # Late-night breaking news no longer dies at INGRESS — it's gated on
+  # *liquidity reality* at trader._evaluate_pure. NULL per-match BBO (e.g.
+  # CLOB /book endpoint failed) ⇒ the filter is a NO-OP, the trade
+  # proceeds. Set either key to `null` to disable that side of the filter.
+  max_spread_bps: 200          # 2% spread max (Polymarket typical = 1-5%)
+  min_book_depth_usdc: 50.0    # need ≥ $50 of top-5 ask liquidity
 
 # ── Trading engines ──────────────────────────────────────────────────────────
 # Each engine runs the same headlines with its own rule set.
@@ -929,6 +937,26 @@ tagger:
   enabled: true
   min_tag_confidence: 1.0          # exact keyword match required
   max_tag_routed_per_headline: 10  # cap so a generic tag can't starve cosine
+
+# ── Phase 4E.2 — pluggable news→market matchers ────────────────────────────
+# Two additional ranking strategies on top of SBERT cosine, both OPT-IN.
+# When enabled, each contributes `extra_score ∈ [0, 1]` weighted by `weight`,
+# folded into the final sort key as `similarity + Σ(weight × extra_score)`.
+# A sibling project (irene/) is building a knowledge-graph matcher that will
+# slot in as a third entry here once it merges. Default OFF — cosine-only
+# behaviour is preserved.
+matchers:
+  cross_encoder:
+    enabled: false                 # opt-in: loads sentence-transformers cross-encoder (~50MB)
+    model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    band_low: 0.3                  # only re-rank candidates with cosine in this band
+    band_high: 0.55
+    weight: 0.3
+  learned_mlp:
+    enabled: false                 # opt-in: trains tiny numpy MLP on closed-trade labels
+    refresh_days: 7
+    min_train_samples: 30          # below this, score() returns neutral 0.5
+    weight: 0.2
 
 # ── Counterfactual sampling (A4E.5) ─────────────────────────────────────────
 # When enabled, 1% of would-have-been-skipped signals at each named filter
