@@ -981,7 +981,7 @@ matchers:
 # Default OFF — flip `enabled: true` to opt in. Deterministic: same
 # (filter, headline, condition, engine) replays the same bypass decision.
 counterfactual:
-  enabled: false
+  enabled: true   # Phase 5 smoke: 1% bypass per filter → marginal-EV measurement
   sample_rate_per_filter: 0.01
   max_cf_per_headline: 3
   enabled_filters:

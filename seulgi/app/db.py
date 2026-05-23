@@ -697,12 +697,19 @@ class SeulgiDB:
             except Exception:  # noqa: BLE001
                 pass
 
-            await self._conn.execute("BEGIN")
+            # FIX (2026-05-23 smoke): set the in-batch flag BEFORE issuing
+            # BEGIN, not after. Between `_conn.execute("BEGIN")` returning
+            # and the assignment, the event loop can run another writer
+            # task that calls `_commit_if_unbatched()` — which sees
+            # `_in_batch == 0` and fires `self._conn.commit()`, closing
+            # the transaction we just opened. The symmetric race exists
+            # on the success path (see below — flag reset moved AFTER
+            # COMMIT).
             self._in_batch = 1
+            await self._conn.execute("BEGIN")
             try:
                 yield
             except BaseException as exc:
-                self._in_batch = 0
                 logger.warning(
                     "[db.batch] rolling back due to %s: %r",
                     type(exc).__name__, exc, exc_info=True,
@@ -736,12 +743,20 @@ class SeulgiDB:
                             _metrics.incr("db.batch.rollback_failed")
                         except Exception:  # noqa: BLE001
                             pass
+                # Reset AFTER rollback completes — same race avoidance as
+                # the success path.
+                self._in_batch = 0
                 raise
             else:
-                self._in_batch = 0
                 # FIX-3B: shield commit too — the symmetric cancellation
                 # window exists on the success path.
+                # FIX (2026-05-23 smoke): reset the in-batch flag AFTER
+                # COMMIT completes, not before. If reset first, a sibling
+                # writer can call `_commit_if_unbatched()` (sees flag=0,
+                # fires `self._conn.commit()`) which closes our open txn —
+                # then our explicit COMMIT raises "no transaction is active".
                 await asyncio.shield(self._conn.execute("COMMIT"))
+                self._in_batch = 0
 
     @asynccontextmanager
     async def _write_lock(self):
