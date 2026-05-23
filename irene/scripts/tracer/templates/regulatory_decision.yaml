@@ -1,0 +1,5 @@
+title: "Tracer #{i}: regulator approves novel drug therapy"
+summary: "Synthetic tracer article #{i} describing a regulatory body approving a novel treatment after expedited review. Used by scripts/tracer/fire.py to verify trade-path propagation."
+source: "tracer"
+source_detail: "regulatory_decision"
+url_pattern: "https://tracer.local/regulatory_decision/{i}"

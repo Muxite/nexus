@@ -1,0 +1,5 @@
+title: "Tracer #{i}: monthly economic indicator surprises to the upside"
+summary: "Synthetic tracer article #{i} reporting an economic indicator print that exceeds consensus expectations. Used by scripts/tracer/fire.py to verify trade-path propagation."
+source: "tracer"
+source_detail: "economic_indicator"
+url_pattern: "https://tracer.local/economic_indicator/{i}"

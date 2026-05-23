@@ -1,223 +1,122 @@
-# Irene — Polymarket Signal-Driven Trading Bot
+# Irene
 
-Irene is a signal-driven trading bot for Polymarket that exploits the information lag between real-world events and market price updates.
+A clean-slate, DKG-shaped paper-trading bot for Polymarket, designed to run in parallel with [seulgi](../seulgi/). Both bots share the same `scraper:9000` HTTP service; **everything else is separate** — DB, chroma store, embeddings, config, dashboard.
 
-## Core Thesis
+Irene is studied-into-existence — every phase ends with a report, every paper the user drops gets a folder under `docs/papers/`, every module gets a `## Specification` block. See `master-plan.md` for the roadmap and `architecture.md` for what currently exists.
 
-Polymarket prices update on minute-to-hour timescales. News wires and public APIs update in seconds. Irene's edge is **faster information incorporation** — detecting events that should move a market probability and placing orders before the crowd reprices.
+---
 
-## Scope
+## Where to find things
 
-**In scope:**
-- News-driven markets across politics, economics, crypto, and world events
-- Markets closing within 1 hour to 1 week (configurable window)
-- Paper trading mode (log decisions without executing)
-- Live trading on Polygon via py-clob-client
+| You want to know… | Look here |
+|---|---|
+| Roadmap / phased build plan | [`master-plan.md`](master-plan.md) |
+| What exists today (current state) | [`architecture.md`](architecture.md) |
+| The DKG design spec (north star) | [`docs/dkg_spec.md`](docs/dkg_spec.md) |
+| **Modularization principles (every module follows these)** | [`docs/modularization.md`](docs/modularization.md) |
+| Decision-funnel walkthrough | `docs/decision_funnel.md` (TBD P1) |
+| Pitfalls / lessons from seulgi | `docs/pitfalls.md` (TBD P1) |
+| Catalogue of past errors + fixes | `docs/errors_and_fixes.md` (TBD P1) |
+| Canonical SQL queries | `docs/queries.md` (TBD P1) |
+| Quant background (Kelly, edge, calibration) | `docs/quant_guide.md` (TBD P2) |
+| Cycle methodology | `docs/cycle_methodology.md` (TBD P1) |
+| Papers + formulas | [`docs/papers/`](docs/papers/) |
+| **What changed today / current state of the world** | latest file in [`handoffs/`](handoffs/) |
+| Point-in-time forensic reports | [`reports/`](reports/) — dated `YYYY-MM-DD-<topic>.md` |
+| Cycle-by-cycle changelog | `changelogs/cycles.md` (TBD P1) |
+| Open research questions | `questions/design_questions.md` (TBD P1) |
+| Operational rules / runbooks | `rules/` (TBD P1) |
+| Tracer-bullet injection + check scripts | `scripts/tracer/` (TBD P1) |
+| Replay / backtest scripts | `scripts/replay/` (TBD P1) |
 
-**Out of scope:**
-- Sports markets (excluded by config keyword filter)
-- Cross-market arbitrage
-- Market making / passive liquidity provision
+Evergreen docs in `docs/` are edited freely; `handoffs/` are dated and immutable after the next one lands; `reports/` are immutable forever (write a new dated report to revise).
 
-## Signal Pipeline
+---
+
+## Pipeline (target shape)
 
 ```
-NewsAPI + RSS feeds + Brave Search + Watched pages (Playwright)
-        │
-        ▼
-    [feeder]  ── embed signal ──▶ cosine similarity vs market index
-        │
-        │  Redis pub/sub (irene:signals)
-        ▼
-    [trader]  ── CLOB price fetch ──▶ edge check ──▶ Kelly sizing ──▶ execute / log
-        │
-        ▼
-  PostgreSQL (trades, positions, market_events, brier_scores)
-        │
-        ▼
-    [monitor] FastAPI + text dashboard (P&L, positions, signals, calibration)
+              ┌──────────────────────────┐
+              │  scraper:9000  (HTTP)    │  ← shared with seulgi
+              │  /fetch  /feed  /twitter │
+              └────────────┬─────────────┘
+                           │ poll
+                           ▼
+              ┌──────────────────────────┐
+              │  ingest    → articles    │
+              │  dedupe    → clusters    │
+              │  markets   → gamma cache │
+              │  match     → signals     │
+              │  predict   → predictions │  (LLM, OpenRouter)
+              │  trade     → trades      │  (paper only in v1)
+              └──────────────────────────┘
+                           │
+              ┌────────────┴─────────────┐
+              ▼                          ▼
+      irene/data/irene.db        irene/data/news_chroma/
 ```
 
-The `[scanner]` service runs independently: it polls the Gamma API for open markets, generates sentence-transformer embeddings, and writes the market index to PostgreSQL. The feeder queries this index via cosine similarity to find which markets each signal touches.
+P2+ layers (`extract` → `entities`/`facts`, `eventize` → `events`, `link` → `market_links`) attach to the same bus but ship later. See `master-plan.md` for phase timing.
 
-## Services
+**Cross-cutting:**
+- Every stage publishes via `bus.publish(topic, payload)`; v1 is in-process (`asyncio.Queue`), v2 swaps to Redis with no other code changes. Payloads are JSON-dicts only.
+- Every gate writes a `decisions` row with `outcome` + `reason`. No silent skips.
+- **Tracer bullets** (synthetic articles tagged `is_tracer=1`) travel the real pipeline for end-to-end verification and back-pressure stress testing. See `scripts/tracer/` (P1).
+- **Replay/backtest** (capture tables `decision_inputs` / `llm_calls`; offline scripts under `scripts/replay/`) runs counterfactual configs without re-paying LLM tokens. See `scripts/replay/` (P1).
 
-| Service    | Port | Role |
-|------------|------|------|
-| `scanner`  | —    | Gamma API poller, market index builder |
-| `feeder`   | —    | NewsAPI + RSS + Brave ingestion, signal → market mapper |
-| `trader`   | —    | Decision engine + py-clob-client execution, position tracker |
-| `monitor`  | host `${IRENE_MONITOR_HOST_PORT:-18080}` → 8080 | FastAPI observability |
-| `postgres` | 5432 | Durable storage |
-| `redis`    | 6379 | Signal pub/sub, rate-limit counters, profiler data |
+---
 
-## Configuration
-
-**Non-secret settings** live in a volume-mounted `config.yaml`. The system rereads this file every 20 seconds — changes take effect without a container restart.
-
-**Secrets and API keys** go in `irene/.env` using the `IRENE__<section>__<key>` form. For NewsAPI and Brave, pass multiple keys as comma-separated values:
+## Quick start (target — most of this lands in P1)
 
 ```bash
-IRENE__SIGNALS__NEWSAPI_KEYS=key1,key2      # round-robin with per-key daily quota
-IRENE__SIGNALS__BRAVE_API_KEYS=key1,key2
+# Start the shared scraper from the root of the parent project:
+docker compose -f ../docker-compose.yml up -d scraper
+
+# Start irene standalone (canonical):
+docker compose -f docker-compose.yml up -d
+
+# Tail logs:
+docker compose logs -f irene
+
+# Fire 10 tracer bullets and verify every stage saw each one:
+python scripts/tracer/fire.py --count 10
+python scripts/tracer/check.py --recent 10
+
+# Replay last hour with a new direction prompt:
+python scripts/replay/predict.py --window 1h --prompt-version direction-v4
+
+# Reconstruct paper-PnL accuracy from snapshots (P1 ship gate):
+python scripts/replay/accuracy.py --since "1h ago"
 ```
 
-Legacy single-key vars (`IRENE__SIGNALS__NEWSAPI_KEY`) still work and are merged into the list. Compose loads `.env` via `env_file` — keys are not listed in `docker-compose.yml`.
+Anything in the table above marked `(TBD)` does not exist yet; see `master-plan.md` for when it lands.
 
-**Host port for the monitor:** set `IRENE_MONITOR_HOST_PORT` in `irene/.env` or shell before `docker compose up`. Compose substitutes it in `docker-compose.yml` (default `18080`).
+---
 
-**Rate limits (UTC day):** `rate_limits` in `config.yaml` sets soft daily caps enforced via `RedisDailyBudgetLimiter` (`shared/irene_shared/ratelimit.py`). For NewsAPI and Brave the limit is **per API key**; `RotatingApiKeyPool` round-robins keys and skips exhausted ones until the next UTC midnight. Default `brave_max_per_day: 500` targets the paid Brave Search API Basic plan — align with your dashboard quota. RSS and CLOB quotas are shared buckets across all feeds/requests. Use `0` for unlimited.
+## Environment variables (target)
 
-See [docs/config_schema.md](docs/config_schema.md) for the full schema.
+| Var | Required | Default | Used by |
+|---|---|---|---|
+| `SCRAPER_URL` | yes | `http://scraper:9000` | ingest stage |
+| `OPENROUTER_API_KEY` | yes (P1+) | unset | predict stage |
+| `IRENE__CYCLE_NAME` | no | `cycle_<timestamp>` | main (cycles writer) |
+| `IRENE__TRADING__BALANCE_USDC` | no | `1000.0` | trade stage |
+| `IRENE__BUS__BACKEND` | no | `inproc` | bus (set `redis` in P2+) |
+| `IRENE__TRACER__ENABLED` | no | `1` | tracer cron + injector |
+| `LOG_LEVEL` | no | `INFO` | all |
 
-## Quick Start
+---
 
-```bash
-cd irene
-cp config.example.yaml config.yaml
-cp .env.example .env
-# Edit .env: set IRENE__SIGNALS__NEWSAPI_KEYS and IRENE__SIGNALS__BRAVE_API_KEYS
-# (RSS + Gamma work without keys — they just provide fewer signals)
-docker compose up -d
+## Hard rules irene follows from day 1
 
-# Monitor dashboard
-open http://localhost:18080
+1. **No DB sharing with seulgi.** A runtime assertion in `db.py` will refuse to connect if the resolved path matches any known seulgi DB path. The dual-container hazard memo (`~/.claude/projects/-home-muk-projects-jennie/memory/project_dual_container.md`) describes the chroma corruption that proves this matters.
+2. **Standalone docker-compose only.** The root `docker-compose.yml` is **not** touched. Run irene from `irene/docker-compose.yml` directly.
+3. **Single-decision-per-headline.** No multi-engine variant fan-out. The comparison axis is `trades.decision_path` (mvp vs dkg), starting P3.
+4. **Tracers and live trades cannot mix.** `db.insert_trade()` will reject any row with `is_tracer=1 AND paper=0`. A tracer can never become a live trade.
+5. **Capture lives inside the live batch.** `decision_inputs` and `llm_calls` writes share the same `db.batch()` as the stage's primary write. Capture cannot lag the live data.
 
-# Text dashboard (updates every 10s)
-watch -n 10 cat irene/data/dashboard.txt
+---
 
-# Live logs from all services
-tail -f irene/logs/*.log
-```
+## Status
 
-## Observability
-
-### HTTP API (monitor)
-
-| Endpoint | Description |
-|----------|-------------|
-| `GET /health` | Service heartbeats, open positions count |
-| `GET /markets` | Active market index with per-market trade count and P&L |
-| `GET /markets/{id}/events` | Full event timeline for a single market |
-| `GET /trades` | Paginated trade log, filterable by condition_id / outcome |
-| `GET /signals` | Recent ingested signals with match counts |
-| `GET /positions` | Open positions with unrealized P&L |
-| `GET /calibration` | Brier score per signal source |
-| `GET /metrics` | Per-service operation latency profiles (p50/p95/p99) |
-
-### Text dashboard (`irene/data/dashboard.txt`)
-
-Updated every 10 seconds. Sections:
-- **Equity & P&L** — starting balance, implied equity, realized/unrealized breakdown
-- **Scorecard** — win/loss/flat counts, win rate, executed vs skipped trades, visual bar chart
-- **Pipeline** — active markets, signals ingested, mapped signals, dispatch counts
-- **Services** — Redis last-seen timestamps + per-operation latency for scanner/feeder/trader
-- **Open positions** — table with direction, size, entry/last price, unrealized P&L, age
-- **Recent closed trades** — last 15 with entry/exit, realized P&L, outcome, exit reason
-- **Calibration** — Brier scores per signal source vs 0.25 random baseline
-- **Skip reasons** — histogram of why trades were rejected
-- **Timeline** — first signal ingested, first trade decided, last trade closed
-
-### File logs (`irene/logs/`)
-
-All services write structured logs to `irene/logs/<service>.log` (mounted volume). Docker stdout is also captured with `json-file` rotation (20 MB × 5 files).
-
-```bash
-tail -f irene/logs/trader.log       # trade decisions and executions
-tail -f irene/logs/feeder.log       # signal ingestion and mapping
-tail -f irene/logs/scanner.log      # market index refreshes
-tail -f irene/logs/*.log            # all at once
-docker compose logs -f trader       # Docker stdout (same content)
-```
-
-### Web UI
-
-`http://localhost:<host-port>/` redirects to `/ui/`, a minimal signals viewer that polls `GET /signals` every 30 seconds. Static files live in `frontend/` and are copied into the monitor image.
-
-### JSON export (`irene/data/signals.json`)
-
-With `monitor.signals_export_dir` set (default `/data/exports`), the monitor writes `signals.json` atomically every `signals_export_interval_seconds` (default 300s). Set the path to `""` or interval to `0` to disable.
-
-## Docker Logs — Normal vs. Noise
-
-- **Redis `Memory overcommit must be enabled`:** On the **host**, run `sudo sysctl vm.overcommit_memory=1` and add `vm.overcommit_memory = 1` to `/etc/sysctl.d/99-redis.conf`. This is a host kernel setting — the container cannot change it.
-- **Redis `no config file specified`:** Informational; the image runs with defaults.
-- **Scanner/feeder Hugging Face unauthenticated warnings:** Harmless. Set `HF_TOKEN` in `.env` for higher Hub rate limits when downloading the embedding model.
-- **SentenceTransformer HTTP 404 on `adapter_config.json` / "UNEXPECTED" keys:** Harmless; the loader probes optional paths.
-- **Services showing `—` in dashboard `SERVICES` section:** Redis `last_seen` keys have a 5-minute TTL. Give containers ~30 seconds after startup; timestamps will appear once the first work cycle completes.
-
-## 24-Hour Paper Test
-
-1. `irene.mode: paper` in `config.yaml` (safe default — no real orders).
-2. Set API keys in `.env` (`IRENE__SIGNALS__NEWSAPI_KEYS`, `IRENE__SIGNALS__BRAVE_API_KEYS`).
-3. `docker compose up -d` from `irene/`.
-4. Monitor with `watch -n 10 cat irene/data/dashboard.txt` or `http://localhost:28080`.
-5. After the run, review `GET /calibration` for Brier scores and `GET /trades` for skip reason patterns.
-6. Tune `signals.similarity_threshold`, `trading.min_edge`, `trading.edge_increment_*` live via `config.yaml` — changes apply within 20 seconds.
-
-## Directory Layout
-
-```
-irene/
-├── config.example.yaml        # template config — copy to config.yaml
-├── config.yaml                # live config (hot-reloaded every 20s)
-├── .env.example               # template secrets
-├── .env                       # live secrets (not committed)
-├── docker-compose.yml
-├── data/                      # monitor exports (bind-mounted, host-visible)
-│   ├── dashboard.txt          # plain-text dashboard (updated every 10s)
-│   └── signals.json           # recent signals export
-├── logs/                      # service logs (bind-mounted, host-visible)
-│   ├── scanner.log
-│   ├── feeder.log
-│   ├── trader.log
-│   └── monitor.log
-├── docs/
-│   └── config_schema.md       # full config reference
-├── frontend/                  # static monitor UI; copied into monitor image
-├── shared/                    # irene_shared Python package
-│   └── irene_shared/
-│       ├── config.py          # IreneConfig Pydantic model + ConfigManager hot-reload
-│       ├── db.py              # asyncpg wrapper, schema migrations, CRUD + get_dashboard_stats()
-│       ├── models.py          # shared Pydantic models
-│       ├── ratelimit.py       # RedisDailyBudgetLimiter + RotatingApiKeyPool
-│       ├── redis_client.py    # pub/sub, heartbeats, profiler read/write
-│       ├── timing.py          # Timer, ProfileStore, jittered_sleep
-│       └── migrations/
-│           └── 001_initial.sql
-├── scanner/
-│   ├── Dockerfile
-│   └── app/
-│       ├── main.py            # Scanner loop
-│       ├── gamma_client.py
-│       ├── market_filter.py
-│       ├── embedder.py        # sentence-transformers/all-MiniLM-L6-v2
-│       └── tests/
-├── feeder/
-│   ├── Dockerfile
-│   └── app/
-│       ├── main.py            # Feeder loop (NewsAPI + RSS + Brave concurrent)
-│       ├── sources/
-│       │   ├── newsapi.py
-│       │   ├── rss.py
-│       │   ├── brave.py       # Brave Search API source
-│       │   └── watched.py     # Playwright persistent tab; MutationObserver on DOM changes
-│       ├── mapper.py          # cosine similarity matching
-│       ├── direction.py       # keyword-based direction classifier
-│       └── tests/
-├── trader/
-│   ├── Dockerfile
-│   └── app/
-│       ├── main.py            # Trader loop (Redis subscriber)
-│       ├── clob_client.py
-│       ├── decision.py        # 5-step edge + Kelly engine
-│       ├── executor.py        # order submission (paper: DB only; live: CLOB)
-│       ├── position_tracker.py
-│       └── tests/
-└── monitor/
-    ├── Dockerfile
-    └── app/
-        ├── main.py            # FastAPI app + export loops
-        ├── text_dashboard.py  # plain-text dashboard.txt writer
-        └── tests/
-```
+**2026-05-23 — Phase 0 (scaffold) just landed.** No code, no container, no schema. See [`handoffs/2026-05-23.md`](handoffs/2026-05-23.md) for what's next.

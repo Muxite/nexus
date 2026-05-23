@@ -1,0 +1,5 @@
+title: "Tracer #{i}: companies announce all-cash merger agreement"
+summary: "Synthetic tracer article #{i} announcing a planned merger between two large public companies, subject to regulatory approval. Used by scripts/tracer/fire.py to verify trade-path propagation."
+source: "tracer"
+source_detail: "merger"
+url_pattern: "https://tracer.local/merger/{i}"

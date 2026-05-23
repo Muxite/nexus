@@ -1,224 +1,66 @@
-# `${VAR:-default}` in this file is resolved by Compose from the process environment
-# and from `.env` in this directory (not the same mechanism as `env_file` on services).
+# Standalone docker-compose for irene.
+#
+# Per the user decision 2026-05-22 ("Standalone only — no root compose
+# edits ever") this file is the ONE WAY to start irene. The root
+# jennie/docker-compose.yml is NEVER edited by irene PRs.
+#
+#   docker compose -f irene/docker-compose.yml up --build
+#
+# Prerequisites:
+#   - The shared scraper must already be up on the `jennie_default` network
+#     (root compose: `docker compose up scraper`). Irene only consumes it
+#     over HTTP — it does not start or own that container.
+#   - irene/config.yaml must exist (copy from config.example.yaml in a
+#     later PR; not present yet — P1 doesn't read config beyond a stub).
 
 services:
-
-  # ---------------------------------------------------------------------------
-  # Infrastructure
-  # ---------------------------------------------------------------------------
-
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: irene
-      POSTGRES_PASSWORD: irene
-      POSTGRES_DB: irene
-    volumes:
-      - irene_postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U irene"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - irene_redis_data:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-
-  # ---------------------------------------------------------------------------
-  # Irene services
-  # ---------------------------------------------------------------------------
-
-  scanner:
+  irene:
     build:
       context: .
-      dockerfile: scanner/Dockerfile
+      dockerfile: Dockerfile
+    container_name: irene
+    restart: unless-stopped
     volumes:
+      - ./data:/data
+      # config.yaml is bind-mounted read-only so the hot-reload picks up
+      # host edits without a container rebuild (pattern from old-irene).
       - ./config.yaml:/config/config.yaml:ro
-      - irene_model_cache:/root/.cache/huggingface
-      - ./logs:/logs
-    env_file:
-      - path: .env
-        required: false
+      # Shared sentence-transformers cache so we don't re-download the
+      # ~500MB model into a separate volume from seulgi.
+      - irene_model_cache:/root/.cache/torch/sentence_transformers
     environment:
-      IRENE_CONFIG_PATH: /config/config.yaml
-      IRENE_LOG_DIR: /logs
-      PYTHONUNBUFFERED: "1"
+      - IRENE_CONFIG=/config/config.yaml
+      - SCRAPER_URL=${SCRAPER_URL:-http://scraper:9000}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Per-cycle name. main.py calls db.ensure_current_cycle(name) on boot.
+      - IRENE_CYCLE=${IRENE_CYCLE:-cycle-0}
+    env_file:
+      - path: ./.env
+        required: false
+    networks:
+      - jennie_default
     logging:
       driver: json-file
       options:
-        max-size: "20m"
-        max-file: "5"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
+        max-size: "50m"
+        max-file: "3"
 
-  feeder:
+  irene-test:
+    profiles: ["test"]
     build:
       context: .
-      dockerfile: feeder/Dockerfile
+      dockerfile: Dockerfile.test
+    container_name: irene-test
     volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      - irene_model_cache:/root/.cache/huggingface
-      - ./logs:/logs
-    env_file:
-      - path: .env
-        required: false
+      - ./data:/data
     environment:
-      IRENE_CONFIG_PATH: /config/config.yaml
-      IRENE_LOG_DIR: /logs
-      PYTHONUNBUFFERED: "1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
-  trader:
-    build:
-      context: .
-      dockerfile: trader/Dockerfile
-    volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      - ./logs:/logs
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      IRENE_CONFIG_PATH: /config/config.yaml
-      IRENE_LOG_DIR: /logs
-      PYTHONUNBUFFERED: "1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
-
-  monitor:
-    build:
-      context: .
-      dockerfile: monitor/Dockerfile
-    ports:
-      - "${IRENE_MONITOR_HOST_PORT:-18080}:8080"
-    volumes:
-      - ./config.yaml:/config/config.yaml:ro
-      - ./data:/data/exports
-      - ./logs:/logs
-    env_file:
-      - path: .env
-        required: false
-    environment:
-      IRENE_CONFIG_PATH: /config/config.yaml
-      IRENE_LOG_DIR: /logs
-      PYTHONUNBUFFERED: "1"
-    logging:
-      driver: json-file
-      options:
-        max-size: "20m"
-        max-file: "5"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-
-  # ---------------------------------------------------------------------------
-  # Test runners
-  #
-  # Run a specific suite:
-  #   docker compose run --rm shared-test
-  #   docker compose run --rm scanner-test
-  #   docker compose run --rm feeder-test
-  #
-  # Enable integration tests (hits real APIs):
-  #   IRENE_INTEGRATION_TESTS=true docker compose run --rm scanner-test
-  # ---------------------------------------------------------------------------
-
-  shared-test:
-    build:
-      context: .
-      dockerfile: shared/Dockerfile.test
-    profiles: [test]
-    environment:
-      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
-
-  scanner-test:
-    build:
-      context: .
-      dockerfile: scanner/Dockerfile.test
-    profiles: [test]
-    environment:
-      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
-
-  feeder-test:
-    build:
-      context: .
-      dockerfile: feeder/Dockerfile.test
-    profiles: [test]
-    environment:
-      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
-
-  trader-test:
-    build:
-      context: .
-      dockerfile: trader/Dockerfile.test
-    profiles: [test]
-    environment:
-      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
-
-  monitor-test:
-    build:
-      context: .
-      dockerfile: monitor/Dockerfile.test
-    profiles: [test]
-    environment:
-      IRENE_INTEGRATION_TESTS: "${IRENE_INTEGRATION_TESTS:-false}"
-
-  # ---------------------------------------------------------------------------
-  # Integration test runner — hits real postgres + redis + Gamma API
-  #
-  # Run:
-  #   docker compose --profile integration run --rm integration-test
-  # ---------------------------------------------------------------------------
-
-  integration-test:
-    build:
-      context: .
-      dockerfile: integration_tests/Dockerfile
-    profiles: [integration]
-    environment:
-      IRENE_INTEGRATION_TESTS: "true"
-      IRENE_DATABASE_URL: "postgresql://irene:irene@postgres:5432/irene"
-      IRENE_REDIS_URL: "redis://redis:6379/0"
-      IRENE_GAMMA_URL: "https://gamma-api.polymarket.com"
-      PYTHONUNBUFFERED: "1"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - PYTHONPATH=/app
+    networks:
+      - jennie_default
 
 volumes:
-  irene_postgres_data:
-  irene_redis_data:
   irene_model_cache:
+
+networks:
+  jennie_default:
+    external: true
