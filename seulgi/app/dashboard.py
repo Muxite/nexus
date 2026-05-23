@@ -1331,6 +1331,37 @@ class Dashboard:
         )
         lines.append("")
 
+        # A4A.2: JIT pricing + IOC outcome tile. Reads in-memory metrics
+        # snapshot (rolling ~5m); no extra DB query.
+        try:
+            import metrics as _m
+            jit_rows = [r for r in _m.snapshot_recent()
+                        if r["name"].startswith("jit.")]
+            if jit_rows:
+                lines.append("## JIT pricing + IOC (rolling ~5m)")
+                lines.append("")
+                fills = sum(r["count"] for r in jit_rows
+                            if r["name"] == "jit.ioc_fill")
+                fails = sum(r["count"] for r in jit_rows
+                            if r["name"] == "jit.ioc_fail")
+                total = fills + fails
+                fail_rate = (fails / total * 100.0) if total > 0 else 0.0
+                delta = next((r for r in jit_rows
+                              if r["name"] == "jit.delta_bps"), None)
+                avg_delta = (delta["sum"] / delta["count"]
+                             if delta and delta["count"] > 0 else 0.0)
+                lines.append(
+                    f"  attempts : {total}  fills : {fills}  fails : {fails}"
+                    f"  fail_rate : {fail_rate:.1f}%"
+                )
+                lines.append(
+                    f"  avg_delta_bps : {avg_delta:+.2f}  "
+                    f"(snapshot → live drift)"
+                )
+                lines.append("")
+        except Exception:  # noqa: BLE001
+            pass
+
         # Cache section reads in-memory state; no extra DB query.
         cache = self._heavy_cache
         last_refresh = cache.get("_last_refresh_at")

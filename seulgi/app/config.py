@@ -208,6 +208,13 @@ class TradingConfig:
     # plus a fee headroom estimate. 0.0 disables (the legacy `min_edge` gate
     # remains the primary filter). Per-engine override allowed.
     min_ev_per_dollar: float = 0.0
+    # A4A.2 (2026-05-23): JIT pricing tolerance band (basis points,
+    # relative to snapshot mid). The trader refetches top-of-book right
+    # before `open_position`; if `|live − snapshot| / snapshot >
+    # jit_tolerance_bps / 10000`, the IOC "fails" and we book a
+    # `ioc_fail_price_moved` skip instead of executing on a stale price.
+    # See app/execution.py. Per-engine override allowed.
+    jit_tolerance_bps: float = 50.0
     # Round-trip trading cost in basis points of stake (1 bp = 0.01%). Default
     # 20 bps = 0.20% of stake deducted at close. Models the bid-ask spread
     # (Polymarket has no protocol fees, but you cross the spread on entry AND
@@ -402,6 +409,8 @@ class VariantConfig:
     freshness_filter: Optional[str] = None
     mid_yes_min: Optional[float] = None
     mid_yes_max: Optional[float] = None
+    # A4A.2 JIT-pricing tolerance override (bps; relative to snapshot mid).
+    jit_tolerance_bps: Optional[float] = None
 
 
 @dataclass
@@ -428,6 +437,8 @@ class EngineConfig:
     stop_loss_pct: Optional[float] = None
     min_entry_yes_mid: Optional[float] = None
     max_market_vol_30m: Optional[float] = None
+    # A4A.2 JIT-pricing tolerance override (bps; relative to snapshot mid).
+    jit_tolerance_bps: Optional[float] = None
     # Per-engine relevance gate override. When None, the global
     # `relevance.keep_scores` is used. When set, this engine evaluates
     # only markets whose Stage-2 relevance verdict is in this list.
@@ -555,6 +566,7 @@ def _build_config(raw: dict) -> Config:
             freshness_filter=v.get("freshness_filter"),
             mid_yes_min=_opt_float(v.get("mid_yes_min")),
             mid_yes_max=_opt_float(v.get("mid_yes_max")),
+            jit_tolerance_bps=_opt_float(v.get("jit_tolerance_bps")),
         )
 
     engine_cfgs = [
@@ -579,6 +591,7 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=_opt_float(e.get("stop_loss_pct")),
             min_entry_yes_mid=_opt_float(e.get("min_entry_yes_mid")),
             max_market_vol_30m=_opt_float(e.get("max_market_vol_30m")),
+            jit_tolerance_bps=_opt_float(e.get("jit_tolerance_bps")),
             relevance_keep_scores=(
                 list(e["relevance_keep_scores"])
                 if isinstance(e.get("relevance_keep_scores"), list)
@@ -667,6 +680,7 @@ def _build_config(raw: dict) -> Config:
             stop_loss_pct=float(t.get("stop_loss_pct", 0.0)),
             min_entry_yes_mid=float(t.get("min_entry_yes_mid", 0.0)),
             max_market_vol_30m=float(t.get("max_market_vol_30m", 0.0)),
+            jit_tolerance_bps=float(t.get("jit_tolerance_bps", 50.0)),
             simulate_total_usdc=float(t.get("simulate_total_usdc", 50.0)),
             simulate_min_trade_usdc=float(t.get("simulate_min_trade_usdc", 1.0)),
             simulate_fees=_load_simulate_fees(t.get("simulate_fees") or t.get("simulate", {}).get("fee_model")),

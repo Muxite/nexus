@@ -47,6 +47,10 @@ sys.path.insert(0, os.path.join(_SEULGI, "scripts", "analysis"))
 
 from ai import ClassifyResult, Direction  # noqa: E402
 from config import load_config  # noqa: E402
+from execution import (  # noqa: E402
+    DEFAULT_JIT_TOLERANCE_BPS,
+    simulate_ioc_outcome,
+)
 from markets import MarketMatch  # noqa: E402
 from trader import (  # noqa: E402
     EntryOutcome,
@@ -54,6 +58,12 @@ from trader import (  # noqa: E402
     _evaluate_pure,
     _EntryCtx,
 )
+
+# A4A.2 — proxy delta-t (seconds) between decided_at and the
+# "live" price we use to simulate the IOC drift. Spec: 1-5s; pick the
+# middle. _PriceTape tolerates an ε window so this is a hint, not a strict
+# requirement. Configurable via --jit-proxy-secs.
+_JIT_PROXY_SECS_DEFAULT = 3
 
 logger = logging.getLogger("backtest")
 
@@ -466,6 +476,8 @@ def _record_skip(rec: dict, skips: list, d: _Decision, reason: str,
 
 def _simulate(cfg, decisions, market_index: dict, tape: _PriceTape,
               freshness: dict, log_every: int = 5000, calibrator=None,
+              simulate_ioc_fail: bool = False,
+              jit_proxy_secs: int = _JIT_PROXY_SECS_DEFAULT,
               ) -> tuple[list, list, dict]:
     """Walk decisions in time order; re-evaluate per engine; emit a
     _TradeRow on TRADE. Per-engine open-position / duplicate state is
@@ -526,6 +538,33 @@ def _simulate(cfg, decisions, market_index: dict, tape: _PriceTape,
             _record_skip(rec, skips, d, "no_price_for_exit",
                          short="no_price_for_exit")
             continue
+
+        # A4A.2 — IOC simulation against live price at decided_at + 1-5s.
+        # Spec says: position_price_snaps[t=+0s] doesn't exist (starts at
+        # +5m), so use market_price_snaps at decided_at + jit_proxy_secs.
+        # Same `simulate_ioc_outcome` the runtime uses, so backtest +
+        # paper-mode behaviours match given identical inputs.
+        if simulate_ioc_fail:
+            jit_tol = float(
+                getattr(trading, "jit_tolerance_bps",
+                        DEFAULT_JIT_TOLERANCE_BPS) or DEFAULT_JIT_TOLERANCE_BPS
+            )
+            jit_target = d.decided_unix + jit_proxy_secs
+            live_mid = tape.nearest(d.condition_id, side, jit_target)
+            ioc = simulate_ioc_outcome(
+                snapshot_mid=entry_price, live_price=live_mid, side=outcome.direction or "YES",
+                target_size_usdc=size,
+                max_acceptable_price=entry_price * (1.0 + jit_tol / 10000.0),
+                tolerance_bps=jit_tol, latency_ms=jit_proxy_secs * 1000,
+                cfg=trading, market_type=d.market_type,
+            )
+            if not ioc.filled:
+                _record_skip(rec, skips, d, ioc.skip_reason or "ioc_fail",
+                             short=ioc.skip_reason or "ioc_fail")
+                continue
+            if ioc.fill_price is not None:
+                entry_price = ioc.fill_price
+                shares = size / entry_price if entry_price > 0 else 0.0
 
         pos = {
             "condition_id": d.condition_id, "direction": outcome.direction,
@@ -721,6 +760,16 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     p.add_argument("--include-neutral", action="store_true",
                    help="Also walk rows with direction='NEUTRAL' (pre-AI "
                    "skips). Off by default — those have no LLM oracle.")
+    # A4A.2 JIT pricing + IOC simulation knobs.
+    p.add_argument("--simulate-ioc-fail", action="store_true",
+                   help="Enable A4A.2 IOC-fail simulation: refetch a "
+                        "proxy 'live' mid from market_price_snaps at "
+                        "decided_at + --jit-proxy-secs and reject the "
+                        "fill when |live - snapshot| > jit_tolerance_bps.")
+    p.add_argument("--jit-proxy-secs", type=int,
+                   default=_JIT_PROXY_SECS_DEFAULT,
+                   help="Seconds between decided_at and the synthetic "
+                        "'live' price proxy. Spec: 1-5s.")
     return p.parse_args(argv)
 
 
@@ -786,8 +835,11 @@ def main(argv: Optional[list] = None) -> int:
                 n_walked, len(hids))
 
     tape = _PriceTape(con, epsilon_s=args.epsilon_secs)
-    trades, skips, stats = _simulate(cfg, decisions, market_index, tape,
-                                     freshness, calibrator=calibrator)
+    trades, skips, stats = _simulate(
+        cfg, decisions, market_index, tape, freshness, calibrator=calibrator,
+        simulate_ioc_fail=args.simulate_ioc_fail,
+        jit_proxy_secs=args.jit_proxy_secs,
+    )
 
     n_skipped_by_reason: dict = {}
     for rec in stats["per_engine"].values():
