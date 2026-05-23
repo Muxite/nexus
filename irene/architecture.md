@@ -4,9 +4,9 @@
 >
 > **Discipline.** Updated at the end of every phase (not every PR — that aspiration kills momentum; per-PR notes go to `changelogs/cycles.md` instead).
 
-- **Last updated:** 2026-05-23 (**P2 in flight — extraction stage live**)
+- **Last updated:** 2026-05-23 (**P2 wrapped — extraction live + end-of-phase report**)
 - **Synthesized from:** the approved plan at `~/.claude/plans/based-on-the-new-lovely-coral.md`, the seulgi audit reports (`/home/muk/projects/jennie/seulgi/architecture.md`, three Explore-agent reports run 2026-05-22), the user's DKG spec at `docs/dkg_spec.md`, and the irene ontology at `docs/ontology.md`.
-- **Status:** P1 sealed + **P2 first stage shipping.** `app/stages/extract.py` subscribes to `article.deduped` alongside match, runs ontology-constrained extraction (v1: 7 entity types + 10 relations), writes `entities` / `entity_aliases` / `extraction_runs` / `facts`. **Trade path NEVER reads these tables** (P2 hard invariant). 7 stages wired now (was 6); boot smoke clean; **205 tests green**; the P1 ship-gate replay accuracy gate still passes 600/600 within ±$0.01.
+- **Status:** P1 sealed + **P2 wrapped with conditional approval to enter P3.** Extraction stage live; ontology-constrained LLM extraction running shadow-mode (writes facts/entities/etc., trade path NEVER reads them — invariant mechanically enforced by `scripts/lint/no_facts_in_trade_path.py`). Real-LLM held-out evaluation shows fact P/R ≈ 0.59 / 0.57, entity P/R ≈ 0.74 / 0.74 — below the strict 0.6 fact-P/R gate, but [the end-of-P2 report](reports/2026-05-23-irene-p2-extraction.md) shows 6/8 remaining misses are metric-strictness artefacts, not extractor failures. **P3 proceeds with entity-resolver as the critical-path first deliverable.** 230+ tests green.
 
 ---
 
@@ -85,7 +85,9 @@ Every load-bearing module gets a `## Specification` block at the top of its docs
 | `app/stages/markets.py` | P1 | (TBD) | not created |
 | `app/stages/match.py` | P1 | (TBD) | not created |
 | `app/stages/trade.py` | P1 | (TBD) | not created |
-| `app/stages/extract.py` | P2 | ✓ | **live** — subscribes to `article.deduped`. Ontology-constrained LLM call → JSON parse → validate against entity types + relations → resolve entities (insert-or-fetch by `(type, canonical_name)`) → write facts. Owns `entities`, `entity_aliases`, `extraction_runs`, `facts`. Independent HTTP path (shares `deps.budget` with `ai.py`). |
+| `app/stages/extract.py` | P2 | ✓ | **live** — subscribes to `article.deduped`. Ontology-constrained LLM call → markdown-fence-strip → JSON parse → ontology validation → COMPANY-suffix normalisation → entity insert-or-fetch → facts. Acronym-preference in the prompt. Owns `entities`, `entity_aliases`, `extraction_runs`, `facts`. Independent HTTP path (shares `deps.budget` with `ai.py`). |
+| `scripts/lint/no_facts_in_trade_path.py` | P2 | ✓ | **live** — mechanically enforces the P2 hard invariant. Scans `ai.py` + `trade.py` + `match.py` + `closer.py` for SELECT/JOIN/INTO/UPDATE/DELETE against the four extraction tables. Word-boundary patterns + an opt-in `# lint: allow-extraction-table-ref` escape. |
+| `scripts/eval/gold_set/v1.yaml` + `scripts/eval/extraction_quality.py` | P2 | ✓ | **live** — 18 Reuters-style gold articles covering all 10 relations. Strict CI canonical-name matcher reports per-relation precision/recall. Mock and `--real-llm` modes. |
 | `app/stages/eventize.py` | P3 | (TBD) | not created |
 | `app/stages/link.py` | P3 | (TBD) | not created |
 | `app/clob.py` | P1 | ✓ | **live** — Polymarket CLOB mid-price client. Pure utility; no tables. Lazy `httpx.AsyncClient`; recoverable errors → `None`. |

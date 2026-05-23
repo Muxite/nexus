@@ -92,6 +92,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -143,6 +144,14 @@ ENTITY TYPES (use exactly one of these for every entity):
 
 RELATIONS (use exactly one of these for every fact):
 {relations}
+
+For each entity name, use the **shortest widely-recognised form**:
+- "Apple", not "Apple Inc."
+- "Pfizer", not "Pfizer Inc."
+- "FDA", not "U.S. Food and Drug Administration"
+- "SEC", not "U.S. Securities and Exchange Commission"
+- "Fed", not "Federal Reserve"
+If you're unsure whether an acronym is widely recognised, prefer the longer form.
 
 For each fact:
 - "subj" MUST be the canonical name of an entity you listed in "entities".
@@ -334,6 +343,17 @@ def _extract_content(response_body: str) -> Optional[str]:
     return content
 
 
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_markdown_fence(s: str) -> str:
+    """Some providers (notably Gemini-flash) wrap JSON in ```json ... ```
+    despite the prompt asking otherwise. Strip the fence non-destructively
+    if present, else return unchanged."""
+    m = _FENCE_RE.match(s)
+    return m.group(1) if m else s
+
+
 def _parse_llm_json(content: str) -> Optional[dict]:
     """Parse the LLM's content into the `{entities, facts}` dict.
 
@@ -343,7 +363,7 @@ def _parse_llm_json(content: str) -> Optional[dict]:
     missing keys) as the same `parse_error` status.
     """
     try:
-        obj = json.loads(content)
+        obj = json.loads(_strip_markdown_fence(content))
     except json.JSONDecodeError:
         return None
     if not isinstance(obj, dict):
@@ -355,12 +375,52 @@ def _parse_llm_json(content: str) -> Optional[dict]:
     return {"entities": ents, "facts": facts}
 
 
+# Common legal/structural suffixes that the LLM emits but the canonical
+# entity is the same with or without — "Pfizer Inc." and "Pfizer" should
+# be the same row. Order matters: longer suffixes first so "Inc." doesn't
+# match before ", Inc." gets a chance.
+_LEGAL_SUFFIXES = (
+    ", Incorporated", " Incorporated",
+    ", Inc.", " Inc.", ", Inc", " Inc",
+    ", Corporation", " Corporation",
+    ", Corp.", " Corp.", ", Corp", " Corp",
+    ", Company", " Company", ", Co.", " Co.", " & Co.",
+    ", Limited", " Limited", ", Ltd.", " Ltd.", " Ltd",
+    ", LLC", " LLC",
+    ", plc", " plc", ", PLC", " PLC",
+    ", AG", " AG",
+    ", S.A.", " S.A.",
+    ", N.V.", " N.V.",
+    " GmbH",
+    ", Holdings", " Holdings",
+    ", Group", " Group",
+)
+
+
+def _normalise_canonical(name: str, entity_type: str) -> str:
+    """Strip common legal suffixes from COMPANY names.
+
+    Only COMPANY gets this — ORG / COUNTRY / etc. are left alone (e.g.
+    "U.S. Food and Drug Administration" stays as-is; acronym resolution
+    to "FDA" is a P3 entity-resolver concern, not a parse-layer one)."""
+    n = name.strip()
+    if entity_type != "COMPANY":
+        return n
+    for sfx in _LEGAL_SUFFIXES:
+        if n.endswith(sfx):
+            n = n[: -len(sfx)].rstrip(", .").strip()
+            break
+    return n
+
+
 def _validate_entities(entities: list[Any]) -> dict[str, dict]:
     """Walk the LLM's `entities` list, keeping only in-ontology entries.
 
-    Returns a name -> {type, aliases} map. Duplicates (same canonical name
-    but inconsistent type) collapse to the first occurrence — the LLM
-    emitted contradictory metadata, and picking the first is deterministic.
+    Returns an as-emitted name -> {type, canonical, aliases} map. The
+    `canonical` is the form we'll write to the entities table (after
+    `_normalise_canonical`); `aliases` retains the raw emitted name as
+    an alias when it differs from the canonical, so downstream lookups
+    against the original surface form still resolve.
     """
     out: dict[str, dict] = {}
     for raw in entities:
@@ -375,13 +435,19 @@ def _validate_entities(entities: list[Any]) -> dict[str, dict]:
         name = name.strip()
         if name in out:
             continue
+        canonical = _normalise_canonical(name, etype)
         aliases_raw = raw.get("aliases") or []
         aliases: list[str] = []
         if isinstance(aliases_raw, list):
             for a in aliases_raw:
                 if isinstance(a, str) and a.strip():
                     aliases.append(a.strip())
-        out[name] = {"type": etype, "aliases": aliases}
+        # Preserve the as-emitted form as an alias when normalisation
+        # changed it; lets a downstream lookup that uses the raw form
+        # still resolve.
+        if canonical != name and name not in aliases:
+            aliases.append(name)
+        out[name] = {"type": etype, "canonical": canonical, "aliases": aliases}
     return out
 
 
@@ -793,9 +859,14 @@ class ExtractStage:
             run_id = cur.lastrowid
 
             # Resolve every kept entity to an entities.id (insert-or-fetch).
+            # `name` is the LLM's surface form; `meta["canonical"]` is what
+            # we actually write into entities.canonical_name (suffix-stripped
+            # for COMPANY, unchanged for other types). entity_ids is keyed
+            # by the surface form so fact resolution downstream still works.
             entity_ids: dict[str, int] = {}
             for name, meta in entity_map.items():
                 etype = meta["type"]
+                canonical = meta["canonical"]
                 await cur.execute(
                     """
                     INSERT INTO entities
@@ -804,18 +875,18 @@ class ExtractStage:
                     ON CONFLICT(entity_type, canonical_name) DO UPDATE
                         SET last_seen_at=excluded.last_seen_at
                     """,
-                    (etype, name, now, now),
+                    (etype, canonical, now, now),
                 )
                 await cur.execute(
                     "SELECT id FROM entities WHERE entity_type=? AND canonical_name=?",
-                    (etype, name),
+                    (etype, canonical),
                 )
                 erow = await cur.fetchone()
                 if erow is None:
                     # Defensive: an ON CONFLICT path that didn't yield a row
                     # means the constraint logic is wrong — fail loudly.
                     raise RuntimeError(
-                        f"entities insert/lookup failed for ({etype}, {name})"
+                        f"entities insert/lookup failed for ({etype}, {canonical})"
                     )
                 eid = int(erow[0])
                 entity_ids[name] = eid

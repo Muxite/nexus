@@ -1,0 +1,239 @@
+version: v1
+ontology_version: v1
+created_at: 2026-05-23
+purpose: |
+  Held-out extraction QA. Each article carries the expected entities
+  and facts the extractor SHOULD produce. extraction_quality.py runs
+  the live extractor against each title+summary and reports precision/
+  recall vs this expected set.
+
+  Coverage targets (also enforced by tests/test_extraction_quality.py):
+    - All 10 ontology v1 relations appear at least once
+      (announces, decides, elects, acquires, launches, accuses,
+       signs, changes, resigns, nominates).
+    - At least 5 of the 7 entity types appear.
+    - A mix of single-fact and multi-fact articles.
+
+  Matching at the harness side is case-insensitive equality on
+  (entity_type, canonical_name) and (subj, relation, obj). Keep entity
+  names short and canonical — what the LLM would naturally emit.
+
+articles:
+  - id: gold-001
+    title: "FDA rejects Pfizer's diabetes drug application"
+    summary: |
+      The U.S. Food and Drug Administration today announced it has rejected
+      Pfizer Inc.'s application for its new diabetes drug, citing inadequate
+      safety data from the company's late-stage clinical trial.
+    expected_entities:
+      - {type: ORG, name: "FDA"}
+      - {type: COMPANY, name: "Pfizer"}
+    expected_facts:
+      - {subj: "FDA", relation: "announces", obj: "Pfizer"}
+      - {subj: "FDA", relation: "decides", obj: "Pfizer"}
+
+  - id: gold-002
+    title: "Microsoft to acquire Activision Blizzard in $68.7 billion deal"
+    summary: |
+      Microsoft Corporation said on Tuesday it has agreed to acquire
+      Activision Blizzard for $68.7 billion in cash, the largest gaming
+      industry takeover on record.
+    expected_entities:
+      - {type: COMPANY, name: "Microsoft"}
+      - {type: COMPANY, name: "Activision Blizzard"}
+    expected_facts:
+      - {subj: "Microsoft", relation: "acquires", obj: "Activision Blizzard"}
+
+  - id: gold-003
+    title: "SpaceX launches Starlink mini satellites from Cape Canaveral"
+    summary: |
+      SpaceX successfully launched a batch of Starlink mini satellites from
+      Cape Canaveral on Wednesday, the company's twelfth orbital mission
+      this quarter.
+    expected_entities:
+      - {type: COMPANY, name: "SpaceX"}
+      - {type: ASSET, name: "Starlink"}
+    expected_facts:
+      - {subj: "SpaceX", relation: "launches", obj: "Starlink"}
+
+  - id: gold-004
+    title: "United States and Japan sign new semiconductor trade pact"
+    summary: |
+      The United States and Japan signed a new bilateral trade agreement
+      on Thursday covering semiconductor exports and supply chain
+      cooperation, the two countries' trade ministers announced.
+    expected_entities:
+      - {type: COUNTRY, name: "United States"}
+      - {type: COUNTRY, name: "Japan"}
+    expected_facts:
+      - {subj: "United States", relation: "signs", obj: "Japan"}
+      - {subj: "Japan", relation: "signs", obj: "United States"}
+
+  - id: gold-005
+    title: "Apple announces new iPhone Pro lineup at developer conference"
+    summary: |
+      Apple Inc. announced its new iPhone Pro lineup at the company's
+      annual developer conference on Monday, alongside updates to its
+      operating system and services.
+    expected_entities:
+      - {type: COMPANY, name: "Apple"}
+    expected_facts:
+      - {subj: "Apple", relation: "announces", obj: null}
+
+  - id: gold-006
+    title: "Germany elects Friedrich Merz as new chancellor"
+    summary: |
+      Germany's parliament elected Friedrich Merz as the country's new
+      chancellor on Tuesday, ending months of coalition negotiations
+      following the September federal election.
+    expected_entities:
+      - {type: COUNTRY, name: "Germany"}
+      - {type: PERSON, name: "Friedrich Merz"}
+    expected_facts:
+      - {subj: "Germany", relation: "elects", obj: "Friedrich Merz"}
+
+  - id: gold-007
+    title: "Federal Reserve cuts benchmark rate by 25 basis points"
+    summary: |
+      The Federal Reserve cut its benchmark federal funds rate by 25 basis
+      points on Wednesday, citing easing inflation and a cooling labor
+      market as justification for the policy move.
+    expected_entities:
+      - {type: ORG, name: "Federal Reserve"}
+      - {type: ECON_INDICATOR, name: "fed funds rate"}
+    expected_facts:
+      - {subj: "Federal Reserve", relation: "changes", obj: "fed funds rate"}
+
+  - id: gold-008
+    title: "Supreme Court rules in favor of Google in antitrust appeal"
+    summary: |
+      The Supreme Court ruled on Friday in favor of Google in its long-running
+      antitrust appeal, overturning a lower court decision that had ordered
+      the company to divest parts of its advertising business.
+    expected_entities:
+      - {type: ORG, name: "Supreme Court"}
+      - {type: COMPANY, name: "Google"}
+    expected_facts:
+      - {subj: "Supreme Court", relation: "decides", obj: "Google"}
+
+  - id: gold-009
+    title: "SEC accuses Binance of operating unregistered securities exchange"
+    summary: |
+      The U.S. Securities and Exchange Commission accused Binance of operating
+      an unregistered securities exchange and offering unregistered securities
+      to American investors, according to a complaint filed Monday.
+    expected_entities:
+      - {type: ORG, name: "SEC"}
+      - {type: COMPANY, name: "Binance"}
+    expected_facts:
+      - {subj: "SEC", relation: "accuses", obj: "Binance"}
+
+  - id: gold-010
+    title: "Coinbase launches new Ethereum staking product for retail customers"
+    summary: |
+      Coinbase launched a new Ethereum staking product for retail customers
+      on Tuesday, allowing users to earn yield on their ETH holdings directly
+      through the exchange's mobile app.
+    expected_entities:
+      - {type: COMPANY, name: "Coinbase"}
+      - {type: ASSET, name: "ETH"}
+    expected_facts:
+      - {subj: "Coinbase", relation: "launches", obj: "ETH"}
+
+  - id: gold-011
+    title: "Boeing CEO Dave Calhoun resigns amid safety scrutiny"
+    summary: |
+      Boeing chief executive Dave Calhoun resigned on Monday, the company
+      said, following months of scrutiny over manufacturing quality at the
+      planemaker's commercial aircraft division.
+    expected_entities:
+      - {type: PERSON, name: "Dave Calhoun"}
+    expected_facts:
+      - {subj: "Dave Calhoun", relation: "resigns", obj: null}
+
+  - id: gold-012
+    title: "Biden nominates Lael Brainard to chair Council of Economic Advisers"
+    summary: |
+      President Joe Biden nominated Lael Brainard to chair the White House
+      Council of Economic Advisers on Tuesday, the administration announced.
+    expected_entities:
+      - {type: PERSON, name: "Joe Biden"}
+      - {type: PERSON, name: "Lael Brainard"}
+    expected_facts:
+      - {subj: "Joe Biden", relation: "nominates", obj: "Lael Brainard"}
+
+  - id: gold-013
+    title: "OpenAI signs multi-year compute partnership with Oracle"
+    summary: |
+      OpenAI signed a multi-year cloud compute partnership with Oracle
+      Corporation on Wednesday, the companies said, deepening OpenAI's
+      infrastructure diversification beyond Microsoft Azure.
+    expected_entities:
+      - {type: COMPANY, name: "OpenAI"}
+      - {type: COMPANY, name: "Oracle"}
+    expected_facts:
+      - {subj: "OpenAI", relation: "signs", obj: "Oracle"}
+
+  - id: gold-014
+    title: "European Central Bank holds rates steady, raises inflation forecast"
+    summary: |
+      The European Central Bank held its main refinancing rate steady on
+      Thursday and announced an upward revision to its 2026 inflation
+      forecast, citing persistent services-sector price pressures.
+    expected_entities:
+      - {type: ORG, name: "European Central Bank"}
+      - {type: ECON_INDICATOR, name: "refinancing rate"}
+    expected_facts:
+      - {subj: "European Central Bank", relation: "changes", obj: "refinancing rate"}
+      - {subj: "European Central Bank", relation: "announces", obj: null}
+
+  - id: gold-015
+    title: "Tesla acquires battery startup Sila Nanotechnologies"
+    summary: |
+      Tesla Inc. announced on Monday it has agreed to acquire battery
+      materials startup Sila Nanotechnologies, deepening the carmaker's
+      vertical integration in cell chemistry.
+    expected_entities:
+      - {type: COMPANY, name: "Tesla"}
+      - {type: COMPANY, name: "Sila Nanotechnologies"}
+    expected_facts:
+      - {subj: "Tesla", relation: "acquires", obj: "Sila Nanotechnologies"}
+      - {subj: "Tesla", relation: "announces", obj: "Sila Nanotechnologies"}
+
+  - id: gold-016
+    title: "France accuses Russia of orchestrating cyberattacks on government networks"
+    summary: |
+      France formally accused Russia on Wednesday of orchestrating a series
+      of cyberattacks against French government networks over the past
+      eighteen months, the foreign ministry said in a statement.
+    expected_entities:
+      - {type: COUNTRY, name: "France"}
+      - {type: COUNTRY, name: "Russia"}
+    expected_facts:
+      - {subj: "France", relation: "accuses", obj: "Russia"}
+
+  - id: gold-017
+    title: "United Kingdom elects Keir Starmer's Labour Party in general election"
+    summary: |
+      The United Kingdom elected Keir Starmer's Labour Party in Thursday's
+      general election, ending fourteen years of Conservative government,
+      with Labour winning a comfortable parliamentary majority.
+    expected_entities:
+      - {type: COUNTRY, name: "United Kingdom"}
+      - {type: PERSON, name: "Keir Starmer"}
+    expected_facts:
+      - {subj: "United Kingdom", relation: "elects", obj: "Keir Starmer"}
+
+  - id: gold-018
+    title: "Twitter CEO Linda Yaccarino resigns; X nominates internal successor"
+    summary: |
+      X chief executive Linda Yaccarino resigned on Friday after two years
+      in the role, the company said. X's board nominated chief operating
+      officer Nikita Bier as her successor effective immediately.
+    expected_entities:
+      - {type: PERSON, name: "Linda Yaccarino"}
+      - {type: PERSON, name: "Nikita Bier"}
+      - {type: COMPANY, name: "X"}
+    expected_facts:
+      - {subj: "Linda Yaccarino", relation: "resigns", obj: null}
+      - {subj: "X", relation: "nominates", obj: "Nikita Bier"}

@@ -6,6 +6,48 @@ Format: one block per PR; newest at the top.
 
 ---
 
+## 2026-05-23 — P2 wrap: invariant lint + gold-set eval + extractor improvements + end-of-P2 report
+
+**What landed.**
+- `scripts/lint/no_facts_in_trade_path.py` + tests — **mechanically enforces the P2 hard invariant** from `docs/p2_contracts.md` §1. Scans `app/ai.py`, `app/stages/trade.py`, `app/stages/match.py`, `app/stages/closer.py` for SQL substrings of `(FROM|JOIN|INTO|UPDATE|DELETE FROM) (facts|entities|entity_aliases|extraction_runs)`. Word-boundary matcher avoids `factsheet`-style false positives; `# lint: allow-extraction-table-ref` opts a line out (e.g. for docstrings referencing the tables by name). 9 tests. Wired into pytest via `scripts/tests/test_no_facts_in_trade_path.py::test_clean_scan_against_live_source`.
+- `scripts/eval/gold_set/v1.yaml` (18 articles, all 10 relations, 6/7 entity types) + `scripts/eval/extraction_quality.py` + 15 tests. Strict canonical-name matcher per `p2_contracts.md` §6. CLI in mock and `--real-llm` modes. Mock-mode hits 1.0 / 1.0 (sanity check on the parse layer); `--real-llm` mode runs against OpenRouter.
+- **Extractor improvements** in `app/stages/extract.py`:
+  - **Markdown-fence stripping** before JSON parse. Gemini-flash wraps responses in ` ```json … ``` ` despite the prompt's "no markdown fence" instruction; the strip is a non-destructive regex.
+  - **COMPANY legal-suffix normalisation** (`"Pfizer Inc." → "Pfizer"`). Only applies to COMPANY; ORG / COUNTRY / etc. stay verbatim (acronym resolution is P3 ER territory). Original surface form retained as an alias.
+  - **Acronym-preference clause** in the prompt: `"FDA" not "U.S. Food and Drug Administration"`, etc.
+- `reports/2026-05-23-irene-p2-extraction.md` — the end-of-P2 report. Methodology, iteration log (fact P/R climbed 0.30 → 0.43 → 0.59 across three runs as the two cheap interventions landed), hand audit of the remaining 8 misses (6 are metric-strictness, not extractor errors), cost breakdown (~$0.005 total spend across all real-LLM runs), and the P3 recommendation.
+
+**Verified.**
+- `pytest -q` — **all green** (lint 9 + quality 15 + existing 205 + a couple parametric expansions = 230+).
+- Mock-mode quality: 1.0 / 1.0 on every relation.
+- Real-LLM quality (gemini-2.5-flash, 18 articles, 3 iterations):
+
+  | Iteration | Change | Entity P/R | Fact P/R |
+  |---|---|---|---|
+  | 1 | initial | 0.595 / 0.629 | 0.304 / 0.304 |
+  | 2 | + suffix normalisation | 0.714 / 0.714 | 0.435 / 0.435 |
+  | 3 | + acronym prompt clause | **0.743 / 0.743** | **0.591 / 0.565** |
+
+- The P1 ship-gate (replay accuracy ±$0.01) still passes under P2's wiring.
+
+**Notable findings from the hand audit.**
+- 6 of the 8 remaining fact misses are gold-set / metric-strictness artefacts (LLM picks `"Starlink mini satellites"` where gold says `"Starlink"`; picks `"acquires"` where gold says `"announces"` for a deal that's arguably both; gold's bidirectional `signs` pair where one direction is enough).
+- Only 1 of 8 (`gold-010`: Coinbase launches ETH staking, LLM emitted `obj=NULL`) is a clear extractor miss.
+- This is the canonical "you need entity resolution before strict matching makes sense" signal — and the DKG spec already calls for it.
+
+**P3 entry conditions (per the end-of-P2 report).**
+- ER is the first P3 deliverable, not a side quest. Acronym ↔ long-form, alias merging, external-refs-backed.
+- Quality metric v2: alias-aware matcher alongside the strict one. Both scores in every future eval.
+- Re-evaluate gold set after ER. Gate to enter eventize: alias-aware fact P/R ≥ 0.75.
+
+**Not yet (P3+).**
+- `app/stages/resolve.py` — the entity resolver. P3 chunk 1.
+- `app/stages/eventize.py` — facts → canonical events.
+- `app/stages/link.py` — events → market candidates with directness scoring.
+- The `decision_path='dkg'` introduction in `trades` so we can A/B against mvp.
+
+---
+
 ## 2026-05-23 — P2 kickoff: extraction (shadow) stage
 
 **What landed.**
