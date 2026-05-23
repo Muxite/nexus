@@ -230,6 +230,30 @@ class _TracerAI:
         return
 
 
+class _TracerBudget:
+    """Budget stand-in for the tracer harness.
+
+    `ExtractStage` requires `deps.budget`; the tracer never starts the
+    extract stage's HTTP path (it isn't subscribed in tracer mode) but
+    the wire_pipeline() construction still needs a non-None budget to
+    satisfy the contract."""
+
+    def is_paused(self) -> bool:
+        return False
+
+    def note_ok(self) -> None:
+        return
+
+    def note_402(self) -> None:
+        return
+
+    async def start(self) -> None:
+        return
+
+    async def stop(self) -> None:
+        return
+
+
 class _TracerCLOB:
     """CLOB stand-in for the tracer harness.
 
@@ -584,16 +608,17 @@ async def _run_async(
     clob = _TracerCLOB(default_mid=closer_mid)
 
     bus = InProcBus()
+    budget = _TracerBudget()
     pipeline = wire_pipeline(
         db=db,
         bus=bus,
         cfg=cfg,
         embedder=embedder,
         ai=ai,
-        # Budget is consumed only by AIClient in production; our fake AI
-        # ignores it. Pass None — pipeline construction itself never reads
-        # the field (TradeStage requires `deps.ai`, which we satisfied).
-        budget=None,
+        # ExtractStage requires deps.budget; AIClient consumes it too in
+        # production. Our fake AI / un-started extract path never call
+        # into the budget's HTTP loop — the stub satisfies the type only.
+        budget=budget,
         clob=clob,
     )
 

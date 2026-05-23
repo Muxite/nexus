@@ -30,6 +30,7 @@ TOPIC_ARTICLE_DEDUPED = "article.deduped"
 TOPIC_MARKETS_REFRESHED = "markets.refreshed"
 TOPIC_SIGNAL_CREATED = "signal.created"
 TOPIC_TRADE_DECIDED = "trade.decided"
+TOPIC_EXTRACTION_COMPLETED = "extraction.completed"
 
 # Telemetry topics (best-effort; dropped first under back-pressure) ---------
 

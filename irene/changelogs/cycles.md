@@ -6,6 +6,33 @@ Format: one block per PR; newest at the top.
 
 ---
 
+## 2026-05-23 — P2 kickoff: extraction (shadow) stage
+
+**What landed.**
+- `docs/ontology.md` — locked ontology v1. **7 entity types** (`COMPANY`, `PERSON`, `ORG`, `COUNTRY`, `ECON_INDICATOR`, `ASSET`, `EVENT`) and **10 relations** (`announces`, `decides`, `elects`, `acquires`, `launches`, `accuses`, `signs`, `changes`, `resigns`, `nominates`). `obj_value` JSON shape spec (`kind` ∈ `{percentage, currency, count, date, string}`). Strict at parse: anything outside the vocab is dropped and counted (`extraction_runs.dropped_fact_count`).
+- `docs/p2_contracts.md` — the P2 contract doc. §1 codifies the hard invariant: **the trade path NEVER reads `facts` / `entities` / `entity_aliases` / `extraction_runs` in P2.** Reject-on-review for any cross-domain SELECT, plus a CI grep check planned alongside the lint suite. §3 locks the `ExtractStage` interface; §4 locks the four schemas; §5 locks the prompt + parse validation; §6 specs the end-of-P2 report.
+- `app/stages/extract.py` + 18 tests — written by a parallel agent against the locked contract. Subscriber on `TOPIC_ARTICLE_DEDUPED` (alongside `MatchStage`). Independent OpenRouter HTTP path (shares `deps.budget` for streak + pause). `ONTOLOGY_VERSION="v1"`, `PROMPT_VERSION="v1"`. UNIQUE on `(article_id, model, ontology_version, prompt_version)` for idempotency; bumping a version forces re-extraction. All four tables created via the standard registry pattern.
+- `app/topics.py` — new constant `TOPIC_EXTRACTION_COMPLETED` (`extraction.completed`). Trade-path (back-pressured). Nothing subscribes in P2; P3 eventize will.
+- `app/config.py` — `ExtractSection` (model / timeout_seconds / max_tokens / max_article_chars).
+- `app/main.py` — `wire_pipeline()` constructs `ExtractStage`; subscribes its `handle()` to `TOPIC_ARTICLE_DEDUPED` alongside `MatchStage`. Boot log line now reads `"7 stages wired … extract=shadow"` (was 6).
+- `scripts/tracer/fire.py` — added a `_TracerBudget` stub (no-op) so `wire_pipeline()` can construct `ExtractStage` even though the tracer never starts it.
+
+**Verified.**
+- `pytest -q` — **205 / 205 green** (187 baseline + 18 new extract).
+- `python -m app` boot smoke (host, no chromadb) — `"irene boot OK, 7 stages wired"`, live Gamma poll fires, SIGTERM exit 0.
+- `python -m scripts.soak.run --count 200 --concurrency 20 --db /tmp/irene_soak_p2.db` — **600 / 600 within ±$0.01, max drift $0.0000** in 9.33s. The P1 ship-gate still passes under the new P2 wiring.
+
+**P2 invariant enforcement (today).**
+- Code review of the diff confirms no `SELECT … FROM facts|entities|entity_aliases|extraction_runs` exists in `trade.py` / `match.py` / `closer.py` / `ai.py`.
+- A grep-based CI lint is planned for the next P2 chunk so the invariant is mechanically enforced.
+
+**Not yet (P2 remaining).**
+- Real-LLM soak. Today's stack uses stub AI in the tracer; the extract HTTP path isn't yet exercised against OpenRouter. Next chunk: a brief live-LLM run + report.
+- Precision/recall held-out batch. The end-of-P2 ship gate requires ~50 articles human-labelled.
+- The end-of-P2 report (`reports/YYYY-MM-DD-irene-p2-extraction.md`) gating P3 entry.
+
+---
+
 ## 2026-05-23 — P1 SEALED: closer + clob + replay + soak
 
 **What landed.**

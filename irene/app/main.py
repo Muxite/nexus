@@ -60,6 +60,7 @@ from app.deps import StageDeps
 from app.embed import Embedder
 from app.stages.closer import CloserStage
 from app.stages.dedupe import DedupeStage
+from app.stages.extract import ExtractStage
 from app.stages.ingest import IngestStage
 from app.stages.markets import MarketIndex, MarketsStage
 from app.stages.match import MatchStage
@@ -136,6 +137,7 @@ class Pipeline:
         match: MatchStage,
         trade: TradeStage,
         closer: CloserStage,
+        extract: ExtractStage,
     ) -> None:
         self.markets = markets
         self.ingest = ingest
@@ -143,10 +145,17 @@ class Pipeline:
         self.match = match
         self.trade = trade
         self.closer = closer
+        self.extract = extract
 
     @property
     def start_order(self) -> tuple:
-        return (self.markets, self.ingest, self.dedupe, self.match, self.trade, self.closer)
+        # P2: extract is wired alongside match on article.deduped. It runs
+        # in parallel with the trade path; the trade path NEVER reads
+        # extract's tables (docs/p2_contracts.md §1).
+        return (
+            self.markets, self.ingest, self.dedupe, self.match,
+            self.trade, self.closer, self.extract,
+        )
 
     @property
     def stop_order(self) -> tuple:
@@ -197,12 +206,16 @@ def wire_pipeline(
     # the boot fails loudly — a paper-trading bot without a price source
     # can't reason about exits.
     closer = CloserStage(full_deps)
+    # Extract (P2) needs `deps.budget`. It runs alongside match on the
+    # same `article.deduped` topic — the bus fans out to both subscribers.
+    extract = ExtractStage(full_deps)
 
     # Subscriptions MUST be registered before bus.start() — the bus
     # rejects late subscribers (catches the wiring bug where a stage
     # silently misses messages).
     bus.subscribe(TOPIC_ARTICLE_INGESTED, dedupe.handle)
     bus.subscribe(TOPIC_ARTICLE_DEDUPED, match.handle)
+    bus.subscribe(TOPIC_ARTICLE_DEDUPED, extract.handle)
     bus.subscribe(TOPIC_SIGNAL_CREATED, trade.handle)
 
     return Pipeline(
@@ -212,6 +225,7 @@ def wire_pipeline(
         match=match,
         trade=trade,
         closer=closer,
+        extract=extract,
     )
 
 
@@ -259,7 +273,7 @@ async def main() -> int:
         await stage.start()
 
     logger.info(
-        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s)",
+        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow)",
         len(pipeline.start_order),
         cfg.irene.cycle,
         cycle_id,

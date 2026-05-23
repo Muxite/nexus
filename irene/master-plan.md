@@ -2,8 +2,8 @@
 
 > The canonical roadmap. For current state, see [`architecture.md`](architecture.md). For the design north star, see [`docs/dkg_spec.md`](docs/dkg_spec.md). The full plan that authorised this build lives at `~/.claude/plans/based-on-the-new-lovely-coral.md` — this file is the in-repo working copy.
 
-- **Last updated:** 2026-05-23 (**P1 sealed**)
-- **Current phase:** **P1 complete.** All three ship-gate items green — see [`reports/2026-05-23-irene-p1-soak.md`](reports/2026-05-23-irene-p1-soak.md). 187 tests green. Next phase: P2 — extraction (shadow) layer.
+- **Last updated:** 2026-05-23 (**P2 in flight** — extraction stage live, shadow mode)
+- **Current phase:** P1 sealed + P2 kickoff landed. `app/stages/extract.py` writes the four DKG-style tables behind the **trade-path-never-reads** invariant. Ontology locked at v1 in `docs/ontology.md`. 205 tests green. Next P2 chunks: real-LLM soak; precision/recall held-out report; the end-of-P2 ship-gate report.
 
 ---
 
@@ -95,7 +95,7 @@ Each phase ends with: (a) code merged, (b) a dated `reports/YYYY-MM-DD-phase-N.m
 |---|---|---|---|
 | **P0** | Scaffold + docs | `irene/` directory tree, 5 root docs, dkg_spec verbatim, first handoff | **✓ complete 2026-05-23** |
 | **P1** | MVP pipeline + tracer + replay | Dockerfile, compose entry, schema, all P1 modules, `scripts/tracer/`, `scripts/replay/accuracy.py`. Runs in parallel with seulgi. | **✓ complete 2026-05-23** ([soak report](reports/2026-05-23-irene-p1-soak.md)) |
-| **P2** | Extraction layer (shadow) | `stages/extract.py` + entities/facts tables. Trade path STILL uses MVP. Reports compare extraction precision/recall on held-out samples. | **next** |
+| **P2** | Extraction layer (shadow) | `stages/extract.py` + entities/facts tables. Trade path STILL uses MVP. Reports compare extraction precision/recall on held-out samples. | **in flight** — stage + ontology + schema landed 2026-05-23; remaining: real-LLM soak + precision/recall report |
 | **P3** | Event + linker (high-risk) | `stages/eventize.py` + `stages/link.py`. Introduces `decision_path='dkg'` alongside `'mvp'`. Research-session-first per critique. | sketch |
 | **P4** | Dual-write comparison + Postgres draft | Reports quantify mvp vs dkg per-trade-path. Postgres DDL drafted (not run). Schema-reviewer agent owns this. | sketch |
 | **P5** | Cutover candidates | One non-critical read (market context) routed through DKG. Then candidate filtering. Final trade decision only after ≥5 consecutive 24h windows of DKG ≥ MVP. | TBD |

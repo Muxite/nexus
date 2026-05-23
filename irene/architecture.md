@@ -4,9 +4,9 @@
 >
 > **Discipline.** Updated at the end of every phase (not every PR — that aspiration kills momentum; per-PR notes go to `changelogs/cycles.md` instead).
 
-- **Last updated:** 2026-05-23 (**P1 sealed**)
-- **Synthesized from:** the approved plan at `~/.claude/plans/based-on-the-new-lovely-coral.md`, the seulgi audit reports (`/home/muk/projects/jennie/seulgi/architecture.md`, three Explore-agent reports run 2026-05-22), and the user's DKG spec captured at `docs/dkg_spec.md`.
-- **Status:** **Phase 1 complete.** All three P1 ship-gate items green (see [`reports/2026-05-23-irene-p1-soak.md`](reports/2026-05-23-irene-p1-soak.md)): container boots clean, tracer at `1000 / 50` shows 0 trade-path drops, replay accuracy reconstructs **3000 / 3000** closed trades within ±$0.01 (max drift $0.0000). **187 tests green.** Next phase: P2 — extraction (shadow) layer.
+- **Last updated:** 2026-05-23 (**P2 in flight — extraction stage live**)
+- **Synthesized from:** the approved plan at `~/.claude/plans/based-on-the-new-lovely-coral.md`, the seulgi audit reports (`/home/muk/projects/jennie/seulgi/architecture.md`, three Explore-agent reports run 2026-05-22), the user's DKG spec at `docs/dkg_spec.md`, and the irene ontology at `docs/ontology.md`.
+- **Status:** P1 sealed + **P2 first stage shipping.** `app/stages/extract.py` subscribes to `article.deduped` alongside match, runs ontology-constrained extraction (v1: 7 entity types + 10 relations), writes `entities` / `entity_aliases` / `extraction_runs` / `facts`. **Trade path NEVER reads these tables** (P2 hard invariant). 7 stages wired now (was 6); boot smoke clean; **205 tests green**; the P1 ship-gate replay accuracy gate still passes 600/600 within ±$0.01.
 
 ---
 
@@ -85,7 +85,7 @@ Every load-bearing module gets a `## Specification` block at the top of its docs
 | `app/stages/markets.py` | P1 | (TBD) | not created |
 | `app/stages/match.py` | P1 | (TBD) | not created |
 | `app/stages/trade.py` | P1 | (TBD) | not created |
-| `app/stages/extract.py` | P2 | (TBD) | not created |
+| `app/stages/extract.py` | P2 | ✓ | **live** — subscribes to `article.deduped`. Ontology-constrained LLM call → JSON parse → validate against entity types + relations → resolve entities (insert-or-fetch by `(type, canonical_name)`) → write facts. Owns `entities`, `entity_aliases`, `extraction_runs`, `facts`. Independent HTTP path (shares `deps.budget` with `ai.py`). |
 | `app/stages/eventize.py` | P3 | (TBD) | not created |
 | `app/stages/link.py` | P3 | (TBD) | not created |
 | `app/clob.py` | P1 | ✓ | **live** — Polymarket CLOB mid-price client. Pure utility; no tables. Lazy `httpx.AsyncClient`; recoverable errors → `None`. |

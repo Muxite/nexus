@@ -125,6 +125,18 @@ class MatchSection(BaseModel):
     top_k: int = Field(default=5, ge=1, le=50)
 
 
+class ExtractSection(BaseModel):
+    """Extraction (P2 shadow layer) — model + token budget per article."""
+
+    model: str = "google/gemini-2.5-flash"
+    timeout_seconds: float = Field(default=20.0, gt=0)
+    max_tokens: int = Field(default=1024, ge=128, le=8192)
+    # Hard upper bound on the article body characters passed to the LLM
+    # (irene's ingested summaries are short, but truncating defensively
+    # keeps a runaway long-form article from blowing up the prompt).
+    max_article_chars: int = Field(default=4000, ge=200)
+
+
 class CLOBSection(BaseModel):
     """Polymarket CLOB client config — base URL + timeout."""
 
@@ -182,6 +194,7 @@ class Config(BaseModel):
     trade: TradeSection = Field(default_factory=TradeSection)
     clob: CLOBSection = Field(default_factory=CLOBSection)
     closer: CloserSection = Field(default_factory=CloserSection)
+    extract: ExtractSection = Field(default_factory=ExtractSection)
 
     model_config = {"frozen": True}
 
