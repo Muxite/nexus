@@ -10,8 +10,8 @@ Coverage:
 - `engine_results`       — always (via record_engine_decisions at FAN_OUT)
 - `llm_calls`            — when LLM ran (A2.1 shipped — `ai._log_llm_call_safe`)
                             NOT when SEULGI_BYPASS_LLM=1
-- `decision_inputs`      — when the A0.12 wiring lands (sibling pending);
-                            test xfails the assertion until then
+- `decision_inputs`      — always (writer wired in engine.process at SIGNAL
+                            stage as fire-and-forget background task)
 - `trades`               — when any engine fires (sized + edge cleared gates)
 - `position_price_snaps` — A2.2 schema shipped; writer is the continuous
                             impact_tracker loop (>=0 sanity assertion)
@@ -233,20 +233,14 @@ class TestCapturePipelineWithLlmMocked:
                 "`ai._log_llm_call_safe`. Re-run with that PR landed."
             )
 
-            # decision_inputs — sibling A0.12 writer is PENDING.
-            # When it ships, this assertion will become active.
-            di_rows = await _count(
+            # decision_inputs — writer fires as a fire-and-forget background
+            # task at the SIGNAL stage (engine.py). It's spawned before the
+            # SIM_GATE so even early-skip headlines write one row.
+            assert await _count(
                 db,
                 "SELECT COUNT(*) FROM decision_inputs WHERE headline_id = ?",
                 (hid,),
-            )
-            if di_rows < 1:
-                pytest.xfail(
-                    "decision_inputs writer not yet wired into engine.process "
-                    "(sibling A0.12 / A2.5-followon pending). Schema exists; "
-                    "engine.py needs an `await db.insert_decision_input(...)` "
-                    "callsite. When that lands this xfail flips to XPASS."
-                )
+            ) >= 1, "decision_inputs row missing"
 
             # trades / position_price_snaps — best-effort; depends on
             # whether the lone match actually cleared the trader gates.
