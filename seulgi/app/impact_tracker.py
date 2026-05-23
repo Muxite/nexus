@@ -46,7 +46,8 @@ Invariants
       most once even when CLOB returns empty.
 
 Side effects
-    - HTTP GET to clob.polymarket.com (/midpoint, /prices-history).
+    - HTTP GET to clob.polymarket.com (/midpoint, /prices-history,
+      /book — the last added in Phase 4A.3 for BBO + depth capture).
     - DB writes: INSERT price_impacts, UPDATE price_impacts (bucket
       cols + timeseries flag), batch INSERT price_timeseries.
     - DB reads: get_pending_price_impacts, get_impacts_needing_timeseries,
@@ -64,7 +65,9 @@ Failure modes
 Non-goals
     - NOT trade execution (trader.py) or live position monitoring
       (trader.monitor_positions @ 60s via main._position_monitor_loop).
-    - NOT book-depth analysis (Phase 4A.3 will add it).
+    - NOT spread/depth gating (Phase 4D.1 will consume the
+      bid/ask/book_depth_usdc captured here). 4A.3 only populates
+      the columns; it does NOT filter on them.
     - NOT on the critical path of `trader.evaluate`; all writes are
       fire-and-forget via `asyncio.create_task` from engine.py.
 """
@@ -81,6 +84,15 @@ from typing import Optional
 import aiohttp
 
 from db import SeulgiDB
+# A4A.3: BBO + book-depth capture lives in `bbo.py`. Re-exported here
+# so existing call sites (`impact_tracker.fetch_bbo`, `BBOResult`) and
+# tests that monkeypatch `impact_tracker._fetch_bbo` keep working.
+# `_bbo_cache` / `_bbo_inflight` are re-exported so test setup can
+# reset state via the impact_tracker namespace too.
+from bbo import (  # noqa: F401 — public re-export surface
+    BBOResult, fetch_bbo,
+    _bbo_cache, _bbo_inflight,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -155,20 +167,14 @@ async def _fetch_price(session: aiohttp.ClientSession, token_id: str) -> Optiona
 async def _fetch_bbo(
     session: aiohttp.ClientSession, token_id: str
 ) -> tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-    """Fetch (mid, bid, ask, book_depth_usdc) for one CLOB token.
+    """Compatibility shim used by `_position_snap_loop` (and tests).
 
-    A2.2 placeholder: the /midpoint endpoint used by the rest of the
-    bot returns only `mid`, so today we degrade gracefully — `bid`,
-    `ask`, and `book_depth_usdc` come back as None and the snap row
-    captures mid only. Phase 4A.3 will swap this helper for a /book
-    parser that fills the BBO columns; the schema is already in place
-    so no migration coordination is needed at that point. Returns
-    (None, None, None, None) on any HTTP / parse error so the caller
-    can treat "no BBO" as a non-event (the loop simply skips the
-    write rather than blocking the rest of the sweep).
+    Returns (mid, bid, ask, book_depth_usdc_top5) for the legacy
+    4-tuple call sites. Delegates to `bbo.fetch_bbo` so the cache +
+    book parsing path runs once per token across both surfaces.
     """
-    mid = await _fetch_price(session, token_id)
-    return (mid, None, None, None)
+    r = await fetch_bbo(session, token_id)
+    return (r.mid, r.bid, r.ask, r.book_depth_usdc_top5)
 
 
 async def _fetch_pre_move(
