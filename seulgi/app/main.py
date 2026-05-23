@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 
 from ai import DirectionClassifier
 from calibration import Calibrator, set_default_calibrator
+from scoring import CompositeScorer, set_default_scorer
 from config import load_config
 from dashboard import Dashboard, WatcherStatus, PositionEvent, SystemHealth
 from db import SeulgiDB
@@ -441,6 +442,37 @@ async def main() -> None:
     dash.set_telemetry(telemetry)
     logger.info("[main] telemetry queue started (max=10000, batch=100, 1s)")
 
+    # A4E.2 (2026-05-23): pluggable news→market matchers. Both default
+    # OFF — cosine-only ranking is preserved until an operator opts in.
+    matchers: list = []
+    matcher_weights: list[float] = []
+    if cfg.matchers.cross_encoder.enabled:
+        from matchers import CrossEncoderReranker
+        matchers.append(CrossEncoderReranker(
+            model_name=cfg.matchers.cross_encoder.model_name,
+            band_low=cfg.matchers.cross_encoder.band_low,
+            band_high=cfg.matchers.cross_encoder.band_high,
+        ))
+        matcher_weights.append(cfg.matchers.cross_encoder.weight)
+        logger.info("[main] CrossEncoderReranker enabled (model=%s, weight=%.2f)",
+                    cfg.matchers.cross_encoder.model_name,
+                    cfg.matchers.cross_encoder.weight)
+    if cfg.matchers.learned_mlp.enabled:
+        from matchers import LearnedMLPMatcher
+        mlp = LearnedMLPMatcher(
+            db=db,
+            refresh_days=cfg.matchers.learned_mlp.refresh_days,
+            min_train_samples=cfg.matchers.learned_mlp.min_train_samples,
+        )
+        try:
+            fitted = await mlp.fit()
+            logger.info("[main] LearnedMLPMatcher enabled (fitted=%s, weight=%.2f)",
+                        fitted, cfg.matchers.learned_mlp.weight)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[main] LearnedMLPMatcher initial fit failed: %s", exc)
+        matchers.append(mlp)
+        matcher_weights.append(cfg.matchers.learned_mlp.weight)
+
     # Engine runner (fans out headlines to all engines)
     runner = EngineRunner(
         engines=engines, index=index, embedder=embedder,
@@ -451,6 +483,8 @@ async def main() -> None:
         min_top_similarity=cfg.relevance.min_top_similarity,
         market_context_cfg=cfg.market_context,
         telemetry=telemetry,
+        matchers=matchers or None,
+        matcher_weights=matcher_weights or None,
     )
 
     # Watchers
