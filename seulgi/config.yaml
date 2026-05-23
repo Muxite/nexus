@@ -831,6 +831,11 @@ engines:
     stop_loss:        0.05
     trailing_stop:    0.020
     min_hold_seconds: 60
+    # 2026-05-23 data-collection run: scout uses LEGACY edge formula so the
+    # calibration-aware true-EV gate doesn't filter every signal. Goal is to
+    # measure how well the current prompt correlates news → realized PnL,
+    # not to make profit. Re-enable true-EV after better signal source ships.
+    use_true_ev_formula: false
     # 2026-05-21: scout broadens the relevance gate to collect research
     # data on markets production engines drop. Production's global
     # default is ["STRONG_YES"] (the only profitable bucket per 30-day
@@ -900,6 +905,10 @@ engines:
     spread_cost_bps: 0.0
     invert_high_conf: false
     relevance_keep_scores: ["STRONG_YES", "YES", "WEAK", "NO"]
+    # 2026-05-23 data-collection: same rationale as scout. Legacy edge so
+    # the loosest research engine captures realized outcomes for every
+    # non-NEUTRAL LLM verdict.
+    use_true_ev_formula: false
     variants:
       - name: "all_signals"
 
@@ -981,8 +990,8 @@ matchers:
 # Default OFF — flip `enabled: true` to opt in. Deterministic: same
 # (filter, headline, condition, engine) replays the same bypass decision.
 counterfactual:
-  enabled: true   # Phase 5 smoke: 1% bypass per filter → marginal-EV measurement
-  sample_rate_per_filter: 0.01
+  enabled: true   # 2026-05-23 data run: cranked to 5% for richer marginal-EV data
+  sample_rate_per_filter: 0.05
   max_cf_per_headline: 3
   enabled_filters:
     - freshness_filter

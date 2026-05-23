@@ -441,6 +441,55 @@ class EngineRunner:
                 else:
                     pre_skips.append((m, r))
 
+        # Phase 5 follow-up: capture every signal's inputs to `decision_inputs`
+        # for offline replay. Fire-and-forget; failures never block the trade
+        # path. Backtest harness reads this as the primary oracle.
+        try:
+            import json as _json
+            import urllib.parse as _urlparse
+            _matches_payload = [
+                {
+                    "cond_id": m.condition_id,
+                    "question": getattr(m, "question", None),
+                    "similarity": float(getattr(m, "similarity", 0.0)),
+                    "mid_yes": getattr(m, "mid_yes", None),
+                    "mid_no": getattr(m, "mid_no", None),
+                    "market_type": getattr(m, "market_type", None),
+                    "tag": getattr(m, "tag", None),
+                    "extra_score": getattr(m, "extra_score", None),
+                    "bid": getattr(m, "bid", None),
+                    "ask": getattr(m, "ask", None),
+                }
+                for m in matches
+            ]
+            _max_sim = max(
+                (float(getattr(m, "similarity", 0.0)) for m in matches),
+                default=0.0,
+            )
+            _emb_bytes = embedding.tobytes() if hasattr(embedding, "tobytes") else None
+            _pre_skips_payload = [
+                {"cond_id": m.condition_id, "reason": r}
+                for (m, r) in pre_skips
+            ]
+            self._spawn_bg(
+                self._db.insert_decision_input(
+                    headline_id=hid,
+                    source_host=_urlparse.urlparse(headline.site_url).netloc or None,
+                    embedding_bytes=_emb_bytes,
+                    matches_json=_json.dumps(_matches_payload, separators=(",", ":")),
+                    freshness_label=freshness.label,
+                    freshness_dist=getattr(freshness, "nearest_dist", None),
+                    freshness_age_secs=freshness.nearest_age_secs,
+                    pre_ai_skips_json=_json.dumps(
+                        _pre_skips_payload, separators=(",", ":"),
+                    ),
+                    max_similarity=_max_sim,
+                ),
+                name=f"decision_input:{hid}",
+            )
+        except Exception as _exc:
+            logger.debug("[SIGNAL] [hid=%s] decision_input capture failed: %r", hid, _exc)
+
         # ── SIM_GATE ─────────────────────────────────────────────────────
         if survivors and self._min_top_similarity > 0:
             max_sim = max(getattr(m, "similarity", 0.0) for m in survivors)
