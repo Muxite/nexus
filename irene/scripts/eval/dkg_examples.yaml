@@ -1,0 +1,177 @@
+# DKG extraction examples — prompt-tuning corpus.
+#
+# 25 headlines + the facts I (Claude Opus 4.7) think the cheap-model
+# extractor SHOULD produce. Used by scripts/eval/dkg_extraction_test.py
+# to compare prompt variants + models. I am the judge.
+#
+# Coverage targets (rough):
+# - all 10 ontology relations appear
+# - all 7 entity types appear
+# - edge cases: acronyms (FDA), suffix variants (Inc.), multi-fact
+#   headlines, ambiguous-relation cases, NULL-object cases, value-object
+#   cases (rate changes), and a few "should-be-extracted-as-related-but-
+#   not-this-fact" near-misses to test for hallucination.
+
+version: v1
+ontology_version: v1
+created_at: 2026-05-23
+purpose: |
+  Prompt iteration for the bulk DKG extractor. Headlines are Reuters-
+  style; each has an `expected_facts` list using the LOCKED ontology
+  (see docs/ontology.md). The harness runs each prompt variant against
+  these headlines and reports matched / missed / extra facts.
+
+  An ENTITY appears in the expected facts via subject + object name +
+  type. Acronym-normalised forms are the canonical (FDA, not "U.S.
+  Food and Drug Administration").
+
+examples:
+  # ---- regulatory / executive --------------------------------------------
+  - id: ex-001
+    headline: "FDA rejects Pfizer's diabetes drug application"
+    expected_facts:
+      - {subj: "FDA", subj_type: "ORG", relation: "decides", obj: "Pfizer", obj_type: "COMPANY"}
+
+  - id: ex-002
+    headline: "SEC sues Binance over unregistered securities offerings"
+    expected_facts:
+      - {subj: "SEC", subj_type: "ORG", relation: "accuses", obj: "Binance", obj_type: "COMPANY"}
+
+  - id: ex-003
+    headline: "DOJ opens antitrust probe into Apple's App Store practices"
+    expected_facts:
+      - {subj: "DOJ", subj_type: "ORG", relation: "accuses", obj: "Apple", obj_type: "COMPANY"}
+
+  # ---- M&A ---------------------------------------------------------------
+  - id: ex-004
+    headline: "Nvidia acquires Run:ai to expand AI infrastructure"
+    expected_facts:
+      - {subj: "Nvidia", subj_type: "COMPANY", relation: "acquires", obj: "Run:ai", obj_type: "COMPANY"}
+
+  - id: ex-005
+    headline: "Microsoft to acquire Activision Blizzard in $68.7 billion deal"
+    expected_facts:
+      - {subj: "Microsoft", subj_type: "COMPANY", relation: "acquires", obj: "Activision Blizzard", obj_type: "COMPANY"}
+
+  # ---- product / service launches ---------------------------------------
+  - id: ex-006
+    headline: "OpenAI launches GPT-5 with native voice and video"
+    expected_facts:
+      # GPT-5 isn't really an entity in our ontology; obj_value captures it.
+      - {subj: "OpenAI", subj_type: "COMPANY", relation: "launches", obj: null, obj_value: "GPT-5"}
+
+  - id: ex-007
+    headline: "SpaceX launches Starlink mini satellites from Cape Canaveral"
+    expected_facts:
+      - {subj: "SpaceX", subj_type: "COMPANY", relation: "launches", obj: null, obj_value: "Starlink mini satellites"}
+
+  # ---- central banks / monetary -----------------------------------------
+  - id: ex-008
+    headline: "Federal Reserve cuts benchmark rate by 25 basis points"
+    expected_facts:
+      - {subj: "Fed", subj_type: "ORG", relation: "changes", obj: null, obj_value: "federal funds rate -25bp"}
+
+  - id: ex-009
+    headline: "ECB raises deposit facility rate to 4.0%"
+    expected_facts:
+      - {subj: "ECB", subj_type: "ORG", relation: "changes", obj: null, obj_value: "deposit facility rate +0% (to 4.0%)"}
+
+  # ---- elections / nominations ------------------------------------------
+  - id: ex-010
+    headline: "Germany elects Friedrich Merz as new chancellor"
+    expected_facts:
+      - {subj: "Germany", subj_type: "COUNTRY", relation: "elects", obj: "Friedrich Merz", obj_type: "PERSON"}
+
+  - id: ex-011
+    headline: "Biden nominates Lael Brainard to chair Council of Economic Advisers"
+    expected_facts:
+      - {subj: "Joe Biden", subj_type: "PERSON", relation: "nominates", obj: "Lael Brainard", obj_type: "PERSON"}
+
+  # ---- resignations -----------------------------------------------------
+  - id: ex-012
+    headline: "Boeing CEO Dave Calhoun resigns amid 737 Max safety scrutiny"
+    expected_facts:
+      - {subj: "Dave Calhoun", subj_type: "PERSON", relation: "resigns"}
+
+  # ---- treaties / agreements --------------------------------------------
+  - id: ex-013
+    headline: "United States and Japan sign new semiconductor trade pact"
+    expected_facts:
+      # Bidirectional or single-direction? Use single — cleaner.
+      - {subj: "United States", subj_type: "COUNTRY", relation: "signs", obj: "Japan", obj_type: "COUNTRY"}
+
+  - id: ex-014
+    headline: "Saudi Arabia and Iran sign agreement to restore diplomatic ties"
+    expected_facts:
+      - {subj: "Saudi Arabia", subj_type: "COUNTRY", relation: "signs", obj: "Iran", obj_type: "COUNTRY"}
+
+  # ---- announces (catch-all) -------------------------------------------
+  - id: ex-015
+    headline: "Tesla announces $5 billion investment in new gigafactory"
+    expected_facts:
+      - {subj: "Tesla", subj_type: "COMPANY", relation: "announces", obj: null, obj_value: "$5B gigafactory investment"}
+
+  - id: ex-016
+    headline: "Apple announces record Q3 earnings, beating analyst expectations"
+    expected_facts:
+      - {subj: "Apple", subj_type: "COMPANY", relation: "announces", obj: null, obj_value: "record Q3 earnings"}
+
+  # ---- multi-fact -------------------------------------------------------
+  - id: ex-017
+    headline: "Fed holds rates steady; Powell signals two cuts possible by year-end"
+    expected_facts:
+      - {subj: "Fed", subj_type: "ORG", relation: "changes", obj: null, obj_value: "federal funds rate +0 (held)"}
+      - {subj: "Jerome Powell", subj_type: "PERSON", relation: "announces", obj: null, obj_value: "two cuts possible by year-end"}
+
+  - id: ex-018
+    headline: "Goldman Sachs upgrades Nvidia to buy, raises price target to $200"
+    expected_facts:
+      - {subj: "Goldman Sachs", subj_type: "COMPANY", relation: "announces", obj: "Nvidia", obj_type: "COMPANY"}
+
+  # ---- crypto / asset ---------------------------------------------------
+  - id: ex-019
+    headline: "Coinbase launches new Ethereum staking product for retail customers"
+    expected_facts:
+      - {subj: "Coinbase", subj_type: "COMPANY", relation: "launches", obj: "ETH", obj_type: "ASSET"}
+
+  - id: ex-020
+    headline: "Bitcoin breaks $100,000 for the first time"
+    # This headline doesn't fit a clean ontology relation — the news
+    # IS the event, not "X does Y". Expect the LLM to skip it OR
+    # produce a single announces with obj_value.
+    expected_facts: []
+
+  # ---- ambiguity / negation -------------------------------------------
+  - id: ex-021
+    headline: "Court denies Trump's bid to delay civil fraud trial"
+    expected_facts:
+      - {subj: "Supreme Court", subj_type: "ORG", relation: "decides", obj: "Donald Trump", obj_type: "PERSON"}
+    # NOTE: the "Supreme Court" assumption is a stretch — "Court" is
+    # underspecified. A good extractor would either pick a specific
+    # court name from context or leave it. I'll accept either form.
+
+  # ---- acronym + suffix mixing ---------------------------------------
+  - id: ex-022
+    headline: "Pfizer Inc. announces FDA approval of new heart disease treatment"
+    expected_facts:
+      - {subj: "FDA", subj_type: "ORG", relation: "decides", obj: "Pfizer", obj_type: "COMPANY"}
+      - {subj: "Pfizer", subj_type: "COMPANY", relation: "announces", obj: null, obj_value: "FDA approval of heart disease treatment"}
+
+  # ---- not-an-event ---------------------------------------------------
+  - id: ex-023
+    headline: "Apple stock falls 3% on weak iPhone sales"
+    # Pure price action, no entity-relation fact. Should extract NOTHING.
+    expected_facts: []
+
+  # ---- sports / entertainment (out of scope) -------------------------
+  - id: ex-024
+    headline: "Lakers defeat Warriors 112-108 in overtime"
+    # ORG / EVENT possible but the relations don't fit our ontology.
+    # Should produce empty or a weak announces. I lean empty.
+    expected_facts: []
+
+  # ---- accuses ---------------------------------------------------------
+  - id: ex-025
+    headline: "Russia accuses NATO of expanding aggressively eastward"
+    expected_facts:
+      - {subj: "Russia", subj_type: "COUNTRY", relation: "accuses", obj: "NATO", obj_type: "ORG"}
