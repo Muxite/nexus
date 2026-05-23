@@ -21,7 +21,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "app"))
 from ai import ClassifyResult, Direction
 from markets import MarketMatch
 from news_memory import FreshnessResult
-from relevance import RelevanceVerdict
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +140,6 @@ class MockDirectionClassifier:
         is_republish: bool = False,
         similar_to: Optional[str] = None,
         source: Optional[str] = None,
-        lesson_notes: Optional[list[str]] = None,
         freshness=None,
         relevance_verdicts: Optional[list] = None,
     ) -> tuple[list[ClassifyResult], dict]:
@@ -184,66 +182,6 @@ class MockDirectionClassifier:
     def stage_hid(self, hid: str) -> None:
         """Set the headline_id whose verdicts to use on the next call."""
         self._next_hid = hid
-
-    async def close(self) -> None:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Mock relevance filter — keep everything (or use historical score if present)
-# ---------------------------------------------------------------------------
-
-
-class MockRelevanceFilter:
-    """Drop-in for `relevance.RelevanceFilter`. By default keeps every
-    match (matches production fail-open behaviour). If a historical
-    `trades.relevance_score` is available for a given (hid, cid), uses
-    that to either keep or drop."""
-
-    def __init__(self, scores: dict[tuple[str, str], tuple[str, str]]) -> None:
-        # scores: (hid, cid) -> (score, reason)
-        self._scores = scores
-        self._min_top_similarity = 0.0  # disable the short-circuit in replay
-        self._next_hid: Optional[str] = None
-
-    def stage_hid(self, hid: str) -> None:
-        self._next_hid = hid
-
-    async def filter(
-        self,
-        headline: str,
-        matches: list,
-        freshness=None,
-        source: Optional[str] = None,
-    ) -> tuple[list, list[RelevanceVerdict], dict]:
-        if not matches:
-            return [], [], {"model": "replay-mock", "tokens": 0, "n_in": 0}
-        hid = self._next_hid
-        self._next_hid = None
-        kept: list = []
-        verdicts: list[RelevanceVerdict] = []
-        for m in matches:
-            score_pair = self._scores.get((hid, m.condition_id)) if hid else None
-            if score_pair is None:
-                # Default keep (matches production fail-open behaviour)
-                verdicts.append(RelevanceVerdict(
-                    keep=True, score="YES", reason="replay:default_keep",
-                ))
-                kept.append(m)
-            else:
-                score, reason = score_pair
-                keep = score in ("STRONG_YES", "YES")
-                verdicts.append(RelevanceVerdict(
-                    keep=keep, score=score, reason=reason or "replay",
-                ))
-                if keep:
-                    kept.append(m)
-        return kept, verdicts, {
-            "model": "replay-mock",
-            "tokens": 5,  # non-zero so log_usage writes
-            "n_in": len(matches),
-            "n_kept": len(kept),
-        }
 
     async def close(self) -> None:
         return None

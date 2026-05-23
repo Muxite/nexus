@@ -46,7 +46,6 @@ from mocks import (
     MockEmbedder,
     MockMarketIndex,
     MockNewsMemory,
-    MockRelevanceFilter,
     ReplayTriple,
     make_mock_fetch_mid_price,
 )
@@ -125,7 +124,6 @@ class ReplayHarness:
         self._runner: Optional[EngineRunner] = None
         self._mock_index: Optional[MockMarketIndex] = None
         self._mock_classifier: Optional[MockDirectionClassifier] = None
-        self._mock_relevance: Optional[MockRelevanceFilter] = None
         self._mock_news: Optional[MockNewsMemory] = None
         self._orig_fetch_mid: Optional[callable] = None
         logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -155,7 +153,6 @@ class ReplayHarness:
         self._mock_news = MockNewsMemory()
         self._mock_index = MockMarketIndex(matches_by_headline={})
         self._mock_classifier = MockDirectionClassifier(verdicts={})
-        self._mock_relevance = MockRelevanceFilter(scores={})
 
         # Monkey-patch engine._fetch_mid_price so the prefetch loop returns
         # historical mids instead of hitting CLOB. Patched on the engine
@@ -179,6 +176,11 @@ class ReplayHarness:
         for e in engines:
             await e.trader.init_from_db()
 
+        # 2026-05-22: EngineRunner stopped accepting `relevance_filter`
+        # when the cycle-2/3 retirement replaced the Stage-2 LLM gate
+        # with a deterministic similarity threshold. The mock filter is
+        # still constructed (it stages historical scores) but the runner
+        # no longer consumes it — the sim-gate is what survivors hit.
         self._runner = EngineRunner(
             engines=engines,
             index=self._mock_index,  # type: ignore[arg-type]
@@ -190,7 +192,6 @@ class ReplayHarness:
             news_memory=self._mock_news,  # type: ignore[arg-type]
             impact_tracker=None,
             article_fetcher=MockArticleFetcher(),  # type: ignore[arg-type]
-            relevance_filter=self._mock_relevance,  # type: ignore[arg-type]
             market_context_cfg=None,
         )
         logger.info(
@@ -221,7 +222,16 @@ class ReplayHarness:
         """Pull N headlines from the source DB joined with their historical
         trades + market state. Returns a list of ReplayTriple, and registers
         each one's matches + verdicts + prices into the mock objects."""
-        con = sqlite3.connect(self._src_path)
+        # `immutable=1` avoids the sqlite-needs-a-journal failure when the
+        # source DB is mounted read-only (the compose seulgi-replay service
+        # mounts ./seulgi/data:/data:ro). Falls back to a plain path for
+        # local invocations against a writable file.
+        if os.path.exists(self._src_path) and not os.access(self._src_path, os.W_OK):
+            con = sqlite3.connect(
+                f"file:{self._src_path}?immutable=1", uri=True,
+            )
+        else:
+            con = sqlite3.connect(self._src_path)
         con.row_factory = sqlite3.Row
 
         # Pick signals that actually produced trades (otherwise replay has
@@ -290,10 +300,9 @@ class ReplayHarness:
         return triples
 
     def _register_in_mocks(self, triples: list[ReplayTriple]) -> None:
-        assert self._mock_index and self._mock_classifier and self._mock_relevance
+        assert self._mock_index and self._mock_classifier
         matches_by_hid: dict[str, list[MarketMatch]] = {}
         verdicts: dict[tuple[str, str], HistoricalTrade] = {}
-        rel_scores: dict[tuple[str, str], tuple[str, str]] = {}
         for triple in triples:
             seen_cids: set[str] = set()
             ms: list[MarketMatch] = []
@@ -312,10 +321,6 @@ class ReplayHarness:
                     market_type=None,
                 ))
                 verdicts[(triple.headline_id, t.condition_id)] = t
-                if t.relevance_score:
-                    rel_scores[(triple.headline_id, t.condition_id)] = (
-                        t.relevance_score, t.relevance_reason or ""
-                    )
                 if t.token_id:
                     if t.mid_yes is not None and t.direction == "YES":
                         self._prices[t.token_id] = t.mid_yes
@@ -324,7 +329,6 @@ class ReplayHarness:
             matches_by_hid[triple.headline_id] = ms
         self._mock_index._map = matches_by_hid
         self._mock_classifier._verdicts = verdicts
-        self._mock_relevance._scores = rel_scores
 
     # ------------------------------------------------------------------
     # Inject + run
@@ -333,14 +337,13 @@ class ReplayHarness:
     async def inject_one(self, triple: ReplayTriple) -> float:
         """Inject one historical headline. Returns the wall-clock ms."""
         assert self._runner and self._mock_index and self._mock_classifier
-        assert self._mock_relevance and self._mock_news
+        assert self._mock_news
 
         # Stage mocks for this headline. Done synchronously in the caller
         # context so concurrent inject calls don't race (these are
         # set-then-immediately-read scalar slots).
         self._mock_index.stage(triple.headline_id)
         self._mock_classifier.stage_hid(triple.headline_id)
-        self._mock_relevance.stage_hid(triple.headline_id)
         self._mock_news.stage(triple.freshness_label, triple.nearest_age_secs)
 
         try:

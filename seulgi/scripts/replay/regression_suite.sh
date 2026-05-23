@@ -19,6 +19,13 @@
 
 set -uo pipefail
 
+# Resolve the replay python entry point relative to this script so the
+# suite runs both from the repo root (bash seulgi/scripts/replay/...)
+# and from inside the seulgi container where the script lives at
+# /app/scripts/replay/regression_suite.sh and no `seulgi/` prefix exists.
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+RUN_PY="$SCRIPT_DIR/run.py"
+
 SRC_DB="${SRC_DB:-seulgi/data/seulgi.db}"
 REPLAY_TMP="${REPLAY_TMP:-/tmp}"
 CONFIG="${CONFIG:-seulgi/config.yaml}"
@@ -43,15 +50,18 @@ run_tier() {
     echo "──────────────────────────────────────────────────────────────"
     echo "TIER: $name (signals=$sigs, concurrency=$conc)"
     echo "──────────────────────────────────────────────────────────────"
-    python3 seulgi/scripts/replay/run.py \
+    # PIPESTATUS so we keep python's real exit code even after the grep
+    # filter strips noisy aiohttp teardown lines. Without this the
+    # suite would always read grep's $? and silently mask failures.
+    python3 "$RUN_PY" \
         --src-db "$SRC_DB" \
         --test-db "$test_db" \
         --config "$CONFIG" \
         --signals "$sigs" \
         --concurrency "$conc" \
         --report "$report" \
-        --log-level WARNING 2>&1 | grep -vE "Unclosed|client_session|connections:|connector:" || true
-    local rc=$?
+        --log-level WARNING 2>&1 | { grep -vE "Unclosed|client_session|connections:|connector:" || true; }
+    local rc=${PIPESTATUS[0]}
     {
         echo ""
         echo "## Tier: $name (sigs=$sigs, conc=$conc, exit=$rc)"

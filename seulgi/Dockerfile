@@ -15,6 +15,13 @@ COPY app/ /app/
 # Baked into the image so a `docker compose restart seulgi` picks up edits.
 COPY rules/ /app/rules/
 
+# Replay regression suite + analysis helpers. Required by the
+# `seulgi-replay` compose service (profile=test) which runs
+# scripts/replay/regression_suite.sh inside this image. Skipping
+# scripts/ here was the silent gap that made the replay gate
+# unrunnable from a fresh image build.
+COPY scripts/ /app/scripts/
+
 # Data directory for SQLite DB
 RUN mkdir -p /data
 
