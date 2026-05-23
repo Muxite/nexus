@@ -1371,6 +1371,39 @@ class Dashboard:
             except Exception:  # noqa: BLE001
                 pass
 
+        # Phase 4E.1: composite scoring diagnostics tile.
+        if self._scorer is not None:
+            try:
+                diag = self._scorer.diagnostics()
+                models = diag.get("models", [])
+                lines.append("## Composite Scoring")
+                lines.append("")
+                if models:
+                    lines.append(
+                        "| direction |   n | train_AUC | test_AUC |"
+                        "       IC | fitted_at           |"
+                    )
+                    lines.append(
+                        "|-----------|----:|----------:|---------:|"
+                        "---------:|---------------------|"
+                    )
+                    for m in models:
+                        ts = (m.get("fitted_at") or "")[:19]
+                        lines.append(
+                            f"| {m['direction']:<9} | {m['n']:>3} | "
+                            f"{m['train_auc']:>9.3f} | {m['test_auc']:>8.3f} | "
+                            f"{m['ic']:+8.3f} | {ts:<19} |"
+                        )
+                    lines.append(
+                        f"  features : {diag.get('n_features', 0)}  "
+                        "(see app/scoring.py:FEATURE_NAMES)"
+                    )
+                else:
+                    lines.append("  (identity fallback — closed-trade sample too small)")
+                lines.append("")
+            except Exception:  # noqa: BLE001
+                pass
+
         # Phase 4A.1: stage-0a capital-floor short-circuit counter.
         lines.append("## Ingress short-circuits (boot-cumulative)")
         lines.append("")

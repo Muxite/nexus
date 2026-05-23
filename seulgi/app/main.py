@@ -403,6 +403,26 @@ async def main() -> None:
     set_default_calibrator(calibrator)
     dash.set_calibrator(calibrator)
 
+    # Phase 4E.1: composite signal scoring. Logistic regression on closed
+    # trades, refreshed every 6h. Identity (score=0.5) fallback when the
+    # closed-trade sample is too small. Trader gate stays OFF until the
+    # `trading.composite_score_floor` knob is raised above 0.
+    scorer = CompositeScorer(db, refresh_hours=6)
+    try:
+        model = await scorer.fit()
+        if model is not None:
+            logger.info("[main] scoring: fitted n=%d train_auc=%.3f "
+                        "test_auc=%.3f ic=%+.3f", model.n_samples,
+                        model.train_auc, model.test_auc, model.ic)
+        else:
+            logger.info("[main] scoring: identity fallback (sample too small)")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[main] scoring: initial fit failed (%s) — "
+                       "identity fallback", exc)
+    set_default_scorer(scorer)
+    if hasattr(dash, "set_scorer"):
+        dash.set_scorer(scorer)
+
     # News memory (semantic deduplication + cycle-9 freshness labels)
     news_memory = NewsMemory(
         path=cfg.news_memory.path,
@@ -572,6 +592,7 @@ async def main() -> None:
         ),
         asyncio.create_task(_headline_drain_loop(queue, runner, dash), name="drain"),
         asyncio.create_task(calibrator.refresh_loop(), name="calibration-refresh"),
+        asyncio.create_task(scorer.refresh_loop(), name="scoring-refresh"),
     ]
     for t in bg_tasks:
         t.add_done_callback(_log_task_exception)
@@ -653,6 +674,8 @@ async def main() -> None:
         # Phase 4B.1: clear the module-level calibrator so a stale
         # reference can't be reused if the process restarts in-place.
         set_default_calibrator(None)
+        # Phase 4E.1: clear the module-level composite scorer.
+        set_default_scorer(None)
         await db.close()    # PRAGMA wal_checkpoint(TRUNCATE) runs inside
 
     try:
