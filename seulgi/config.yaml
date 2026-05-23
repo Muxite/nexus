@@ -427,6 +427,21 @@ markets:
                                # A wider universe means each headline's top-15 is
                                # drawn from a much broader pool — better matches
                                # without raising per-headline LLM cost.
+  min_quality_score: 0.3       # A4E.3: drop non-polymarket rows whose derived
+                               # quality (liquidity / volume / days-to-resolution
+                               # / spread) falls below this floor at index load.
+                               # 0.0 disables. Polymarket rows are exempt.
+
+# ── Market discovery beyond Polymarket (A4E.3, default OFF) ────────────────
+# When enabled, ActiveDiscoveryLoop polls Kalshi + Predictit every
+# `interval_secs`, drops rows below `min_quality`, dedups by (source, cond_id),
+# upserts into the `markets` table and triggers a MarketIndex refresh.
+discovery:
+  enabled: false              # opt-in until live credentials verified
+  interval_secs: 1800         # 30 min — Kalshi/Predictit move slower than gamma
+  min_quality: 0.3
+  kalshi_enabled: true
+  predictit_enabled: true
 
 # ── AI direction classifier (via OpenRouter) ─────────────────────────────────
 # OpenRouter model IDs: https://openrouter.ai/models
@@ -470,6 +485,11 @@ ai:
   # still works (it would floor to 0 if we baked agreement into confidence).
   min_agreement: 0.66         # 2-of-3 majority required for an ensemble of 3
   min_confidence: 0.35        # below this → treat as NEUTRAL, skip trade
+  # A4E.4 (2026-05-23): max markets per LLM call. Smaller batches let the
+  # model spend its output-token budget on per-market reasoning (including
+  # the <scratch> chain-of-thought block) instead of cramming 25
+  # distributions into one bounded response. Per master plan 4E.4(g).
+  batch_size: 10
 
 # ── Pre-headline market context (cycle 11) ──────────────────────────────────
 # After Stage-2 culls candidates, fetch 30 min of CLOB mid-price history per
@@ -897,6 +917,18 @@ news_memory:
 # Set to 20 to be safe; increase if you upgrade your plan.
 search_budget:
   brave_per_hour: 20
+
+# ── Phase 4D.2 — macro tag-based routing ────────────────────────────────────
+# Cheap keyword pre-classifier (app/tagger.py) tags each headline with macro
+# categories (interest_rates, geopolitics, elections, sports, weather, tech,
+# crypto, earnings). Tagged headlines bypass the SBERT cosine gate and route
+# to markets whose questions mention the tag's bucket keywords. The keyword
+# maps themselves live in app/tagger.py (code, not config) so changes go
+# through PR review. See seulgi/master-plan.md A0.9 + 4D.2.
+tagger:
+  enabled: true
+  min_tag_confidence: 1.0          # exact keyword match required
+  max_tag_routed_per_headline: 10  # cap so a generic tag can't starve cosine
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 log_level: "INFO"               # DEBUG for verbose Playwright + embedding output

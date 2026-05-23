@@ -66,6 +66,25 @@ class MarketsConfig:
     similarity_threshold: float = 0.35  # min cosine similarity to match
     top_k: int = 15                     # max markets per headline
     max_tracked_markets: int = 300      # cap on markets kept in index (top N by volume)
+    # A4E.3 (2026-05-23): minimum quality score for markets surfaced to
+    # the index. 0.0 disables (legacy behaviour). Composite of liquidity,
+    # volume, days-to-resolution, spread — see app/discovery.py:quality_score.
+    min_quality_score: float = 0.3
+
+
+@dataclass
+class DiscoveryConfig:
+    """A4E.3 (2026-05-23): non-polymarket market discovery.
+
+    Default OFF. When `enabled: true`, an `ActiveDiscoveryLoop` polls
+    Kalshi + Predictit every `interval_secs`, drops markets below
+    `min_quality`, dedups by `(source, cond_id)`, and triggers a
+    MarketIndex refresh after each batch."""
+    enabled: bool = False
+    interval_secs: float = 1800.0
+    min_quality: float = 0.3
+    kalshi_enabled: bool = True
+    predictit_enabled: bool = True
 
 
 @dataclass
@@ -94,6 +113,11 @@ class AIConfig:
     # 1.0 demands unanimity. Decoupled from `confidence` so the edge model
     # keeps using the model's native probability output.
     min_agreement: float = 0.66
+    # A4E.4 (2026-05-23): max markets per LLM call. Smaller batches let
+    # the model spend its output-token budget on per-market reasoning
+    # (including the <scratch> chain-of-thought block) instead of cramming
+    # 25 distributions into one bounded response. Per master plan 4E.4(g).
+    batch_size: int = 10
 
 
 @dataclass
@@ -377,6 +401,27 @@ class DashboardConfig:
 
 
 @dataclass
+class TaggerConfig:
+    """Phase 4D.2 — keyword pre-classifier that routes macro headlines
+    (Fed, FOMC, war, etc.) directly to relevant prediction-market buckets,
+    bypassing the SBERT cosine gate's strict lexical match requirement.
+
+    The keyword maps themselves live in `app/tagger.py` (code, not config)
+    because they're operator-curated and changes go through PR review.
+    """
+    enabled: bool = True
+    # Reserved for a future graded-confidence tagger (Phase 5 BERT). The
+    # current keyword tagger always emits 1.0 on a match so any threshold
+    # ≤ 1.0 admits every fired tag.
+    min_tag_confidence: float = 1.0
+    # Caps the number of tag-routed matches added per headline so a very
+    # generic tag (e.g. "elections" with 200 election markets in the
+    # universe) cannot blow past the cosine top-K cap and starve the
+    # actually-relevant matches.
+    max_tag_routed_per_headline: int = 10
+
+
+@dataclass
 class SearchBudgetConfig:
     """Caps on expensive external API calls."""
     brave_per_hour: int = 20   # max Brave Search API calls per hour across all Twitter watchers
@@ -492,6 +537,8 @@ class Config:
     relevance: RelevanceConfig = field(default_factory=RelevanceConfig)
     market_context: MarketContextConfig = field(default_factory=MarketContextConfig)
     search_budget: SearchBudgetConfig = field(default_factory=SearchBudgetConfig)
+    tagger: TaggerConfig = field(default_factory=TaggerConfig)
+    discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     log_level: str = "INFO"
 
 
@@ -551,6 +598,8 @@ def _build_config(raw: dict) -> Config:
     rv = raw.get("relevance", {})
     mctx = raw.get("market_context", {})
     sb = raw.get("search_budget", {})
+    tg = raw.get("tagger", {})
+    dsc = raw.get("discovery", {})
 
     social_cfgs = [
         SocialAccount(
@@ -646,6 +695,7 @@ def _build_config(raw: dict) -> Config:
             similarity_threshold=float(m.get("similarity_threshold", 0.35)),
             top_k=int(m.get("top_k", 15)),
             max_tracked_markets=int(m.get("max_tracked_markets", 300)),
+            min_quality_score=float(m.get("min_quality_score", 0.3)),
         ),
         news_memory=NewsMemoryConfig(
             path=str(nm.get("path", "/data/news_chroma")),
@@ -690,6 +740,7 @@ def _build_config(raw: dict) -> Config:
             ensemble_samples=int(a.get("ensemble_samples", 3)),
             ensemble_temperature=float(a.get("ensemble_temperature", 0.5)),
             min_agreement=float(a.get("min_agreement", 0.66)),
+            batch_size=int(a.get("batch_size", 10)),
         ),
         trading=TradingConfig(
             balance_usdc=float(t.get("balance_usdc", 1000.0)),
@@ -730,6 +781,18 @@ def _build_config(raw: dict) -> Config:
         ),
         search_budget=SearchBudgetConfig(
             brave_per_hour=int(sb.get("brave_per_hour", 20)),
+        ),
+        tagger=TaggerConfig(
+            enabled=bool(tg.get("enabled", True)),
+            min_tag_confidence=float(tg.get("min_tag_confidence", 1.0)),
+            max_tag_routed_per_headline=int(tg.get("max_tag_routed_per_headline", 10)),
+        ),
+        discovery=DiscoveryConfig(
+            enabled=bool(dsc.get("enabled", False)),
+            interval_secs=float(dsc.get("interval_secs", 1800.0)),
+            min_quality=float(dsc.get("min_quality", 0.3)),
+            kalshi_enabled=bool(dsc.get("kalshi_enabled", True)),
+            predictit_enabled=bool(dsc.get("predictit_enabled", True)),
         ),
         log_level=str(raw.get("log_level", "INFO")),
     )

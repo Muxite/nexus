@@ -533,6 +533,32 @@ _MIGRATIONS = [
     "ON position_price_snaps(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_position_price_snaps_t_unix "
     "ON position_price_snaps(t_unix)",
+    # A4E.5 (2026-05-23): counterfactual sampling. When the operator opts
+    # in (counterfactual.enabled: true), 1% of would-have-been-skipped
+    # signals per named filter pass through anyway and land as trades
+    # tagged with `cf_bypassed_filter=<filter_name>`. NULL on every
+    # legacy row and on every normal (non-bypassed) decision. The same
+    # column is added to `engine_results` so per-filter decision counts
+    # in the funnel can be cross-referenced. Idempotent via ALTER's
+    # caught-and-ignored duplicate-column error.
+    "ALTER TABLE trades ADD COLUMN cf_bypassed_filter TEXT",
+    "ALTER TABLE engine_results ADD COLUMN cf_bypassed_filter TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_trades_cf_bypassed "
+    "ON trades(cf_bypassed_filter) WHERE cf_bypassed_filter IS NOT NULL",
+    # A4E.3 (2026-05-23): market discovery beyond Polymarket. Adds a
+    # `source` column to `markets` so Kalshi / Predictit records can sit
+    # alongside Polymarket rows. Default 'polymarket' so existing rows
+    # backfill correctly without a SELECT-then-UPDATE migration step.
+    # See app/discovery.py for the adapter contract.
+    "ALTER TABLE markets ADD COLUMN source TEXT NOT NULL DEFAULT 'polymarket'",
+    "CREATE INDEX IF NOT EXISTS idx_markets_source ON markets(source)",
+    # Phase 4D.2 (2026-05-23): macro tag-based routing. When the tagger
+    # augments a market in (rather than the SBERT cosine top-K matching
+    # it), the triggering tag is persisted here so per-tag counterfactuals
+    # + the dashboard can attribute PnL per macro category. NULL on every
+    # cosine-only decision and on legacy rows.
+    "ALTER TABLE engine_results ADD COLUMN tag TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_engine_results_tag ON engine_results(tag)",
 ]
 
 
@@ -950,10 +976,38 @@ class SeulgiDB:
         )
         await self._commit_if_unbatched()
 
+    async def upsert_discovered_market(self, m) -> None:
+        """Persist a `discovery.DiscoveredMarket` to the `markets` table.
+
+        The natural key for non-polymarket sources is `(source, cond_id)`.
+        We collapse that to a single PK column by storing
+        `<source>:<cond_id>` as `condition_id` (Polymarket rows keep
+        their bare condition_id). Embedding is left NULL — MarketIndex's
+        next refresh / load step generates it from the question text.
+        """
+        cid = m.cond_id if m.source == "polymarket" else f"{m.source}:{m.cond_id}"
+        await self._conn.execute(
+            """
+            INSERT INTO markets
+              (condition_id, question, token_yes, token_no, end_date,
+               volume_usdc, embedding, fetched_at, source)
+            VALUES (?, ?, NULL, NULL, NULL, ?, NULL, ?, ?)
+            ON CONFLICT(condition_id) DO UPDATE SET
+              question    = excluded.question,
+              volume_usdc = excluded.volume_usdc,
+              fetched_at  = excluded.fetched_at,
+              source      = excluded.source,
+              closed_at   = NULL
+            """,
+            (cid, m.question, m.volume_24h_usdc, _now_iso(), m.source),
+        )
+        await self._commit_if_unbatched()
+
     async def get_markets_with_embeddings(self) -> list[dict]:
         async with self._conn.execute(
             """
-            SELECT condition_id, question, token_yes, token_no, embedding, market_type
+            SELECT condition_id, question, token_yes, token_no, embedding, market_type,
+                   volume_usdc, source
             FROM markets
             WHERE embedding IS NOT NULL
               AND closed_at IS NULL
@@ -970,6 +1024,8 @@ class SeulgiDB:
                 "token_no": row["token_no"],
                 "embedding": emb,
                 "market_type": row["market_type"],
+                "volume_usdc": row["volume_usdc"],
+                "source": row["source"] if "source" in row.keys() else "polymarket",
             })
         return result
 
@@ -1123,6 +1179,7 @@ class SeulgiDB:
         mkt_max_30m: Optional[float] = None,
         mkt_drift_30m: Optional[float] = None,
         mkt_n_samples: Optional[int] = None,
+        cf_bypassed_filter: Optional[str] = None,
     ) -> int:
         async with self._write_lock():
             try:
@@ -1137,9 +1194,9 @@ class SeulgiDB:
                        mid_yes, mid_no, inverted, variant_name,
                        freshness_label, relevance_score, relevance_reason,
                        mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
-                       mkt_drift_30m, mkt_n_samples)
+                       mkt_drift_30m, mkt_n_samples, cf_bypassed_filter)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (signal_id, condition_id, question, token_id, direction, similarity,
                      p_hat, mid_price, size_usdc, skip_reason, _now_iso(), headline_id,
@@ -1149,7 +1206,7 @@ class SeulgiDB:
                      mid_yes, mid_no, inverted, variant_name,
                      freshness_label, relevance_score, relevance_reason,
                      mkt_vol_30m, mkt_mean_30m, mkt_min_30m, mkt_max_30m,
-                     mkt_drift_30m, mkt_n_samples),
+                     mkt_drift_30m, mkt_n_samples, cf_bypassed_filter),
                 )
                 await self._commit_if_unbatched()
                 self._bump_ok("insert_trade", "trades")
@@ -1608,6 +1665,14 @@ class SeulgiDB:
                 now,
                 headline_id,
                 signal_latency_ms,
+                # A4E.5: per-decision cf_bypassed_filter (None on normal
+                # path). Mirrored from `trades.cf_bypassed_filter` so the
+                # funnel + per-filter rollups can read either table.
+                getattr(d, "cf_bypassed_filter", None),
+                # Phase 4D.2: macro tag attribution. None on cosine-only
+                # matches; populated by the tagger's augment step in
+                # MarketIndex.find_matches.
+                getattr(d, "tag", None),
             )
             for d in decisions
         ]
@@ -1615,8 +1680,9 @@ class SeulgiDB:
             INSERT INTO engine_results
               (engine_name, condition_id, question, direction, confidence,
                similarity, p_hat, mid_price, edge, size_usdc, executed,
-               skip_reason, decided_at, headline_id, signal_latency_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               skip_reason, decided_at, headline_id, signal_latency_ms,
+               cf_bypassed_filter, tag)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         async with self._write_lock():
             try:

@@ -115,6 +115,11 @@ class MarketMatch:
     # Forwarded from `Market.market_type` so the rules engine can gate without
     # hitting the DB per match.
     market_type: Optional[str] = None
+    # Phase 4D.2: when the tag-based router augmented this match in (rather
+    # than the cosine top-K), `tag` is the macro category that caught it
+    # (e.g. "interest_rates"). NULL for cosine-only matches. Persisted on
+    # `engine_results.tag` so per-tag counterfactuals can attribute PnL.
+    tag: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -385,10 +390,38 @@ class MarketIndex:
         Load the market index from the database (used on startup if DB exists).
 
         Falls back to an empty index if the DB has no markets.
+
+        A4E.3 (2026-05-23): when `cfg.markets.min_quality_score > 0`,
+        non-polymarket rows whose recomputed `discovery.quality_score`
+        falls below the floor are dropped at load time. Polymarket rows
+        are exempt — the gamma adapter doesn't capture liquidity/spread
+        on every row so their derived score would be 0 across the board.
         """
         rows = await self._db.get_markets_with_embeddings()
         if not rows:
             return 0
+
+        min_q = getattr(self._cfg.markets, "min_quality_score", 0.0) or 0.0
+        kept_rows = rows
+        if min_q > 0.0:
+            try:
+                from discovery import DiscoveredMarket, quality_score
+                kept_rows = []
+                for r in rows:
+                    src = r.get("source") or "polymarket"
+                    if src == "polymarket":
+                        kept_rows.append(r)
+                        continue
+                    dm = DiscoveredMarket(
+                        source=src, cond_id=r["condition_id"],
+                        question=r["question"],
+                        volume_24h_usdc=r.get("volume_usdc"),
+                    )
+                    if quality_score(dm) >= min_q:
+                        kept_rows.append(r)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("min_quality_score filter skipped: %s", exc)
+                kept_rows = rows
 
         self._markets = [
             Market(
@@ -398,14 +431,18 @@ class MarketIndex:
                 token_no=r["token_no"],
                 market_type=(r["market_type"] if "market_type" in r.keys() else None),
             )
-            for r in rows
+            for r in kept_rows
         ]
         self._matrix = np.stack([r["embedding"] for r in rows])  # (N, 384)
         logger.info("MarketIndex: loaded %d markets from DB", len(self._markets))
         return len(self._markets)
 
     @prof.traced("markets/search")
-    def find_matches(self, query_embedding: np.ndarray) -> list[MarketMatch]:
+    def find_matches(
+        self,
+        query_embedding: np.ndarray,
+        headline: Optional[str] = None,
+    ) -> list[MarketMatch]:
         """
         Find the top-K markets most similar to the given embedding.
 
@@ -413,6 +450,14 @@ class MarketIndex:
         sorted by descending similarity.
 
         O(N * dim) — negligible at typical Polymarket scale.
+
+        Phase 4D.2 tag-augment step: when `headline` is non-empty AND the
+        tagger config is enabled (default), each match is run through
+        `tagger.tag_headline`; any tag whose `route_market_bucket` keyword
+        appears in a market's question text is unioned into the result
+        (after the cosine pass). Tag-routed matches are marked with their
+        triggering tag in `MarketMatch.tag`. Cosine matches keep `tag=None`.
+        The total result is still capped at `cfg.markets.top_k`.
         """
         if self._matrix is None or len(self._markets) == 0:
             return []
@@ -433,12 +478,14 @@ class MarketIndex:
 
         # Get indices sorted by score descending
         order = np.argsort(-scores)
-        results = []
+        results: list[MarketMatch] = []
+        seen_ids: set[str] = set()
         for idx in order:
             sim = float(scores[idx])
             if sim < threshold:
                 break
             market = self._markets[idx]
+            seen_ids.add(market.condition_id)
             results.append(MarketMatch(
                 condition_id=market.condition_id,
                 question=market.question,
@@ -449,5 +496,60 @@ class MarketIndex:
             ))
             if len(results) >= top_k:
                 break
+
+        # ── Phase 4D.2 tag-augment ────────────────────────────────────────
+        # When the headline is supplied AND the tagger is enabled, scan
+        # market questions for any tag's bucket keywords. Union with cosine
+        # matches (dedup by condition_id). Capped at top_k total.
+        tagger_cfg = getattr(self._cfg, "tagger", None)
+        if (
+            headline
+            and tagger_cfg is not None
+            and getattr(tagger_cfg, "enabled", False)
+            and len(results) < top_k
+        ):
+            try:
+                from tagger import tag_headline, route_market_bucket
+            except ImportError:
+                tag_headline = None  # type: ignore[assignment]
+                route_market_bucket = None  # type: ignore[assignment]
+            if tag_headline is not None and route_market_bucket is not None:
+                tag_result = tag_headline(headline)
+                if tag_result.tags:
+                    keywords = route_market_bucket(tag_result.tags)
+                    if keywords:
+                        max_routed = int(getattr(
+                            tagger_cfg, "max_tag_routed_per_headline", 10))
+                        added = 0
+                        # Lowercase keyword scan over every market question.
+                        # Cheap: ~10-50us per market on a ~1k-market index.
+                        for i, market in enumerate(self._markets):
+                            if len(results) >= top_k or added >= max_routed:
+                                break
+                            if market.condition_id in seen_ids:
+                                continue
+                            q_lower = market.question.lower()
+                            matched_tag: Optional[str] = None
+                            for tag in tag_result.tags:
+                                bucket = [
+                                    kw for kw in route_market_bucket([tag])
+                                    if kw in q_lower
+                                ]
+                                if bucket:
+                                    matched_tag = tag
+                                    break
+                            if matched_tag is None:
+                                continue
+                            seen_ids.add(market.condition_id)
+                            results.append(MarketMatch(
+                                condition_id=market.condition_id,
+                                question=market.question,
+                                token_yes=market.token_yes,
+                                token_no=market.token_no,
+                                similarity=float(scores[i]),
+                                market_type=market.market_type,
+                                tag=matched_tag,
+                            ))
+                            added += 1
 
         return results
