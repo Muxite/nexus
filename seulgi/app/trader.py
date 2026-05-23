@@ -54,9 +54,11 @@ import aiohttp
 
 from ai import Direction, ClassifyResult, DirectionClassifier
 from db import SeulgiDB
+from fastpath import FastPath, TelemetryQueue
 from markets import MarketMatch
 from watcher import RawHeadline
 import simulate as sim
+import execution as _execution
 
 # Defensive — analysis CLIs import trader.py without app.metrics.
 try:
@@ -651,6 +653,8 @@ class PaperTrader:
         rule_engine=None,
         variant_name: Optional[str] = None,
         parent_engine: Optional[str] = None,
+        fastpath: Optional[FastPath] = None,
+        telemetry: Optional[TelemetryQueue] = None,
     ) -> None:
         self._db = db
         self._classifier = classifier
@@ -665,6 +669,44 @@ class PaperTrader:
         self._last_tokens_used: int = 0
         self._lock = asyncio.Lock()
         self._session: Optional[aiohttp.ClientSession] = None
+        # Phase 4C.1: optional fast-path + async telemetry queue. When
+        # both are supplied, the hot path stops touching the DB writer:
+        # duplicate-position checks read in-memory state, and `trades`
+        # rows enqueue for A4C.2's worker. When either is None, the
+        # legacy path runs unchanged (backward-compatible for the 224
+        # tests already in tree).
+        self._fastpath: Optional[FastPath] = fastpath
+        self._telemetry: Optional[TelemetryQueue] = telemetry
+        # Phase 4A.1: optional callback invoked after every balance mutation.
+        # EngineRunner wires this to its capital-floor cache invalidator so
+        # ingress-stage capital checks never serve stale True after a drain.
+        # `_notify_balance_change()` is the single chokepoint; mutate
+        # `self._balance` then call it.
+        self._balance_change_cb = None
+
+    def set_balance_change_callback(self, cb) -> None:
+        """Phase 4A.1: register a sync callback invoked after every balance
+        mutation. EngineRunner uses this to bust its stage-0a capital cache."""
+        self._balance_change_cb = cb
+
+    def _notify_balance_change(self) -> None:
+        """Fire the registered callback. Safe to call from any path; the
+        callback (if any) is best-effort — exceptions are swallowed so a
+        broken observer can't corrupt trader state."""
+        cb = self._balance_change_cb
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def attach_fastpath(self, fastpath: FastPath,
+                        telemetry: TelemetryQueue) -> None:
+        """Wire a FastPath + telemetry queue post-construction. A4C.2's
+        EngineRunner calls this once after both have been created."""
+        self._fastpath = fastpath
+        self._telemetry = telemetry
 
     async def init_from_db(self) -> None:
         """Restore balance/staked from DB (cycle-scoped under infinite mode)."""
@@ -675,6 +717,7 @@ class PaperTrader:
                 self._engine_name, since_ts=since_ts,
             )
             self._balance, self._total_staked = gain, staked
+            self._notify_balance_change()
             logger.info(
                 "[trader] [%s] infinite restored (cycle=%s): gain=%+.2f staked=%.2f",
                 self._engine_name, cycle["name"] if cycle else "<none>",
@@ -691,6 +734,7 @@ class PaperTrader:
             )
         else:
             self._balance = self._cfg.balance_usdc
+        self._notify_balance_change()
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -847,6 +891,7 @@ class PaperTrader:
                 self._balance += outcome.proceeds
             else:
                 self._balance += pos["size_usdc"] + outcome.realized_pnl
+            self._notify_balance_change()
             await self._db.close_position(pos["trade_id"])
             await self._db.close_trade(
                 pos["trade_id"], outcome.realized_pnl,
@@ -855,6 +900,10 @@ class PaperTrader:
                 exit_price=outcome.exit_price,
                 entry_price_at_close=pos["entry_price"],
             )
+            # Phase 4C.1: keep in-memory state in sync on close.
+            if self._fastpath is not None:
+                eng = pos.get("engine_name") or self._engine_name
+                await self._fastpath.state.remove(pos["condition_id"], eng)
 
     async def _evaluate_market(
         self, session: aiohttp.ClientSession, signal_id: int,
@@ -883,13 +932,29 @@ class PaperTrader:
                         match.mid_no = refetched
 
         async with self._lock:
+            # Phase 4C.1: when FastPath is attached, duplicate /
+            # count / unique-market checks read in-memory state instead
+            # of hitting the DB on the hot path.
+            if self._fastpath is not None:
+                open_n = await self._fastpath.state.count(
+                    engine_name=self._engine_name)
+                unique_n = await self._fastpath.state.unique_markets(
+                    engine_name=self._engine_name)
+                dup = await self._fastpath.state.has(
+                    match.condition_id, self._engine_name)
+            else:
+                open_n = await self._db.count_open_positions(
+                    engine_name=self._engine_name)
+                unique_n = await self._db.count_unique_open_markets(
+                    engine_name=self._engine_name)
+                dup = await self._db.has_open_position(
+                    match.condition_id, engine_name=self._engine_name)
             ctx = _EntryCtx(
                 cfg=self._cfg, ai_cfg=self._ai_cfg,
                 engine_name=self._engine_name, parent_engine=self._parent_engine,
-                open_positions=await self._db.count_open_positions(engine_name=self._engine_name),
-                unique_markets=await self._db.count_unique_open_markets(engine_name=self._engine_name),
-                duplicate_position=await self._db.has_open_position(
-                    match.condition_id, engine_name=self._engine_name),
+                open_positions=open_n,
+                unique_markets=unique_n,
+                duplicate_position=dup,
                 balance=self._balance, cluster_factor=cluster_factor,
                 rules_post_ai_reason=rules_post_ai_reason,
                 freshness_label=getattr(headline, "_freshness_label", None),
@@ -898,13 +963,132 @@ class PaperTrader:
             decision = _outcome_to_decision(outcome, match, result)
             if outcome.action == "SKIP":
                 # Cycle-2: skip row is dropped (engine_results holds it).
-                await self._record(signal_id, decision, token_id=outcome.token_id)
+                if self._fastpath is not None and self._telemetry is not None:
+                    await self._fastpath.record_skip(
+                        decision.skip_reason or "unknown",
+                        {"engine_name": self._engine_name,
+                         "condition_id": match.condition_id,
+                         "question": match.question},
+                        self._telemetry,
+                    )
+                else:
+                    await self._record(signal_id, decision,
+                                       token_id=outcome.token_id)
                 return decision
+
+            # A4A.2 JIT pricing + IOC simulation. The LLM's view of the
+            # snapshot mid is now stale by 1-3s; refetch live BBO and
+            # bail if the market moved against us > jit_tolerance_bps.
+            # Skip the refetch when there's no snapshot to compare against
+            # (degraded: no token / no mid → fall through and let
+            # open_position handle the legacy path). Fast-path branch
+            # delegates JIT to FastPath.execute_trade (A4C.1 wiring).
+            jit_tolerance_bps = float(
+                getattr(self._cfg, "jit_tolerance_bps",
+                        _execution.DEFAULT_JIT_TOLERANCE_BPS) or
+                _execution.DEFAULT_JIT_TOLERANCE_BPS
+            )
+            snapshot_mid = outcome.mid_price
+            jit_result: Optional[_execution.ExecutionResult] = None
+            if (outcome.token_id is not None and snapshot_mid is not None
+                    and self._fastpath is None):
+                max_acceptable_price = (
+                    snapshot_mid * (1.0 + jit_tolerance_bps / 10_000.0)
+                )
+                jit_result = await _execution.execute_with_jit_pricing(
+                    session=session,
+                    condition_id=match.condition_id,
+                    token_id=outcome.token_id,
+                    direction=outcome.direction or "YES",
+                    target_size_usdc=outcome.size_usdc or 0.0,
+                    snapshot_mid=snapshot_mid,
+                    max_acceptable_price=max_acceptable_price,
+                    tolerance_bps=jit_tolerance_bps,
+                    cfg=self._cfg, market_type=match.market_type,
+                    headline_id=getattr(headline, "headline_id", None),
+                )
+                if not jit_result.filled:
+                    # IOC failed — book a skip, don't persist a trade row,
+                    # don't touch balance. Engine results / metrics capture it.
+                    decision.executed = False
+                    decision.skip_reason = jit_result.skip_reason
+                    await self._record(signal_id, decision,
+                                       token_id=outcome.token_id)
+                    return decision
+                # Filled — rebase entry_price to the live fill price so
+                # downstream PnL accounting reflects the actual cost paid.
+                if jit_result.fill_price is not None:
+                    outcome.entry_price = jit_result.fill_price
 
             # TRADE — persist + open position. Roll back on open_position failure.
             if not self._cfg.infinite_balance:
                 self._balance -= outcome.size_usdc
+                self._notify_balance_change()
             self._total_staked += outcome.size_usdc
+
+            # Phase 4C.1 fast path: JIT-price against the LIVE BBO, then
+            # hand off to FastPath (state update + telemetry enqueue).
+            # NO synchronous DB writes on this branch.
+            if self._fastpath is not None and self._telemetry is not None:
+                # Step 1 — live BBO recompute (A4A.2 JIT pricing).
+                snapshot_mid_fp = outcome.mid_price
+                if (outcome.token_id is not None
+                        and snapshot_mid_fp is not None):
+                    jit_tol = float(
+                        getattr(self._cfg, "jit_tolerance_bps",
+                                _execution.DEFAULT_JIT_TOLERANCE_BPS) or
+                        _execution.DEFAULT_JIT_TOLERANCE_BPS
+                    )
+                    max_acc = snapshot_mid_fp * (1.0 + jit_tol / 10_000.0)
+                    jit_r = await _execution.execute_with_jit_pricing(
+                        session=session, condition_id=match.condition_id,
+                        token_id=outcome.token_id,
+                        direction=outcome.direction or "YES",
+                        target_size_usdc=outcome.size_usdc or 0.0,
+                        snapshot_mid=snapshot_mid_fp,
+                        max_acceptable_price=max_acc, tolerance_bps=jit_tol,
+                        cfg=self._cfg, market_type=match.market_type,
+                        headline_id=getattr(headline, "headline_id", None),
+                    )
+                    if not jit_r.filled:
+                        # Roll back balance + state-staked; enqueue skip.
+                        if not self._cfg.infinite_balance:
+                            self._balance += outcome.size_usdc
+                            self._notify_balance_change()
+                        self._total_staked -= outcome.size_usdc
+                        decision.executed = False
+                        decision.skip_reason = jit_r.skip_reason
+                        await self._fastpath.record_skip(
+                            jit_r.skip_reason or "jit_failed",
+                            {"engine_name": self._engine_name,
+                             "condition_id": match.condition_id,
+                             "headline_id": getattr(headline, "headline_id", None)},
+                            self._telemetry, decision=decision,
+                        )
+                        return decision
+                    if jit_r.fill_price is not None:
+                        outcome.entry_price = jit_r.fill_price
+
+                # Steps 2 + 3 live inside FastPath.execute_trade.
+                decision.entry_price = outcome.entry_price  # type: ignore[attr-defined]
+                decision.shares = outcome.shares  # type: ignore[attr-defined]
+                decision.entry_fee_usdc = outcome.entry_fee_usdc  # type: ignore[attr-defined]
+                decision.direction_value = outcome.direction  # type: ignore[attr-defined]
+                decision.token_id = outcome.token_id  # type: ignore[attr-defined]
+                decision.ev_per_dollar = outcome.ev_usdc  # type: ignore[attr-defined]
+                await self._fastpath.execute_trade(
+                    decision, self._telemetry,
+                    engine_name=self._engine_name,
+                    live_ev_per_dollar=outcome.ev_usdc,
+                )
+                logger.info(
+                    "[trader/fp] PAPER %s %s $%.2f @ %.3f edge=%.4f conf=%.0f%%",
+                    outcome.direction, match.condition_id[:12],
+                    outcome.size_usdc, outcome.mid_price or 0.0,
+                    outcome.edge_value or 0.0, result.confidence * 100,
+                )
+                return decision
+
             mid = outcome.mid_price
             mc = getattr(match, "_mkt_ctx", None)
             trade_id = await self._db.insert_trade(
@@ -954,6 +1138,7 @@ class PaperTrader:
                 )
                 if not self._cfg.infinite_balance:
                     self._balance += outcome.size_usdc
+                    self._notify_balance_change()
                 self._total_staked -= outcome.size_usdc
 
         logger.info(

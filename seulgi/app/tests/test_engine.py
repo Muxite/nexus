@@ -397,3 +397,134 @@ class TestMonitorAllPositions:
 
         # See test_engines_run_concurrently for tolerance reasoning.
         assert elapsed < 0.6, f"Monitors appear sequential ({elapsed:.3f}s)"
+
+
+# ---------------------------------------------------------------------------
+# Phase 4A.1: stage-0a capital floor short-circuit
+# ---------------------------------------------------------------------------
+
+
+def _make_drained_trader(name="drained", balance=0.5, min_trade=50.0):
+    """A trader mock with ONLY engines drained — capital check should fail.
+
+    Explicitly sets `infinite_balance=False` (the default MagicMock attr is
+    truthy and would short-circuit _engines_have_capital's no-op path).
+    """
+    trader = MagicMock(spec=PaperTrader)
+    trader.balance = float(balance)
+    trader.infinite_balance = False
+    trader.cfg = MagicMock()
+    trader.cfg.min_trade_usdc = float(min_trade)
+    trader.cfg.infinite_balance = False
+    trader.cfg.mode = "paper"
+    # Spec-bound attrs.
+    trader.evaluate = AsyncMock(return_value=[])
+    trader.process = AsyncMock(return_value=[])
+    trader.monitor_positions = AsyncMock()
+    trader.set_balance_change_callback = MagicMock()
+    return trader
+
+
+class TestStage0aCapitalFloor:
+    """Phase 4A.1: capital_floor short-circuit fires BEFORE embed / freshness /
+    match / CLOB / DB writes when every engine is drained.
+
+    Tests set `SEULGI_DISABLE_HOUR_GATE=1` because the hour-gate runs first
+    and otherwise eats the test on UTC 23/00/01.
+    """
+
+    def test_engines_have_capital_returns_false_when_all_drained(self, monkeypatch):
+        monkeypatch.delenv("SEULGI_BYPASS_LLM", raising=False)
+        e1 = Engine(name="e1", trader=_make_drained_trader("e1", balance=0.5))
+        e2 = Engine(name="e2", trader=_make_drained_trader("e2", balance=0.0))
+        runner = _make_runner(engines=[e1, e2], n_matches=1)
+        assert runner._engines_have_capital() is False
+
+    def test_engines_have_capital_returns_true_when_one_has_capital(self, monkeypatch):
+        monkeypatch.delenv("SEULGI_BYPASS_LLM", raising=False)
+        e_rich = Engine(name="rich", trader=_make_drained_trader("rich", balance=500.0))
+        e_poor = Engine(name="poor", trader=_make_drained_trader("poor", balance=0.0))
+        runner = _make_runner(engines=[e_rich, e_poor], n_matches=1)
+        assert runner._engines_have_capital() is True
+
+    def test_engines_have_capital_noop_in_bypass(self, monkeypatch):
+        """SEULGI_BYPASS_LLM=1 ⇒ always True (no-op, even when drained)."""
+        monkeypatch.setenv("SEULGI_BYPASS_LLM", "1")
+        e1 = Engine(name="e1", trader=_make_drained_trader("e1", balance=0.0))
+        runner = _make_runner(engines=[e1], n_matches=1)
+        assert runner._engines_have_capital() is True
+
+    def test_engines_have_capital_noop_in_infinite_balance(self, monkeypatch):
+        """infinite_balance=True on any engine ⇒ always True (no-op)."""
+        monkeypatch.delenv("SEULGI_BYPASS_LLM", raising=False)
+        t = _make_drained_trader("inf", balance=0.0)
+        t.infinite_balance = True
+        e1 = Engine(name="inf", trader=t)
+        runner = _make_runner(engines=[e1], n_matches=1)
+        assert runner._engines_have_capital() is True
+
+    @pytest.mark.asyncio
+    async def test_drained_short_circuits_before_embed(self, monkeypatch):
+        """All engines drained → process() returns before embed/match/DB.
+
+        The strongest assertion possible: embed must NOT be called, no
+        signal must be inserted, evaluate must NOT be called.
+        """
+        monkeypatch.setenv("SEULGI_DISABLE_HOUR_GATE", "1")
+        monkeypatch.delenv("SEULGI_BYPASS_LLM", raising=False)
+        e1 = Engine(name="e1", trader=_make_drained_trader("e1", balance=0.0))
+        e2 = Engine(name="e2", trader=_make_drained_trader("e2", balance=0.0))
+        runner = _make_runner(engines=[e1, e2], n_matches=2)
+
+        await runner.process(_make_headline())
+
+        # Zero downstream cost: embed, signal insert, evaluate untouched.
+        runner._embedder.embed.assert_not_called()
+        runner._db.insert_signal.assert_not_called()
+        runner._db.bump_market_heat.assert_not_called()
+        e1.trader.evaluate.assert_not_called()
+        e2.trader.evaluate.assert_not_called()
+        # Counter ticked.
+        assert runner._capital_floor_skips == 1
+
+    @pytest.mark.asyncio
+    async def test_one_engine_with_capital_lets_pipeline_proceed(self, monkeypatch):
+        """At least one engine has free cash → check passes; embed runs."""
+        monkeypatch.setenv("SEULGI_DISABLE_HOUR_GATE", "1")
+        monkeypatch.delenv("SEULGI_BYPASS_LLM", raising=False)
+        e_rich = Engine(name="rich", trader=_make_drained_trader("rich", balance=500.0))
+        # rich needs to behave like a real engine — return a decision when
+        # evaluate is called. Same shape as _make_trader_mock.
+        decision = TradeDecision(
+            condition_id="cid0", question="Q0?", direction=Direction.YES,
+            confidence=0.85, similarity=0.80, p_hat=0.534, mid_price=0.45,
+            edge=0.084, size_usdc=50.0, executed=True, skip_reason=None,
+        )
+        e_rich.trader.evaluate = AsyncMock(return_value=[decision])
+        e_poor = Engine(name="poor", trader=_make_drained_trader("poor", balance=0.0))
+        e_poor.trader.evaluate = AsyncMock(return_value=[])
+        runner = _make_runner(engines=[e_rich, e_poor], n_matches=1)
+
+        # Same prefetch patch as TestEngineRunnerProcess: a real CLOB fetch
+        # would return None and drop every match as 'no_price' before
+        # insert_signal runs.
+        with patch("engine._fetch_mid_price", AsyncMock(return_value=0.5)):
+            await runner.process(_make_headline())
+
+        # Pipeline progressed past stage 0a.
+        runner._embedder.embed.assert_called()
+        runner._db.insert_signal.assert_called()
+        assert runner._capital_floor_skips == 0
+
+    def test_balance_change_callback_invalidates_cache(self, monkeypatch):
+        """A balance mutation must clear the cache so the next call sees fresh state."""
+        monkeypatch.delenv("SEULGI_BYPASS_LLM", raising=False)
+        t = _make_drained_trader("e", balance=500.0)
+        e = Engine(name="e", trader=t)
+        runner = _make_runner(engines=[e], n_matches=1)
+        # Prime the cache (True).
+        assert runner._engines_have_capital() is True
+        assert runner._capital_cache is not None
+        # Fire the invalidator (this is what PaperTrader._notify_balance_change does).
+        runner._invalidate_capital_cache()
+        assert runner._capital_cache is None

@@ -215,6 +215,9 @@ class Dashboard:
         self._dir = data_dir
         self._interval = interval_secs
         self._db = db                         # Optional[SeulgiDB] for new views
+        # A4C.2: optional telemetry queue ref; surfaced in db_health.txt
+        # so silent drops on the async write path are observable.
+        self._telemetry = None
         self._started_at = datetime.now(timezone.utc)
 
         # Ring buffers
@@ -257,6 +260,9 @@ class Dashboard:
         # plan §3: True while LLM is paused because no engine has free capital
         self._ai_paused: bool = False
         self._ai_paused_since: Optional[str] = None
+        # Phase 4A.1: boot-cumulative count of stage-0a capital-floor skips.
+        # Updated each render tick by the runner; rendered in db_health.txt.
+        self._capital_floor_skips: int = 0
         # plan §2: starting bankroll for simulate mode (recorded so the
         # dashboard can show "free + staked + realized = total" reconciliation)
         self._simulate_total_usdc: float = 0.0
@@ -427,6 +433,11 @@ class Dashboard:
         )
         self._flush_now.set()
 
+    def set_telemetry(self, telemetry) -> None:
+        """A4C.2: attach the async telemetry queue so db_health.txt can
+        surface depth, drop counters, flush stats."""
+        self._telemetry = telemetry
+
     def set_balance(self, engine_name: str, balance: float) -> None:
         self._engine_balances[engine_name] = balance
 
@@ -522,6 +533,12 @@ class Dashboard:
             return
         self._ai_paused = paused
         self._ai_paused_since = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    def set_capital_floor_skips(self, n: int) -> None:
+        """Phase 4A.1: boot-cumulative count of headlines short-circuited by
+        the stage-0a capital-floor check. Surfaced in `db_health.txt` so
+        operators can see how many headlines avoided the full pipeline."""
+        self._capital_floor_skips = int(n)
 
     # ------------------------------------------------------------------
     # Background loop
@@ -1279,6 +1296,39 @@ class Dashboard:
             )
         if not counters:
             lines.append("| (no write attempts yet)                                |")
+        lines.append("")
+
+        # A4C.2: telemetry queue tile.
+        if self._telemetry is not None:
+            try:
+                tm = self._telemetry.metrics
+                lines.append("## Telemetry queue")
+                lines.append("")
+                lines.append(
+                    "| depth | max | dropped_skip | dropped_decision | "
+                    "flush_batches | flush_errors |"
+                )
+                lines.append(
+                    "|------:|----:|-------------:|-----------------:|"
+                    "-------------:|-------------:|"
+                )
+                mark = " ⚠" if tm.get("flush_errors", 0) > 0 else ""
+                lines.append(
+                    f"| {tm['depth']:>5} | {tm['max']:>3} | "
+                    f"{tm['dropped_skip']:>12} | {tm['dropped_decision']:>16} | "
+                    f"{tm['flush_batches']:>13} | {tm['flush_errors']:>12} |{mark}"
+                )
+                lines.append("")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Phase 4A.1: stage-0a capital-floor short-circuit counter.
+        lines.append("## Ingress short-circuits (boot-cumulative)")
+        lines.append("")
+        lines.append(
+            f"  capital_floor_skips : {self._capital_floor_skips}  "
+            "(headlines saved from embed/CLOB/DB)"
+        )
         lines.append("")
 
         # Cache section reads in-memory state; no extra DB query.

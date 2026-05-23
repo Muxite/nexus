@@ -16,7 +16,10 @@ context → predict (LLM) → fan-out → batched write.
   YAML engines + variants + optional `AGGRESSIVE_CORE_ENABLE=1` core.
 
 **Pipeline stages.** Each log line starts with `[STAGE]`:
-- `[INGRESS]` — hour gate, embed, freshness, match, mid-prefetch, heat.
+- `[INGRESS]` — hour gate → **stage 0a capital floor** (Phase 4A.1) →
+  embed → freshness → match → mid-prefetch → heat. Stage 0a is a
+  zero-cost short-circuit: if NO engine has `balance >= min_trade_usdc`,
+  return before any LLM / embed / chromadb / CLOB / DB-insert work.
 - `[SIGNAL]` — `insert_signal`, freshness short-circuit, universal pre-AI.
 - `[SIM_GATE]` — low-sim short-circuit + per-match SIM_PASS/SIM_FAIL.
 - `[MARKET_CONTEXT]` — parallel CLOB pre-headline snapshot.
@@ -51,8 +54,12 @@ positions (`trader.py`), call the LLM (`ai.py`), maintain market embeddings
 (`markets.py`), or decide freshness labels (`news_memory.py`).
 
 ## Notes
-- TODO(Phase 4A.1): capital check belongs at INGRESS stage 0a (before embed
-  + match). Today only [PREDICT] AI-paused gates capital.
+- Phase 4A.1 (2026-05-23): capital check now lives at INGRESS stage 0a —
+  `_engines_have_capital()` is checked immediately after the hour gate
+  and BEFORE article_fetch / embed / freshness / match / mid-prefetch.
+  When False, `process()` returns with zero downstream cost; the
+  `[PREDICT] ai_paused_no_capital` gate still runs as a defence-in-depth
+  belt-and-braces check until Phase 4A.1 has soaked for ≥ 1 week.
 """
 
 from __future__ import annotations
@@ -76,6 +83,12 @@ from db import SeulgiDB
 from markets import MarketIndex, Embedder, MarketMatch
 from trader import PaperTrader, TradeDecision, _fetch_mid_price
 from watcher import RawHeadline
+
+# Defensive — engine.py runs in tests that don't initialise app.metrics.
+try:
+    import metrics as _metrics
+except Exception:  # noqa: BLE001
+    _metrics = None
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +138,7 @@ class EngineRunner:
         rule_engine=None, dashboard=None, news_memory=None,
         impact_tracker=None, article_fetcher=None, market_context_cfg=None,
         min_top_similarity: float = 0.45,
+        telemetry=None,
     ) -> None:
         self._engines, self._index, self._embedder = engines, index, embedder
         self._db, self._classifier, self._rules = db, classifier, rule_engine
@@ -134,11 +148,22 @@ class EngineRunner:
         self._article_fetcher = article_fetcher
         self._min_top_similarity = float(min_top_similarity)
         self._mkt_ctx_cfg = market_context_cfg
+        # A4C.2: optional async telemetry queue. A4C.1's FastPath uses
+        # this to offload engine_results / decision_inputs / llm_calls /
+        # trades writes off the trade-critical path. None = legacy
+        # direct-write path (current behaviour preserved).
+        self._telemetry = telemetry
         self._mkt_ctx_cache: dict = {}  # 30s TTL inside market_context.fetch_*
         self._price_session: Optional[aiohttp.ClientSession] = None
         # token_id → (price|None, monotonic_expiry); 10 s burst-traffic shield.
         self._price_cache: dict[str, tuple[Optional[float], float]] = {}
         self._price_cache_ttl: float = 10.0
+        # A4A.3: wall-clock cap for BBO fan-out inside _prefetch_prices.
+        # Per-call timeout is set inside `fetch_bbo` itself (500 ms);
+        # this budget caps the parallel gather across all matched
+        # tokens. On overrun we fall through to mid-only snaps —
+        # ingress is never blocked on CLOB book availability.
+        self._bbo_budget_s: float = 0.5
         # Held refs for fire-and-forget tasks — without this set, the GC can
         # reap an in-flight asyncio.create_task() mid-run.
         self._bg_tasks: set[asyncio.Task] = set()
@@ -146,6 +171,21 @@ class EngineRunner:
         self._simulate_mode: bool = bool(
             engines and getattr(engines[0].trader.cfg, "mode", "paper") == "simulate")
         self._ai_paused: bool = False
+        # Phase 4A.1: stage-0a capital floor cache. `_capital_cache` is
+        # (have_capital, expiry_monotonic). TTL is short (5 s) so a stale
+        # True window can never burn more than ~5 s of headlines on a fresh
+        # drain; PaperTrader._notify_balance_change clears it immediately
+        # whenever a real mutation happens.
+        self._capital_cache: Optional[tuple[bool, float]] = None
+        self._capital_cache_ttl_secs: float = 5.0
+        self._capital_floor_skips: int = 0  # boot-cumulative; surfaced in db_health
+        for _e in engines:
+            try:
+                _e.trader.set_balance_change_callback(self._invalidate_capital_cache)
+            except Exception:  # noqa: BLE001
+                # Test mocks may not implement the setter; the TTL still
+                # bounds staleness so the cache is safe without the hook.
+                pass
         # E.5b: engines with last-50 hit-rate below floor are skipped at
         # dispatch (n >= min_n so brand-new variants aren't paused on noise).
         self._hit_rate_cache: dict[str, tuple[float, int, float]] = {}
@@ -204,6 +244,51 @@ class EngineRunner:
                 return False
         return True
 
+    def _invalidate_capital_cache(self) -> None:
+        """Phase 4A.1: bust the stage-0a capital cache. Called by
+        PaperTrader._notify_balance_change after any balance mutation
+        AND on every cache-miss recompute path."""
+        self._capital_cache = None
+
+    def _engines_have_capital(self) -> bool:
+        """Phase 4A.1 stage-0a gate. Returns True iff ANY engine has
+        `balance >= min_trade_usdc`. The check is GLOBAL on purpose: if
+        even one engine can trade, the embed+match cost is recouped by
+        that engine's potential trade — only when ALL engines are drained
+        does the headline genuinely waste downstream work.
+
+        Caches the bool for `_capital_cache_ttl_secs` (5 s) so repeated
+        calls inside one process() tick are O(1); the trader callback
+        busts the cache immediately on real mutations so we never serve
+        stale True.
+
+        No-ops (always True):
+        - `SEULGI_BYPASS_LLM=1` — bypass mode still wants the full
+          pipeline to exercise (cost is synthetic anyway).
+        - Any engine in `infinite_balance` mode — balance is gain-only,
+          `min_trade_usdc` is meaningless there.
+        """
+        # Bypass + infinite_balance escape hatch (no DB calls).
+        if os.environ.get("SEULGI_BYPASS_LLM", "0") == "1":
+            return True
+        for e in self._engines:
+            if getattr(e.trader, "infinite_balance", False):
+                return True
+        # TTL cache fast-path.
+        if self._capital_cache is not None:
+            have, expiry = self._capital_cache
+            if expiry > time.monotonic():
+                return have
+        # Recompute — in-memory attribute read per engine, no DB.
+        have = False
+        for e in self._engines:
+            cfg = e.trader.cfg
+            if e.trader.balance >= cfg.min_trade_usdc:
+                have = True
+                break
+        self._capital_cache = (have, time.monotonic() + self._capital_cache_ttl_secs)
+        return have
+
     def _update_ai_pause_state(self) -> bool:
         """Recompute the pause flag, log on edges, notify dashboard."""
         paused = self._ai_should_pause()
@@ -234,14 +319,34 @@ class EngineRunner:
         hid = getattr(headline, "headline_id", "")
 
         # ── INGRESS ──────────────────────────────────────────────────────
-        # TODO(Phase 4A.1): capital check belongs HERE (stage 0a) — BEFORE
-        # embed + match. Today [PREDICT] AI-paused is the only capital gate.
         # Phase-E E11: drop UTC hours 23/00/01 (`SEULGI_DISABLE_HOUR_GATE=1`).
         if os.getenv("SEULGI_DISABLE_HOUR_GATE") != "1":
             h = datetime.now(timezone.utc).hour
             if h in (23, 0, 1):
                 logger.debug("[INGRESS] [hid=%s] hour_gate skip (UTC %02d)", hid, h)
                 return
+        # Stage 0a (Phase 4A.1, 2026-05-23): capital floor — short-circuit
+        # BEFORE embed/freshness/match/CLOB/DB writes when NO engine can
+        # afford a trade. The [PREDICT] _update_ai_pause_state gate below
+        # is kept as belt-and-braces and will be removed after a 1-week
+        # soak confirms cache invalidation is correct.
+        if not self._engines_have_capital():
+            self._capital_floor_skips += 1
+            logger.info(
+                "[INGRESS] [hid=%s] capital_floor skip — no engine has "
+                "free_cash >= min_trade", hid,
+            )
+            if _metrics is not None:
+                try:
+                    _metrics.incr("engine.capital_floor_skip")
+                except Exception:  # noqa: BLE001
+                    pass
+            if self._dashboard is not None:
+                try:
+                    self._dashboard.set_capital_floor_skips(self._capital_floor_skips)
+                except Exception:  # noqa: BLE001
+                    pass
+            return
         if self._article_fetcher is not None and getattr(headline, "article_url", None):
             self._spawn_bg(
                 self._article_fetcher.fetch_and_store(
@@ -339,6 +444,10 @@ class EngineRunner:
         await self._fetch_market_context(survivors, hid)
 
         # ── PREDICT ──────────────────────────────────────────────────────
+        # TODO(Phase 4A.1 post-soak): remove this fallback gate. Stage 0a
+        # already short-circuits before any embed/CLOB/DB work; keeping
+        # this here for ≥ 1-week soak as belt-and-braces against a buggy
+        # cache invalidation. Track removal in master-plan §4A.1.
         if survivors and self._update_ai_pause_state():
             logger.info("[PREDICT] [hid=%s] ai_paused_no_capital — %d×%d skipped",
                         hid, len(self._engines), len(survivors))
@@ -543,28 +652,62 @@ class EngineRunner:
         if len(kept) != len(matches):
             logger.info("[INGRESS] [hid=%s] dropped %d/%d no-price matches",
                         hid, len(matches) - len(kept), len(matches))
+        # A4A.3 (2026-05-22): BBO + depth capture. Fan out per-token
+        # /book fetches IN PARALLEL with a strict overall budget
+        # (`_BBO_BUDGET_S`). On timeout / failure we fall through to
+        # mid-only snaps so the ingress path is never blocked on CLOB.
+        # The per-token cache inside `fetch_bbo` collapses bursts
+        # across `_prefetch_prices` and `_position_snap_loop`.
+        bbo_by_token: dict[str, "impact_tracker.BBOResult"] = {}
+        if kept:
+            from impact_tracker import fetch_bbo as _fb
+            unique_tokens: list[str] = []
+            seen: set[str] = set()
+            for m in kept:
+                tok = m.token_yes if m.mid_yes is not None else m.token_no
+                if tok and tok not in seen:
+                    seen.add(tok)
+                    unique_tokens.append(tok)
+            if unique_tokens:
+                try:
+                    bbo_results = await asyncio.wait_for(
+                        asyncio.gather(
+                            *(_fb(session, t) for t in unique_tokens),
+                            return_exceptions=True,
+                        ),
+                        timeout=self._bbo_budget_s,
+                    )
+                    for tok, br in zip(unique_tokens, bbo_results):
+                        if isinstance(br, BaseException):
+                            continue
+                        bbo_by_token[tok] = br
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        "[INGRESS] [hid=%s] bbo budget %.0fms exceeded — "
+                        "mid-only snaps", hid, self._bbo_budget_s * 1000,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("[INGRESS] [hid=%s] bbo gather failed: %r",
+                                 hid, exc)
+
         # Persist mids so backtest has a price corpus for every matched
         # market (not only ones that traded). Awaited so writes join any
-        # enclosing batch.
-        #
-        # A2.2 (2026-05-22): widened to the 10-tuple shape so the
-        # bid/ask/book_depth_usdc columns added by the matching
-        # migration are populated. The CLOB /midpoint endpoint used by
-        # `_fetch_mid_price` does NOT return BBO separately today —
-        # Phase 4A.3 (decoupled book state) will add a /book parser and
-        # backfill these columns. Left NULL until then; the schema is
-        # ready so Phase 4D.1 (spread+depth filter) can light up
-        # without another migration.
+        # enclosing batch. A4A.3 fills bid/ask/book_depth_usdc when the
+        # CLOB /book endpoint returned data; otherwise NULL.
         if kept:
             t_unix = int(time.time())
-            snaps = [
-                ((m.condition_id, m.token_yes, "yes", float(m.mid_yes),
-                  t_unix, "prefetch", hid, None, None, None)
-                 if m.mid_yes is not None else
-                 (m.condition_id, m.token_no, "no", float(m.mid_no),
-                  t_unix, "prefetch", hid, None, None, None))
-                for m in kept
-            ]
+            snaps: list[tuple] = []
+            for m in kept:
+                if m.mid_yes is not None:
+                    side, tok, price = "yes", m.token_yes, float(m.mid_yes)
+                else:
+                    side, tok, price = "no", m.token_no, float(m.mid_no)
+                br = bbo_by_token.get(tok or "")
+                bid = br.bid if br is not None else None
+                ask = br.ask if br is not None else None
+                depth = br.book_depth_usdc_top5 if br is not None else None
+                snaps.append((m.condition_id, tok, side, price,
+                              t_unix, "prefetch", hid, bid, ask, depth))
             try:
                 await self._db.insert_market_price_snaps(snaps)
             except Exception as exc:  # noqa: BLE001
