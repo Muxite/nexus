@@ -539,6 +539,11 @@ class Config:
     search_budget: SearchBudgetConfig = field(default_factory=SearchBudgetConfig)
     tagger: TaggerConfig = field(default_factory=TaggerConfig)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+    # A4E.5 counterfactual sampling. Stored as the raw dict so we don't
+    # impose a circular dep (counterfactual.py imports config indirectly
+    # via runtime wiring). EngineRunner builds the actual sampler from
+    # this dict via `counterfactual.load_from_yaml(cfg.counterfactual)`.
+    counterfactual: dict = field(default_factory=dict)
     log_level: str = "INFO"
 
 
@@ -794,6 +799,7 @@ def _build_config(raw: dict) -> Config:
             kalshi_enabled=bool(dsc.get("kalshi_enabled", True)),
             predictit_enabled=bool(dsc.get("predictit_enabled", True)),
         ),
+        counterfactual=raw.get("counterfactual", {}) or {},
         log_level=str(raw.get("log_level", "INFO")),
     )
 

@@ -930,5 +930,25 @@ tagger:
   min_tag_confidence: 1.0          # exact keyword match required
   max_tag_routed_per_headline: 10  # cap so a generic tag can't starve cosine
 
+# ── Counterfactual sampling (A4E.5) ─────────────────────────────────────────
+# When enabled, 1% of would-have-been-skipped signals at each named filter
+# pass through anyway, tagged with `cf_bypassed_filter`. After enough closed
+# trades land, `python -m scripts.analysis counterfactual-report` ranks the
+# per-filter marginal EV — if positive the filter is HURTING (loosen it),
+# if very negative it is HELPING (the cf trades are net losses → tighten).
+#
+# Default OFF — flip `enabled: true` to opt in. Deterministic: same
+# (filter, headline, condition, engine) replays the same bypass decision.
+counterfactual:
+  enabled: false
+  sample_rate_per_filter: 0.01
+  max_cf_per_headline: 3
+  enabled_filters:
+    - freshness_filter
+    - mid_band
+    - min_confidence
+    - min_edge
+    - duplicate_position
+
 # ── Logging ──────────────────────────────────────────────────────────────────
 log_level: "INFO"               # DEBUG for verbose Playwright + embedding output

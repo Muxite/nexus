@@ -318,6 +318,8 @@ async def main() -> None:
         premium_sim_threshold=cfg.ai.premium_sim_threshold,
         ensemble_samples=cfg.ai.ensemble_samples,
         ensemble_temperature=cfg.ai.ensemble_temperature,
+        # A4E.4 (2026-05-23): chunk size for the Stage-3 prediction LLM.
+        batch_size=cfg.ai.batch_size,
         # A2.1 (2026-05-22): hand the classifier a DB ref so it can log
         # every LLM round-trip to `llm_calls` for replay/cache lookup.
         db=db,

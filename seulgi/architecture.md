@@ -95,7 +95,7 @@ sit in.
 
 | Module | Lines | Spec block? | Phase-1 approach (master-plan §"Rewrite vs refactor") |
 |---|---:|---|---|
-| `ai.py` | 883 | yes (L32) | HYBRID — rewrite parse pipeline (A2.1 `llm_calls` writer, A4E.4 `json_schema`); refactor prompt assembly. |
+| `ai.py` | 1,197 | yes (L32) | A4E.4 LANDED (2026-05-23): `json_schema` + `<scratch>` CoT + 2/3 agreement gate + `batch_size=10` chunking + regex-extract fallback. A2.1 (`llm_calls` writer) earlier. |
 | `article_fetch.py` | 182 | no | KEEP — fire-and-forget body fetch; production-validated. |
 | `budget.py` | 185 | no | KEEP AS-IS — new (cycle-2), small, well-tested. |
 | `config.py` | 733 | no | REFACTOR — collapse dataclass duplication; preserve override semantics. |

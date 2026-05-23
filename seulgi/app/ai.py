@@ -1,111 +1,77 @@
-"""
-Seulgi AI direction classifier — OpenRouter backend.
+"""Seulgi AI direction classifier — OpenRouter backend.
 
-Uses OpenRouter's OpenAI-compatible chat completions API so any model
-available on OpenRouter can be used without changing this file.
-
-Default model: google/gemini-2.5-flash-lite  (fast, cheap, great at structured JSON)
-
-Performance design
-──────────────────
-• Batched classification: a single API call evaluates ALL market questions for
-  a headline at once, reducing cost by up to 15× vs one call per market.
-• System message primes the LLM to output valid JSON without preamble.
-• response_format=json_object enforces JSON output (no code-fence stripping needed).
-• Price + similarity context is included so the model can see current market
-  pricing and how relevant the headline is, improving accuracy.
-• Tiered model: classify_batch() uses the configured cheap model by default.
-  Set ai.premium_model in config to route high-similarity (≥0.7) batches through
-  a better model (e.g. google/gemini-2.5-flash) without changing the default.
-
-Config (config.yaml → ai section):
-    model          : OpenRouter model ID, e.g. "google/gemini-2.5-flash-lite"
-    premium_model  : optional higher-quality model for high-sim batches
-    premium_sim_threshold : similarity threshold to trigger premium model (default 0.7)
-    api_key        : OpenRouter API key (or set OPENROUTER_API_KEY env var)
-    api_base       : override base URL (default: https://openrouter.ai/api/v1)
-    min_confidence : below this → treat result as NEUTRAL
+See the `## Specification` block below for the canonical surface. Top-line:
+batched + chunked classification (one API call per `batch_size` markets),
+N-sample ensemble at higher temperature with majority-vote + 2/3 agreement
+gate, tiered model routing (premium when max sim ≥ threshold), strict
+`response_format=json_schema` with `<scratch>` CoT preamble + regex-extract
+fallback, and `SEULGI_BYPASS_LLM=1` for zero-spend dry-runs.
 
 OpenRouter API reference: https://openrouter.ai/docs
 """
 
 # ## Specification ──────────────────────────────────────────────────────────────
 # Purpose:
-#     OpenRouter chat-completion client + Stage-3 ensemble direction
-#     classifier. Given a headline + a list of candidate Polymarket
-#     questions (already culled by similarity/relevance), emits a
-#     per-market probability tuple (p_yes, p_no, p_neutral, p_alpha,
-#     risk) plus an aggregated direction + confidence. Stage 2
-#     (relevance LLM) was retired 2026-05-22; this is now the only
-#     remote LLM call in the hot path.
+#   OpenRouter chat-completion client + Stage-3 ensemble direction
+#   classifier. Given a headline + candidate Polymarket questions (already
+#   culled by similarity/relevance), emits a per-market probability tuple
+#   (p_yes, p_no, p_neutral, p_alpha, risk) plus an aggregated direction +
+#   confidence. Stage 2 (relevance LLM) was retired 2026-05-22; this is the
+#   only remote LLM call in the hot path.
 #
 # Public interface:
-#     DirectionClassifier(api_key, model, premium_model=None,
-#                         premium_sim_threshold=0.70,
-#                         ensemble_samples=3, ensemble_temperature=0.5)
-#       .classify_batch(headline, matches, *, is_republish, similar_to,
-#                       source, freshness, relevance_verdicts)
-#           -> (list[ClassifyResult], prompt_meta: dict)
-#       .classify(headline, question, …) -> ClassifyResult  # legacy fallback
-#       .close()  # closes the aiohttp session
-#     Module helpers: `_BATCH_PROMPT_TEMPLATE`, `_parse_one`,
-#     `_parse_batch_response`, `_aggregate_ensemble`,
-#     `_format_freshness_block`, `_mkt_ctx_to_dict`.
+#   DirectionClassifier(api_key, model, premium_model=None,
+#                       premium_sim_threshold=0.70, ensemble_samples=3,
+#                       ensemble_temperature=0.5, batch_size=10)
+#     .classify_batch(headline, matches, *, is_republish, similar_to,
+#                     source, freshness, relevance_verdicts)
+#         -> (list[ClassifyResult], prompt_meta: dict)
+#     .classify(headline, question, ...) -> ClassifyResult   # legacy fallback
+#     .close()   # closes the aiohttp session
+#   Helpers: `_BATCH_PROMPT_TEMPLATE`, `_parse_one`, `_parse_batch_response`,
+#   `_aggregate_ensemble`, `_regex_extract_partial`, `_RESPONSE_SCHEMA`.
+#
+# A4E.4 (2026-05-23) — prompt + parse upgrade:
+#   - `response_format=json_schema` (strict) replaces `json_object` when
+#     the provider supports it; a 400 with a schema-unsupported marker
+#     auto-flips the instance to `json_object` for its lifetime.
+#   - `<scratch>...</scratch>` chain-of-thought block in the prompt;
+#     `_extract_text` strips everything before the first `{`/`[` so the
+#     scratch content is discarded (memory `feedback_reasoning_budget`).
+#   - `_aggregate_ensemble` enforces a hard 2/3 agreement gate
+#     (`_AGREEMENT_DEMOTE_THRESHOLD`). agreement < 2/3 → NEUTRAL with
+#     confidence=0.0, regardless of stated p_alpha.
+#   - `batch_size` (default 10) chunks `matches` into parallel sub-batches.
+#     Results are concatenated in input order.
+#   - `_regex_extract_partial` recovers per-market tuples from malformed
+#     JSON; accepted only when ≥ 50% of expected markets are recovered.
+#   - Few-shot exemplars (4E.4(e)) DEFERRED — TODO at prompt-build path.
 #
 # Invariants:
-#   - Ensemble = N=ensemble_samples parallel calls at
-#     ensemble_temperature; aggregated per-market by mean(p_yes/p_no/
-#     p_neutral/p_alpha/risk) and majority-vote on the per-sample
-#     argmax direction. Ties resolve to NEUTRAL.
-#   - `agreement` = max_votes / N (1/N → no signal; 1.0 → unanimous).
-#   - `confidence` = `p_alpha` when the model emitted it (cycle-7
-#     contract); else falls back to mean(P[winning_direction]).
-#     KNOWN AMBIGUITY (A0.3): the trader's `2·conf − 1` edge rescale
-#     reads `confidence`, so the production edge silently switches
-#     semantics between samples that emit p_alpha and ones that don't.
-#     `agreement` is NOT folded into `confidence` despite the docstring
-#     at `_aggregate_ensemble` claiming it is. Phase 1 must pick one.
-#   - If ALL N samples fail to parse, the classifier falls back to
-#     per-market single-call classify(); if those also fail, every
-#     market gets NEUTRAL with confidence=0.0 ("api_error"/"parse_error").
-#     classify_batch never raises to the caller.
-#   - Distributions are L1-normalised to 1.0 in `_parse_one` before
-#     argmax; legacy `{direction, confidence}` responses synthesise a
-#     plausible distribution so downstream aggregation still works.
+#   - Ensemble = N parallel calls at `ensemble_temperature`; per-market
+#     mean(p_*) + majority-vote argmax; ties → NEUTRAL.
+#   - `agreement` = max_votes/N. agreement < 2/3 → NEUTRAL, conf=0.0
+#     (A4E.4 belt-and-braces; trader's `min_agreement` is the soft gate).
+#   - `confidence` = `p_alpha` when present (cycle-7 contract); else
+#     mean(P[winner]). KNOWN AMBIGUITY (A0.3): trader's `2·conf − 1`
+#     edge silently changes semantics between samples.
+#   - All N samples fail to parse AND regex recovers < 50% → per-market
+#     single-call classify(); those failing → NEUTRAL conf=0.0. Never raises.
+#   - SEULGI_BYPASS_LLM=1 short-circuits before any HTTP (A1.6).
 #
-# Side effects:
-#   - HTTPS POSTs to OpenRouter `/chat/completions` (one per ensemble
-#     sample; semaphore = max(max_concurrent, 2·ensemble_samples)).
-#   - DB writes (A2.1, 2026-05-22) — when `db` was passed to
-#     `DirectionClassifier(...)`, classify_batch logs ONE row per
-#     ensemble sample to `llm_calls` (parse_ok=0/1, response_text
-#     capped at 8KB) plus a paired `llm_parse_failures` row on parse
-#     errors. Writes are awaited synchronously before classify_batch
-#     returns so ordering is deterministic for replay tooling. Errors
-#     are swallowed so the trading path is never blocked by logging.
-#     SEULGI_BYPASS_LLM=1 short-circuits BEFORE any logging — no LLM
-#     call happened, no `llm_calls` row written.
-#   - The caller (engine.py) still writes:
-#       * `usage_events` (kind='ai_tokens', stage='prediction').
+# Side effects: HTTPS POSTs to OpenRouter `/chat/completions` (one per
+# ensemble sample, semaphore-throttled); A2.1 (2026-05-22) DB writes to
+# `llm_calls` + `llm_parse_failures` when `db` is passed (errors swallowed
+# so logging never blocks the trade path). engine.py writes the paired
+# `usage_events` row.
 #
-# Failure modes:
-#   - HTTP 429 → exponential backoff up to 3 attempts, then None.
-#   - HTTP 5xx / other → logged + None on first failure (no retry).
-#   - HTTP 402 (insufficient credits) → currently SWALLOWED as a
-#     generic non-200 (no special surface); the OpenRouter budget
-#     poller is the only mechanism that notices and toggles
-#     `data/budget_paused.flag` (engine.py reads, ai.py does not).
-#   - aiohttp timeout (30s) / connection error → logged + None, no retry.
-#   - JSON parse error (truncation at max_tokens, prose preamble,
-#     trailing punctuation in `reason`, schema regression to legacy
-#     {direction,confidence}) → batch returns None, falls back to
-#     per-market path; all-failed batches log a single warning.
+# Failure modes: 429 → expo backoff 3 attempts; other non-200 → None
+# (HTTP 402 silently treated as generic failure — budget.py owns pause).
+# Timeout/connection error → None. Parse error → regex-extract fallback;
+# < 50% recovered → per-market classify() fallback; that fails → NEUTRAL.
 #
-# Non-goals:
-#   - Pre-AI rules (engine.py / rules.py).
-#   - Trade sizing, gating, Kelly, fees (trader.py / simulate.py).
-#   - OpenRouter credit polling / budget enforcement (budget.py).
-#   - Persisting decision telemetry (engine.py owns decision_inputs).
+# Non-goals: pre-AI rules, sizing/gating/Kelly/fees, credit polling,
+# decision_inputs persistence.
 # ───────────────────────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -130,15 +96,66 @@ logger = logging.getLogger(__name__)
 _DEFAULT_API_BASE = "https://openrouter.ai/api/v1"
 _CHAT_PATH = "/chat/completions"
 
-# A2.1 (2026-05-22): cap for `llm_calls.response_text` writes. Chosen to
-# match the schema comment in db.py while keeping per-call row size bounded.
-# Responses longer than the cap get truncated with the `[...truncated]`
-# suffix preserved verbatim so post-hoc tooling can detect truncation.
+# A2.1 (2026-05-22): caps for response_text writes. Truncated responses get
+# the `[...truncated]` suffix so post-hoc tooling can detect truncation.
 _LLM_CALL_RESPONSE_CAP = 8 * 1024
 _LLM_CALL_TRUNC_SUFFIX = "[...truncated]"
-
-# A2.1 cap for `llm_parse_failures.response_text` — schema says ~4KB.
 _LLM_PARSE_FAILURE_RESPONSE_CAP = 4 * 1024
+
+# A4E.4 (2026-05-23): strict JSON schema for Stage-3. OpenRouter passes
+# this to providers that support OpenAI-compatible `json_schema`. A 400
+# matching `_SCHEMA_UNSUPPORTED_MARKERS` flips the instance to `json_object`
+# for the remainder of its lifetime.
+_RESPONSE_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "headline_classification",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "decisions": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "idx": {"type": "integer"},
+                            "p_yes": {"type": "number", "minimum": 0, "maximum": 1},
+                            "p_no": {"type": "number", "minimum": 0, "maximum": 1},
+                            "p_neutral": {"type": "number", "minimum": 0, "maximum": 1},
+                            "p_alpha": {"type": "number", "minimum": 0, "maximum": 1},
+                            "reason": {"type": "string"},
+                        },
+                        "required": ["idx", "p_yes", "p_no", "p_neutral",
+                                     "p_alpha", "reason"],
+                    },
+                },
+            },
+            "required": ["decisions"],
+        },
+    },
+}
+
+# A4E.4: hard 2/3 agreement gate enforced in `_aggregate_ensemble`. Below
+# this, direction is NEUTRAL and confidence is 0.0 (independent of trader's
+# `min_agreement` soft skip).
+_AGREEMENT_DEMOTE_THRESHOLD = 2.0 / 3.0
+
+# A4E.4: regex-extract fallback for malformed JSON.
+_PARTIAL_OBJECT_RE = re.compile(
+    r'"idx"\s*:\s*(?P<idx>\d+).*?'
+    r'"p_yes"\s*:\s*(?P<p_yes>[0-9.]+).*?'
+    r'"p_no"\s*:\s*(?P<p_no>[0-9.]+).*?'
+    r'"p_neutral"\s*:\s*(?P<p_neutral>[0-9.]+)'
+    r'(?:.*?"p_alpha"\s*:\s*(?P<p_alpha>[0-9.]+))?',
+    re.DOTALL,
+)
+
+# A4E.4: case-insensitive substrings indicating a provider rejected json_schema.
+_SCHEMA_UNSUPPORTED_MARKERS = (
+    "json_schema", "json schema", "response_format.*schema",
+    "schema is not supported", "unsupported response_format",
+)
 
 
 def _truncate_response(text: str, cap: int) -> str:
@@ -158,25 +175,18 @@ def _truncate_response(text: str, cap: int) -> str:
         return _LLM_CALL_TRUNC_SUFFIX[:cap]
     return text[:head] + _LLM_CALL_TRUNC_SUFFIX
 
-# A1.6 (2026-05-22): operator toggle that short-circuits the Stage-3
-# prediction LLM with a deterministic favorite-side synthetic result.
-# Set `SEULGI_BYPASS_LLM=1` to run the trade-filter pipeline at full
-# volume with $0 OpenRouter spend; trader gates (mid_band, min_edge,
-# max_positions, freshness, etc.) still apply. Default 0 = LLM enabled.
+# A1.6: operator toggle — SEULGI_BYPASS_LLM=1 short-circuits Stage-3 with
+# deterministic favorite-side results (zero OpenRouter spend; trader gates
+# still apply). Read fresh each call so tests can toggle via monkeypatch.
 _BYPASS_ENV_VAR = "SEULGI_BYPASS_LLM"
 _BYPASS_MODEL_TAG = "llm_bypass"
 
 
 def _bypass_enabled() -> bool:
-    """True when `SEULGI_BYPASS_LLM=1`. Read fresh each call so tests can
-    toggle the env var via monkeypatch without recreating the classifier."""
     return os.environ.get(_BYPASS_ENV_VAR, "0") == "1"
 
 
-# Emit the startup banner exactly once per process so log volume stays
-# proportional to ensemble batches, not headlines. Reset to False in tests
-# via `ai._BYPASS_STARTUP_LOGGED = False` if you want to re-observe it.
-_BYPASS_STARTUP_LOGGED = False
+_BYPASS_STARTUP_LOGGED = False  # reset to False in tests to re-observe
 
 
 def _log_bypass_startup_once() -> None:
@@ -185,9 +195,8 @@ def _log_bypass_startup_once() -> None:
         return
     _BYPASS_STARTUP_LOGGED = True
     logger.info(
-        "[ai] LLM_BYPASS active — env %s=1; Stage-3 prediction will return "
-        "favorite-side synthetic results with 0 OpenRouter spend",
-        _BYPASS_ENV_VAR,
+        "[ai] LLM_BYPASS active — env %s=1; Stage-3 returns favorite-side "
+        "synthetic results, $0 OpenRouter spend", _BYPASS_ENV_VAR,
     )
 
 _SYSTEM_MESSAGE = """\
@@ -217,10 +226,24 @@ Rules:
 """
 
 # Batched prompt — evaluates N markets in one call (main path)
+#
+# A4E.4 (2026-05-23): the system message now permits a `<scratch>...</scratch>`
+# chain-of-thought block before the JSON. The parser strips everything before
+# the first `{` so the scratch content is discarded — token spend goes to
+# reasoning, the trader only sees the final structured output. Per memory
+# `feedback_reasoning_budget`: spend on thinking, constrain output.
 _BATCH_SYSTEM_MESSAGE = """\
 You are a quantitative prediction market analyst. Evaluate a news headline against
-multiple Polymarket questions. Output ONLY a JSON array, one object per question,
-in the same order as the input list. No prose, no markdown.
+multiple Polymarket questions.
+
+FIRST, in a <scratch>...</scratch> block, think step-by-step through the
+headline → market relationship for each question. Consider: does the headline
+introduce new information, is the market already priced for it, what is the
+source's trustworthiness. The scratch block will be DISCARDED after parsing —
+only the JSON is consumed downstream.
+
+THEN, output the final JSON object. No prose between the </scratch> tag and the
+opening `{`. No markdown fences.
 """
 
 _BATCH_PROMPT_TEMPLATE = """\
@@ -230,8 +253,8 @@ Evaluate the headline against each of the following Polymarket questions:
 
 {questions_block}
 
-For each question output exactly:
-{{"idx": <0-based index>, "p_yes": <0.0-1.0>, "p_no": <0.0-1.0>, "p_neutral": <0.0-1.0>, "p_alpha": <0.0-1.0>, "risk": <0.0-1.0>, "reason": "<one sentence>"}}
+After your <scratch> reasoning, emit a JSON object with one entry per question:
+{{"decisions": [{{"idx": <0-based index>, "p_yes": <0.0-1.0>, "p_no": <0.0-1.0>, "p_neutral": <0.0-1.0>, "p_alpha": <0.0-1.0>, "reason": "<one sentence>"}}, ...]}}
 
 Rules:
 - p_yes  = probability the headline increases YES outcome likelihood
@@ -245,10 +268,8 @@ Rules:
     Lower it when mid is already pinned near 0/1, the headline is a restatement, or the source is low-trust.
     Raise it when the headline introduces a hard fact (numbers, names, decisions) and the market is mid-range and reactive.
     p_alpha ≤ 0.5 means "do not bet, even though I have a directional guess".
-- risk = expected magnitude of the realized 5-minute |Δprice| on a 0–1 scale.
-    0 ≈ ±0.5¢ noise; 0.5 ≈ ±2–3¢ typical; 1 ≈ bimodal ±10¢, hard to predict direction.
 
-- Respond with EXACTLY this JSON shape: {{"results": [<array of {n} objects, ordered by idx>]}}
+- The "decisions" array must have EXACTLY {n} entries, ordered by idx.
 """
 
 _REPUBLISH_BLOCK = """\
@@ -266,12 +287,8 @@ FRESHNESS: {label} (nearest prior: {age_str}, cosine_dist={dist_str})
 
 
 def _mkt_ctx_to_dict(ctx) -> Optional[dict]:
-    """Serialize a MarketContext for prompt_meta. None passes through.
-
-    Inlined here to avoid a circular import between ai.py and
-    market_context.py — both ultimately depend on each other via the
-    runner, so this tiny duplicate keeps the import graph clean.
-    """
+    """Serialize MarketContext for prompt_meta. None passes through. Inlined
+    to avoid a circular import with market_context.py."""
     if ctx is None:
         return None
     return {
@@ -280,43 +297,48 @@ def _mkt_ctx_to_dict(ctx) -> Optional[dict]:
     }
 
 
-def _build_bypass_results(matches: list) -> list["ClassifyResult"]:
-    """
-    Build deterministic favorite-side synthetic ClassifyResults for the
-    `SEULGI_BYPASS_LLM=1` runtime toggle. Pure function — no I/O, no token
-    spend. Direction = favorite of `mid_yes` (NO when mid is None so the
-    direction is at least defined). Confidence/p_alpha = 0.9 / 1.0 clear
-    any plausible min_confidence / EV floors; the trader's mid_band /
-    min_edge / max_positions / freshness gates still apply.
+def _build_prompt_meta(
+    *, model, n_samples, samples_ok, temperature, is_republish, similar_to,
+    source, freshness, relevance_verdicts, matches,
+) -> dict:
+    """A4E.4: shared prompt_meta builder for bypass + real-LLM paths."""
+    return {
+        "model": model, "n_samples": n_samples, "samples_ok": samples_ok,
+        "temperature": temperature, "is_republish": bool(is_republish),
+        "similar_to": (similar_to or "")[:200] if similar_to else None,
+        "source": source,
+        "freshness_label": getattr(freshness, "label", None) if freshness else None,
+        "nearest_age_secs": (
+            getattr(freshness, "nearest_age_secs", None) if freshness else None
+        ),
+        "nearest_dist": getattr(freshness, "nearest_dist", None) if freshness else None,
+        "relevance_scores": (
+            [getattr(v, "score", None) for v in relevance_verdicts]
+            if relevance_verdicts else None
+        ),
+        "market_context": [
+            _mkt_ctx_to_dict(getattr(m, "_mkt_ctx", None)) for m in matches
+        ],
+    }
 
-    Determinism contract: same `matches` (same `mid_yes` values) → same
-    results, byte-for-byte. The aggregator/parser is intentionally NOT
-    used here — synthesised results bypass that whole code path.
-    """
+
+def _build_bypass_results(matches: list) -> list["ClassifyResult"]:
+    """SEULGI_BYPASS_LLM=1 synthetic results — favorite-side direction,
+    confidence/p_alpha pinned high enough to clear trader gates. Pure,
+    deterministic, no HTTP. Direction = favorite of mid_yes (None→NO)."""
     out: list[ClassifyResult] = []
     for m in matches:
         mid = getattr(m, "mid_yes", None)
-        # Favorite-side: YES when mid >= 0.5, NO otherwise. None → NO (the
-        # "favorite" is undefined; pick a stable side so the result is
-        # deterministic and the trader can still evaluate its own gates).
         is_yes = mid is not None and mid >= 0.5
         direction = Direction.YES if is_yes else Direction.NO
         p_yes = 0.9 if is_yes else 0.1
         p_no = 0.9 if not is_yes else 0.1
         out.append(ClassifyResult(
-            direction=direction,
-            confidence=0.9,
-            reason="LLM bypass: favorite-side synthetic",
-            tokens_used=0,
-            p_yes=p_yes,
-            p_no=p_no,
-            p_neutral=0.0,
-            agreement=1.0,
-            p_alpha=1.0,
-            risk_score=0.0,
-            raw_response="",
-            votes={direction.value: 1},
-            bypass=True,
+            direction=direction, confidence=0.9,
+            reason="LLM bypass: favorite-side synthetic", tokens_used=0,
+            p_yes=p_yes, p_no=p_no, p_neutral=0.0,
+            agreement=1.0, p_alpha=1.0, risk_score=0.0,
+            raw_response="", votes={direction.value: 1}, bypass=True,
         ))
     return out
 
@@ -365,40 +387,28 @@ class Direction(str, Enum):
 
 @dataclass
 class ClassifyResult:
+    # Production-facing fields the trader consumes.
     direction: Direction
-    confidence: float      # 0.0–1.0  — production-facing (alias of p_alpha in cycle 7+)
+    confidence: float      # cycle-7+: alias of p_alpha when emitted
     reason: str
     tokens_used: int = 0
-    # Ensemble-aware fields (filled by classify_batch when ensemble_samples > 1;
-    # a single-sample call leaves these defaulted). The dataclass carries them
-    # so callers can downsample what they log without parsing JSON twice.
-    #
-    # p_yes / p_no / p_neutral: average of per-sample model-emitted distributions
-    # agreement: fraction of ensemble samples that voted for the winning direction
-    #            (1.0 = unanimous, 1/N = no signal — model can't decide)
-    # p_alpha: probability the argmax-direction trade is +EV in 5–30 min
-    # risk_score: expected |Δ5m| magnitude on a [0,1] scale (0=tiny, 1=bimodal big)
+    # Ensemble-aware fields — filled by classify_batch when ensemble_samples>1;
+    # single-sample calls leave these defaulted. p_*: mean of per-sample
+    # distributions. agreement: max_votes/N (1.0=unanimous, 1/N=no signal).
+    # p_alpha: probability the argmax-direction trade is +EV in 5–30 min.
+    # risk_score: expected |Δ5m| on [0,1].
     p_yes: float = 0.0
     p_no: float = 0.0
     p_neutral: float = 0.0
     agreement: float = 0.0
     p_alpha: float = 0.0
     risk_score: float = 0.0
-    # Per-market raw JSON object the model emitted (one entry of the batch
-    # "results" array, dumped back to text and truncated to ~2KB). Persisted
-    # on the trade row so post-hoc analysis can re-parse the full distribution
-    # without a separate log file. Populated for ensembled batch calls; left
-    # empty on the legacy single-market path.
+    # Per-market raw JSON the model emitted (≤2KB). Persisted on the trade
+    # row so post-hoc analysis can re-parse the distribution.
     raw_response: str = ""
-    # Per-market ensemble vote counts {"YES":n, "NO":n, "NEUTRAL":n}. Carries
-    # the same information as `agreement` but lets the dashboard show 2/3 vs
-    # 3/3 separately, and `agreement` discards which directions lost.
+    # Per-market vote counts {"YES":n,"NO":n,"NEUTRAL":n}.
     votes: dict = field(default_factory=dict)
-    # A1.6 (2026-05-22): True when this result was synthesised by the
-    # `SEULGI_BYPASS_LLM=1` operator toggle instead of an OpenRouter call.
-    # The trader's pre-AI rules and post-AI gates still apply — this flag
-    # only marks "no LLM was consulted" so post-mortem queries can filter
-    # bypass rows out of any model-quality analysis.
+    # A1.6 (2026-05-22): True when synthesised by SEULGI_BYPASS_LLM=1.
     bypass: bool = False
 
 
@@ -427,6 +437,7 @@ class DirectionClassifier:
         premium_sim_threshold: float = 0.70,
         ensemble_samples: int = 3,
         ensemble_temperature: float = 0.5,
+        batch_size: int = 10,
         db=None,
     ) -> None:
         self._api_key = api_key
@@ -434,20 +445,19 @@ class DirectionClassifier:
         self._premium_model = premium_model
         self._premium_sim_threshold = premium_sim_threshold
         self._url = api_base.rstrip("/") + _CHAT_PATH
-        # Semaphore caps API concurrency. Multiply by ensemble_samples so a
-        # single ensembled call doesn't monopolise the budget on its peers.
+        # Semaphore — caps API concurrency; max() with ensemble_samples*2 so
+        # a single ensembled call doesn't starve its peers.
         self._semaphore = asyncio.Semaphore(max(max_concurrent, ensemble_samples * 2))
         self._session: Optional[aiohttp.ClientSession] = None
-        # Ensemble config: N parallel calls at ensemble_temperature, then
-        # average the per-sample distributions and majority-vote the
-        # direction. ensemble_samples=1 falls back to legacy behaviour.
+        # Ensemble: N parallel calls at ensemble_temperature; aggregated by
+        # majority-vote + mean distribution. N=1 reproduces single-call path.
         self._ensemble_samples = max(1, ensemble_samples)
         self._ensemble_temperature = ensemble_temperature
-        # A2.1 (2026-05-22): optional `db` for capturing every LLM round-trip
-        # to `llm_calls`. None disables logging entirely so tests / scripts
-        # that don't need it can stay decoupled from a real DB. Writes are
-        # wrapped in try/except so a logging failure NEVER blocks the trade
-        # path — fire-and-forget semantics with synchronous ordering.
+        # A4E.4: batch_size chunks matches into sub-batches per LLM call.
+        self._batch_size = max(1, batch_size)
+        # A4E.4: prefer json_schema; first schema-unsupported 400 flips False.
+        self._schema_supported = True
+        # A2.1: optional db for logging every round-trip to llm_calls.
         self._db = db
 
     def _get_session(self) -> aiohttp.ClientSession:
@@ -476,54 +486,104 @@ class DirectionClassifier:
         relevance_verdicts: Optional[list] = None,  # list[_SimVerdict] aligned to matches
         headline_id: Optional[str] = None,       # A2.1 — for llm_calls correlation
     ) -> tuple[list[ClassifyResult], dict]:
-        """
-        Classify a headline against ALL matching markets in a single API call.
-
-        Up to 15× cheaper than calling classify() per market.
-        Returns `(results, prompt_meta)` where results has one entry per
-        match in input order, and `prompt_meta` captures the runtime context
-        (model, samples, republish flag, source, lessons) so the trader can
-        persist it on every trade row.
-        Falls back to per-market classify() if the batch parse fails.
-        """
+        """Classify headline against `matches`. Returns (results, prompt_meta).
+        Results are in input order, one per match. A4E.4: chunks into
+        sub-batches of `batch_size`. Falls back to per-market classify()
+        when both the JSON parse and the regex-extract recovery fail."""
         if not matches:
             return [], {}
 
-        # A1.6 (2026-05-22): SEULGI_BYPASS_LLM=1 short-circuits BEFORE any
-        # OpenRouter HTTP — zero token spend, deterministic favorite-side
-        # results. Trader gates downstream still apply. Checked first so
-        # the entire prompt-building path below is skipped on bypass.
+        # A1.6: SEULGI_BYPASS_LLM=1 short-circuits BEFORE any HTTP — zero
+        # token spend, deterministic favorite-side results.
         if _bypass_enabled():
             _log_bypass_startup_once()
             results = _build_bypass_results(matches)
-            logger.info(
-                "[ai] LLM_BYPASS active — synthesizing %d results", len(results),
+            logger.info("[ai] LLM_BYPASS active — synthesizing %d results", len(results))
+            meta = _build_prompt_meta(
+                model=_BYPASS_MODEL_TAG, n_samples=0, samples_ok=0, temperature=0.0,
+                is_republish=is_republish, similar_to=similar_to, source=source,
+                freshness=freshness, relevance_verdicts=relevance_verdicts,
+                matches=matches,
             )
-            prompt_meta = {
-                "model": _BYPASS_MODEL_TAG,
-                "bypass": True,
-                "n_samples": 0,
-                "samples_ok": 0,
-                "temperature": 0.0,
-                "is_republish": bool(is_republish),
-                "similar_to": (similar_to or "")[:200] if similar_to else None,
-                "source": source,
-                "freshness_label": getattr(freshness, "label", None) if freshness else None,
-                "nearest_age_secs": getattr(freshness, "nearest_age_secs", None) if freshness else None,
-                "nearest_dist": getattr(freshness, "nearest_dist", None) if freshness else None,
-                "relevance_scores": (
-                    [getattr(v, "score", None) for v in relevance_verdicts]
-                    if relevance_verdicts else None
-                ),
-                "market_context": [
-                    _mkt_ctx_to_dict(getattr(m, "_mkt_ctx", None)) for m in matches
-                ],
-            }
-            return results, prompt_meta
+            meta["bypass"] = True
+            return results, meta
 
-        # Freshness block replaces the legacy binary republish hint when
-        # we have a labelled FreshnessResult. The legacy block stays as a
-        # fallback for callers that haven't migrated to the assess() API.
+        # Premium model gate
+        max_sim = max(getattr(m, "similarity", 0.0) for m in matches)
+        model = (
+            self._premium_model
+            if self._premium_model and max_sim >= self._premium_sim_threshold
+            else self._model
+        )
+        if model != self._model:
+            logger.info("[ai] routing batch to premium model=%s (max_sim=%.2f)", model, max_sim)
+
+        # A4E.4: chunk into batch_size sub-batches and run them concurrently.
+        n = len(matches)
+        bs = self._batch_size
+        chunk_indices = [list(range(i, min(i + bs, n))) for i in range(0, n, bs)]
+        chunk_results: list[list[ClassifyResult]] = [[] for _ in chunk_indices]
+        chunk_tokens = [0] * len(chunk_indices)
+        chunk_samples_ok = [0] * len(chunk_indices)
+
+        async def _run_chunk(ci: int) -> None:
+            indices = chunk_indices[ci]
+            sub_matches = [matches[j] for j in indices]
+            sub_rv = (
+                [relevance_verdicts[j] for j in indices if j < len(relevance_verdicts)]
+                if relevance_verdicts else None
+            )
+            res, tokens, samples_ok = await self._classify_chunk(
+                headline=headline, matches=sub_matches, model=model,
+                is_republish=is_republish, similar_to=similar_to, source=source,
+                freshness=freshness, relevance_verdicts=sub_rv,
+                headline_id=headline_id,
+            )
+            chunk_results[ci] = res
+            chunk_tokens[ci] = tokens
+            chunk_samples_ok[ci] = samples_ok
+
+        await asyncio.gather(*[_run_chunk(ci) for ci in range(len(chunk_indices))])
+
+        aggregated: list[ClassifyResult] = []
+        for chunk in chunk_results:
+            aggregated.extend(chunk)
+
+        total_tokens = sum(chunk_tokens)
+        meta = _build_prompt_meta(
+            model=model, n_samples=self._ensemble_samples,
+            samples_ok=sum(chunk_samples_ok),
+            temperature=(self._ensemble_temperature if self._ensemble_samples > 1 else 0.1),
+            is_republish=is_republish, similar_to=similar_to, source=source,
+            freshness=freshness, relevance_verdicts=relevance_verdicts,
+            matches=matches,
+        )
+        meta["n_chunks"] = len(chunk_indices)
+        meta["batch_size"] = self._batch_size
+
+        logger.info(
+            "[ai] ensemble classify: %d markets in %d chunk(s) of %d, "
+            "samples_ok=%d, model=%s, tokens=%d",
+            n, len(chunk_indices), bs, sum(chunk_samples_ok), model, total_tokens,
+        )
+        return aggregated, meta
+
+    async def _classify_chunk(
+        self,
+        *,
+        headline: str,
+        matches: list,
+        model: str,
+        is_republish: bool,
+        similar_to: Optional[str],
+        source: Optional[str],
+        freshness,
+        relevance_verdicts: Optional[list],
+        headline_id: Optional[str],
+    ) -> tuple[list[ClassifyResult], int, int]:
+        """A4E.4: classify one chunk (≤ batch_size markets). Returns
+        (per_market_results, total_tokens, samples_ok)."""
+        # Freshness replaces legacy binary republish hint when available.
         freshness_block = _format_freshness_block(freshness)
         if freshness_block:
             republish_block = ""
@@ -533,18 +593,14 @@ class DirectionClassifier:
                 if is_republish and similar_to else ""
             )
         source_block = f"Source: {source}\n" if source else ""
-        # Lessons system retired 2026-05-22 — the seeded "treat as NEUTRAL"
-        # advisories were biasing every output toward NEUTRAL while
-        # providing no empirical lift. The template still references
-        # {lessons_block} so we pass an empty string to keep the format()
-        # call happy.
+        # Lessons retired 2026-05-22; template still references {lessons_block}.
         lessons_block = ""
 
-        # Build the numbered question block. mid_yes is the YES-token mid,
-        # which is what "current likelihood of YES" maps to in [0,1].
-        # When relevance verdicts are available, surface the Stage-2 score +
-        # short reason so the prediction model can defer/agree explicitly.
-        rv_by_idx = {}
+        # TODO(A4E.4(e)): few-shot exemplars from recent EXECUTED+profitable
+        # trades — DEFERRED. Needs a nightly mining job + sample cache so the
+        # ~1500-token exemplar block doesn't tax every prediction call.
+
+        rv_by_idx: dict[int, object] = {}
         if relevance_verdicts:
             for i, v in enumerate(relevance_verdicts[:len(matches)]):
                 rv_by_idx[i] = v
@@ -553,30 +609,23 @@ class DirectionClassifier:
             mid = getattr(m, "mid_yes", None)
             mid_str = f"{mid:.3f}" if mid is not None else "unknown"
             rv = rv_by_idx.get(i)
-            if rv is not None:
-                rv_str = f" | relevance={rv.score}:{rv.reason[:70]}"
-            else:
-                rv_str = ""
+            rv_str = f" | relevance={rv.score}:{rv.reason[:70]}" if rv is not None else ""
             lines.append(
                 f"{i}. [YES mid={mid_str} | sim={m.similarity:.2f}{rv_str}] {m.question}"
             )
         questions_block = "\n".join(lines)
 
-        # Cycle-11: optional pre-headline market behaviour block.
-        # Rendered from per-match `_mkt_ctx` attrs (populated by the
-        # runner via market_context.fetch_context_for_matches). Empty
-        # string when no match has context, so unbreached.
         try:
             from market_context import format_market_context_block
             mkt_ctx_block = format_market_context_block(matches)
         except Exception:  # noqa: BLE001
             mkt_ctx_block = ""
 
-        # Prepend freshness on its own line so blocks don't run together.
-        if freshness_block and not freshness_block.endswith("\n"):
-            freshness_block_norm = freshness_block + "\n"
-        else:
-            freshness_block_norm = freshness_block
+        freshness_block_norm = (
+            freshness_block + "\n"
+            if freshness_block and not freshness_block.endswith("\n")
+            else freshness_block
+        )
         prompt = _BATCH_PROMPT_TEMPLATE.format(
             headline=headline,
             source_block=source_block,
@@ -587,37 +636,26 @@ class DirectionClassifier:
             n=len(matches),
         )
 
-        # Use premium model if max similarity crosses threshold
-        max_sim = max(getattr(m, "similarity", 0.0) for m in matches)
-        model = (
-            self._premium_model
-            if self._premium_model and max_sim >= self._premium_sim_threshold
-            else self._model
-        )
-        if model != self._model:
-            logger.info("[ai] routing batch to premium model=%s (max_sim=%.2f)", model, max_sim)
-
-        # Ensemble: N parallel calls at higher temperature, then aggregate
-        # per-market across samples. N=1 reproduces the single-call path.
         N = self._ensemble_samples
         temp = self._ensemble_temperature if N > 1 else 0.1
 
         def _build_body() -> dict:
-            return {
+            body = {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": _BATCH_SYSTEM_MESSAGE},
                     {"role": "user",   "content": prompt},
                 ],
-                "max_tokens": 160 * len(matches) + 100,
+                # Headroom for the <scratch> block + the JSON body.
+                "max_tokens": 200 * max(1, len(matches)) + 200,
                 "temperature": temp,
-                "response_format": {"type": "json_object"},
             }
+            body["response_format"] = (
+                _RESPONSE_SCHEMA if self._schema_supported
+                else {"type": "json_object"}
+            )
+            return body
 
-        # A2.1: SHA-256 of the full user prompt — stable content-addressable
-        # key for replay/cache lookup. The system message + body envelope are
-        # constants by model, so hashing the user prompt is sufficient. We
-        # compute it once per batch (same prompt across N ensemble samples).
         prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         request_ts = _dt.datetime.now(_dt.timezone.utc).isoformat()
 
@@ -626,22 +664,18 @@ class DirectionClassifier:
             return_exceptions=False,
         )
 
-        # Parse each sample. Drop ones that errored or failed to parse — if
-        # we're left with zero, fall back to per-market on a single sample.
-        # A2.1: log every sample (success OR parse-failure) to `llm_calls`,
-        # and additionally write a `llm_parse_failures` row on parse errors.
-        # Logging never raises into the trade path (wrapped in try/except).
         per_sample_results: list[list[ClassifyResult]] = []
         per_sample_raws: list[list[str]] = []
         total_tokens = 0
         for data in sample_responses:
             if data is None:
-                # HTTP-level failure (non-200 or exception); _call_api already
-                # logged. No usage block to mine, no response_text to persist —
-                # skip the llm_calls write so a row only ever exists for
-                # round-trips that actually completed.
                 continue
             parsed = _parse_batch_response(data, len(matches))
+            if parsed is None:
+                # A4E.4(b): regex-extract fallback. Tries to recover
+                # per-market tuples from malformed JSON. Accepts the
+                # partial if ≥ 50% of expected markets are covered.
+                parsed = _regex_extract_partial(_extract_text(data), len(matches))
             parse_ok = parsed is not None
             response_text_raw = _extract_text(data)
             usage = data.get("usage", {}) or {}
@@ -657,8 +691,6 @@ class DirectionClassifier:
                 batch_size=len(matches),
             )
             if not parse_ok:
-                # Paired write: failure-mode analysis table. Carries the
-                # error context that `llm_calls` (replay-focused) doesn't.
                 await self._log_llm_parse_failure_safe(
                     ts=request_ts,
                     model=model,
@@ -671,28 +703,9 @@ class DirectionClassifier:
             per_sample_raws.append(parsed[1])
             total_tokens += int(usage.get("total_tokens", 0))
 
-        prompt_meta = {
-            "model": model,
-            "n_samples": N,
-            "samples_ok": len(per_sample_results),
-            "temperature": temp,
-            "is_republish": bool(is_republish),
-            "similar_to": (similar_to or "")[:200] if similar_to else None,
-            "source": source,
-            "freshness_label": getattr(freshness, "label", None) if freshness else None,
-            "nearest_age_secs": getattr(freshness, "nearest_age_secs", None) if freshness else None,
-            "nearest_dist": getattr(freshness, "nearest_dist", None) if freshness else None,
-            "relevance_scores": (
-                [getattr(v, "score", None) for v in relevance_verdicts]
-                if relevance_verdicts else None
-            ),
-            "market_context": [
-                _mkt_ctx_to_dict(getattr(m, "_mkt_ctx", None)) for m in matches
-            ],
-        }
-
         if not per_sample_results:
-            logger.warning("[ai] all %d ensemble samples failed — per-market fallback", N)
+            logger.warning("[ai] all %d ensemble samples failed in chunk — "
+                           "per-market fallback", N)
             fallback = await asyncio.gather(*[
                 self.classify(headline, m.question,
                               mid_price=getattr(m, "mid_price", None),
@@ -700,20 +713,16 @@ class DirectionClassifier:
                               is_republish=is_republish, similar_to=similar_to)
                 for m in matches
             ])
-            return fallback, prompt_meta
+            return list(fallback), total_tokens, 0
 
         aggregated = _aggregate_ensemble(
-            per_sample_results, n_markets=len(matches), raw_samples=per_sample_raws,
+            per_sample_results, n_markets=len(matches),
+            raw_samples=per_sample_raws,
         )
         per_market_tokens = max(1, total_tokens // max(1, len(aggregated)))
         for r in aggregated:
             r.tokens_used = per_market_tokens
-
-        logger.info(
-            "[ai] ensemble classify: %d markets × %d/%d samples, model=%s, tokens=%d",
-            len(matches), len(per_sample_results), N, model, total_tokens,
-        )
-        return aggregated, prompt_meta
+        return aggregated, total_tokens, len(per_sample_results)
 
     # ------------------------------------------------------------------
     # Single-market path (legacy / fallback)
@@ -776,62 +785,50 @@ class DirectionClassifier:
     # ------------------------------------------------------------------
 
     async def _log_llm_call_safe(
-        self,
-        *,
-        ts: str,
-        model: str,
-        prompt_sha: str,
-        prompt_tokens,
-        completion_tokens,
-        response_text: str,
-        parse_ok: bool,
-        headline_id: Optional[str],
-        batch_size: int,
+        self, *, ts: str, model: str, prompt_sha: str,
+        prompt_tokens, completion_tokens, response_text: str,
+        parse_ok: bool, headline_id: Optional[str], batch_size: int,
     ) -> None:
-        """Best-effort `db.log_llm_call` wrapper. No-op when db wasn't
-        supplied to the constructor. Errors are logged and swallowed."""
+        """Best-effort db.log_llm_call wrapper. No-op when db is None."""
         if self._db is None:
             return
         try:
             await self._db.log_llm_call(
-                ts=ts,
-                model=model,
-                prompt_sha=prompt_sha,
+                ts=ts, model=model, prompt_sha=prompt_sha,
                 prompt_tokens=(int(prompt_tokens) if prompt_tokens is not None else None),
                 completion_tokens=(int(completion_tokens) if completion_tokens is not None else None),
                 response_text=_truncate_response(response_text or "", _LLM_CALL_RESPONSE_CAP),
-                parse_ok=parse_ok,
-                headline_id=headline_id,
-                batch_size=batch_size,
+                parse_ok=parse_ok, headline_id=headline_id, batch_size=batch_size,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[ai] log_llm_call failed (non-fatal): %r", exc)
 
     async def _log_llm_parse_failure_safe(
-        self,
-        *,
-        ts: str,
-        model: str,
-        error_msg: str,
-        response_text: str,
-        headline_id: Optional[str],
+        self, *, ts: str, model: str, error_msg: str,
+        response_text: str, headline_id: Optional[str],
     ) -> None:
-        """Best-effort `db.log_llm_parse_failure` wrapper. No-op when db
-        wasn't supplied. Errors are logged and swallowed."""
+        """Best-effort db.log_llm_parse_failure wrapper. No-op when db is None."""
         if self._db is None:
             return
         try:
             await self._db.log_llm_parse_failure(
-                ts=ts,
-                model=model,
-                error_msg=error_msg,
+                ts=ts, model=model, error_msg=error_msg,
                 response_text=_truncate_response(
-                    response_text or "", _LLM_PARSE_FAILURE_RESPONSE_CAP,
-                ),
+                    response_text or "", _LLM_PARSE_FAILURE_RESPONSE_CAP),
                 headline_id=headline_id,
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("[ai] log_llm_parse_failure failed (non-fatal): %r", exc)
+
+    @staticmethod
+    def _is_schema_unsupported_error(text: str) -> bool:
+        """A4E.4: True when a 400 body indicates the provider rejected
+        json_schema. Permissive — a false-positive only costs strict-schema
+        reasoning, never correctness."""
+        if not text:
+            return False
+        lowered = text.lower()
+        return any(marker in lowered for marker in _SCHEMA_UNSUPPORTED_MARKERS)
 
     async def _call_api(self, body: dict) -> Optional[dict]:
         """POST to OpenRouter, retry up to 3× on 429. Returns None on failure."""
@@ -858,6 +855,26 @@ class DirectionClassifier:
                             continue
                         if resp.status != 200:
                             text = await resp.text()
+                            # A4E.4: detect "json_schema unsupported" 400s
+                            # and auto-flip the instance to json_object for
+                            # the remainder of its lifetime. Retry the same
+                            # request once with the fallback format so this
+                            # call still succeeds (not just the next one).
+                            if (
+                                resp.status == 400
+                                and self._schema_supported
+                                and self._is_schema_unsupported_error(text)
+                                and isinstance(body.get("response_format"), dict)
+                                and body["response_format"].get("type") == "json_schema"
+                            ):
+                                logger.warning(
+                                    "[ai] provider rejected json_schema; "
+                                    "falling back to json_object for this "
+                                    "classifier (model=%s)", body.get("model"),
+                                )
+                                self._schema_supported = False
+                                body["response_format"] = {"type": "json_object"}
+                                continue
                             logger.warning("[ai] OpenRouter %d: %s", resp.status, text[:200])
                             return None
                         return await resp.json()
@@ -874,31 +891,30 @@ class DirectionClassifier:
 
 
 def _extract_text(data: dict) -> str:
-    """Pull the content string from an OpenRouter chat completion response."""
+    """Pull the content string from a chat completion response. A4E.4: drops
+    `<scratch>` blocks + any prose preamble by trimming everything before
+    the first `{` or `[`."""
     choices = data.get("choices", [])
     if not choices:
         return ""
     text = choices[0].get("message", {}).get("content", "").strip()
-    # Strip markdown code fences (response_format=json_object usually prevents these)
     text = re.sub(r"^```[a-z]*\n?", "", text).rstrip("`").strip()
+    first_brace = text.find("{")
+    first_bracket = text.find("[")
+    candidates = [p for p in (first_brace, first_bracket) if p != -1]
+    if candidates and min(candidates) > 0:
+        text = text[min(candidates):]
     return text
 
 
 def _parse_one(obj: dict) -> ClassifyResult:
-    """
-    Parse one classification object. Accepts either the new distribution form
-    (`p_yes`, `p_no`, `p_neutral`) or the legacy form (`direction`,
-    `confidence`). Models occasionally regress to the legacy form; we accept
-    both rather than throwing the row away.
-
-    The distribution is normalized to sum 1 (defensive against models that
-    don't quite hit unity), then we pick the argmax as the direction and use
-    its probability as the confidence. argmax ties resolve to NEUTRAL.
+    """Parse one classification object. Accepts the new distribution form
+    ({p_yes,p_no,p_neutral}, normalised to sum=1, argmax→direction) or
+    the legacy {direction,confidence} form (models occasionally regress).
     """
     reason = str(obj.get("reason", ""))[:200]
-    # Cycle-7 fields: optional in the response. Defaulted to "no signal"
-    # values so a model that regresses to the old schema doesn't poison the
-    # downstream edge model with a bogus high p_alpha.
+    # Cycle-7 fields optional — default 0 so a regression doesn't poison
+    # the trader edge model with a bogus high p_alpha.
     p_alpha = max(0.0, min(1.0, float(obj.get("p_alpha", 0.0) or 0.0)))
     risk_score = max(0.0, min(1.0, float(obj.get("risk", 0.0) or 0.0)))
 
@@ -978,23 +994,12 @@ def _aggregate_ensemble(
     n_markets: int,
     raw_samples: Optional[list[list[str]]] = None,
 ) -> list[ClassifyResult]:
-    """
-    Collapse N ensemble samples into one per-market ClassifyResult.
+    """Collapse N ensemble samples into one per-market ClassifyResult.
 
-    Inputs: `samples` is a list of N lists, each of length `n_markets`,
-    holding one ClassifyResult per market per sample.
-
-    Aggregation:
-      * Distribution = mean of the per-sample (p_yes, p_no, p_neutral) tuples.
-      * Direction = majority vote of per-sample argmaxes; tie → NEUTRAL.
-        (Picking direction from the *averaged* distribution would silently
-        prefer the largest-mean even when 2/3 samples disagreed; we want
-        agreement to gate execution, so the vote count matters here.)
-      * confidence = mean(P[winning_direction]) × agreement_fraction.
-        This composes "how strongly does the model believe in its pick" with
-        "how often does the model reach the same pick under resampling".
-      * agreement = max(vote_count_yes, vote_count_no, vote_count_neutral) / N.
-        1/N = no signal; 1.0 = unanimous.
+    Per-market: distribution = mean(p_*); direction = majority-vote
+    argmax (ties → NEUTRAL); agreement = max_votes/N; confidence = p_alpha
+    when emitted else mean(P[winner]). A4E.4 hard gate: agreement < 2/3 →
+    NEUTRAL with confidence=0.0, regardless of stated p_alpha.
     """
     if not samples:
         return [ClassifyResult(Direction.NEUTRAL, 0.0, "empty_ensemble") for _ in range(n_markets)]
@@ -1048,6 +1053,14 @@ def _aggregate_ensemble(
             mean_p = p_neu
         confidence = p_alpha if p_alpha > 0.0 else mean_p
 
+        # A4E.4: hard 2/3 agreement gate. Below threshold → NEUTRAL,
+        # confidence=0.0. Distribution + votes still surfaced for dashboards.
+        demoted_reason = ""
+        if agreement + 1e-9 < _AGREEMENT_DEMOTE_THRESHOLD:
+            demoted_reason = f"agreement_below_threshold({agreement:.2f}<2/3)"
+            direction = Direction.NEUTRAL
+            confidence = 0.0
+
         # Pick one representative raw response (the first sample's text for
         # this market). Keeping all N would balloon DB rows; one is enough to
         # recover the model's stated distribution + reason verbatim.
@@ -1061,7 +1074,7 @@ def _aggregate_ensemble(
         out.append(ClassifyResult(
             direction=direction,
             confidence=confidence,
-            reason=reasons[0] if reasons else "",
+            reason=demoted_reason or (reasons[0] if reasons else ""),
             p_yes=p_yes, p_no=p_no, p_neutral=p_neu,
             agreement=agreement,
             p_alpha=p_alpha,
@@ -1075,26 +1088,23 @@ def _aggregate_ensemble(
 def _parse_batch_response(
     data: dict, n: int
 ) -> Optional[tuple[list[ClassifyResult], list[str]]]:
-    """
-    Parse a batched response that should contain a JSON array of n objects.
-
-    The LLM may return:
-      - A top-level array: [{...}, ...]
-      - A wrapper object: {"results": [...]}  or  {"classifications": [...]}
-
-    Returns None if parsing fails so the caller can fall back.
-    """
+    """Parse a batched response: expects `{"decisions":[...]}` (A4E.4
+    schema) but also accepts legacy `{"results":[...]}` /
+    `{"classifications":[...]}` / `{"answers":[...]}` / a top-level
+    array. Returns None on failure so the caller can fall back."""
     try:
         text = _extract_text(data)
         if not text:
             return None
         parsed = json.loads(text)
 
-        # Expected shape: {"results": [...]}. Some models still wrap differently;
+        # Expected shape: {"decisions": [...]} (A4E.4 strict schema) or the
+        # legacy {"results": [...]}. Some models still wrap differently;
         # accept a small set of fallback keys before giving up.
         if isinstance(parsed, dict):
             inner = (
-                parsed.get("results")
+                parsed.get("decisions")
+                or parsed.get("results")
                 or parsed.get("classifications")
                 or parsed.get("answers")
             )
@@ -1138,3 +1148,50 @@ def _parse_batch_response(
         logger.warning("[ai] batch parse error: %s | text=%s", exc,
                        _extract_text(data)[:200] if data else "")
         return None
+
+
+def _regex_extract_partial(
+    text: str, n: int,
+) -> Optional[tuple[list[ClassifyResult], list[str]]]:
+    """A4E.4: regex-extract fallback for malformed JSON. Recovers per-market
+    tuples via a permissive regex; accepts only when ≥ 50% of expected
+    markets are recovered. Missing indices in [0,n) are padded NEUTRAL."""
+    if not text:
+        return None
+    recovered: dict[int, dict] = {}
+    for match in _PARTIAL_OBJECT_RE.finditer(text):
+        try:
+            idx = int(match.group("idx"))
+        except (TypeError, ValueError):
+            continue
+        if idx < 0 or idx >= n or idx in recovered:
+            continue
+        try:
+            recovered[idx] = {
+                "idx": idx,
+                "p_yes": float(match.group("p_yes")),
+                "p_no": float(match.group("p_no")),
+                "p_neutral": float(match.group("p_neutral")),
+                "p_alpha": float(match.group("p_alpha")) if match.group("p_alpha") else 0.0,
+                "reason": "regex_extract",
+            }
+        except (TypeError, ValueError):
+            continue
+
+    if len(recovered) < (n + 1) // 2:
+        return None
+
+    results: list[ClassifyResult] = []
+    raws: list[str] = []
+    for i in range(n):
+        obj = recovered.get(i)
+        if obj is None:
+            results.append(ClassifyResult(Direction.NEUTRAL, 0.0, "missing_regex"))
+            raws.append("")
+            continue
+        results.append(_parse_one(obj))
+        try:
+            raws.append(json.dumps(obj, separators=(",", ":"))[:2000])
+        except Exception:  # noqa: BLE001
+            raws.append("")
+    return results, raws
