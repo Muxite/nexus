@@ -109,6 +109,10 @@ def _make_trader(balance: float = 1000.0):
     # against ClassifyResult fixtures that don't supply `p_alpha`.
     cfg.use_true_ev_formula = False
     cfg.min_ev_per_dollar = 0.0
+    # A4D.3: legacy binary `duplicate_position` lockout for pipeline tests.
+    cfg.position_scaling_enabled = False
+    cfg.max_exposure_per_condition_usdc = 0.0
+    cfg.simulate_min_trade_usdc = 1.0
 
     ai_cfg = MagicMock()
     ai_cfg.min_confidence = 0.45

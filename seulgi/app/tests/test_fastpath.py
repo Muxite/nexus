@@ -147,13 +147,16 @@ class TestOpenPositionsState:
         s = OpenPositionsState()
         await s.add("cid_a", "scout", {"size_usdc": 10, "nested": {"x": 1}})
         snap = s.snapshot()
+        # A4D.3: each key maps to a list of position dicts.
         # Mutating the snapshot must not bleed into state.
-        snap[("cid_a", "scout")]["size_usdc"] = 9999
-        snap[("cid_a", "scout")]["nested"]["x"] = 9999
-        snap[("cid_z", "main")] = {"size_usdc": 1}
+        snap[("cid_a", "scout")][0]["size_usdc"] = 9999
+        snap[("cid_a", "scout")][0]["nested"]["x"] = 9999
+        snap[("cid_a", "scout")].append({"size_usdc": 7777})
+        snap[("cid_z", "main")] = [{"size_usdc": 1}]
         snap2 = s.snapshot()
-        assert snap2[("cid_a", "scout")]["size_usdc"] == 10
-        assert snap2[("cid_a", "scout")]["nested"]["x"] == 1
+        assert snap2[("cid_a", "scout")][0]["size_usdc"] == 10
+        assert snap2[("cid_a", "scout")][0]["nested"]["x"] == 1
+        assert len(snap2[("cid_a", "scout")]) == 1
         assert ("cid_z", "main") not in snap2
 
 
@@ -316,10 +319,10 @@ class TestSnapshotState:
         await fp.execute_trade(_FakeDecision(), q, engine_name="scout")
         snap = fp.snapshot_state()
         assert ("cid_x", "scout") in snap
-        # Mutation isolation.
-        snap[("cid_x", "scout")]["size_usdc"] = -1
+        # A4D.3: lists per key. Mutation isolation.
+        snap[("cid_x", "scout")][0]["size_usdc"] = -1
         snap2 = fp.snapshot_state()
-        assert snap2[("cid_x", "scout")]["size_usdc"] == 10.0
+        assert snap2[("cid_x", "scout")][0]["size_usdc"] == 10.0
 
 
 # ---------------------------------------------------------------------------

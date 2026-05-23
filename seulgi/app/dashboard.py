@@ -221,6 +221,9 @@ class Dashboard:
         # Phase 4B.1: optional calibrator ref; surfaced as a Calibration
         # tile in db_health.txt with per-direction IC / Brier / fitted_at.
         self._calibrator = None
+        # Phase 4E.1: optional composite scorer ref; surfaced as a Composite
+        # Scoring tile in db_health.txt with model AUC / IC / n_samples.
+        self._scorer = None
         self._started_at = datetime.now(timezone.utc)
 
         # Ring buffers
@@ -440,6 +443,11 @@ class Dashboard:
         """Phase 4B.1: attach the per-direction calibrator so db_health.txt
         can render its diagnostics tile (n / IC / Brier / fitted_at)."""
         self._calibrator = calibrator
+
+    def set_scorer(self, scorer) -> None:
+        """Phase 4E.1: attach the composite scorer so db_health.txt can
+        render its diagnostics tile (n / train_auc / test_auc / IC)."""
+        self._scorer = scorer
 
     def set_telemetry(self, telemetry) -> None:
         """A4C.2: attach the async telemetry queue so db_health.txt can

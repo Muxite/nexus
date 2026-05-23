@@ -85,6 +85,12 @@ def _make_cfg(
     # The dedicated TestTrueEVFormula class flips this back on.
     cfg.use_true_ev_formula = False
     cfg.min_ev_per_dollar = 0.0
+    # A4D.3: position scaling defaults OFF here so the pre-existing
+    # `duplicate_position` tests keep their binary-lockout semantics.
+    # The dedicated `test_position_scaling.py` suite flips this ON.
+    cfg.position_scaling_enabled = False
+    cfg.max_exposure_per_condition_usdc = 0.0
+    cfg.simulate_min_trade_usdc = 1.0
     return cfg
 
 
@@ -878,6 +884,11 @@ def _pure_cfg(**overrides):
         # TestTrueEVFormula class flips it on per-call.
         use_true_ev_formula = False
         mode = "paper"
+        # A4D.3: legacy mode for pure-fn tests; dedicated
+        # `test_position_scaling.py` opts in.
+        position_scaling_enabled = False
+        max_exposure_per_condition_usdc = 0.0
+        simulate_min_trade_usdc = 1.0
     c = C()
     for k, v in overrides.items():
         setattr(c, k, v)
@@ -895,13 +906,14 @@ def _pure_ai_cfg(min_confidence=0.45, min_agreement=0.0):
 
 def _pure_ctx(cfg, ai_cfg, *, open_positions=0, unique=0, duplicate=False,
               balance=1000.0, cluster_factor=1.0, post_ai=None,
-              freshness=None):
+              freshness=None, current_exposure=0.0):
     return _EntryCtx(
         cfg=cfg, ai_cfg=ai_cfg, engine_name="balanced",
         parent_engine="balanced", open_positions=open_positions,
         unique_markets=unique, duplicate_position=duplicate,
         balance=balance, cluster_factor=cluster_factor,
         rules_post_ai_reason=post_ai, freshness_label=freshness,
+        current_exposure=current_exposure,
     )
 
 

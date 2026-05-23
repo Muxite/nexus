@@ -314,6 +314,11 @@ def _make_cfg_trader():
     cfg.mid_yes_max = 1.0
     cfg.use_true_ev_formula = False
     cfg.min_ev_per_dollar = 0.0
+    # A4D.3: tests in this file probe the legacy binary `duplicate_position`
+    # skip + cf-bypass interaction. Position scaling is OFF here.
+    cfg.position_scaling_enabled = False
+    cfg.max_exposure_per_condition_usdc = 0.0
+    cfg.simulate_min_trade_usdc = 1.0
     return cfg
 
 

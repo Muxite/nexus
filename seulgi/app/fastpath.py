@@ -64,38 +64,91 @@ class ExecutionOutcome:
 
 
 class OpenPositionsState:
-    """`(condition_id, engine_name) -> position dict`. Hydrated from DB
-    once at boot; mutated in-process thereafter."""
+    """`(condition_id, engine_name) -> list[position dict]`.
+
+    Hydrated from DB once at boot; mutated in-process thereafter.
+
+    A4D.3 (2026-05-23): each key now maps to a LIST of position dicts so
+    position scaling (multiple delta-adds against the same condition × engine)
+    can coexist. Pre-A4D.3 callers treated this as a single position dict;
+    `has()` / `count()` / `unique_markets()` semantics preserved by counting
+    keys with at least one position.
+    """
 
     def __init__(self) -> None:
-        self._positions: dict[tuple[str, str], dict] = {}
+        self._positions: dict[tuple[str, str], list[dict]] = {}
         self._lock = asyncio.Lock()
 
     async def add(self, condition_id: str, engine_name: str, pos: dict) -> None:
+        """Append a position to the (cond_id, engine) bucket. Multiple
+        adds on the same key STACK — each represents a separate trade row."""
         async with self._lock:
-            self._positions[(condition_id, engine_name)] = dict(pos)
+            self._positions.setdefault(
+                (condition_id, engine_name), []
+            ).append(dict(pos))
 
     async def remove(self, condition_id: str, engine_name: str) -> None:
+        """Remove ALL positions on this key. Legacy single-position callers
+        keep this behaviour; multi-position closers should use
+        `remove_by_trade_id` to drop one leg at a time."""
         async with self._lock:
             self._positions.pop((condition_id, engine_name), None)
 
+    async def remove_by_trade_id(
+        self, condition_id: str, engine_name: str, trade_id: Any,
+    ) -> bool:
+        """A4D.3: drop a single leg by `trade_id`. Returns True iff a row
+        was removed. Empties the bucket entirely when it was the last leg."""
+        async with self._lock:
+            key = (condition_id, engine_name)
+            bucket = self._positions.get(key)
+            if not bucket:
+                return False
+            for i, p in enumerate(bucket):
+                if p.get("trade_id") == trade_id:
+                    bucket.pop(i)
+                    if not bucket:
+                        del self._positions[key]
+                    return True
+            return False
+
     async def has(self, condition_id: str, engine_name: str) -> bool:
         async with self._lock:
-            return (condition_id, engine_name) in self._positions
+            return bool(self._positions.get((condition_id, engine_name)))
+
+    async def exposure(self, condition_id: str, engine_name: str) -> float:
+        """A4D.3: sum of `size_usdc` across all positions on this key."""
+        async with self._lock:
+            bucket = self._positions.get((condition_id, engine_name)) or []
+            return sum(float(p.get("size_usdc", 0.0) or 0.0) for p in bucket)
+
+    async def positions_for(
+        self, condition_id: str, engine_name: str,
+    ) -> list[dict]:
+        """A4D.3: deep-copy of every position on this key. Callers iterate
+        without holding the lock."""
+        async with self._lock:
+            bucket = self._positions.get((condition_id, engine_name)) or []
+            return [dict(p) for p in bucket]
 
     async def count(self, engine_name: Optional[str] = None) -> int:
+        """Number of (cond_id, engine) keys with at least one position.
+        NOT the leg count — open-position cap is per-condition, not per-leg.
+        """
         async with self._lock:
             if engine_name is None:
-                return len(self._positions)
-            return sum(1 for (_, e) in self._positions if e == engine_name)
+                return sum(1 for v in self._positions.values() if v)
+            return sum(1 for (_, e), v in self._positions.items()
+                       if e == engine_name and v)
 
     async def unique_markets(self, engine_name: Optional[str] = None) -> int:
         async with self._lock:
             if engine_name is None:
-                return len({c for (c, _) in self._positions})
-            return len({c for (c, e) in self._positions if e == engine_name})
+                return len({c for (c, _), v in self._positions.items() if v})
+            return len({c for (c, e), v in self._positions.items()
+                        if e == engine_name and v})
 
-    def snapshot(self) -> dict[tuple[str, str], dict]:
+    def snapshot(self) -> dict[tuple[str, str], list[dict]]:
         """Deep copy for the dashboard. Single torn read tolerated."""
         return copy.deepcopy(self._positions)
 
@@ -186,6 +239,10 @@ class FastPath:
             direction_val = d.value if hasattr(d, "value") else d
 
         # 3. In-memory state update.
+        # A4D.3 — carry `trade_id` when the decision exposes it (FastPath
+        # callers wire it on after the telemetry writer has minted one) so
+        # multi-leg buckets can be drained one leg at a time on close via
+        # `remove_by_trade_id`.
         pos_row = {
             "condition_id": decision.condition_id,
             "engine_name": engine_name,
@@ -193,6 +250,7 @@ class FastPath:
             "size_usdc": size_usdc,
             "entry_price": entry_price,
             "shares": shares,
+            "trade_id": getattr(decision, "trade_id", None),
         }
         await self.state.add(decision.condition_id, engine_name, pos_row)
 
@@ -231,6 +289,9 @@ class FastPath:
             engine_name=engine_name, skip_reason=skip_reason,
         )
 
-    def snapshot_state(self) -> dict[tuple[str, str], dict]:
-        """Dashboard / health-check accessor. Deep copy; no locking."""
+    def snapshot_state(self) -> dict[tuple[str, str], list[dict]]:
+        """Dashboard / health-check accessor. Deep copy; no locking.
+
+        A4D.3: returns lists per key (multiple legs supported).
+        """
         return self.state.snapshot()

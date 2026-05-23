@@ -582,6 +582,34 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
     else:
         trace.append({**edge_step, "pass": True})
 
+    # A4E.1 — composite scoring gate. OPT-IN: only fires when
+    # `cfg.composite_score_floor > 0`. Default 0.0 = no behavior change.
+    # `score_features` returns 0.5 (uninformative) until main.py registers
+    # a fitted scorer via `set_default_scorer`.
+    composite_floor = _opt_float(cfg, "composite_score_floor", 0.0)
+    composite_score = 0.5
+    if composite_floor > 0.0:
+        try:
+            feats = _build_features(match, result, ctx)
+            composite_score = _score_features(
+                feats, direction=result.direction.value,
+            )
+        except Exception:  # noqa: BLE001 — best-effort
+            composite_score = 0.5
+        comp_step = {"step": "composite_score",
+                     "value": round(composite_score, 4),
+                     "threshold": composite_floor}
+        if composite_score < composite_floor:
+            if not _maybe_bypass("composite_score"):
+                return _skip(
+                    f"composite_score_too_low:{composite_score:.3f}",
+                    step={**comp_step, "pass": False},
+                )
+            trace.append({**comp_step, "pass": "cf_bypass"})
+        else:
+            trace.append({**comp_step, "pass": True})
+    state["composite_score"] = composite_score
+
     if ctx.open_positions >= cfg.max_open_positions:
         return _skip(f"max_positions:{ctx.open_positions}",
                      step={"step": "max_positions", "pass": False,

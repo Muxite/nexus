@@ -241,6 +241,13 @@ class TradingConfig:
     # ambiguously `p_alpha` OR `mean_p_winner` per ai.py:_aggregate_ensemble).
     # See trader.py spec block. 0.0 disables (default — backward-compat).
     min_p_alpha: float = 0.0
+    # A4E.1 (2026-05-23): composite signal scoring floor. When > 0, the
+    # trader feeds live features into the fitted logistic regression from
+    # app/scoring.py and skips trades whose P(profitable_trade) lies below
+    # this threshold. Default 0.0 = gate OFF (backward-compat). Per-engine
+    # override allowed. Scorer registered at boot via set_default_scorer;
+    # until fitted the score is 0.5 so any floor < 0.5 trivially passes.
+    composite_score_floor: float = 0.0
     # A1.2 (2026-05-22, master plan 4B.2): if > 0, additionally gate the
     # entry on the True-EV-per-$1 measure from simulate.compute_ev_{yes,no}
     # plus a fee headroom estimate. 0.0 disables (the legacy `min_edge` gate
@@ -869,6 +876,7 @@ def _build_config(raw: dict) -> Config:
             ),
             jit_tolerance_bps=float(t.get("jit_tolerance_bps", 50.0)),
             min_ev_per_dollar=float(t.get("min_ev_per_dollar", 0.0)),
+            composite_score_floor=float(t.get("composite_score_floor", 0.0)),
             use_true_ev_formula=bool(t.get("use_true_ev_formula", True)),
             simulate_total_usdc=float(t.get("simulate_total_usdc", 50.0)),
             simulate_min_trade_usdc=float(t.get("simulate_min_trade_usdc", 1.0)),

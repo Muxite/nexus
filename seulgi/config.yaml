@@ -589,6 +589,19 @@ trading:
   # proceeds. Set either key to `null` to disable that side of the filter.
   max_spread_bps: 200          # 2% spread max (Polymarket typical = 1-5%)
   min_book_depth_usdc: 50.0    # need ≥ $50 of top-5 ask liquidity
+  # ── Phase 4D.3 (2026-05-23): position scaling ────────────────────────
+  # Replace the binary `duplicate_position` lockout with a delta-add path:
+  # when the engine already holds size on `(condition_id, engine)` and a
+  # reinforcing headline arrives, open an ADDITIONAL trade at
+  # `delta = max(0, kelly_target − current_exposure)`. False reverts to
+  # the legacy binary lockout (per-engine `position_scaling_enabled: false`
+  # override is supported for operator opt-out).
+  position_scaling_enabled: true
+  # Hard cap on total `size_usdc` summed across legs for a single
+  # `(condition_id, engine)`. Delta-adds that would exceed this either
+  # truncate to the remaining room (when room ≥ `simulate_min_trade_usdc`)
+  # or skip with `duplicate_position:at_max_exposure_cap`. 0.0 disables.
+  max_exposure_per_condition_usdc: 100.0
 
 # ── Trading engines ──────────────────────────────────────────────────────────
 # Each engine runs the same headlines with its own rule set.
