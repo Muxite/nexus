@@ -47,6 +47,7 @@ from markets import Embedder, MarketIndex
 from impact_tracker import PriceImpactTracker
 import metrics
 from news_memory import NewsMemory
+from telemetry import AsyncTelemetryQueue
 from watcher import (
     RawHeadline, SiteWatcher, TwitterAccountWatcher, TruthSocialWatcher, FeedWatcher,
     SearchBudget, ScraperHealthPoller,
@@ -406,6 +407,22 @@ async def main() -> None:
     article_fetcher = ArticleFetcher(db=db)
     logger.info("[main] ArticleFetcher ready")
 
+    # A4C.2: async telemetry queue. Bounded in-process queue + single
+    # background worker that batch-inserts engine_results,
+    # decision_inputs, llm_calls, trades. A4C.1's FastPath uses `.put`
+    # to offload writes; on shutdown `.stop()` drains the queue (and
+    # spills overflow to data/telemetry_lost_<ts>.jsonl on timeout).
+    telemetry = AsyncTelemetryQueue(
+        db=db,
+        max_size=10_000,
+        batch_size=100,
+        batch_interval_ms=1000,
+        lost_dir=cfg.dashboard.data_dir,
+    )
+    telemetry.start()
+    dash.set_telemetry(telemetry)
+    logger.info("[main] telemetry queue started (max=10000, batch=100, 1s)")
+
     # Engine runner (fans out headlines to all engines)
     runner = EngineRunner(
         engines=engines, index=index, embedder=embedder,
@@ -415,6 +432,7 @@ async def main() -> None:
         article_fetcher=article_fetcher,
         min_top_similarity=cfg.relevance.min_top_similarity,
         market_context_cfg=cfg.market_context,
+        telemetry=telemetry,
     )
 
     # Watchers
@@ -575,6 +593,10 @@ async def main() -> None:
         await runner.close()
         for engine in engines:
             await engine.trader.close()
+        # A4C.2: drain the telemetry queue BEFORE db.close() so the
+        # worker's final batch lands in the DB instead of spilling to
+        # the JSONL recovery file.
+        await telemetry.stop()
         await db.close()    # PRAGMA wal_checkpoint(TRUNCATE) runs inside
 
     try:
