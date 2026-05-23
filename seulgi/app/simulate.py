@@ -41,6 +41,25 @@ Invariants (hardened in this rewrite — 2026-05-22, A1.1):
       Skip codes: kelly_nan_input | kelly_at_rail | kelly_negative_edge |
       kelly_below_min | None.
 
+Cap policy (4B.3, 2026-05-23):
+    `max_fractional_kelly_cap` clips the Kelly multiplier itself
+    (`effective_kelly = min(kelly_fraction, hard_cap)`) AND caps the final
+    bankroll fraction (`stake ≤ bankroll × hard_cap`). Default 0.10 was
+    validated on 50 sampled closed trades:
+      - production cfg (kelly_fraction=0.25, max_bankroll_pct=0.05): cap is
+        DORMANT because bankroll_pct binds first (0.05 < 0.10);
+      - hypothetical aggressive variant (kelly_fraction=0.50,
+        max_bankroll_pct=0.50): cap reduces stake on 100% of trades.
+    Conclusion: keep 0.10 as a tail-risk safety belt for un-vetted engine
+    configs. Lowering to 0.05 over-restricts moderately-aggressive variants
+    we may want to test; 0.10 lets the bankroll_pct knob remain the
+    primary control while bounding worst-case kelly_fraction misuse.
+    Per-engine override via EngineConfig.kelly_cap_override propagates
+    into simulate_sizing.max_fractional_kelly_cap before the trader call.
+    `kelly_cap_hit` counter increments whenever the cap clips the
+    multiplier (cfg.kelly_fraction > hard_cap); A4B.2 EV + dashboard
+    surface it.
+
 Slippage curve (refit 2026-05-22):
     walk = min(max_price_move, bps_per_dollar * notional_usdc / 10000)
     Historical fit on 90 matched price_impacts rows yielded
@@ -59,6 +78,7 @@ live in trader.py; this module exposes config but does not apply them.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Optional
@@ -68,6 +88,15 @@ from config import (
     SimulateSizingConfig,
     SimulateSlippageConfig,
 )
+
+logger = logging.getLogger(__name__)
+
+# Module-level counter — incremented whenever the fractional-Kelly hard cap
+# clips the multiplier (i.e. cfg.kelly_fraction > cfg.max_fractional_kelly_cap).
+# 4B.3 surfaces this to the dashboard so an over-aggressive engine knob is
+# visible at the same place as funnel skip reasons. Reset between cycles by
+# reassigning the attribute (see tests).
+kelly_cap_hit: int = 0
 
 
 def _is_finite(*values: float) -> bool:
@@ -252,6 +281,11 @@ def fractional_kelly(
     if f_star <= 0:
         return KellyResult(f_star, 0.0, 0.0, 0.0, "kelly_negative_edge")
     hard_cap = getattr(cfg, "max_fractional_kelly_cap", 0.10)
+    if cfg.kelly_fraction > hard_cap:
+        global kelly_cap_hit
+        kelly_cap_hit += 1
+        logger.info("kelly_cap_hit: kelly_fraction=%.3f > hard_cap=%.3f",
+                    cfg.kelly_fraction, hard_cap)
     effective_kelly = min(cfg.kelly_fraction, hard_cap)
     fractional = f_star * effective_kelly
     capped_pct = min(fractional, cfg.max_bankroll_pct, hard_cap)

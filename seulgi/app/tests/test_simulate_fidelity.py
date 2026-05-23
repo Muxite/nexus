@@ -321,6 +321,84 @@ def test_kelly_hard_cap_overrides_unsafe_knob():
     assert r.stake_usdc <= 100.0 * 0.10 + 1e-6
 
 
+def test_kelly_cap_binding_clips_kelly_fraction():
+    """4B.3: kelly_fraction=0.50, cap=0.10 → effective multiplier = 0.10.
+
+    Reproduces the binding cap path. We choose p_true=0.55, p_market=0.40 so
+    f_star ≈ 0.25; with cap=0.10 stake = 100 * 0.25 * 0.10 = 2.5 USDC.
+    With cap=1.0 (unbounded) stake = 100 * 0.25 * 0.50 = 12.5 USDC, then
+    clipped by max_bankroll_pct=0.50 → 50 USDC ceiling (not binding here).
+    """
+    cfg_cap = SimulateSizingConfig(kelly_fraction=0.50, max_bankroll_pct=0.50,
+                                   min_stake_usdc=0.01,
+                                   max_fractional_kelly_cap=0.10)
+    cfg_uncap = SimulateSizingConfig(kelly_fraction=0.50, max_bankroll_pct=0.50,
+                                     min_stake_usdc=0.01,
+                                     max_fractional_kelly_cap=1.0)
+    r_cap = sim.fractional_kelly(100.0, 0.55, 0.40, 1000.0, cfg_cap)
+    r_uncap = sim.fractional_kelly(100.0, 0.55, 0.40, 1000.0, cfg_uncap)
+    assert r_cap.stake_usdc < r_uncap.stake_usdc - 1e-6
+    # Stake bounded by bankroll * hard_cap = $10.
+    assert r_cap.stake_usdc <= 100.0 * 0.10 + 1e-6
+
+
+def test_kelly_cap_not_binding_when_kelly_fraction_below_cap():
+    """4B.3: kelly_fraction=0.05, cap=0.10 → effective = 0.05 (cap NOT
+    binding). Stake should match the cap=1.0 case modulo other bounds."""
+    cfg_cap = SimulateSizingConfig(kelly_fraction=0.05, max_bankroll_pct=0.50,
+                                   min_stake_usdc=0.01,
+                                   max_fractional_kelly_cap=0.10)
+    cfg_uncap = SimulateSizingConfig(kelly_fraction=0.05, max_bankroll_pct=0.50,
+                                     min_stake_usdc=0.01,
+                                     max_fractional_kelly_cap=1.0)
+    r_cap = sim.fractional_kelly(100.0, 0.55, 0.40, 1000.0, cfg_cap)
+    r_uncap = sim.fractional_kelly(100.0, 0.55, 0.40, 1000.0, cfg_uncap)
+    # Same stake — cap=0.10 didn't kick in because kelly_fraction=0.05 < 0.10.
+    assert r_cap.stake_usdc == pytest.approx(r_uncap.stake_usdc)
+
+
+def test_kelly_cap_hit_counter_increments_when_cap_binds():
+    """4B.3: kelly_cap_hit module-level counter increments per cap-clipped call."""
+    sim.kelly_cap_hit = 0
+    cfg = SimulateSizingConfig(kelly_fraction=0.50, max_bankroll_pct=0.50,
+                               min_stake_usdc=0.01,
+                               max_fractional_kelly_cap=0.10)
+    sim.fractional_kelly(100.0, 0.55, 0.40, 1000.0, cfg)
+    sim.fractional_kelly(100.0, 0.60, 0.40, 1000.0, cfg)
+    assert sim.kelly_cap_hit == 2
+
+
+def test_kelly_cap_hit_counter_unchanged_when_cap_does_not_bind():
+    """Counter stays put when kelly_fraction ≤ hard_cap."""
+    sim.kelly_cap_hit = 0
+    cfg = SimulateSizingConfig(kelly_fraction=0.05, max_bankroll_pct=0.50,
+                               min_stake_usdc=0.01,
+                               max_fractional_kelly_cap=0.10)
+    sim.fractional_kelly(100.0, 0.55, 0.40, 1000.0, cfg)
+    sim.fractional_kelly(100.0, 0.60, 0.40, 1000.0, cfg)
+    assert sim.kelly_cap_hit == 0
+
+
+def test_kelly_cap_per_engine_override_via_merge():
+    """4B.3: EngineConfig.kelly_cap_override propagates into the engine's
+    simulate_sizing.max_fractional_kelly_cap (engine._merge_trading_cfg path).
+    """
+    from config import EngineConfig, TradingConfig
+    from engine import _merge_trading_cfg
+    base = TradingConfig()  # default cap 0.10
+    assert base.simulate_sizing.max_fractional_kelly_cap == pytest.approx(0.10)
+    # No override → no change.
+    ec_default = EngineConfig(name="balanced")
+    merged_default = _merge_trading_cfg(base, ec_default)
+    assert merged_default.simulate_sizing.max_fractional_kelly_cap == pytest.approx(0.10)
+    # Override → cap reduced for this engine only.
+    ec_scout = EngineConfig(name="scout/all_signals", kelly_cap_override=0.02)
+    merged_scout = _merge_trading_cfg(base, ec_scout)
+    assert merged_scout.simulate_sizing.max_fractional_kelly_cap == pytest.approx(0.02)
+    # The base is unchanged (copy-on-write).
+    assert base.simulate_sizing.max_fractional_kelly_cap == pytest.approx(0.10)
+
+
 def test_kelly_at_rail_when_p_market_max():
     """Bug #14: confirm kelly_at_rail reachable. p_market=1.0 → clamp→0.99 →
     b ≈ 0.0101 (positive), so we get kelly_negative_edge instead. But if a

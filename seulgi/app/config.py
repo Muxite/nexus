@@ -439,6 +439,11 @@ class EngineConfig:
     max_market_vol_30m: Optional[float] = None
     # A4A.2 JIT-pricing tolerance override (bps; relative to snapshot mid).
     jit_tolerance_bps: Optional[float] = None
+    # A4B.3 (2026-05-23): per-engine override of the fractional-Kelly hard
+    # cap (simulate_sizing.max_fractional_kelly_cap). When set, the engine's
+    # simulate_sizing is rebuilt with this cap; when None, the global value
+    # is used. Example: scout/all_signals=0.02, balanced/*=0.10 (default).
+    kelly_cap_override: Optional[float] = None
     # Per-engine relevance gate override. When None, the global
     # `relevance.keep_scores` is used. When set, this engine evaluates
     # only markets whose Stage-2 relevance verdict is in this list.
@@ -592,6 +597,7 @@ def _build_config(raw: dict) -> Config:
             min_entry_yes_mid=_opt_float(e.get("min_entry_yes_mid")),
             max_market_vol_30m=_opt_float(e.get("max_market_vol_30m")),
             jit_tolerance_bps=_opt_float(e.get("jit_tolerance_bps")),
+            kelly_cap_override=_opt_float(e.get("kelly_cap_override")),
             relevance_keep_scores=(
                 list(e["relevance_keep_scores"])
                 if isinstance(e.get("relevance_keep_scores"), list)

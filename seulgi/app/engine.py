@@ -935,14 +935,26 @@ _OVERRIDABLE_TRADING_FIELDS = (
     "invert_high_conf", "invert_conf_threshold", "spread_cost_bps",
     "stop_loss_pct", "min_entry_yes_mid", "max_market_vol_30m",
     "direction_filter", "freshness_filter", "mid_yes_min", "mid_yes_max",
+    # A4B.2 — true-EV formula toggle + per-engine EV floor.
+    "use_true_ev_formula", "min_ev_per_dollar",
 )
 
 
 def _merge_trading_cfg(base: TradingConfig, override) -> TradingConfig:
-    """Apply per-engine overrides on top of base. None ⇒ inherit base."""
+    """Apply per-engine overrides on top of base. None ⇒ inherit base.
+
+    Also handles A4B.3 `kelly_cap_override`: when set on the override, the
+    base's `simulate_sizing` is replaced with a copy whose
+    `max_fractional_kelly_cap` reflects the engine-local cap.
+    """
     from dataclasses import replace
     updates = {a: v for a in _OVERRIDABLE_TRADING_FIELDS
                if (v := getattr(override, a, None)) is not None}
+    kelly_cap = getattr(override, "kelly_cap_override", None)
+    if kelly_cap is not None and base.simulate_sizing is not None:
+        updates["simulate_sizing"] = replace(
+            base.simulate_sizing, max_fractional_kelly_cap=float(kelly_cap),
+        )
     return replace(base, **updates)
 
 
