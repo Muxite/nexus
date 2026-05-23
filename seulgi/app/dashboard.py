@@ -1403,6 +1403,49 @@ class Dashboard:
         except Exception:  # noqa: BLE001
             pass
 
+        # A4E.5 — counterfactual sampling: per-filter cf-trade counts over
+        # the last 24h. One quick query against the indexed cf column;
+        # tile is suppressed when the column is all-NULL (sampling OFF).
+        try:
+            cutoff = (now - timedelta(hours=24)).isoformat()
+            async with self._db._conn.execute(
+                """
+                SELECT COALESCE(cf_bypassed_filter, 'unknown') AS f,
+                       COUNT(*) AS n_total,
+                       SUM(CASE WHEN size_usdc > 0 AND skip_reason IS NULL
+                                THEN 1 ELSE 0 END)                AS n_exec,
+                       SUM(CASE WHEN realized_pnl IS NOT NULL
+                                THEN 1 ELSE 0 END)                AS n_closed,
+                       COALESCE(SUM(realized_pnl), 0)             AS sum_pnl
+                  FROM trades
+                 WHERE cf_bypassed_filter IS NOT NULL
+                   AND decided_at >= ?
+                 GROUP BY f
+                 ORDER BY n_total DESC
+                """,
+                (cutoff,),
+            ) as cur:
+                cf_rows = await cur.fetchall()
+            if cf_rows:
+                lines.append("## Counterfactual (24h, per-filter cf trades)")
+                lines.append("")
+                lines.append(
+                    "| filter              | n_total | n_exec | n_closed |  sum_pnl |"
+                )
+                lines.append(
+                    "|---------------------|--------:|-------:|---------:|---------:|"
+                )
+                for r in cf_rows:
+                    lines.append(
+                        f"| {r['f']:<19} | {r['n_total']:>7} | "
+                        f"{r['n_exec']:>6} | {r['n_closed']:>8} | "
+                        f"{r['sum_pnl']:>+8.2f} |"
+                    )
+                lines.append("")
+        except Exception:  # noqa: BLE001
+            # Older DB before migration / locked writer — silently skip.
+            pass
+
         # Cache section reads in-memory state; no extra DB query.
         cache = self._heavy_cache
         last_refresh = cache.get("_last_refresh_at")

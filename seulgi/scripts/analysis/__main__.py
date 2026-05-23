@@ -19,6 +19,7 @@ from typing import Iterable
 _SUBCOMMANDS: tuple[str, ...] = (
     "close_reasons",
     "conf_buckets",
+    "counterfactual_report",
     "decision_card",
     "direction",
     "drag",

@@ -103,6 +103,11 @@ class TradeDecision:
     mid_yes: Optional[float] = None
     mid_no: Optional[float] = None
     inverted: bool = False
+    # A4E.5 counterfactual sampling — name of the filter that was bypassed
+    # to let this decision through. None on normal trades AND on normal
+    # skips. A non-None value means "this trade would have been skipped
+    # by <filter> but cf-sampling let it pass through".
+    cf_bypassed_filter: Optional[str] = None
     # Phase 4D.2 — macro tag that augmented this market in via the tag-based
     # router (e.g. "interest_rates"). NULL when the SBERT cosine top-K
     # surfaced the match itself. Persisted on engine_results.tag so
@@ -127,6 +132,9 @@ class EntryOutcome:
     p_hat: float = 0.0
     inverted: bool = False
     direction_enum: Optional[Direction] = None
+    # A4E.5: name of the filter the cf-sampler let this trade past, or
+    # None on a normal trade / normal skip.
+    cf_bypassed_filter: Optional[str] = None
 
 @dataclass
 class CloseOutcome:
@@ -155,6 +163,11 @@ class _EntryCtx:
     cluster_factor: float = 1.0
     rules_post_ai_reason: Optional[str] = None
     freshness_label: Optional[str] = None
+    # A4E.5 counterfactual sampling. When non-None and `enabled`, the
+    # named filters consult it before raising their skip.
+    cf_sampler: Optional[object] = None
+    headline_id: Optional[str] = None
+    condition_id: Optional[str] = None
 
 async def _fetch_mid_price(
     session: aiohttp.ClientSession, token_id: str
@@ -287,6 +300,13 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
 
     Returns an `EntryOutcome` with `action ∈ {"TRADE", "SKIP"}` and the
     full trader_trace step list. The orchestrator writes the result.
+
+    A4E.5 — counterfactual sampling: when `ctx.cf_sampler` is attached and
+    enabled, named filters (see `TOP_5_FILTERS`) consult it before raising
+    their skip. If the sampler returns True, the skip is suppressed, the
+    trade proceeds, and `state["cf_bypassed_filter"]` is set so the
+    resulting `trades` row gets tagged. Only the FIRST bypass per
+    evaluation takes effect — a trade is attributed to exactly one filter.
     """
     cfg = ctx.cfg
     ai_cfg = ctx.ai_cfg
@@ -295,7 +315,37 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
     state = {
         "token_id": None, "mid_price": match.mid_yes, "p_hat": 0.0,
         "edge_value": None, "ev_usdc": None, "inverted": False,
+        # A4E.5 — name of the filter we bypassed (if any).
+        "cf_bypassed_filter": None,
     }
+
+    def _maybe_bypass(filter_name: str) -> bool:
+        """Consult cf_sampler. Returns True iff the caller should suppress
+        its skip and continue. Records the bypass in `state` and `trace`
+        on the first hit; subsequent bypasses on the same evaluation are
+        refused (a trade is attributable to exactly one filter)."""
+        if state["cf_bypassed_filter"] is not None:
+            return False
+        sampler = ctx.cf_sampler
+        if sampler is None:
+            return False
+        try:
+            ok = sampler.should_bypass(
+                filter_name=filter_name,
+                headline_id=ctx.headline_id,
+                condition_id=ctx.condition_id,
+                engine=ctx.engine_name,
+            )
+        except Exception:  # noqa: BLE001 — sampler is best-effort.
+            return False
+        if not ok:
+            return False
+        state["cf_bypassed_filter"] = filter_name
+        trace.append({"step": "cf_bypass", "filter": filter_name,
+                      "headline_id": ctx.headline_id,
+                      "engine": ctx.engine_name})
+        _bump_metric("trader.cf_bypass", tags={"filter": filter_name})
+        return True
 
     def _skip(reason: str, step: Optional[dict] = None) -> EntryOutcome:
         if step is not None:
@@ -307,6 +357,7 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
             token_id=state["token_id"], mid_price=state["mid_price"],
             p_hat=state["p_hat"], edge_value=state["edge_value"],
             ev_usdc=state["ev_usdc"], inverted=state["inverted"],
+            cf_bypassed_filter=state["cf_bypassed_filter"],
         )
 
     trace.append({
@@ -326,10 +377,14 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
                  "value": round(result.confidence, 4),
                  "threshold": ai_cfg.min_confidence}
     if result.confidence < ai_cfg.min_confidence:
-        _bump_metric("trader.low_confidence_skips")
-        return _skip(f"low_confidence:{result.confidence:.2f}",
-                     step={**conf_step, "pass": False})
-    trace.append({**conf_step, "pass": True})
+        if _maybe_bypass("min_confidence"):
+            trace.append({**conf_step, "pass": "cf_bypass"})
+        else:
+            _bump_metric("trader.low_confidence_skips")
+            return _skip(f"low_confidence:{result.confidence:.2f}",
+                         step={**conf_step, "pass": False})
+    else:
+        trace.append({**conf_step, "pass": True})
 
     min_agree = getattr(ai_cfg, "min_agreement", 0.66)
     agree = getattr(result, "agreement", 0.0) or 0.0
@@ -362,19 +417,21 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
                            "got": result.direction.value, "want": dir_filter})
     fresh_filter = getattr(cfg, "freshness_filter", "") or ""
     if fresh_filter and (ctx.freshness_label or "") != fresh_filter:
-        return _skip(f"freshness_filter:{fresh_filter}_only",
-                     step={"step": "freshness_filter", "pass": False,
-                           "got": ctx.freshness_label or "",
-                           "want": fresh_filter})
+        if not _maybe_bypass("freshness_filter"):
+            return _skip(f"freshness_filter:{fresh_filter}_only",
+                         step={"step": "freshness_filter", "pass": False,
+                               "got": ctx.freshness_label or "",
+                               "want": fresh_filter})
     v_mid_min = getattr(cfg, "mid_yes_min", 0.0) or 0.0
     v_mid_max = getattr(cfg, "mid_yes_max", 1.0) or 1.0
     if match.mid_yes is not None and (
         match.mid_yes < v_mid_min or match.mid_yes > v_mid_max
     ):
-        return _skip(f"variant_mid_band:{match.mid_yes:.3f}",
-                     step={"step": "variant_mid_band", "pass": False,
-                           "mid_yes": round(match.mid_yes, 4),
-                           "band": [v_mid_min, v_mid_max]})
+        if not _maybe_bypass("mid_band"):
+            return _skip(f"variant_mid_band:{match.mid_yes:.3f}",
+                         step={"step": "variant_mid_band", "pass": False,
+                               "mid_yes": round(match.mid_yes, 4),
+                               "band": [v_mid_min, v_mid_max]})
     max_vol = cfg.max_market_vol_30m
     mkt_ctx = getattr(match, "_mkt_ctx", None)
     if max_vol > 0 and mkt_ctx is not None and mkt_ctx.vol > max_vol:
@@ -467,22 +524,29 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
                  "ev_threshold": round(ev_threshold, 4),
                  "use_true_ev_formula": use_true_ev}
 
+    edge_failed = False
     if use_true_ev:
         if ev_per_dollar < ev_threshold:
+            edge_failed = True
             _bump_metric("trader.edge_too_small_skips",
                          tags={"formula": "true_ev"})
-            return _skip(
-                f"edge_too_small (ev={ev_per_dollar:.4f} < {ev_threshold:.4f})",
-                step={**edge_step, "pass": False},
+            edge_reason = (
+                f"edge_too_small (ev={ev_per_dollar:.4f} < {ev_threshold:.4f})"
             )
     else:
         # Legacy gate — `min_edge` against the linear-confidence edge.
         if edge < cfg.min_edge:
+            edge_failed = True
             _bump_metric("trader.edge_too_small_skips",
                          tags={"formula": "legacy"})
-            return _skip(f"edge_too_small:{edge:.4f}",
-                         step={**edge_step, "pass": False})
-    trace.append({**edge_step, "pass": True})
+            edge_reason = f"edge_too_small:{edge:.4f}"
+    if edge_failed:
+        if _maybe_bypass("min_edge"):
+            trace.append({**edge_step, "pass": "cf_bypass"})
+        else:
+            return _skip(edge_reason, step={**edge_step, "pass": False})
+    else:
+        trace.append({**edge_step, "pass": True})
 
     if ctx.open_positions >= cfg.max_open_positions:
         return _skip(f"max_positions:{ctx.open_positions}",
@@ -490,8 +554,9 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
                            "value": ctx.open_positions,
                            "threshold": cfg.max_open_positions})
     if ctx.duplicate_position:
-        return _skip("duplicate_position",
-                     step={"step": "duplicate_position", "pass": False})
+        if not _maybe_bypass("duplicate_position"):
+            return _skip("duplicate_position",
+                         step={"step": "duplicate_position", "pass": False})
     if ctx.unique_markets >= cfg.max_unique_markets:
         return _skip(f"max_unique_markets:{ctx.unique_markets}",
                      step={"step": "max_unique_markets", "pass": False,
@@ -557,6 +622,7 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
         edge_value=edge, ev_usdc=ev_per_dollar, trader_trace=trace,
         token_id=token_id, mid_price=mid_price, p_hat=p_hat,
         inverted=state["inverted"],
+        cf_bypassed_filter=state["cf_bypassed_filter"],
     )
 
 def _exit_at_mid(pos: dict, current_price: float, shares: float, cfg
@@ -689,6 +755,7 @@ def _outcome_to_decision(outcome: EntryOutcome, match: MarketMatch,
         risk_score=getattr(result, "risk_score", 0.0),
         mid_yes=match.mid_yes, mid_no=match.mid_no,
         inverted=outcome.inverted,
+        cf_bypassed_filter=outcome.cf_bypassed_filter,
         tag=getattr(match, "tag", None),
     )
 
@@ -709,6 +776,7 @@ class PaperTrader:
         parent_engine: Optional[str] = None,
         fastpath: Optional[FastPath] = None,
         telemetry: Optional[TelemetryQueue] = None,
+        cf_sampler=None,
     ) -> None:
         self._db = db
         self._classifier = classifier
@@ -731,6 +799,10 @@ class PaperTrader:
         # tests already in tree).
         self._fastpath: Optional[FastPath] = fastpath
         self._telemetry: Optional[TelemetryQueue] = telemetry
+        # A4E.5 — optional counterfactual sampler. Default None means
+        # legacy hard-skip behaviour (cf-sampling OFF). EngineRunner wires
+        # this in when `counterfactual.enabled: true` in config.yaml.
+        self._cf_sampler = cf_sampler
         # Phase 4A.1: optional callback invoked after every balance mutation.
         # EngineRunner wires this to its capital-floor cache invalidator so
         # ingress-stage capital checks never serve stale True after a drain.
@@ -1012,6 +1084,9 @@ class PaperTrader:
                 balance=self._balance, cluster_factor=cluster_factor,
                 rules_post_ai_reason=rules_post_ai_reason,
                 freshness_label=getattr(headline, "_freshness_label", None),
+                cf_sampler=self._cf_sampler,
+                headline_id=getattr(headline, "headline_id", None),
+                condition_id=match.condition_id,
             )
             outcome = _evaluate_pure(match, result, ctx)
             decision = _outcome_to_decision(outcome, match, result)
@@ -1173,6 +1248,7 @@ class PaperTrader:
                 mkt_min_30m=getattr(mc, "lo", None), mkt_max_30m=getattr(mc, "hi", None),
                 mkt_drift_30m=getattr(mc, "drift", None),
                 mkt_n_samples=getattr(mc, "n_samples", None),
+                cf_bypassed_filter=outcome.cf_bypassed_filter,
             )
             simulate_mode = getattr(self._cfg, "mode", "paper") == "simulate"
             try:

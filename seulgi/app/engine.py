@@ -878,13 +878,15 @@ class EngineRunner:
 
 
 def _make_engine(name: str, *, db, classifier, trading, ai, rule_engine,
-                 parent: str, balance: Optional[float] = None) -> Engine:
+                 parent: str, balance: Optional[float] = None,
+                 cf_sampler=None) -> Engine:
     return Engine(
         name=name,
         trader=PaperTrader(
             db=db, classifier=classifier, cfg=trading, ai_cfg=ai,
             engine_name=name, rule_engine=rule_engine,
             variant_name=name, parent_engine=parent,
+            cf_sampler=cf_sampler,
         ),
         fixed_balance=balance,
     )
@@ -895,11 +897,37 @@ def build_engines(cfg, db: SeulgiDB, classifier: DirectionClassifier,
     """Build engines + variants from cfg. Empty cfg.engines → one "default".
     AGGRESSIVE_CORE_ENABLE=1 appends the carved-out aggressive_core strategy.
     """
+    # A4E.5 — shared CounterfactualSampler across every engine/variant in
+    # this process. The per-headline cap is enforced inside the sampler
+    # so a single noisy headline can't spawn 20 cf trades across 20
+    # variants. Default OFF via `counterfactual.enabled: false` in
+    # config.yaml.
+    cf_sampler = None
+    try:
+        from counterfactual import (
+            CounterfactualSampler, load_from_yaml as _cf_load,
+        )
+        cf_cfg = _cf_load(getattr(cfg, "counterfactual", None))
+        if cf_cfg.enabled:
+            cf_sampler = CounterfactualSampler(cf_cfg)
+            logger.info(
+                "[FAN_OUT] counterfactual sampler enabled "
+                "(rate=%.3f, cap=%d, filters=%s)",
+                cf_cfg.sample_rate_per_filter, cf_cfg.max_cf_per_headline,
+                sorted(cf_sampler.enabled_filters),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[FAN_OUT] counterfactual sampler init failed: %r — cf-sampling OFF",
+            exc,
+        )
+
     engine_cfgs = getattr(cfg, "engines", [])
     if not engine_cfgs:
         return [_make_engine("default", db=db, classifier=classifier,
                              trading=cfg.trading, ai=cfg.ai,
-                             rule_engine=rule_engine, parent="default")]
+                             rule_engine=rule_engine, parent="default",
+                             cf_sampler=cf_sampler)]
 
     engines: list[Engine] = []
     for ec in engine_cfgs:
@@ -915,7 +943,7 @@ def build_engines(cfg, db: SeulgiDB, classifier: DirectionClassifier,
             engines.append(_make_engine(
                 v_name, db=db, classifier=classifier, trading=v_trading,
                 ai=v_ai, rule_engine=rule_engine, parent=ec.name,
-                balance=ec.balance_usdc,
+                balance=ec.balance_usdc, cf_sampler=cf_sampler,
             ))
 
     # Carved-out strategy module — opt-in via AGGRESSIVE_CORE_ENABLE=1.
