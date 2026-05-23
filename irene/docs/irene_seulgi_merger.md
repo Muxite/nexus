@@ -50,6 +50,14 @@ The **interfaces with the outside world** are also shared:
 - Polymarket Gamma API + CLOB — different clients, same upstream.
 - OpenRouter — different budget tracking, same upstream.
 
+## Migration log
+
+- **2026-05-23 — one-time data-layer import landed.** See
+  `reports/2026-05-23-irene-seulgi-migration.md`. 27,914 articles +
+  10,462 markets imported via `scripts/migrate/from_seulgi.py`.
+  Scope was data-layer only (no trades/engine_results/price_impacts).
+  This realises the "fourth end-state" described below.
+
 ## Three plausible end-states
 
 ### A. Irene wins; seulgi retires
@@ -94,6 +102,23 @@ on tracked markets, seulgi has broader coverage.
 - Documented "which bot is canonical for what" — e.g. seulgi's signals
   are the historical ledger, irene's funnel is the live experiment.
 
+### D. Irene-as-warehouse; seulgi-as-demo (chosen 2026-05-23)
+
+Irene's DB becomes the canonical store for the migrated historical
+corpus + the DKG. Seulgi keeps running against its own DB to demo its
+thinking system, but irene is where analytics, DKG queries, and
+future trade-decision work happens. Realised by the
+2026-05-23 data-layer import (see "Migration log" above).
+
+**What this needs:**
+- One-time importer (`scripts/migrate/from_seulgi.py` — done).
+- Acknowledgement that seulgi's ongoing writes do NOT propagate to
+  irene; the snapshot is frozen at import time. Anyone querying for
+  recent seulgi state queries seulgi directly.
+- A plan for what to do with seulgi's decision/trade ledger when
+  it eventually matters for irene — see follow-up #2 in the
+  migration report.
+
 ## The cost of NOT planning for merger
 
 If we let irene and seulgi diverge without a merger plan, three
@@ -122,12 +147,33 @@ specific risks compound:
 A draft. The full migration script lands when migration is actually
 green-lit; this is the rosetta.
 
+> **2026-05-23 update.** This draft predates seulgi's refactor that
+> removed the `headlines` and `mapped_signals` tables. The corrected
+> mapping (and what was actually implemented in the 2026-05-23 import)
+> is below; the original draft is preserved at the bottom of this
+> section for reference.
+
+### Corrected mapping (as-built)
+
+| irene table | seulgi source (actual) | status |
+|---|---|---|
+| `articles` | `signals` LEFT JOIN `headline_articles` ON `signals.headline_id = headline_articles.headline_id` | **migrated 2026-05-23** — 27,914 rows. `title ← signals.headline`, `summary ← headline_articles.body`, `published_at ← signals.detected_at`, `url ← coalesce(article_url, 'seulgi-headline://'\|\|headline_id)`, `source='seulgi_migration'`. |
+| `markets` | `markets` | **migrated 2026-05-23** — 10,462 rows. Embedding is raw `np.float32.tobytes()` in seulgi (NOT pickled — the draft was wrong about this). `embedder_id='sentence-transformers/all-MiniLM-L6-v2@384'` stamped post-hoc. |
+| `cycles` | (none) | **migrated 2026-05-23** — synthetic cycle `seulgi-import-2026-05-23` (id=1). |
+| `article_clusters` / `article_cluster_members` | (none) | Empty post-import. Cluster history of migrated articles starts at `BREAKING` (own cluster). |
+| `price_impacts` | `price_impacts` | **NOT migrated.** irene's schema requires `trade_id NOT NULL UNIQUE REFERENCES trades(id)`; with trades out of scope, this can't land without back-filling trades or relaxing the FK. Deferred. |
+| `signals` / `predictions` / `decisions` | (would be `engine_results`) | **NOT migrated.** Original filter `executed=1 OR edge IS NOT NULL` returned 100% of seulgi's 10.64M engine_results rows (every row has `edge` computed). Skipped per locked decision; revisit if irene needs the historical decision ledger. |
+| `trades` / `trade_closures` / `trade_features` | (would be `trades` + `positions`) | **NOT migrated.** Out of scope. 564 seulgi trades + 44 positions stay seulgi-only. |
+| `entities` + `entity_aliases` + `extraction_runs` + `facts` + `entity_resolutions` | (none) | Empty post-import. Populated by the in-flight DKG bulk-extraction thread (`scripts/migrate/dkg_bulk_sample.py` + the replay step). |
+
+### Original draft (pre-2026-05-23, for reference)
+
 | irene table | seulgi source | notes |
 |---|---|---|
-| `articles` | `headlines` + `headline_articles` | seulgi splits the metadata + body; irene keeps it in one row. `articles.published_at` ← `headlines.detected_at`. `is_tracer=0` for all migrated rows. |
+| `articles` | `headlines` + `headline_articles` | seulgi splits the metadata + body; irene keeps it in one row. `articles.published_at` ← `headlines.detected_at`. `is_tracer=0` for all migrated rows. **Stale: `headlines` no longer exists.** |
 | `article_clusters` + `article_cluster_members` | (none) | Seulgi's near-dup detection is per-fetch via `news_memory.py` (chromadb) — no historical cluster table. Cluster history of migrated articles starts at `BREAKING` (own cluster). |
-| `markets` | `markets` | Direct field-by-field map. `embedding` (BLOB) ← seulgi's pickle-wrapped numpy → re-pickle as np.float32.tobytes() per irene's convention. `embedder_id` stamped post-hoc from seulgi's known model. |
-| `signals` | `engine_results` + `mapped_signals` | seulgi's `engine_results` mixes signal + decision + trade. Project to irene's `signals` (article × market match only — no direction column). One signal row per (signal_id, condition_id) tuple. |
+| `markets` | `markets` | Direct field-by-field map. `embedding` (BLOB) ← seulgi's pickle-wrapped numpy → re-pickle as np.float32.tobytes() per irene's convention. **Stale: seulgi stores raw float32 bytes, no pickle.** `embedder_id` stamped post-hoc from seulgi's known model. |
+| `signals` | `engine_results` + `mapped_signals` | seulgi's `engine_results` mixes signal + decision + trade. Project to irene's `signals` (article × market match only — no direction column). One signal row per (signal_id, condition_id) tuple. **Stale: `mapped_signals` no longer exists.** |
 | `predictions` | `engine_results` (direction columns) | Direction + confidence float — map straight. Cache key `prompt_sha` is unknown for legacy rows; leave NULL and they don't participate in dedup. |
 | `decisions` | `engine_results` (skip_reason + executed) | If `executed=1` → outcome='execute', reason='ok'. Else outcome='reject', reason=<skip_reason>. |
 | `trades` + `trade_closures` | `trades` + `positions` | seulgi's `trades.closed_at` populated → write a `trade_closures` row. `realized_pnl` field maps direct. |
