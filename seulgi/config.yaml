@@ -969,16 +969,21 @@ tagger:
 # behaviour is preserved.
 matchers:
   cross_encoder:
-    enabled: false                 # opt-in: loads sentence-transformers cross-encoder (~50MB)
-    model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    enabled: true                  # 2026-05-23: opt-in (Phase C of profitability plan)
+    model_name: "cross-encoder/ms-marco-MiniLM-L-6-v2"  # ~50MB download on first call
     band_low: 0.3                  # only re-rank candidates with cosine in this band
     band_high: 0.55
     weight: 0.3
   learned_mlp:
-    enabled: false                 # opt-in: trains tiny numpy MLP on closed-trade labels
-    refresh_days: 7
-    min_train_samples: 30          # below this, score() returns neutral 0.5
-    weight: 0.2
+    enabled: true                  # 2026-05-23: opt-in (returns neutral 0.5 until
+    refresh_days: 7                # ≥30 closed trades have decision_inputs joined;
+    min_train_samples: 30          # current count is 0 — fit becomes useful as
+    weight: 0.2                    # decision_inputs accumulates from 2026-05-23 onwards)
+  # Irene merge point — knowledge-graph matcher reserved. Enable when
+  # KnowledgeGraphMatcher lands in app/matchers.py and is wired in main.py.
+  # knowledge_graph:
+  #   enabled: false
+  #   weight: 0.3
 
 # ── Counterfactual sampling (A4E.5) ─────────────────────────────────────────
 # When enabled, 1% of would-have-been-skipped signals at each named filter
