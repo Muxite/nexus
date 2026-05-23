@@ -218,6 +218,9 @@ class Dashboard:
         # A4C.2: optional telemetry queue ref; surfaced in db_health.txt
         # so silent drops on the async write path are observable.
         self._telemetry = None
+        # Phase 4B.1: optional calibrator ref; surfaced as a Calibration
+        # tile in db_health.txt with per-direction IC / Brier / fitted_at.
+        self._calibrator = None
         self._started_at = datetime.now(timezone.utc)
 
         # Ring buffers
@@ -432,6 +435,11 @@ class Dashboard:
             f"{reason}  PnL={sign}{realized_pnl:.2f}"
         )
         self._flush_now.set()
+
+    def set_calibrator(self, calibrator) -> None:
+        """Phase 4B.1: attach the per-direction calibrator so db_health.txt
+        can render its diagnostics tile (n / IC / Brier / fitted_at)."""
+        self._calibrator = calibrator
 
     def set_telemetry(self, telemetry) -> None:
         """A4C.2: attach the async telemetry queue so db_health.txt can
@@ -1319,6 +1327,39 @@ class Dashboard:
                     f"{tm['flush_batches']:>13} | {tm['flush_errors']:>12} |{mark}"
                 )
                 lines.append("")
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Phase 4B.1: per-direction calibration diagnostics tile.
+        if self._calibrator is not None:
+            try:
+                diag = self._calibrator.diagnostics()
+                rows = diag.get("directions", [])
+                if rows:
+                    lines.append("## Calibration")
+                    lines.append("")
+                    lines.append(
+                        "| direction | method   |   n | IC_before | "
+                        "IC_after | Brier_before | Brier_after | fitted_at           |"
+                    )
+                    lines.append(
+                        "|-----------|----------|----:|----------:|"
+                        "---------:|-------------:|------------:|---------------------|"
+                    )
+                    for d in rows:
+                        ts = (d.get("fitted_at") or "")[:19]
+                        lines.append(
+                            f"| {d['direction']:<9} | {d['method']:<8} | "
+                            f"{d['n']:>3} | {d['ic_before']:+9.3f} | "
+                            f"{d['ic_after']:+8.3f} | {d['brier_before']:>12.4f} | "
+                            f"{d['brier_after']:>11.4f} | {ts:<19} |"
+                        )
+                    lines.append("")
+                else:
+                    lines.append("## Calibration")
+                    lines.append("")
+                    lines.append("  (identity fallback — closed-trade sample too small)")
+                    lines.append("")
             except Exception:  # noqa: BLE001
                 pass
 

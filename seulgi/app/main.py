@@ -37,6 +37,7 @@ import sys
 from datetime import datetime, timezone
 
 from ai import DirectionClassifier
+from calibration import Calibrator, set_default_calibrator
 from config import load_config
 from dashboard import Dashboard, WatcherStatus, PositionEvent, SystemHealth
 from db import SeulgiDB
@@ -384,6 +385,21 @@ async def main() -> None:
 
     logger.info("[main] engines: %s", [e.name for e in engines])
 
+    # Phase 4B.1: per-direction calibration. Best-effort initial fit;
+    # identity fallback if the DB doesn't yet have enough closed trades
+    # or the fit raises. `refresh_loop()` re-fits every 4 h so the
+    # curves tighten as the cycle progresses.
+    calibrator = Calibrator(db, method="isotonic")
+    try:
+        curves = await calibrator.fit()
+        logger.info("[main] calibration: fitted %d curve(s): %s",
+                    len(curves), sorted(curves.keys()))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[main] calibration: initial fit failed (%s) — "
+                       "identity fallback", exc)
+    set_default_calibrator(calibrator)
+    dash.set_calibrator(calibrator)
+
     # News memory (semantic deduplication + cycle-9 freshness labels)
     news_memory = NewsMemory(
         path=cfg.news_memory.path,
@@ -519,6 +535,7 @@ async def main() -> None:
             name="system-health",
         ),
         asyncio.create_task(_headline_drain_loop(queue, runner, dash), name="drain"),
+        asyncio.create_task(calibrator.refresh_loop(), name="calibration-refresh"),
     ]
     for t in bg_tasks:
         t.add_done_callback(_log_task_exception)
@@ -597,6 +614,9 @@ async def main() -> None:
         # worker's final batch lands in the DB instead of spilling to
         # the JSONL recovery file.
         await telemetry.stop()
+        # Phase 4B.1: clear the module-level calibrator so a stale
+        # reference can't be reused if the process restarts in-place.
+        set_default_calibrator(None)
         await db.close()    # PRAGMA wal_checkpoint(TRUNCATE) runs inside
 
     try:
