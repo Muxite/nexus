@@ -17,10 +17,15 @@ Bug fixes (xref: 2026-05-22-trader-{entry,exit}-bugs.md):
   else `mean_p_winner`. Treated as direction-confidence for `min_confidence`;
   the AI's real +EV signal lives in `result.p_alpha`. New optional gate
   `cfg.min_p_alpha` (default 0.0) filters on +EV mass directly.
-- True EV (4B.2) — `_evaluate_pure` computes `ev_per_dollar` via
-  `sim.compute_ev_{yes,no}`. Legacy `edge` stays for the `min_edge` gate
-  and `trades.signed_edge`; opt-in EV gate via `cfg.min_ev_per_dollar > 0`
-  (threshold = min_ev + 2·default_rate). TODO(4B.1) calibrate p_alpha.
+- True EV (4B.2) — when `cfg.use_true_ev_formula` is True (the default),
+  `_evaluate_pure` is gated by `ev = compute_ev_{yes,no}(p_true, p_ask)` with
+  `p_true = calibration.calibrate(p_alpha, direction)` and threshold
+  `min_ev_per_dollar + 2 · fee_rate_for(market_type)`. The legacy edge is
+  still computed and persisted on the trade row for back-compat dashboards
+  but is NOT the entry gate. The escape hatch `use_true_ev_formula=False`
+  reverts to the legacy `edge = increment × (2·conf − 1)` gated by `min_edge`.
+  Calibration is identity (`p_true = p_alpha`) until A4B.1's nightly fit
+  populates the per-direction Platt/isotonic curves.
 - Cycle-2 skip contract — `_record` drops skip writes to `trades`;
   `engine_results` (runner) holds them. DEV raises on violation.
 - `is_scout` = `"scout" in name` (scout AND super_scout).
@@ -53,6 +58,7 @@ from typing import Literal, Optional
 import aiohttp
 
 from ai import Direction, ClassifyResult, DirectionClassifier
+from calibration import calibrate
 from db import SeulgiDB
 from fastpath import FastPath, TelemetryQueue
 from markets import MarketMatch
@@ -164,6 +170,17 @@ async def _fetch_mid_price(
 def _compute_edge(confidence: float, cfg) -> float:
     """Legacy edge model: `edge = edge_increment × (2·conf − 1)`."""
     return cfg.edge_increment * max(0.0, 2.0 * confidence - 1.0)
+
+
+def _bump_metric(name: str, tags: Optional[dict] = None) -> None:
+    """Best-effort metric bump. No-op when `app.metrics` isn't importable
+    (analysis CLIs / scripts may pull `trader.py` without the full app)."""
+    if _metrics is None:
+        return
+    try:
+        _metrics.incr(name, tags=tags)
+    except Exception:  # noqa: BLE001
+        pass
 
 def _compute_ev_per_dollar(direction: Direction, p_true: float,
                            mid_yes: Optional[float], mid_no: Optional[float]) -> float:
@@ -304,6 +321,7 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
                  "value": round(result.confidence, 4),
                  "threshold": ai_cfg.min_confidence}
     if result.confidence < ai_cfg.min_confidence:
+        _bump_metric("trader.low_confidence_skips")
         return _skip(f"low_confidence:{result.confidence:.2f}",
                      step={**conf_step, "pass": False})
     trace.append({**conf_step, "pass": True})
@@ -402,37 +420,64 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
     if rail_thr > 0:
         trace.append({"step": "rail_skip", "pass": True, "mid": round(mid_price, 4)})
 
+    # Legacy edge is still computed for back-compat (persisted on
+    # `trades.signed_edge` and in `trader_trace` so dashboards & postmortems
+    # stay readable). When `use_true_ev_formula=True` (default), the gate is
+    # EV; when False, the gate is the legacy `min_edge` against `edge`.
     edge = _compute_edge(result.confidence, cfg)
     p_hat = mid_price + edge
     state["p_hat"] = p_hat
     state["edge_value"] = edge
-    # TODO(4B.1): replace `p_alpha` with calibrated probability once available.
-    ev_per_dollar = _compute_ev_per_dollar(result.direction, p_alpha,
+
+    # A4B.2 — calibrated probability flowing into BOTH EV math and Kelly sizing.
+    # `calibrate()` is identity until A4B.1's nightly fit lands; the call-site
+    # stays stable so this file doesn't change again when A4B.1 turns on.
+    p_calibrated = calibrate(p_alpha, result.direction)
+    state["p_calibrated"] = p_calibrated
+    ev_per_dollar = _compute_ev_per_dollar(result.direction, p_calibrated,
                                            match.mid_yes, match.mid_no)
     state["ev_usdc"] = ev_per_dollar
+
+    use_true_ev = bool(getattr(cfg, "use_true_ev_formula", True))
+    min_ev = _opt_float(cfg, "min_ev_per_dollar", 0.0)
+    # Round-trip fee threshold: 2 × the taker rate for this market_type.
+    # Falls back to 0 when no `simulate_fees` is attached to the cfg (paper
+    # mode / lightweight test cfgs) — caller can pin `min_ev_per_dollar`
+    # to enforce a hard floor regardless of the fee leg.
+    sim_fees = getattr(cfg, "simulate_fees", None)
+    if sim_fees is not None:
+        fee_round_trip = 2.0 * sim.fee_rate_for(
+            getattr(match, "market_type", None), sim_fees,
+        )
+    else:
+        fee_round_trip = 0.0
+    ev_threshold = min_ev + fee_round_trip
 
     edge_step = {"step": "edge",
                  "p_hat": round(p_hat, 4), "mid": round(mid_price, 4),
                  "edge": round(edge, 4), "min_edge": cfg.min_edge,
-                 "ev_per_dollar": round(ev_per_dollar, 4)}
-    if edge < cfg.min_edge:
-        return _skip(f"edge_too_small:{edge:.4f}",
-                     step={**edge_step, "pass": False})
-    trace.append({**edge_step, "pass": True})
+                 "p_alpha": round(p_alpha, 4),
+                 "p_calibrated": round(p_calibrated, 4),
+                 "ev_per_dollar": round(ev_per_dollar, 4),
+                 "ev_threshold": round(ev_threshold, 4),
+                 "use_true_ev_formula": use_true_ev}
 
-    # 4B.2 optional EV gate (threshold = min_ev + 2·default_rate, off by default).
-    min_ev = _opt_float(cfg, "min_ev_per_dollar", 0.0)
-    if min_ev > 0.0:
-        sim_fees = getattr(cfg, "simulate_fees", None)
-        default_rate = getattr(sim_fees, "default_rate", 0.0) if sim_fees is not None else 0.0
-        ev_threshold = min_ev + 2.0 * default_rate
-        ev_step = {"step": "ev_gate",
-                   "ev_per_dollar": round(ev_per_dollar, 4),
-                   "threshold": round(ev_threshold, 4)}
+    if use_true_ev:
         if ev_per_dollar < ev_threshold:
-            return _skip(f"ev_too_small:{ev_per_dollar:.4f}",
-                         step={**ev_step, "pass": False})
-        trace.append({**ev_step, "pass": True})
+            _bump_metric("trader.edge_too_small_skips",
+                         tags={"formula": "true_ev"})
+            return _skip(
+                f"edge_too_small (ev={ev_per_dollar:.4f} < {ev_threshold:.4f})",
+                step={**edge_step, "pass": False},
+            )
+    else:
+        # Legacy gate — `min_edge` against the linear-confidence edge.
+        if edge < cfg.min_edge:
+            _bump_metric("trader.edge_too_small_skips",
+                         tags={"formula": "legacy"})
+            return _skip(f"edge_too_small:{edge:.4f}",
+                         step={**edge_step, "pass": False})
+    trace.append({**edge_step, "pass": True})
 
     if ctx.open_positions >= cfg.max_open_positions:
         return _skip(f"max_positions:{ctx.open_positions}",
@@ -457,9 +502,12 @@ def _evaluate_pure(match: MarketMatch, result: ClassifyResult,
     )
     size: Optional[float] = None
     if use_kelly:
-        # TODO(4B.1): swap p_hat for calibrated p_alpha.
+        # A4B.2: pass the CALIBRATED probability to Kelly when the EV gate is
+        # active. Legacy path keeps `p_hat = mid + legacy_edge` so prior sim
+        # runs reproduce byte-for-byte.
+        kelly_p = p_calibrated if use_true_ev else p_hat
         size, kelly_step, kelly_skip = _size_kelly(
-            result.direction, match, mid_price, p_hat, ctx.balance, cfg,
+            result.direction, match, mid_price, kelly_p, ctx.balance, cfg,
         )
         trace.append(kelly_step)
         if kelly_skip is not None:

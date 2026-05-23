@@ -80,6 +80,11 @@ def _make_cfg(
     cfg.freshness_filter = ""
     cfg.mid_yes_min = 0.0
     cfg.mid_yes_max = 1.0
+    # A4B.2: legacy mode is the test-helper default so the 280+ pre-existing
+    # cases (which don't supply `p_alpha`) keep exercising the same gates.
+    # The dedicated TestTrueEVFormula class flips this back on.
+    cfg.use_true_ev_formula = False
+    cfg.min_ev_per_dollar = 0.0
     return cfg
 
 
@@ -869,6 +874,9 @@ def _pure_cfg(**overrides):
         mid_yes_max = 1.0
         min_p_alpha = 0.0
         min_ev_per_dollar = 0.0
+        # A4B.2: pure-fn tests inherit the legacy formula by default; the new
+        # TestTrueEVFormula class flips it on per-call.
+        use_true_ev_formula = False
         mode = "paper"
     c = C()
     for k, v in overrides.items():
@@ -1045,6 +1053,154 @@ class TestEvaluatePure:
             _pure_ctx(cfg, _pure_ai_cfg()),
         )
         assert out.skip_reason == "no_token"
+
+
+# ---------------------------------------------------------------------------
+# A4B.2 — true EV formula in trader.evaluate
+# ---------------------------------------------------------------------------
+
+
+def _ev_result(direction, confidence=0.85, p_alpha=0.0):
+    """Helper — ClassifyResult with explicit p_alpha for EV-gate tests."""
+    r = ClassifyResult(direction, confidence, "ev_test")
+    r.p_alpha = p_alpha
+    return r
+
+
+class TestTrueEVFormula:
+    """A4B.2: replace `edge = increment × (2c − 1)` with the calibrated
+    EV formula `compute_ev_{yes,no}(p_true, p_ask)` as the entry gate."""
+
+    def test_high_p_alpha_low_mid_yes_trades(self):
+        """p_alpha=0.7, mid_yes=0.4 → ev = 0.7·0.6 - 0.3·0.4 = +0.30 → TRADE."""
+        cfg = _pure_cfg(use_true_ev_formula=True, min_ev_per_dollar=0.0)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.4),
+            _ev_result(Direction.YES, confidence=0.85, p_alpha=0.7),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "TRADE"
+        assert out.ev_usdc == pytest.approx(0.30, abs=1e-6)
+        edge_step = next(s for s in out.trader_trace if s.get("step") == "edge")
+        assert edge_step["p_calibrated"] == pytest.approx(0.7, abs=1e-6)
+        assert edge_step["use_true_ev_formula"] is True
+
+    def test_low_p_alpha_high_mid_yes_skips(self):
+        """p_alpha=0.2, mid_yes=0.7 → ev = 0.2·0.3 - 0.8·0.7 = -0.50 → SKIP."""
+        cfg = _pure_cfg(use_true_ev_formula=True, min_ev_per_dollar=0.0)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.7),
+            _ev_result(Direction.YES, confidence=0.85, p_alpha=0.2),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "SKIP"
+        assert out.skip_reason.startswith("edge_too_small (ev=")
+        assert out.ev_usdc == pytest.approx(-0.50, abs=1e-6)
+
+    def test_legacy_formula_fires_when_disabled(self):
+        """`use_true_ev_formula=False` reverts to `edge = increment·(2c-1)`."""
+        cfg = _pure_cfg(use_true_ev_formula=False, min_edge=0.04)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.45),
+            _ev_result(Direction.YES, confidence=0.85, p_alpha=0.0),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "TRADE"
+        edge_step = next(s for s in out.trader_trace if s.get("step") == "edge")
+        assert edge_step["use_true_ev_formula"] is False
+        assert "p_calibrated" in edge_step
+
+    def test_direction_no_uses_ev_no_formula(self):
+        """Direction.NO routes through `compute_ev_no`. p=0.3, mid_no=0.4 →
+        ev_no = 0.7·0.6 - 0.3·0.4 = +0.30 → TRADE."""
+        cfg = _pure_cfg(use_true_ev_formula=True, min_ev_per_dollar=0.0)
+        m = _pure_match(mid_yes=0.6, mid_no=0.4)
+        out = _evaluate_pure(
+            m, _ev_result(Direction.NO, confidence=0.85, p_alpha=0.3),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "TRADE"
+        assert out.direction == "NO"
+        assert out.ev_usdc == pytest.approx(0.30, abs=1e-6)
+
+    def test_direction_no_negative_ev_skips(self):
+        """Same NO direction, but p_alpha=0.8 (model says YES is likely) →
+        ev_no = 0.2·0.6 - 0.8·0.4 = -0.20 → SKIP."""
+        cfg = _pure_cfg(use_true_ev_formula=True, min_ev_per_dollar=0.0)
+        m = _pure_match(mid_yes=0.6, mid_no=0.4)
+        out = _evaluate_pure(
+            m, _ev_result(Direction.NO, confidence=0.85, p_alpha=0.8),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "SKIP"
+        assert out.skip_reason.startswith("edge_too_small (ev=")
+        assert out.ev_usdc == pytest.approx(-0.20, abs=1e-6)
+
+    def test_calibration_identity_fallback(self):
+        """With no fitted calibrator (default in test env), `calibrate()` is
+        the identity: p_true == p_alpha. The EV gate then computes against
+        the raw probability."""
+        from calibration import calibrate, set_default_calibrator
+        set_default_calibrator(None)
+        assert calibrate(0.7, "YES") == pytest.approx(0.7)
+        assert calibrate(0.42, "NO") == pytest.approx(0.42)
+        cfg = _pure_cfg(use_true_ev_formula=True, min_ev_per_dollar=0.0)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.4),
+            _ev_result(Direction.YES, confidence=0.85, p_alpha=0.7),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "TRADE"
+        edge_step = next(s for s in out.trader_trace if s.get("step") == "edge")
+        assert edge_step["p_calibrated"] == pytest.approx(0.7, abs=1e-6)
+
+    def test_fee_round_trip_in_ev_threshold(self):
+        """When `simulate_fees` is attached, the gate is `min_ev + 2·fee_rate`.
+        A positive EV smaller than the fee threshold gets skipped."""
+        class Fees:
+            default_rate = 0.05
+            category_rates: dict = {}
+        cfg = _pure_cfg(use_true_ev_formula=True, min_ev_per_dollar=0.0,
+                        simulate_fees=Fees())
+        # p_alpha=0.51, mid_yes=0.5 → ev = 0.51·0.5 - 0.49·0.5 = 0.01
+        # threshold = 0 + 2·0.05 = 0.10 → 0.01 < 0.10 → SKIP
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.5),
+            _ev_result(Direction.YES, confidence=0.85, p_alpha=0.51),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "SKIP"
+        assert out.skip_reason.startswith("edge_too_small (ev=")
+        edge_step = next(s for s in out.trader_trace if s.get("step") == "edge")
+        assert edge_step["ev_threshold"] == pytest.approx(0.10, abs=1e-6)
+
+    def test_min_ev_per_dollar_raises_threshold(self):
+        """A non-zero `min_ev_per_dollar` raises the gate above raw EV."""
+        # p_alpha=0.7, mid_yes=0.5 → ev = 0.7·0.5 - 0.3·0.5 = +0.20
+        cfg = _pure_cfg(use_true_ev_formula=True, min_ev_per_dollar=0.30)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.5),
+            _ev_result(Direction.YES, confidence=0.85, p_alpha=0.7),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "SKIP"
+        assert out.skip_reason.startswith("edge_too_small (ev=")
+        assert out.ev_usdc == pytest.approx(0.20, abs=1e-6)
+
+    def test_p_calibrated_persisted_on_trader_trace(self):
+        """Postmortems must be able to read `ev_per_dollar` AND
+        `p_calibrated` from `trader_trace` regardless of TRADE vs SKIP."""
+        cfg = _pure_cfg(use_true_ev_formula=True)
+        out = _evaluate_pure(
+            _pure_match(mid_yes=0.8),
+            _ev_result(Direction.YES, confidence=0.85, p_alpha=0.1),
+            _pure_ctx(cfg, _pure_ai_cfg()),
+        )
+        assert out.action == "SKIP"
+        edge_step = next(s for s in out.trader_trace if s.get("step") == "edge")
+        for key in ("p_alpha", "p_calibrated", "ev_per_dollar",
+                    "ev_threshold", "use_true_ev_formula"):
+            assert key in edge_step
 
 
 class TestClosePure:

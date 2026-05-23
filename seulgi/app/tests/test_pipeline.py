@@ -105,6 +105,10 @@ def _make_trader(balance: float = 1000.0):
     cfg.freshness_filter = ""
     cfg.mid_yes_min = 0.0
     cfg.mid_yes_max = 1.0
+    # A4B.2: legacy formula keeps these pipeline integration tests deterministic
+    # against ClassifyResult fixtures that don't supply `p_alpha`.
+    cfg.use_true_ev_formula = False
+    cfg.min_ev_per_dollar = 0.0
 
     ai_cfg = MagicMock()
     ai_cfg.min_confidence = 0.45

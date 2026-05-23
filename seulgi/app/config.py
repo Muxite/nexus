@@ -208,6 +208,16 @@ class TradingConfig:
     # plus a fee headroom estimate. 0.0 disables (the legacy `min_edge` gate
     # remains the primary filter). Per-engine override allowed.
     min_ev_per_dollar: float = 0.0
+    # A4B.2 (2026-05-23): when True (default), the trader's entry gate uses
+    # the true-EV formula end-to-end:
+    #   p_true = calibration.calibrate(p_alpha, direction)
+    #   ev = compute_ev_yes/no(p_true, mid_yes_or_no)
+    #   gate: ev >= min_ev_per_dollar + 2 · fee_rate_for(market_type)
+    # When False, the legacy `edge = increment × (2c − 1)` formula fires and
+    # the trader's primary gate is `min_edge` (backward-compat escape hatch).
+    # Per the A3.2 warning, calibration shipped alone collapses execution
+    # volume — A4B.2 bundled with A4B.1 (calibration) + A4B.4 (threshold tune).
+    use_true_ev_formula: bool = True
     # A4A.2 (2026-05-23): JIT pricing tolerance band (basis points,
     # relative to snapshot mid). The trader refetches top-of-book right
     # before `open_position`; if `|live − snapshot| / snapshot >
@@ -411,6 +421,10 @@ class VariantConfig:
     mid_yes_max: Optional[float] = None
     # A4A.2 JIT-pricing tolerance override (bps; relative to snapshot mid).
     jit_tolerance_bps: Optional[float] = None
+    # A4B.2 per-variant escape hatch back to the legacy edge formula.
+    use_true_ev_formula: Optional[bool] = None
+    # A4B.2 per-variant override of the EV-per-$1 floor.
+    min_ev_per_dollar: Optional[float] = None
 
 
 @dataclass
@@ -439,6 +453,10 @@ class EngineConfig:
     max_market_vol_30m: Optional[float] = None
     # A4A.2 JIT-pricing tolerance override (bps; relative to snapshot mid).
     jit_tolerance_bps: Optional[float] = None
+    # A4B.2 per-engine escape hatch back to the legacy edge formula.
+    use_true_ev_formula: Optional[bool] = None
+    # A4B.2 per-engine override of the EV-per-$1 floor.
+    min_ev_per_dollar: Optional[float] = None
     # A4B.3 (2026-05-23): per-engine override of the fractional-Kelly hard
     # cap (simulate_sizing.max_fractional_kelly_cap). When set, the engine's
     # simulate_sizing is rebuilt with this cap; when None, the global value
@@ -572,6 +590,11 @@ def _build_config(raw: dict) -> Config:
             mid_yes_min=_opt_float(v.get("mid_yes_min")),
             mid_yes_max=_opt_float(v.get("mid_yes_max")),
             jit_tolerance_bps=_opt_float(v.get("jit_tolerance_bps")),
+            use_true_ev_formula=(
+                bool(v["use_true_ev_formula"])
+                if "use_true_ev_formula" in v else None
+            ),
+            min_ev_per_dollar=_opt_float(v.get("min_ev_per_dollar")),
         )
 
     engine_cfgs = [
@@ -598,6 +621,11 @@ def _build_config(raw: dict) -> Config:
             max_market_vol_30m=_opt_float(e.get("max_market_vol_30m")),
             jit_tolerance_bps=_opt_float(e.get("jit_tolerance_bps")),
             kelly_cap_override=_opt_float(e.get("kelly_cap_override")),
+            use_true_ev_formula=(
+                bool(e["use_true_ev_formula"])
+                if "use_true_ev_formula" in e else None
+            ),
+            min_ev_per_dollar=_opt_float(e.get("min_ev_per_dollar")),
             relevance_keep_scores=(
                 list(e["relevance_keep_scores"])
                 if isinstance(e.get("relevance_keep_scores"), list)
@@ -687,6 +715,8 @@ def _build_config(raw: dict) -> Config:
             min_entry_yes_mid=float(t.get("min_entry_yes_mid", 0.0)),
             max_market_vol_30m=float(t.get("max_market_vol_30m", 0.0)),
             jit_tolerance_bps=float(t.get("jit_tolerance_bps", 50.0)),
+            min_ev_per_dollar=float(t.get("min_ev_per_dollar", 0.0)),
+            use_true_ev_formula=bool(t.get("use_true_ev_formula", True)),
             simulate_total_usdc=float(t.get("simulate_total_usdc", 50.0)),
             simulate_min_trade_usdc=float(t.get("simulate_min_trade_usdc", 1.0)),
             simulate_fees=_load_simulate_fees(t.get("simulate_fees") or t.get("simulate", {}).get("fee_model")),
