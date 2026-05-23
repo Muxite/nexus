@@ -594,6 +594,15 @@ engines:
     stop_loss:        0.030
     trailing_stop:    0.010
     min_hold_seconds: 300
+    # A4B.4 (2026-05-23) phased rollout — keep the legacy edge gate while
+    # the calibration curves accumulate samples + the EV math gets retuned.
+    # Backtest 2026-05-18..23 (270 baseline trades) showed isotonic
+    # calibration deflates p_alpha 0.65 → 0.33 so far that the true-EV gate
+    # AND Kelly sizing reject every entry (size_too_small + kelly_negative_edge
+    # = 100% skips). See seulgi/reports/2026-05-23-a4b4-threshold-tune.md.
+    # Restore to inheriting the global default once calibration_method:
+    # platt or a model upgrade brings p_calibrated within ~5pp of p_alpha.
+    use_true_ev_formula: false
     variants:
       # 2026-05-19 Phase-E cut: drop _lowvol — forensic showed vol<0.005
       # bucket (which is where the _lowvol filter lands trades) had hit
@@ -723,6 +732,8 @@ engines:
     stop_loss:        0.030
     trailing_stop:    0.010
     min_hold_seconds: 300
+    # A4B.4 (2026-05-23) phased rollout — see balanced engine note.
+    use_true_ev_formula: false
     invert_high_conf: true
     # Lowered from 0.85 → 0.75: the 0.75-0.85 bucket was also flat/anti-
     # informative in the 6h analysis (n=21, 100% no_signal). Catching it too
@@ -808,6 +819,8 @@ engines:
     stop_loss:        0.045
     trailing_stop:    0.012
     min_hold_seconds: 300
+    # A4B.4 (2026-05-23) phased rollout — see balanced engine note.
+    use_true_ev_formula: false
     relevance_keep_scores: ["STRONG_YES", "YES"]
     variants:
       - name: "default"

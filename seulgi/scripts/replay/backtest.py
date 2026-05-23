@@ -357,6 +357,9 @@ def _build_engine_cfg(base_cfg, engine_name: str):
         "invert_high_conf", "invert_conf_threshold", "spread_cost_bps",
         "stop_loss_pct", "min_entry_yes_mid", "max_market_vol_30m",
         "direction_filter", "freshness_filter", "mid_yes_min", "mid_yes_max",
+        # A4B.4 — needed so per-engine `use_true_ev_formula: false`
+        # phased-rollout overrides actually take effect in the replay.
+        "use_true_ev_formula", "min_ev_per_dollar",
     )
     trading = base_trading
     ai = base_ai
@@ -750,13 +753,22 @@ def _parse_args(argv: Optional[list] = None) -> argparse.Namespace:
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     p.add_argument("--calibration", default="none",
                    choices=("none", "platt", "isotonic"),
-                   help="Apply offline calibration curve to confidence "
-                        "BEFORE _evaluate_pure runs (A3.2 prototype; "
-                        "production module lives in Phase 4B.1).")
+                   help="A3.2 prototype mode — calibrate result.confidence "
+                        "BEFORE _evaluate_pure runs (so calibration "
+                        "affects min_confidence + edge + EV).")
+    p.add_argument("--prod-calibration", default="none",
+                   choices=("none", "platt", "isotonic"),
+                   help="A4B.4 production-matching mode — install the "
+                        "curve via calibration.set_default_calibrator() "
+                        "so only `p_alpha → p_calibrated` (used by EV + "
+                        "Kelly) is rewritten; result.confidence (used by "
+                        "min_confidence + _compute_edge) stays raw. "
+                        "This is what production actually does.")
     p.add_argument("--calibration-curve", default=None,
                    help="Path to calibration.json from "
                         "scripts.analysis.calibration_prototype --out. "
-                        "Required when --calibration != none.")
+                        "Required when --calibration != none OR "
+                        "--prod-calibration != none.")
     p.add_argument("--include-neutral", action="store_true",
                    help="Also walk rows with direction='NEUTRAL' (pre-AI "
                    "skips). Off by default — those have no LLM oracle.")
@@ -789,6 +801,36 @@ def main(argv: Optional[list] = None) -> int:
         calibrator = load_calibrator(args.calibration_curve, args.calibration)
         logger.info("[backtest] calibration=%s curve=%s",
                     args.calibration, args.calibration_curve)
+
+    # A4B.4 — production-matching calibration installs the curve via the
+    # module-level `set_default_calibrator()`, exactly as `main.py` does in
+    # production. The trader's `calibrate(p_alpha, direction)` call inside
+    # `_evaluate_pure` picks it up automatically; result.confidence stays raw.
+    if args.prod_calibration != "none":
+        if not args.calibration_curve:
+            raise SystemExit(
+                "--prod-calibration {platt,isotonic} requires "
+                "--calibration-curve PATH."
+            )
+        from calibration_prototype import load_calibrator  # noqa: E402
+        from calibration import set_default_calibrator  # noqa: E402
+        _f = load_calibrator(args.calibration_curve, args.prod_calibration)
+
+        class _ShimCalibrator:
+            """Quacks like app.calibration.Calibrator — only `.calibrate()`
+            is called by trader.calibrate()."""
+            def calibrate(self, c_raw, direction):  # noqa: D401
+                try:
+                    return float(_f(float(c_raw), direction))
+                except Exception:  # noqa: BLE001
+                    try:
+                        return float(c_raw)
+                    except (TypeError, ValueError):
+                        return 0.0
+
+        set_default_calibrator(_ShimCalibrator())
+        logger.info("[backtest] prod_calibration=%s curve=%s (module installed)",
+                    args.prod_calibration, args.calibration_curve)
 
     source_db = args.source_db or os.path.join(_SEULGI, "data", "seulgi.db")
     variant_cfg_path = args.variant_config or os.path.join(_SEULGI, "config.yaml")
@@ -885,6 +927,7 @@ def main(argv: Optional[list] = None) -> int:
         "epsilon_secs": args.epsilon_secs,
         "run_seconds": run_seconds,
         "calibration": args.calibration,
+        "prod_calibration": args.prod_calibration,
         "calibration_curve_path": args.calibration_curve,
     }
 
