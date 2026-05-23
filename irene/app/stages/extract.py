@@ -196,6 +196,8 @@ _EXTRACT_DDL = [
         canonical_name  TEXT NOT NULL,
         external_refs   TEXT,
         status          TEXT NOT NULL DEFAULT 'active',
+        embedding       BLOB,
+        embedder_id     TEXT,
         first_seen_at   TEXT NOT NULL,
         last_seen_at    TEXT NOT NULL,
         UNIQUE(entity_type, canonical_name)
