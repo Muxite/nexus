@@ -103,6 +103,11 @@ class TradeDecision:
     mid_yes: Optional[float] = None
     mid_no: Optional[float] = None
     inverted: bool = False
+    # Phase 4D.2 — macro tag that augmented this market in via the tag-based
+    # router (e.g. "interest_rates"). NULL when the SBERT cosine top-K
+    # surfaced the match itself. Persisted on engine_results.tag so
+    # per-tag counterfactuals can attribute PnL.
+    tag: Optional[str] = None
 
 @dataclass
 class EntryOutcome:
@@ -684,6 +689,7 @@ def _outcome_to_decision(outcome: EntryOutcome, match: MarketMatch,
         risk_score=getattr(result, "risk_score", 0.0),
         mid_yes=match.mid_yes, mid_no=match.mid_no,
         inverted=outcome.inverted,
+        tag=getattr(match, "tag", None),
     )
 
 

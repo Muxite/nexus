@@ -366,10 +366,20 @@ class EngineRunner:
         headline._similar_to = freshness.similar_to
         headline._freshness_label = freshness.label
         headline._nearest_age_secs = freshness.nearest_age_secs
-        matches = self._index.find_matches(embedding)
+        matches = self._index.find_matches(embedding, headline=headline.headline)
         if not matches:
             logger.debug("[INGRESS] [hid=%s] no matches: %s", hid, headline.headline[:80])
             return
+        # Phase 4D.2: surface tag-routed augment matches so the new path is
+        # observable. Cosine-only matches keep `tag=None`; tag-routed ones
+        # carry their triggering macro category (e.g. "interest_rates").
+        tag_routed = [m for m in matches if getattr(m, "tag", None)]
+        if tag_routed:
+            tag_set = sorted({m.tag for m in tag_routed if m.tag})
+            logger.info(
+                "[INGRESS] [hid=%s] tag-routing added %d matches via tags=%s",
+                hid, len(tag_routed), tag_set,
+            )
         await self._db.bump_market_heat([m.condition_id for m in matches])
         matches = await self._prefetch_prices(matches, hid)
         if not matches:
