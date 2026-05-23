@@ -86,12 +86,33 @@ logger = logging.getLogger(__name__)
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _VALID_DIRECTIONS = ("YES", "NO", "NEUTRAL")
-_JSON_SUFFIX = (
-    '\n\nRespond with JSON ONLY (no prose, no markdown fence):\n'
-    '{"direction": "YES" | "NO" | "NEUTRAL", '
-    '"confidence": <float between 0.0 and 1.0>, '
-    '"reasoning": "<one sentence>"}'
+
+# Per `docs/philosophy.md`: irene is a speed bot, not a forecaster. The
+# system prompt below is intentionally tiny + STATIC so providers that
+# do prompt-prefix caching (Anthropic / Gemini-via-OpenRouter / vLLM)
+# can keep it warm. The user message carries only Condition + News.
+#
+# We force `max_tokens=1`, `temperature=0`, and a `logit_bias` that
+# concentrates probability on `Y` / `N` / `U` — three token IDs the
+# parse layer maps to direction. The savings vs. the old JSON-parse
+# path are dominated by tokens-out: ~250 → ~1, cutting time-to-final-
+# token by roughly an order of magnitude.
+_SYSTEM_MESSAGE = (
+    "You are a high-speed financial resolution engine. "
+    "Task: Determine if the News strictly entails the Market Condition. "
+    "Rules:\n"
+    "- Output exactly ONE character.\n"
+    "- Output 'Y' if the news proves the condition is TRUE.\n"
+    "- Output 'N' if the news proves the condition is FALSE.\n"
+    "- Output 'U' if the news is UNRELATED, AMBIGUOUS, or INCONCLUSIVE.\n"
+    "- Do not output any other text, whitespace, or punctuation."
 )
+
+# Token-level forcing. `logit_bias` keys are token IDs — for chat
+# providers we pass the bare characters and rely on the provider to map
+# them. Providers that don't honour `logit_bias` ignore the field; the
+# `max_tokens=1` + `temperature=0` constraints are universal.
+_LOGIT_BIAS_YNU = {"Y": 100, "N": 100, "U": 100}
 
 
 _AI_DDL = [
@@ -170,28 +191,38 @@ def _now_iso() -> str:
 
 
 def _parse_response(raw: str) -> tuple[str, float] | None:
-    """Return (direction, confidence) on success, None on parse error."""
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
+    """Return (direction, confidence) on success, None on parse error.
+
+    Post-v2-fast the LLM emits a single character: Y / N / U.
+    - 'Y' (any case) → ('YES', 1.0)
+    - 'N' (any case) → ('NO', 1.0)
+    - 'U' (any case) → ('NEUTRAL', 0.0)
+    Anything else (e.g. provider returned extra text) → None.
+
+    The `confidence` field stays in the contract surface for backward
+    compat with the gate cascade, but per `docs/philosophy.md` it
+    represents decisiveness (binary in the new regime), not probability.
+    """
+    if not isinstance(raw, str):
         return None
-    if not isinstance(obj, dict):
+    s = raw.strip().upper()
+    if not s:
         return None
-    direction = obj.get("direction")
-    confidence = obj.get("confidence")
-    if direction not in _VALID_DIRECTIONS:
-        return None
-    try:
-        confidence = float(confidence)
-    except (TypeError, ValueError):
-        return None
-    if not 0.0 <= confidence <= 1.0:
-        return None
-    return direction, confidence
+    ch = s[0]
+    if ch == "Y":
+        return "YES", 1.0
+    if ch == "N":
+        return "NO", 1.0
+    if ch == "U":
+        return "NEUTRAL", 0.0
+    return None
 
 
 class AIClient:
-    PROMPT_VERSION: str = "v1"
+    # v2-fast: single-char Y/N/U output. Bump invalidates the llm_calls
+    # cache so old JSON-parse rows aren't mis-interpreted by the new
+    # single-char parser.
+    PROMPT_VERSION: str = "v2-fast"
 
     def __init__(self, *, db: DB, budget: Budget, config: Config) -> None:
         self._db = db
@@ -218,8 +249,13 @@ class AIClient:
         tracer_id: Optional[str] = None,
     ) -> DirectionResult:
         cycle_id = current_cycle_id()
-        full_prompt = prompt + _JSON_SUFFIX
-        prompt_sha = _sha1(f"{full_prompt}|{self._model}|{self.PROMPT_VERSION}")
+        # `prompt` here is just the user content (Condition + News). The
+        # system message is appended to the cache key so a future change
+        # to it forces a fresh round-trip even at the same PROMPT_VERSION.
+        full_prompt = prompt
+        prompt_sha = _sha1(
+            f"{_SYSTEM_MESSAGE}|{full_prompt}|{self._model}|{self.PROMPT_VERSION}"
+        )
 
         if self._budget.is_paused():
             return await self._neutral_with_failure(
@@ -274,6 +310,11 @@ class AIClient:
         Catches all network errors and returns a synthetic dict with
         `status_code=0` and `error` populated rather than raising. This
         keeps the caller's transaction shape uniform.
+
+        v2-fast: enforces `max_tokens=1`, `temperature=0`,
+        `logit_bias` concentrated on `Y/N/U`. Sends the system message
+        as a separate `role: system` entry so providers that cache the
+        prompt prefix (Anthropic, Gemini) keep it warm across calls.
         """
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self._timeout)
@@ -284,8 +325,13 @@ class AIClient:
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json={
                     "model": self._model,
-                    "messages": [{"role": "user", "content": full_prompt}],
-                    "max_tokens": 512,
+                    "messages": [
+                        {"role": "system", "content": _SYSTEM_MESSAGE},
+                        {"role": "user", "content": full_prompt},
+                    ],
+                    "max_tokens": 1,
+                    "temperature": 0,
+                    "logit_bias": _LOGIT_BIAS_YNU,
                 },
             )
         except httpx.HTTPError as exc:

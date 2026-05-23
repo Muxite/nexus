@@ -46,6 +46,7 @@ import logging
 import os
 import signal
 import sys
+from pathlib import Path
 from typing import Optional
 
 from app import db as db_module
@@ -58,9 +59,11 @@ from app.cycle import set_cycle_id
 from app.db import DB
 from app.deps import StageDeps
 from app.embed import Embedder
+from app.dashboard import Dashboard
 from app.stages.closer import CloserStage
 from app.stages.dedupe import DedupeStage
 from app.stages.extract import ExtractStage
+from app.stages.impact_tracker import ImpactTrackerStage
 from app.stages.ingest import IngestStage
 from app.stages.markets import MarketIndex, MarketsStage
 from app.stages.match import MatchStage
@@ -71,6 +74,7 @@ from app.topics import (
     TOPIC_ARTICLE_INGESTED,
     TOPIC_EXTRACTION_COMPLETED,
     TOPIC_SIGNAL_CREATED,
+    TOPIC_TRADE_DECIDED,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,6 +145,7 @@ class Pipeline:
         closer: CloserStage,
         extract: ExtractStage,
         resolve: ResolveStage,
+        impact_tracker: ImpactTrackerStage,
     ) -> None:
         self.markets = markets
         self.ingest = ingest
@@ -150,19 +155,20 @@ class Pipeline:
         self.closer = closer
         self.extract = extract
         self.resolve = resolve
+        self.impact_tracker = impact_tracker
 
     @property
     def start_order(self) -> tuple:
-        # P2: extract is wired alongside match on article.deduped. It runs
-        # in parallel with the trade path; the trade path NEVER reads
-        # extract's or resolve's tables (docs/p2_contracts.md §1 +
-        # docs/p3_contracts.md §1).
-        # P3 chunk 1: resolve subscribes to extraction.completed. It runs
-        # after extract per-article and writes the entity_resolutions
-        # overlay.
+        # P2: extract is wired alongside match on article.deduped.
+        # P3 chunk 1: resolve subscribes to extraction.completed.
+        # Impact tracker (observability): subscribes to trade.decided and
+        # polls CLOB at +1m/5m/15m/30m/60m. Pure diagnostic — never feeds
+        # the trade path (docs/philosophy.md "we don't predict; we
+        # verify the speed thesis holds via this data").
         return (
             self.markets, self.ingest, self.dedupe, self.match,
             self.trade, self.closer, self.extract, self.resolve,
+            self.impact_tracker,
         )
 
     @property
@@ -220,6 +226,10 @@ def wire_pipeline(
     # Resolve (P3 chunk 1) subscribes to extraction.completed. It owns
     # the entity_resolutions overlay; never mutates extract's tables.
     resolve = ResolveStage(full_deps)
+    # Impact tracker (observability): subscribes to trade.decided. Polls
+    # CLOB at +1m/5m/15m/30m/60m to measure whether the price moved the
+    # way we bet. Pure diagnostic; never reads back into the trade path.
+    impact_tracker = ImpactTrackerStage(full_deps)
 
     # Subscriptions MUST be registered before bus.start() — the bus
     # rejects late subscribers (catches the wiring bug where a stage
@@ -229,6 +239,7 @@ def wire_pipeline(
     bus.subscribe(TOPIC_ARTICLE_DEDUPED, extract.handle)
     bus.subscribe(TOPIC_SIGNAL_CREATED, trade.handle)
     bus.subscribe(TOPIC_EXTRACTION_COMPLETED, resolve.handle)
+    bus.subscribe(TOPIC_TRADE_DECIDED, impact_tracker.handle)
 
     return Pipeline(
         markets=markets,
@@ -239,6 +250,7 @@ def wire_pipeline(
         closer=closer,
         extract=extract,
         resolve=resolve,
+        impact_tracker=impact_tracker,
     )
 
 
@@ -276,6 +288,21 @@ async def main() -> int:
         db=db, bus=bus, cfg=cfg, embedder=embedder, ai=ai, budget=budget, clob=clob,
     )
 
+    # Dashboard runs in the background, writing text panels every
+    # interval_secs. Self-contained; reads the DB but never writes.
+    # Dashboard directory derives from the DB path so dev runs with
+    # `:memory:` route to /tmp and don't try to write to /data (which
+    # only the container has permissions for).
+    if cfg.db.path == ":memory:":
+        dashboard_dir = "/tmp/irene_dashboard"
+    else:
+        dashboard_dir = str(Path(cfg.db.path).parent / "dashboard")
+    dashboard = Dashboard(
+        data_dir=dashboard_dir,
+        db=db,
+        interval_secs=30,
+    )
+
     # Only start the OpenRouter poll if we have a credential — a blank
     # key would loop on 401s and clutter the boot log.
     if cfg.openrouter.api_key:
@@ -284,9 +311,10 @@ async def main() -> int:
     await bus.start()
     for stage in pipeline.start_order:
         await stage.start()
+    dashboard._task = asyncio.create_task(dashboard.run())
 
     logger.info(
-        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow resolve=shadow)",
+        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow resolve=shadow impact=tracking)",
         len(pipeline.start_order),
         cfg.irene.cycle,
         cycle_id,
@@ -303,6 +331,7 @@ async def main() -> int:
         await stop
     finally:
         logger.info("irene shutting down")
+        await dashboard.stop()
         for stage in pipeline.stop_order:
             try:
                 await stage.stop()

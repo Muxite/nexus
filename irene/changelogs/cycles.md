@@ -6,6 +6,45 @@ Format: one block per PR; newest at the top.
 
 ---
 
+## 2026-05-23 — Philosophy lock-in: speed bot + observability + ultra-short prompt
+
+**What landed.**
+
+### Philosophy & docs
+- `docs/philosophy.md` (NEW) — locks the speed-not-prediction framing. Authoritative; if anything else contradicts, this file wins.
+- `master-plan.md` §Context — adds the philosophy callout + bullets on latency observability, the impact tracker, calibration de-emphasis, short-horizon market preference.
+- `docs/irene_seulgi_merger.md` (NEW) — forward-look on what the eventual merger/sync needs. Three end-states (irene wins / seulgi wins / coexist), schema mapping draft, operational gates, open questions.
+
+### Observability port from seulgi
+- `app/dashboard.py` (NEW) + 7 tests — text-panel dashboard like seulgi's, atomic `.tmp`-then-rename writes. Five panels: `dashboard.txt` (main), `latency.txt` (per-stage p50/p95/p99 — **the headline metric**), `funnel.txt`, `recent_trades.txt`, `news_staleness.txt` (the speed-thesis check: `traded_at - article.published_at`).
+- `app/stages/impact_tracker.py` (NEW) + 15 tests, agent-written — subscriber on `TOPIC_TRADE_DECIDED`. For every executed trade, polls CLOB at +1m/5m/15m/30m/60m and records `edge_realised_tXs`. **This IS the "edge detect graph" the user asked for** — measures whether the price moves our way after we buy. Sign convention: positive = market moved the way we bet. New `ImpactSection` config (`poll_seconds=30`, `max_age_hours=2.0`).
+- `scripts/analysis/` (NEW) — analysis CLI ported from seulgi. `_common.py` + `_format.py` for shared infra; subcommands `funnel`, `latency`, `decision_card` (full provenance for one signal), `impact` (realised-edge by horizon). `python -m scripts.analysis <sub>` dispatches.
+- `app/main.py` — wires both the dashboard (`asyncio.create_task(dashboard.run())`) and the impact tracker (added to `wire_pipeline()`'s 9th stage). Boot log: `"9 stages wired … extract=shadow resolve=shadow impact=tracking"`.
+
+### Ultra-short LLM prompt (v2-fast)
+- `app/ai.py` — `PROMPT_VERSION = "v2-fast"`. New static system message ("You are a high-speed financial resolution engine. Output exactly ONE character: Y / N / U."). User message carries only `Condition: / News: / Output:`. HTTP request now sends `max_tokens=1`, `temperature=0`, `logit_bias={'Y':100,'N':100,'U':100}`. `_parse_response` rewritten: single char → `('YES', 1.0)` / `('NO', 1.0)` / `('NEUTRAL', 0.0)`. `_JSON_SUFFIX` removed.
+- `app/stages/trade.py` `_compose_prompt` — strips out the multi-line decision-tree text; emits just `Condition: <market>\nNews: <article>\nOutput:`. The system prompt is in ai.py and stays cached at the provider.
+- `app/config.py` `MatchSection.top_k` — default bumped from **5 to 25**. With ~100x cheaper per call (1 output token vs ~250) we can fan out across more candidate markets per article without raising cost.
+- Real-LLM smoke against `google/gemini-2.5-flash` ✓: "FDA rejected Pfizer's diabetes drug" + "FDA approves Pfizer drug by end of year" → `'N'` in `tokens_out=1`. Speed thesis in action.
+
+**Verified.**
+- `pytest -q` — **269 / 269 green** (247 baseline + 7 dashboard + 15 impact_tracker = 269).
+- Real-LLM smoke confirms 1-token output + correct interpretation.
+
+**Why the philosophy clarification matters.**
+
+The pre-existing code framed the LLM call as "predict the direction". That's a forecasting frame — wrong for irene. The new frame is **interpretation**: does the article DECISIVELY say the market resolves Y / N / unclear? The `confidence` field stops being a probability and becomes a binary decisiveness signal (1.0 for Y/N, 0.0 for U). Every downstream gate keeps working unchanged because the math is the same; the *meaning* is what shifted.
+
+The follow-on consequence (cheaper calls ⇒ more candidates) is what makes the new design valuable — we get to interrogate the LLM on 5x more markets per article without paying 5x the cost.
+
+**Not yet (P3 chunk 2+).**
+- Eventize + linker still pending.
+- Dual-path trader (`decision_path='dkg'`) still pending.
+- Real-LLM end-of-P3 measurement of "does DKG path beat MVP path".
+- A potential merger trigger (per `docs/irene_seulgi_merger.md`) — none of the four operational gates is met today.
+
+---
+
 ## 2026-05-23 — P3 chunk 1: entity resolver + alias-aware metric
 
 **What landed.**

@@ -434,18 +434,39 @@ class TradeStage:
         }
 
     def _compose_prompt(self, article: dict, market: dict) -> str:
+        # Per `docs/philosophy.md`: irene is not a forecaster. The LLM is
+        # asked to read the news as natural language and tell us whether
+        # the article DECISIVELY resolves the market, not to estimate the
+        # probability of YES. `confidence` here is "how clearly the news
+        # resolves it", not P(YES).
         title = article["title"] or ""
         summary = article["summary"] or "(none)"
         question = market["question"] or ""
         description = market["description"] or "(none)"
         return (
-            f"NEWS: {title}\n"
-            f"SUMMARY: {summary}\n"
+            f"NEWS HEADLINE: {title}\n"
+            f"NEWS SUMMARY:  {summary}\n"
             f"\n"
-            f"MARKET: {question}\n"
-            f"DETAILS: {description}\n"
+            f"MARKET QUESTION: {question}\n"
+            f"MARKET DETAILS:  {description}\n"
             f"\n"
-            f"Will this news move the market YES, NO, or NEUTRAL? Output JSON ONLY."
+            f"Read the news as plain language. Does the news DECISIVELY\n"
+            f"resolve this market?\n"
+            f"\n"
+            f"  YES     — the news plainly says the market's YES outcome\n"
+            f"            will happen or has just happened.\n"
+            f"  NO      — the news plainly says the market's NO outcome\n"
+            f"            will happen or has just happened.\n"
+            f"  NEUTRAL — the news is unrelated, ambiguous, or doesn't\n"
+            f"            clearly push the market either way. Default to\n"
+            f"            this whenever you're unsure.\n"
+            f"\n"
+            f"`confidence` is how CLEARLY the news resolves the market\n"
+            f"(not a probability of YES). 0.9 = the article spells out\n"
+            f"the resolution; 0.5 = related but ambiguous; below the gate\n"
+            f"falls through to NEUTRAL anyway.\n"
+            f"\n"
+            f"Output JSON ONLY."
         )
 
     async def _resolve_mid(self, *, direction: str, market: Optional[dict]) -> float:

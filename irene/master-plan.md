@@ -19,6 +19,40 @@ Seulgi's lessons (banked over months of cycles): WAL deadlocks, dual-container H
 
 The user studies-while-building. Every paper they drop gets a folder under `docs/papers/`. Every phase ends with a dated report. Every module gets a `## Specification` block (format below).
 
+### What irene actually does (and what it doesn't)
+
+> **Authoritative philosophy doc:** [`docs/philosophy.md`](docs/philosophy.md).
+> If the rest of this plan ever contradicts that file, that file wins.
+
+**Irene does not predict anything.** Irene reads news, confirms the
+wording is decisive for a known market, and buys before the market
+reprices. The edge is **time**, not insight.
+
+The LLM's role is **natural-language understanding** — "does this
+article say the FDA approved or rejected drug X?" — not probability
+estimation. The `direction` + `confidence` fields on `predictions`
+are interpretation outputs, not forecasts. Every downstream gate
+uses them as if they were probabilities because the math is the
+same, but their *meaning* is "how decisively does this news resolve
+the market".
+
+What this means for the plan:
+
+- **Latency observability is the first-class diagnostic.** Per-stage
+  p50/p95/p99 and end-to-end article→trade time matter more than
+  almost anything else. The plan reserves a dashboard surface for
+  this from P1 forward.
+- **The impact tracker is how we know we have edge.** For every
+  executed trade we poll CLOB at +1m / +5m / +15m / +30m / +60m and
+  ask "did the price move our way?". Lands in P3+ alongside the
+  observability port from seulgi.
+- **We de-emphasise calibration.** A miscalibrated LLM lets noisy
+  trades through the gate — fixable with a stricter confidence floor.
+  It is not a six-month research project.
+- **Short-horizon markets are our home.** Long-horizon resolution
+  markets give other actors time to absorb news; we don't compete
+  there.
+
 ---
 
 ## User decisions locked in (2026-05-22)

@@ -119,10 +119,17 @@ class DedupeSection(BaseModel):
 
 
 class MatchSection(BaseModel):
-    """Match stage — cosine floor + top-k cap for article → market candidates."""
+    """Match stage — cosine floor + top-k cap for article → market candidates.
+
+    `top_k` was 5 in P1; we bumped it to 25 once the ai.py prompt went
+    ultra-short (`max_tokens=1`, single-char Y/N/U) — see
+    `docs/philosophy.md`. Cheaper per-call enables fan-out across more
+    candidate markets per article, which is the right move when the
+    matcher's cosine floor is permissive.
+    """
 
     similarity_floor: float = Field(default=0.35, gt=0.0, lt=1.0)
-    top_k: int = Field(default=5, ge=1, le=50)
+    top_k: int = Field(default=25, ge=1, le=100)
 
 
 class ExtractSection(BaseModel):
@@ -155,6 +162,16 @@ class CloserSection(BaseModel):
     # When CLOB can't return a mid for an open trade, hold the position
     # rather than close it at the default; closer just skips this cycle.
     skip_on_missing_mid: bool = True
+
+
+class ImpactSection(BaseModel):
+    """Impact-tracker poll cadence."""
+
+    poll_seconds: int = Field(default=30, ge=5)
+    # Maximum age (hours) we keep polling a price_impacts row. After this
+    # we stop polling even if some buckets are NULL — the t=3600s bucket
+    # is the last interesting one anyway.
+    max_age_hours: float = Field(default=2.0, gt=0)
 
 
 class TradeSection(BaseModel):
@@ -195,6 +212,7 @@ class Config(BaseModel):
     clob: CLOBSection = Field(default_factory=CLOBSection)
     closer: CloserSection = Field(default_factory=CloserSection)
     extract: ExtractSection = Field(default_factory=ExtractSection)
+    impact: ImpactSection = Field(default_factory=ImpactSection)
 
     model_config = {"frozen": True}
 

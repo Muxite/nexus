@@ -54,20 +54,26 @@ def _fake_config(model: str = "google/gemini-2.5-flash") -> object:
     return _Cfg()
 
 
-def _ok_response(direction: str = "YES", confidence: float = 0.72) -> dict:
-    """Construct an OpenRouter-shaped response body containing our JSON."""
-    inner = json.dumps({"direction": direction, "confidence": confidence, "reasoning": "n/a"})
+def _ok_response(direction: str = "YES", confidence: float = 1.0) -> dict:
+    """OpenRouter-shaped 2xx body. v2-fast: content is a single char.
+
+    The `confidence` arg is kept for test-call ergonomics but is ignored
+    in the new regime — the parser fixes 1.0 for Y/N and 0.0 for U.
+    Defaults to YES @ 1.0 to match the most common test shape.
+    """
+    inner_map = {"YES": "Y", "NO": "N", "NEUTRAL": "U"}
+    content = inner_map.get(direction, direction[:1].upper())
     return {
         "status_code": 200,
         "body": json.dumps(
             {
-                "choices": [{"message": {"content": inner}}],
-                "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 50, "completion_tokens": 1},
             }
         ),
         "latency_ms": 12.3,
-        "tokens_in": 10,
-        "tokens_out": 5,
+        "tokens_in": 50,
+        "tokens_out": 1,
         "error": None,
     }
 
@@ -112,19 +118,27 @@ async def ai(db_ready, monkeypatch):
 
 
 def test_parse_response_happy():
-    assert _parse_response(json.dumps({"direction": "YES", "confidence": 0.6})) == ("YES", 0.6)
-    assert _parse_response(json.dumps({"direction": "NEUTRAL", "confidence": 0.0})) == ("NEUTRAL", 0.0)
+    # v2-fast single-char outputs.
+    assert _parse_response("Y") == ("YES", 1.0)
+    assert _parse_response("N") == ("NO", 1.0)
+    assert _parse_response("U") == ("NEUTRAL", 0.0)
+    # Case-insensitive + tolerates whitespace.
+    assert _parse_response("y") == ("YES", 1.0)
+    assert _parse_response(" Y ") == ("YES", 1.0)
+    assert _parse_response("u\n") == ("NEUTRAL", 0.0)
+    # First character wins (provider sometimes emits trailing text).
+    assert _parse_response("Yes, definitely") == ("YES", 1.0)
 
 
 @pytest.mark.parametrize(
     "raw",
     [
-        "not json",
-        json.dumps({"direction": "MAYBE", "confidence": 0.5}),       # bad direction
-        json.dumps({"direction": "YES", "confidence": "high"}),      # bad conf type
-        json.dumps({"direction": "YES", "confidence": 1.5}),         # out of range
-        json.dumps({"direction": "YES", "confidence": -0.1}),
-        json.dumps([1, 2, 3]),                                       # not a dict
+        "",                                                   # empty
+        "  ",                                                 # whitespace-only
+        "X",                                                  # neither Y/N/U
+        "Maybe",                                              # M
+        "{",                                                  # punctuation
+        "\n\n",                                               # only whitespace
     ],
 )
 def test_parse_response_rejects_malformed(raw):
@@ -143,7 +157,9 @@ async def test_direction_happy_path_writes_call_and_prediction(ai, db_ready):
         result = await client.direction(signal_id=10, prompt="news X market Y")
     assert isinstance(result, DirectionResult)
     assert result.direction == "YES"
-    assert result.confidence == 0.7
+    # v2-fast: confidence is fixed (Y/N → 1.0, U → 0.0). The arg to
+    # _ok_response is preserved for ergonomics but no longer round-trips.
+    assert result.confidence == 1.0
     assert result.cached is False
     assert budget.ok_count == 1
     assert budget.f402_count == 0
@@ -153,7 +169,7 @@ async def test_direction_happy_path_writes_call_and_prediction(ai, db_ready):
     cur = await db_ready.conn.execute("SELECT direction, confidence, cached FROM predictions WHERE signal_id=10")
     row = await cur.fetchone()
     assert row["direction"] == "YES"
-    assert row["confidence"] == 0.7
+    assert row["confidence"] == 1.0
     assert row["cached"] == 0
     cur = await db_ready.conn.execute("SELECT COUNT(*) FROM llm_parse_failures")
     assert (await cur.fetchone())[0] == 0
@@ -170,7 +186,7 @@ async def test_direction_second_call_same_prompt_is_cache_hit(ai, db_ready):
     assert first.direction == "NO"
     assert first.cached is False
     assert second.direction == "NO"           # cache served the original
-    assert second.confidence == 0.55
+    assert second.confidence == 1.0           # v2-fast: NO → 1.0 fixed
     assert second.cached is True
 
     cur = await db_ready.conn.execute("SELECT COUNT(*) FROM llm_calls")

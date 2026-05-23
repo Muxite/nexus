@@ -4,7 +4,7 @@
 >
 > **Discipline.** Updated at the end of every phase (not every PR — that aspiration kills momentum; per-PR notes go to `changelogs/cycles.md` instead).
 
-- **Last updated:** 2026-05-23 (**P3 chunk 1 landed — entity resolver + alias-aware metric**)
+- **Last updated:** 2026-05-23 (**philosophy locked + observability port + v2-fast prompt**)
 - **Synthesized from:** the approved plan, the seulgi audit reports, the user's DKG spec at `docs/dkg_spec.md`, the irene ontology at `docs/ontology.md`, and the P3 contracts at `docs/p3_contracts.md`.
 - **Status:** P1 + P2 sealed. **P3 chunk 1 landed.** `app/stages/resolve.py` subscribes to `extraction.completed`, runs deterministic acronym → alias → suffix → self rule chain, owns the `entity_resolutions` overlay (facts stay immutable). Acronym table covers 37 common name-pairs. `--alias-aware` metric in `extraction_quality.py` extends with expansion-overlap matching. **Median alias-aware fact P/R = 0.71 / 0.65** across 3 real-LLM runs; the [P3 chunk 1 report](reports/2026-05-23-irene-p3-resolver.md) recommends chunk 2 (eventize + linker) proceeds — most of the gap to the 0.75 gate is gold-set ambiguity, not extractor failure, and chunk 2's actual success criterion is dual-path PnL parity not absolute P/R. **8 stages wired**, 247 tests green, P1 ship-gate still passing.
 
