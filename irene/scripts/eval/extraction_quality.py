@@ -76,10 +76,12 @@ import app.main  # noqa: F401 — registers cycles DDL
 import app.stages.dedupe  # noqa: F401
 import app.stages.extract  # noqa: F401 — registers extract DDL
 import app.stages.ingest  # noqa: F401
+import app.stages.resolve  # noqa: F401 — registers entity_resolutions DDL
 from app.cycle import cycle_scope
 from app.db import DB
 from app.deps import StageDeps
 from app.stages.extract import ExtractStage
+from app.stages.resolve import ResolveStage
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +110,11 @@ class QualityResult:
     fact_recall: float = 1.0
     per_relation: dict[str, dict[str, float]] = field(default_factory=dict)
     per_article: list[dict] = field(default_factory=list)
+    # Alias-aware (P3) numbers — populated only when the runner was
+    # called with `alias_aware=True`. None otherwise. The alias-aware
+    # result is itself a `QualityResult` (with its own .alias_aware =
+    # None) so the printer can iterate over both shapes uniformly.
+    alias_aware: Optional["QualityResult"] = None
 
 
 # ---------------------------------------------------------------------------
@@ -377,9 +384,16 @@ async def _run_async(
     db_path: str,
     real_llm: bool,
     mock_factory=None,
+    alias_aware: bool = False,
 ) -> QualityResult:
     """Async core. `mock_factory(article) -> response_dict` lets tests
-    inject degraded mocks (drop / hallucinate). Default = exact-gold mock."""
+    inject degraded mocks (drop / hallucinate). Default = exact-gold mock.
+
+    `alias_aware=True` also runs `ResolveStage` after each extract pass
+    (so `entity_resolutions` is populated) and scores the gold a second
+    time using an expansion-based matcher (canonical ∪ aliases ∪
+    resolution chain ∪ acronym pairs). Both strict and alias-aware
+    numbers come back on the result."""
     articles = _load_gold(gold_path)
 
     if real_llm:
@@ -406,6 +420,11 @@ async def _run_async(
         stage = ExtractStage(deps)
         await stage.start()
 
+        resolver: Optional[ResolveStage] = None
+        if alias_aware:
+            resolver = ResolveStage(deps)
+            await resolver.start()
+
         # Seed all articles first so each handle() finds its row.
         for idx, art in enumerate(articles, start=1):
             await _seed_article(
@@ -428,17 +447,242 @@ async def _run_async(
                     "is_tracer": False,
                     "tracer_id": None,
                 })
+                if resolver is not None:
+                    # Look up the extraction_run we just wrote so the
+                    # resolver can target it. The eval drives the bus by
+                    # hand here (instead of going through bus.publish) so
+                    # the loop stays deterministic — resolve fires
+                    # synchronously after extract.
+                    cur = await db.conn.execute(
+                        "SELECT id, status FROM extraction_runs "
+                        "WHERE article_id = ? ORDER BY id DESC LIMIT 1",
+                        (idx,),
+                    )
+                    row = await cur.fetchone()
+                    await cur.close()
+                    if row is not None:
+                        await resolver.handle({
+                            "extraction_run_id": row["id"],
+                            "article_id": idx,
+                            "status": row["status"],
+                            "fact_count": 0,    # unused by resolver
+                            "entity_count": 0,  # unused by resolver
+                            "is_tracer": False,
+                            "tracer_id": None,
+                        })
 
+        if resolver is not None:
+            await resolver.stop()
         await stage.stop()
 
+        # Strict scoring (the P2 metric).
         result = await _score(db, articles)
+        # Alias-aware second pass, when asked. Doesn't re-read extract —
+        # uses the SAME extracted rows but a richer matcher.
+        if alias_aware:
+            expansions = await _build_expansions(db)
+            result.alias_aware = await _score(
+                db, articles, expansions=expansions,
+            )
     finally:
         await db.close()
     return result
 
 
-async def _score(db: DB, articles: list[dict]) -> QualityResult:
-    """Walk the gold articles, compare against the DB, build QualityResult."""
+async def _build_expansions(db: DB) -> dict[tuple[str, str], set[str]]:
+    """Build per-(entity_type, lowercased_canonical_or_alias) → expansion set.
+
+    The expansion set for a name N of type T is every other surface form
+    that should be considered equivalent under alias-aware matching:
+      - N's own canonical (always)
+      - every alias attached to the canonical entity (and reverse: every
+        canonical reachable from an alias)
+      - the resolved-to canonical, if N's entity has an entity_resolutions
+        row (and reverse: every entity that resolves TO N's canonical)
+      - acronym pairs from the loaded acronym table (both directions)
+
+    All keys + values are case-folded. The matcher tests pairwise
+    set-overlap.
+    """
+    out: dict[tuple[str, str], set[str]] = {}
+
+    def _add(etype: str, key: str, val: str) -> None:
+        ke = (etype.upper(), key.strip().lower())
+        ve = val.strip().lower()
+        if ke[1] == ve:
+            return
+        out.setdefault(ke, set()).add(ve)
+
+    # entity_aliases: alias <-> canonical, both ways.
+    cur = await db.conn.execute(
+        """
+        SELECT e.entity_type AS et, e.canonical_name AS canon, a.alias AS alias
+        FROM entity_aliases a
+        JOIN entities e ON e.id = a.entity_id
+        """
+    )
+    for row in await cur.fetchall():
+        _add(row["et"], row["canon"], row["alias"])
+        _add(row["et"], row["alias"], row["canon"])
+    await cur.close()
+
+    # entity_resolutions: any A resolved-to B → B is an expansion of A's
+    # canonical (and vice versa).
+    cur = await db.conn.execute(
+        """
+        SELECT
+            e1.entity_type   AS et,
+            e1.canonical_name AS src,
+            e2.canonical_name AS dst
+        FROM entity_resolutions r
+        JOIN entities e1 ON e1.id = r.entity_id
+        JOIN entities e2 ON e2.id = r.resolved_to_id
+        WHERE r.resolution_kind != 'self'
+        """
+    )
+    for row in await cur.fetchall():
+        _add(row["et"], row["src"], row["dst"])
+        _add(row["et"], row["dst"], row["src"])
+    await cur.close()
+
+    # Acronym table (loaded straight from disk to avoid coupling to the
+    # resolver's internal state). Bidirectional.
+    acronyms = _load_acronym_table()
+    for entry in acronyms:
+        etype, short, long_form = entry["type"], entry["short"], entry["long"]
+        _add(etype, short, long_form)
+        _add(etype, long_form, short)
+    return out
+
+
+def _load_acronym_table() -> list[dict]:
+    """Read the same YAML the resolver reads. Cheap; called once per
+    `_build_expansions`. Returns the raw `acronyms:` list."""
+    path = Path(__file__).resolve().parents[2] / "app" / "stages" / "data" / "acronyms.yaml"
+    if not path.exists():
+        return []
+    doc = yaml.safe_load(path.read_text()) or {}
+    return doc.get("acronyms") or []
+
+
+def _expand(name: str, etype: str, expansions: dict[tuple[str, str], set[str]]) -> set[str]:
+    """Return {lowered name} ∪ its known equivalences. Always at least
+    contains the input itself, so a name with no aliases / resolutions /
+    acronym mappings still matches itself."""
+    base = name.strip().lower()
+    out = {base}
+    out.update(expansions.get((etype.upper(), base), ()))
+    return out
+
+
+def _entities_overlap(
+    etype: str,
+    a: str,
+    b: str,
+    expansions: Optional[dict[tuple[str, str], set[str]]],
+) -> bool:
+    """True iff the expansion sets of (etype, a) and (etype, b) intersect.
+    When `expansions is None`, falls back to strict CI equality."""
+    if expansions is None:
+        return a.strip().lower() == b.strip().lower()
+    return bool(_expand(a, etype, expansions) & _expand(b, etype, expansions))
+
+
+def _alias_aware_entity_match(
+    expected: set[tuple[str, str]],
+    extracted: set[tuple[str, str]],
+    expansions: dict[tuple[str, str], set[str]],
+) -> set[tuple[str, str]]:
+    """For each expected (type, name_lower), count it as matched if ANY
+    extracted entity of the same type has an overlapping expansion set.
+
+    Returns a set of expected keys that were matched, so the caller can
+    take its size as the alias-aware "matched_ents" count. Same shape as
+    the strict matcher's `expected_ents & extracted_ents`.
+    """
+    matched: set[tuple[str, str]] = set()
+    for (etype, ename) in expected:
+        ent_expansion = _expand(ename, etype, expansions)
+        for (etype_x, ename_x) in extracted:
+            if etype_x != etype:
+                continue
+            ext_expansion = _expand(ename_x, etype_x, expansions)
+            if ent_expansion & ext_expansion:
+                matched.add((etype, ename))
+                break
+    return matched
+
+
+def _alias_aware_fact_match(
+    expected: set[tuple],
+    extracted: set[tuple],
+    *,
+    type_by_name: dict[str, str],
+    expansions: dict[tuple[str, str], set[str]],
+) -> set[tuple]:
+    """Match facts when subj / obj overlap on expansion sets and relation matches.
+
+    Each fact is `(subj_lower, relation, obj_lower_or_None)`. obj_None
+    is its own expansion set ({None}); it matches only obj_None on the
+    other side."""
+    matched: set[tuple] = set()
+    for exp_fact in expected:
+        exp_subj, exp_rel, exp_obj = exp_fact
+        if exp_subj is None:
+            continue
+        exp_subj_type = type_by_name.get(exp_subj)
+        exp_obj_type = type_by_name.get(exp_obj) if exp_obj else None
+        exp_subj_set = (
+            _expand(exp_subj, exp_subj_type, expansions)
+            if exp_subj_type else {exp_subj}
+        )
+        exp_obj_set = (
+            _expand(exp_obj, exp_obj_type, expansions)
+            if (exp_obj and exp_obj_type) else ({exp_obj} if exp_obj else None)
+        )
+        for ext_fact in extracted:
+            ext_subj, ext_rel, ext_obj = ext_fact
+            if ext_rel != exp_rel:
+                continue
+            if ext_subj is None:
+                continue
+            ext_subj_type = type_by_name.get(ext_subj, exp_subj_type)
+            ext_subj_set = (
+                _expand(ext_subj, ext_subj_type, expansions)
+                if ext_subj_type else {ext_subj}
+            )
+            if not (exp_subj_set & ext_subj_set):
+                continue
+            # Object handling: both None → match. Both not None → require
+            # overlap. One None and one not → no match (object polarity
+            # is meaningful — a `signs (X, NULL)` is a different
+            # assertion from `signs (X, Y)`).
+            if exp_obj is None and ext_obj is None:
+                matched.add(exp_fact)
+                break
+            if exp_obj is None or ext_obj is None:
+                continue
+            ext_obj_type = type_by_name.get(ext_obj, exp_obj_type)
+            ext_obj_set = (
+                _expand(ext_obj, ext_obj_type, expansions)
+                if ext_obj_type else {ext_obj}
+            )
+            if exp_obj_set & ext_obj_set:
+                matched.add(exp_fact)
+                break
+    return matched
+
+
+async def _score(
+    db: DB,
+    articles: list[dict],
+    *,
+    expansions: Optional[dict[tuple[str, str], set[str]]] = None,
+) -> QualityResult:
+    """Walk the gold articles, compare against the DB, build QualityResult.
+
+    When `expansions` is provided, matching uses alias-aware expansion
+    overlap instead of strict CI equality."""
     result = QualityResult(n_articles=len(articles))
 
     # Per-relation accumulators. Initialise every ontology relation so the
@@ -472,8 +716,28 @@ async def _score(db: DB, articles: list[dict]) -> QualityResult:
             _fact_key(subj, rel, obj) for (subj, rel, obj) in extracted_facts_rows
         }
 
-        ent_match = expected_ents & extracted_ents
-        fact_match = expected_facts_set & extracted_facts_set
+        # Type lookup for the alias-aware matcher: fact rows arrive with
+        # subj/obj as bare names, so we need to know which entity_type to
+        # expand them against. Build a name → type map from the article's
+        # extracted entities.
+        type_by_name = {n.strip().lower(): t for (t, n) in extracted_ents_rows}
+        # Add the expected-side types too so unmatched expectations can
+        # be expanded.
+        for e in art["expected_entities"]:
+            type_by_name.setdefault(e["name"].strip().lower(), e["type"])
+
+        if expansions is None:
+            ent_match = expected_ents & extracted_ents
+            fact_match = expected_facts_set & extracted_facts_set
+        else:
+            ent_match = _alias_aware_entity_match(
+                expected_ents, extracted_ents, expansions,
+            )
+            fact_match = _alias_aware_fact_match(
+                expected_facts_set, extracted_facts_set,
+                type_by_name=type_by_name,
+                expansions=expansions,
+            )
 
         # Per-relation tally — count expectations + extractions + matches
         # keyed by the relation itself.
@@ -544,6 +808,7 @@ def run_inproc(
     db_path: str = ":memory:",
     real_llm: bool = False,
     mock_factory=None,
+    alias_aware: bool = False,
 ) -> QualityResult:
     """Synchronous wrapper around the async runner — mirrors accuracy.py."""
     return asyncio.run(
@@ -552,6 +817,7 @@ def run_inproc(
             db_path=db_path,
             real_llm=real_llm,
             mock_factory=mock_factory,
+            alias_aware=alias_aware,
         )
     )
 
@@ -572,6 +838,11 @@ def _print_report(result: QualityResult) -> None:
           f"{result.entity_precision:.3f} / {result.entity_recall:.3f}")
     print(f"  fact precision/recall:   "
           f"{result.fact_precision:.3f} / {result.fact_recall:.3f}")
+    if result.alias_aware is not None:
+        a = result.alias_aware
+        print("  alias-aware (resolver + acronyms + aliases):")
+        print(f"    entity P/R:            {a.entity_precision:.3f} / {a.entity_recall:.3f}")
+        print(f"    fact P/R:              {a.fact_precision:.3f} / {a.fact_recall:.3f}")
     print("  per-relation:")
     for r in ONTOLOGY_RELATIONS:
         row = result.per_relation.get(r, {})
@@ -601,7 +872,7 @@ def _print_report(result: QualityResult) -> None:
 
 
 def _result_to_jsonable(result: QualityResult) -> dict:
-    return {
+    out = {
         "n_articles": result.n_articles,
         "n_expected_entities": result.n_expected_entities,
         "n_expected_facts": result.n_expected_facts,
@@ -614,6 +885,9 @@ def _result_to_jsonable(result: QualityResult) -> dict:
         "per_relation": result.per_relation,
         "per_article": result.per_article,
     }
+    if result.alias_aware is not None:
+        out["alias_aware"] = _result_to_jsonable(result.alias_aware)
+    return out
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -626,6 +900,9 @@ def main(argv: Optional[list[str]] = None) -> int:
                         help="DB path (default ':memory:'; use a file for persistence).")
     parser.add_argument("--real-llm", action="store_true",
                         help="Use real OpenRouter (requires OPENROUTER_API_KEY).")
+    parser.add_argument("--alias-aware", action="store_true",
+                        help="Also run the resolver and report alias-aware "
+                             "P/R alongside the strict numbers (P3+).")
     parser.add_argument("--json", dest="as_json", action="store_true",
                         help="Emit machine-readable JSON instead of the human report.")
     args = parser.parse_args(argv)
@@ -635,6 +912,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             gold_path=args.gold,
             db_path=args.db,
             real_llm=args.real_llm,
+            alias_aware=args.alias_aware,
         )
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         print(f"extraction quality: ERROR {exc}", flush=True)

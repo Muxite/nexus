@@ -4,9 +4,9 @@
 >
 > **Discipline.** Updated at the end of every phase (not every PR — that aspiration kills momentum; per-PR notes go to `changelogs/cycles.md` instead).
 
-- **Last updated:** 2026-05-23 (**P2 wrapped — extraction live + end-of-phase report**)
-- **Synthesized from:** the approved plan at `~/.claude/plans/based-on-the-new-lovely-coral.md`, the seulgi audit reports (`/home/muk/projects/jennie/seulgi/architecture.md`, three Explore-agent reports run 2026-05-22), the user's DKG spec at `docs/dkg_spec.md`, and the irene ontology at `docs/ontology.md`.
-- **Status:** P1 sealed + **P2 wrapped with conditional approval to enter P3.** Extraction stage live; ontology-constrained LLM extraction running shadow-mode (writes facts/entities/etc., trade path NEVER reads them — invariant mechanically enforced by `scripts/lint/no_facts_in_trade_path.py`). Real-LLM held-out evaluation shows fact P/R ≈ 0.59 / 0.57, entity P/R ≈ 0.74 / 0.74 — below the strict 0.6 fact-P/R gate, but [the end-of-P2 report](reports/2026-05-23-irene-p2-extraction.md) shows 6/8 remaining misses are metric-strictness artefacts, not extractor failures. **P3 proceeds with entity-resolver as the critical-path first deliverable.** 230+ tests green.
+- **Last updated:** 2026-05-23 (**P3 chunk 1 landed — entity resolver + alias-aware metric**)
+- **Synthesized from:** the approved plan, the seulgi audit reports, the user's DKG spec at `docs/dkg_spec.md`, the irene ontology at `docs/ontology.md`, and the P3 contracts at `docs/p3_contracts.md`.
+- **Status:** P1 + P2 sealed. **P3 chunk 1 landed.** `app/stages/resolve.py` subscribes to `extraction.completed`, runs deterministic acronym → alias → suffix → self rule chain, owns the `entity_resolutions` overlay (facts stay immutable). Acronym table covers 37 common name-pairs. `--alias-aware` metric in `extraction_quality.py` extends with expansion-overlap matching. **Median alias-aware fact P/R = 0.71 / 0.65** across 3 real-LLM runs; the [P3 chunk 1 report](reports/2026-05-23-irene-p3-resolver.md) recommends chunk 2 (eventize + linker) proceeds — most of the gap to the 0.75 gate is gold-set ambiguity, not extractor failure, and chunk 2's actual success criterion is dual-path PnL parity not absolute P/R. **8 stages wired**, 247 tests green, P1 ship-gate still passing.
 
 ---
 
@@ -86,6 +86,8 @@ Every load-bearing module gets a `## Specification` block at the top of its docs
 | `app/stages/match.py` | P1 | (TBD) | not created |
 | `app/stages/trade.py` | P1 | (TBD) | not created |
 | `app/stages/extract.py` | P2 | ✓ | **live** — subscribes to `article.deduped`. Ontology-constrained LLM call → markdown-fence-strip → JSON parse → ontology validation → COMPANY-suffix normalisation → entity insert-or-fetch → facts. Acronym-preference in the prompt. Owns `entities`, `entity_aliases`, `extraction_runs`, `facts`. Independent HTTP path (shares `deps.budget` with `ai.py`). |
+| `app/stages/resolve.py` | P3 ch.1 | ✓ | **live** — subscribes to `extraction.completed`. Deterministic acronym → alias → suffix → self rule chain. Owns `entity_resolutions` (the overlay; facts/entities stay immutable). 37-row `data/acronyms.yaml`; `RESOLVER_VERSION="v1"`. Publishes `resolution.completed`. |
+| `app/stages/data/acronyms.yaml` | P3 ch.1 | ✓ | **live** — 37 name-pairs across ORG, COUNTRY, ECON_INDICATOR, ASSET. Lookup is bidirectional + case-insensitive. Adding a row requires a regression test under `test_resolve.py`. |
 | `scripts/lint/no_facts_in_trade_path.py` | P2 | ✓ | **live** — mechanically enforces the P2 hard invariant. Scans `ai.py` + `trade.py` + `match.py` + `closer.py` for SELECT/JOIN/INTO/UPDATE/DELETE against the four extraction tables. Word-boundary patterns + an opt-in `# lint: allow-extraction-table-ref` escape. |
 | `scripts/eval/gold_set/v1.yaml` + `scripts/eval/extraction_quality.py` | P2 | ✓ | **live** — 18 Reuters-style gold articles covering all 10 relations. Strict CI canonical-name matcher reports per-relation precision/recall. Mock and `--real-llm` modes. |
 | `app/stages/eventize.py` | P3 | (TBD) | not created |

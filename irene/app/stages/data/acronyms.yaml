@@ -1,0 +1,75 @@
+# Acronym table for the entity resolver (P3 chunk 1).
+#
+# Each entry is a (entity_type, short, long) tuple. The resolver maps
+# EITHER direction: short → long OR long → short — whichever form survives
+# in the `entities` table is the canonical, and the other becomes the
+# alias-target via `entity_resolutions`.
+#
+# Adding a row REQUIRES a regression test under
+# `app/tests/stages/test_resolve.py` that demonstrates the merge fires.
+# Don't extend this casually; the same prompt that taught the extractor
+# to emit "FDA" not "U.S. Food and Drug Administration" should usually
+# be the first move. Acronyms in this file are the safety net for cases
+# where (a) the LLM ignores the prompt, or (b) the corpus pre-dates the
+# prompt change.
+
+version: v1
+created_at: 2026-05-23
+
+acronyms:
+  # Regulatory / executive (US)
+  - {type: ORG, short: "FDA",  long: "U.S. Food and Drug Administration"}
+  - {type: ORG, short: "SEC",  long: "U.S. Securities and Exchange Commission"}
+  - {type: ORG, short: "FTC",  long: "Federal Trade Commission"}
+  - {type: ORG, short: "DOJ",  long: "U.S. Department of Justice"}
+  - {type: ORG, short: "IRS",  long: "Internal Revenue Service"}
+  - {type: ORG, short: "EPA",  long: "Environmental Protection Agency"}
+  - {type: ORG, short: "NASA", long: "National Aeronautics and Space Administration"}
+  - {type: ORG, short: "CFTC", long: "Commodity Futures Trading Commission"}
+  - {type: ORG, short: "FCC",  long: "Federal Communications Commission"}
+
+  # Central banks / monetary policy
+  - {type: ORG, short: "Fed",  long: "Federal Reserve"}
+  - {type: ORG, short: "FOMC", long: "Federal Open Market Committee"}
+  - {type: ORG, short: "ECB",  long: "European Central Bank"}
+  - {type: ORG, short: "BoE",  long: "Bank of England"}
+  - {type: ORG, short: "BoJ",  long: "Bank of Japan"}
+  - {type: ORG, short: "PBoC", long: "People's Bank of China"}
+  - {type: ORG, short: "RBA",  long: "Reserve Bank of Australia"}
+
+  # International orgs
+  - {type: ORG, short: "UN",   long: "United Nations"}
+  - {type: ORG, short: "WHO",  long: "World Health Organization"}
+  - {type: ORG, short: "WTO",  long: "World Trade Organization"}
+  - {type: ORG, short: "IMF",  long: "International Monetary Fund"}
+  - {type: ORG, short: "OPEC", long: "Organization of the Petroleum Exporting Countries"}
+  - {type: ORG, short: "EU",   long: "European Union"}
+  - {type: ORG, short: "NATO", long: "North Atlantic Treaty Organization"}
+
+  # Country acronyms (often emitted as country names in news)
+  - {type: COUNTRY, short: "US",  long: "United States"}
+  - {type: COUNTRY, short: "USA", long: "United States"}
+  - {type: COUNTRY, short: "UK",  long: "United Kingdom"}
+  - {type: COUNTRY, short: "UAE", long: "United Arab Emirates"}
+  - {type: COUNTRY, short: "DRC", long: "Democratic Republic of the Congo"}
+
+  # Common economic indicators
+  - {type: ECON_INDICATOR, short: "CPI",  long: "Consumer Price Index"}
+  - {type: ECON_INDICATOR, short: "GDP",  long: "Gross Domestic Product"}
+  - {type: ECON_INDICATOR, short: "PPI",  long: "Producer Price Index"}
+  # Rate-name synonyms — the table is really a name-pair lookup; we use
+  # it for any case where two surface forms refer to the same
+  # indicator. "Short" is editorial here; either side resolves.
+  - {type: ECON_INDICATOR, short: "fed funds rate",  long: "federal funds rate"}
+  - {type: ECON_INDICATOR, short: "FFR",             long: "federal funds rate"}
+  - {type: ECON_INDICATOR, short: "ECB rate",        long: "refinancing rate"}
+  - {type: ECON_INDICATOR, short: "deposit rate",    long: "deposit facility rate"}
+  - {type: ECON_INDICATOR, short: "BoE rate",        long: "bank rate"}
+  - {type: ECON_INDICATOR, short: "unemployment",    long: "unemployment rate"}
+  - {type: ECON_INDICATOR, short: "core CPI",        long: "core consumer price index"}
+
+  # Crypto / common asset tickers
+  - {type: ASSET, short: "BTC",  long: "Bitcoin"}
+  - {type: ASSET, short: "ETH",  long: "Ethereum"}
+  - {type: ASSET, short: "SOL",  long: "Solana"}
+  - {type: ASSET, short: "USDC", long: "USD Coin"}

@@ -64,10 +64,12 @@ from app.stages.extract import ExtractStage
 from app.stages.ingest import IngestStage
 from app.stages.markets import MarketIndex, MarketsStage
 from app.stages.match import MatchStage
+from app.stages.resolve import ResolveStage
 from app.stages.trade import TradeStage
 from app.topics import (
     TOPIC_ARTICLE_DEDUPED,
     TOPIC_ARTICLE_INGESTED,
+    TOPIC_EXTRACTION_COMPLETED,
     TOPIC_SIGNAL_CREATED,
 )
 
@@ -138,6 +140,7 @@ class Pipeline:
         trade: TradeStage,
         closer: CloserStage,
         extract: ExtractStage,
+        resolve: ResolveStage,
     ) -> None:
         self.markets = markets
         self.ingest = ingest
@@ -146,15 +149,20 @@ class Pipeline:
         self.trade = trade
         self.closer = closer
         self.extract = extract
+        self.resolve = resolve
 
     @property
     def start_order(self) -> tuple:
         # P2: extract is wired alongside match on article.deduped. It runs
         # in parallel with the trade path; the trade path NEVER reads
-        # extract's tables (docs/p2_contracts.md §1).
+        # extract's or resolve's tables (docs/p2_contracts.md §1 +
+        # docs/p3_contracts.md §1).
+        # P3 chunk 1: resolve subscribes to extraction.completed. It runs
+        # after extract per-article and writes the entity_resolutions
+        # overlay.
         return (
             self.markets, self.ingest, self.dedupe, self.match,
-            self.trade, self.closer, self.extract,
+            self.trade, self.closer, self.extract, self.resolve,
         )
 
     @property
@@ -209,6 +217,9 @@ def wire_pipeline(
     # Extract (P2) needs `deps.budget`. It runs alongside match on the
     # same `article.deduped` topic — the bus fans out to both subscribers.
     extract = ExtractStage(full_deps)
+    # Resolve (P3 chunk 1) subscribes to extraction.completed. It owns
+    # the entity_resolutions overlay; never mutates extract's tables.
+    resolve = ResolveStage(full_deps)
 
     # Subscriptions MUST be registered before bus.start() — the bus
     # rejects late subscribers (catches the wiring bug where a stage
@@ -217,6 +228,7 @@ def wire_pipeline(
     bus.subscribe(TOPIC_ARTICLE_DEDUPED, match.handle)
     bus.subscribe(TOPIC_ARTICLE_DEDUPED, extract.handle)
     bus.subscribe(TOPIC_SIGNAL_CREATED, trade.handle)
+    bus.subscribe(TOPIC_EXTRACTION_COMPLETED, resolve.handle)
 
     return Pipeline(
         markets=markets,
@@ -226,6 +238,7 @@ def wire_pipeline(
         trade=trade,
         closer=closer,
         extract=extract,
+        resolve=resolve,
     )
 
 
@@ -273,7 +286,7 @@ async def main() -> int:
         await stage.start()
 
     logger.info(
-        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow)",
+        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow resolve=shadow)",
         len(pipeline.start_order),
         cfg.irene.cycle,
         cycle_id,

@@ -48,8 +48,12 @@ TRADE_PATH_FILES = (
     "app/stages/closer.py",
 )
 
-# The four tables owned by the extraction stage.
-FORBIDDEN_TABLES = ("facts", "entities", "entity_aliases", "extraction_runs")
+# The four extraction tables (P2) + the resolver's overlay (P3). Trade
+# path may not read any of them.
+FORBIDDEN_TABLES = (
+    "facts", "entities", "entity_aliases", "extraction_runs",
+    "entity_resolutions",
+)
 
 # A line containing this token is intentionally allowed (e.g. a comment
 # referring to the table by name without reading from it).

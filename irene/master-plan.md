@@ -2,8 +2,8 @@
 
 > The canonical roadmap. For current state, see [`architecture.md`](architecture.md). For the design north star, see [`docs/dkg_spec.md`](docs/dkg_spec.md). The full plan that authorised this build lives at `~/.claude/plans/based-on-the-new-lovely-coral.md` — this file is the in-repo working copy.
 
-- **Last updated:** 2026-05-23 (**P2 wrapped** — extraction + held-out eval + invariant lint; end-of-phase report shipped)
-- **Current phase:** P1 + P2 both complete. Real-LLM held-out evaluation produced **entity P/R ≈ 0.74 / 0.74, fact P/R ≈ 0.59 / 0.57**; [end-of-P2 report](reports/2026-05-23-irene-p2-extraction.md) recommends P3 proceeds with the entity-resolver as the first critical-path deliverable (most remaining gap is metric-strictness, not extractor failure). 230+ tests green. Next: P3 — events + linker, starting with `app/stages/resolve.py`.
+- **Last updated:** 2026-05-23 (**P3 chunk 1 landed** — entity resolver + alias-aware metric; chunk-1 report shipped)
+- **Current phase:** P1 + P2 sealed; **P3 chunk 1 wrapped** ([resolver report](reports/2026-05-23-irene-p3-resolver.md)). Median real-LLM alias-aware fact P/R = 0.71 / 0.65 across 3 runs (best 0.73 / 0.70); below the 0.75 gate but the gap is dominated by gold-set ambiguity. Chunk-1 ships; chunk 2 (eventize + linker + dual-path trader) is the next ramp.
 
 ---
 
@@ -95,7 +95,8 @@ Each phase ends with: (a) code merged, (b) a dated `reports/YYYY-MM-DD-phase-N.m
 |---|---|---|---|
 | **P0** | Scaffold + docs | `irene/` directory tree, 5 root docs, dkg_spec verbatim, first handoff | **✓ complete 2026-05-23** |
 | **P1** | MVP pipeline + tracer + replay | Dockerfile, compose entry, schema, all P1 modules, `scripts/tracer/`, `scripts/replay/accuracy.py`. Runs in parallel with seulgi. | **✓ complete 2026-05-23** ([soak report](reports/2026-05-23-irene-p1-soak.md)) |
-| **P2** | Extraction layer (shadow) | `stages/extract.py` + entities/facts tables. Trade path STILL uses MVP. Reports compare extraction precision/recall on held-out samples. | **✓ complete 2026-05-23** ([extraction report](reports/2026-05-23-irene-p2-extraction.md)) — P3 proceeds with ER on the critical path |
+| **P2** | Extraction layer (shadow) | `stages/extract.py` + entities/facts tables. Trade path STILL uses MVP. Reports compare extraction precision/recall on held-out samples. | **✓ complete 2026-05-23** ([extraction report](reports/2026-05-23-irene-p2-extraction.md)) |
+| **P3** | Event + linker | Three chunks: **(1) entity resolver** ✓ ([resolver report](reports/2026-05-23-irene-p3-resolver.md)); (2) eventize + link; (3) dual-path trader. Open-research session before each chunk. | **chunk 1 done 2026-05-23**; chunks 2-3 pending |
 | **P3** | Event + linker (high-risk) | `stages/eventize.py` + `stages/link.py`. Introduces `decision_path='dkg'` alongside `'mvp'`. Research-session-first per critique. | sketch |
 | **P4** | Dual-write comparison + Postgres draft | Reports quantify mvp vs dkg per-trade-path. Postgres DDL drafted (not run). Schema-reviewer agent owns this. | sketch |
 | **P5** | Cutover candidates | One non-critical read (market context) routed through DKG. Then candidate filtering. Final trade decision only after ≥5 consecutive 24h windows of DKG ≥ MVP. | TBD |

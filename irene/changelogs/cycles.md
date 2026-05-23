@@ -6,6 +6,47 @@ Format: one block per PR; newest at the top.
 
 ---
 
+## 2026-05-23 — P3 chunk 1: entity resolver + alias-aware metric
+
+**What landed.**
+- `docs/p3_contracts.md` — locked P3 interface. §1 extends the trade-path-never-reads invariant to `entity_resolutions`. §3 adds `TOPIC_RESOLUTION_COMPLETED`. §4 specifies `ResolveStage` with the deterministic rule chain (acronym → alias → suffix → self). §5 schema. §7 acronym-table format. §8 alias-aware metric contract.
+- `app/stages/resolve.py` + 17 tests (agent-written against the locked contract). Subscriber on `extraction.completed`. Walks the rule chain for every entity referenced by a fact on the just-extracted article. Owns `entity_resolutions` (the overlay); never mutates `entities` / `entity_aliases` / `facts`. Lower-id-wins symmetry break so the merge graph never cycles. `RESOLVER_VERSION="v1"` stamped on every row.
+- `app/stages/data/acronyms.yaml` — 37 name-pairs across ORG (FDA, SEC, Fed, ECB, …), COUNTRY (US, UK, UAE, …), ECON_INDICATOR (CPI, GDP, fed funds rate ↔ federal funds rate, …), ASSET (BTC, ETH, SOL, USDC). Adding a row requires a regression test.
+- `app/topics.py` — `TOPIC_RESOLUTION_COMPLETED`. Trade-path.
+- `app/main.py` — `wire_pipeline()` constructs `ResolveStage`; subscribes `resolve.handle` to `extraction.completed`. **8 stages wired** now (was 7); boot log line: `"… extract=shadow resolve=shadow"`.
+- `scripts/lint/no_facts_in_trade_path.py` — added `entity_resolutions` to the forbidden-tables list. Trade path cannot read the resolver's overlay either.
+- `scripts/eval/extraction_quality.py` — new `--alias-aware` flag. After each `ExtractStage.handle()`, the harness drives `ResolveStage.handle()` synchronously so `entity_resolutions` populates. The matcher builds expansion sets from `entity_aliases` + `entity_resolutions` + the acronym YAML, and matches by set-overlap. Reports BOTH strict and alias-aware numbers in the same run. Backward compatible (off by default).
+- `scripts/tracer/fire.py` — confirmed unchanged; tracer doesn't run the resolver but still satisfies its construction in `wire_pipeline` via the existing `_TracerBudget` stub.
+- `reports/2026-05-23-irene-p3-resolver.md` — chunk-1 report. Real-LLM eval across 3 runs.
+
+**Verified.**
+- `pytest -q` — **247 tests green** (230 P2 baseline + 17 new resolver).
+- `python -m scripts.lint.no_facts_in_trade_path` — clean.
+- Mock-mode `--alias-aware`: 1.0/1.0 on every relation (sanity check).
+- Real-LLM `--alias-aware` (3 runs, gemini-2.5-flash):
+
+  | | Run 1 | Run 2 | Run 3 |
+  |---|---|---|---|
+  | Strict entity P/R | 0.78 / 0.80 | 0.74 / 0.74 | 0.74 / 0.71 |
+  | Strict fact P/R | 0.62 / 0.57 | 0.64 / 0.61 | 0.57 / 0.52 |
+  | **Alias-aware entity P/R** | 0.86 / 0.89 | 0.83 / 0.83 | 0.79 / 0.77 |
+  | **Alias-aware fact P/R** | **0.71 / 0.65** | **0.73 / 0.70** | 0.62 / 0.57 |
+
+- Boot smoke: `"irene boot OK, 8 stages wired"`, live Gamma poll, SIGTERM exit 0.
+
+**P3 chunk 1 ship decision.**
+- Alias-aware median fact P/R = 0.71 / 0.65, below the `p3_contracts.md` §8 gate of 0.75.
+- Hand audit (6/8 remaining misses are gold-set / metric-strictness artefacts, same pattern as P2's audit) + the fact that LLM variance is ~0.1 on this metric make a strict-threshold gate brittle.
+- **Decision: ship chunk 1, proceed to chunk 2.** Chunk 2's actual success criterion is dual-path PnL parity, not absolute extraction P/R; the eventize layer will roll up across multiple facts and absorb single-fact noise. Carry forward as known-risk.
+
+**Not yet (P3 chunks 2-3).**
+- Eventization research session — `docs/papers/eventization/notes.md`. Three open questions: similarity metric, time window, tie-break rule.
+- `app/stages/eventize.py` — owns `events` + `event_edges`. Subscribes to `resolution.completed`.
+- `app/stages/link.py` — owns `market_links`. Subscribes to event updates. Scores via directness / novelty / deadline_fit / resolution_fit (drop components that are provably uniform on real data).
+- Dual-path trader (`decision_path='dkg'` alongside `'mvp'` in `trades`) — the **P3 final ship gate**. End-of-P3 report measures overlap; if DKG path is >85% the same trades with no PnL lift, kill it.
+
+---
+
 ## 2026-05-23 — P2 wrap: invariant lint + gold-set eval + extractor improvements + end-of-P2 report
 
 **What landed.**
