@@ -28,6 +28,11 @@ class Dashboard:
     db: DB
     interval_secs: int = 30
     plot_interval_secs: int = 300   # PNGs are expensive; refresh every 5 min
+    # Optional handles so pages can render AI/budget state. Old call sites
+    # that don't pass these (tests, P1 wiring) keep working — pages must
+    # check for None.
+    budget: Optional[object] = None
+    cfg: Optional[object] = None
     _task: Optional[asyncio.Task] = None
     _plot_task: Optional[asyncio.Task] = None
     _stopped: bool = False

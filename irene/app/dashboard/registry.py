@@ -8,11 +8,11 @@ from __future__ import annotations
 
 from .pages import (
     cycle_summary,
+    decisions,
     entity_extraction,
     entity_resolutions,
     funnel,
     latency,
-    llm_calls,
     main,
     news_staleness,
     pnl,
@@ -25,19 +25,19 @@ PAGES = [
     cycle_summary,
     latency,
     funnel,
+    decisions,
     recent_trades,
     news_staleness,
     throughput,
-    llm_calls,
     entity_extraction,
     entity_resolutions,
     pnl,
 ]
 
-# Files that have never existed and should not be reintroduced. Mirrors
-# seulgi's A1_5_CULLED_FILES convention so the regression test pattern
-# stays consistent across bots.
+# Files that have never existed (or have been deliberately removed) and
+# should not be reintroduced. Mirrors seulgi's A1_5_CULLED_FILES.
 DEAD_FILES = frozenset({
-    # irene has never had these; if you add one of these names, you are
-    # almost certainly duplicating an existing page.
+    # Absorbed into dashboard.txt's AI subsystem panel (2026-05-24,
+    # chunk-3 follow-up: "fewer files, more info per file").
+    "llm_calls.txt",
 })

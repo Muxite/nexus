@@ -1,0 +1,71 @@
+# irene config — P3 chunk 3 onwards.
+#
+# Env overlay: IRENE__SECTION__KEY=value overrides any field below
+# (e.g. IRENE__TRADE__BALANCE_USDC=2000). See app/config.py.
+
+irene:
+  cycle: chunk3-soak-1
+  log_level: INFO
+
+db:
+  path: /data/irene.db
+
+scraper:
+  url: http://scraper:9000
+  timeout_seconds: 12
+
+openrouter:
+  # api_key comes from .env (OPENROUTER_API_KEY) — never commit secrets.
+  direction_model: google/gemini-2.5-flash
+
+budget:
+  monthly_cap_usd: 50.0
+  pause_at_remaining_usd: 2.0
+  poll_seconds: 60
+
+ingest:
+  # Hand-validated against scraper:9000 on 2026-05-24. Reuters/AP/WaPo
+  # have all dropped public RSS; HTML watcher is the path to recover
+  # those (deferred).
+  feeds:
+    # Existing (seulgi mirror)
+    - https://www.aljazeera.com/xml/rss/all.xml
+    - https://www.timesofisrael.com/feed/
+    - https://www.thehindu.com/news/feeder/default.rss
+    # Broad-coverage majors
+    - http://feeds.bbci.co.uk/news/rss.xml
+    - https://www.theguardian.com/world/rss
+    - https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+    - https://feeds.washingtonpost.com/rss/world  # may 404; scraper logs handle
+    - https://api.axios.com/feed/
+    - https://www.ft.com/world?format=rss
+    - https://feeds.npr.org/1001/rss.xml
+    - https://feeds.skynews.com/feeds/rss/world.xml
+    - https://www.cbsnews.com/latest/rss/world
+    - https://abcnews.go.com/abcnews/internationalheadlines
+    # Business / markets
+    - https://www.cnbc.com/id/100727362/device/rss/rss.html
+    - https://feeds.bloomberg.com/politics/news.rss
+    - https://www.economist.com/the-world-this-week/rss.xml
+    # Politics
+    - https://feeds.feedburner.com/politico
+  poll_seconds: 60
+
+trade:
+  balance_usdc: 1000.0
+
+dkg_trade:
+  # Chunk-3 dual-path trader. final_score >= 0.8 gives ~69% precision
+  # per reports/2026-05-24-irene-link-backfill.md.
+  enabled: true
+  score_floor: 0.8
+
+closer:
+  # Hold positions for 24h then exit. Real Polymarket markets typically
+  # resolve in days; this is the soak's safety net, not the primary exit.
+  poll_seconds: 60
+  timeout_hours: 24.0
+
+impact:
+  poll_seconds: 30
+  max_age_hours: 2.0

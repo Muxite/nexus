@@ -172,13 +172,13 @@ class IngestStage:
             await self._ingest_item(source="rss", source_detail=feed_url, item=item)
 
     async def _fetch_feed(self, feed_url: str) -> Optional[list[dict[str, Any]]]:
-        """GET {scraper.url}/feed?url=<feed_url>. Returns the items list, or
-        None on any HTTP-layer error (logged, swallowed)."""
+        """POST {scraper.url}/feed with `{"url": feed_url}`. Returns the
+        items list, or None on any HTTP-layer error (logged, swallowed)."""
         assert self._client is not None
         try:
-            resp = await self._client.get(
+            resp = await self._client.post(
                 f"{self._scraper_url}/feed",
-                params={"url": feed_url},
+                json={"url": feed_url},
             )
             resp.raise_for_status()
             data = resp.json()

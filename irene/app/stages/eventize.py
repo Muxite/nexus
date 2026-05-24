@@ -632,8 +632,12 @@ class EventizeStage:
                     self._members_by_event[eid].add(int(mr[1]))
 
     async def _fetch_article(self, article_id: int) -> Optional[dict]:
+        # `published_at` is nullable on `articles` (some RSS items omit it).
+        # `events.first_seen_at` is NOT NULL — fall back to `ingested_at`,
+        # which is always set and is within minutes of publication anyway.
         cur = await self._db.conn.execute(
-            "SELECT id, published_at, cycle_id, is_tracer, tracer_id "
+            "SELECT id, COALESCE(published_at, ingested_at) AS published_at, "
+            "cycle_id, is_tracer, tracer_id "
             "FROM articles WHERE id = ?",
             (article_id,),
         )

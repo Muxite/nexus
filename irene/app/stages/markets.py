@@ -411,6 +411,13 @@ class MarketsStage:
 
     async def start(self) -> None:
         self._client = httpx.AsyncClient(timeout=_GAMMA_TIMEOUT_SECONDS)
+        # Warm the MarketIndex from existing embedded rows BEFORE the
+        # poll/embed loops fire. Without this, MatchStage sees an empty
+        # index and `signals` stays 0 — the live-trade path silently
+        # stalls. Index reload after subsequent embed cycles is handled
+        # in `refresh_embeddings_once`.
+        loaded = await self.index.load(self._db)  # type: ignore[attr-defined]
+        logger.info("markets: index warmed (%d rows)", loaded)
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._embed_task = asyncio.create_task(self._embed_loop())
 
@@ -534,6 +541,8 @@ class MarketsStage:
                         r["condition_id"],
                     ),
                 )
+        # Re-warm the in-memory index so MatchStage sees the new vectors.
+        await self.index.load(self._db)
         return len(rows)
 
     # ---- helpers --------------------------------------------------------
