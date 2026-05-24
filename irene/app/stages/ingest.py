@@ -1,9 +1,15 @@
 """
 ## Specification
 
-**Purpose.** News ingest stage — polls the shared `scraper:9000` HTTP service
+**Purpose.** News ingest stage — polls the shared scraper-v2 HTTP service
 on a fixed cadence, writes new articles to the `articles` table, and publishes
 `article.ingested` on the bus so downstream stages (dedupe) can pick them up.
+
+**Two ingestion paths (cycle 4).**
+- RSS feeds via `/feed` (shape-compatible across v1 and v2). Source tag `rss`.
+- HTML homepages via `/scrape` mode=`links` (v2 only). The endpoint
+  returns the boilerplate-stripped headline link-set for a site so we
+  can pick up Reuters/AP/WaPo/etc. whose RSS is dead. Source tag `html`.
 
 **Public interface.**
 - `IngestStage`:
@@ -37,21 +43,22 @@ path lives in `scripts/tracer/fire.py` (future PR).
 - No module-level mutable state. The httpx client and the background task
   are stage-instance attributes.
 
-**Side effects.** HTTP GETs to `{scraper.url}/feed?url=…`. SQLite writes to
-`articles`. Bus publishes on `TOPIC_ARTICLE_INGESTED`.
+**Side effects.** HTTP POSTs to `{scraper.url}/feed` and `/scrape`.
+SQLite writes to `articles`. Bus publishes on `TOPIC_ARTICLE_INGESTED`.
 
 **Failure modes.**
-- `httpx.HTTPError` during a poll: warning logged, this feed skipped, loop
-  continues.
-- Malformed `/feed` JSON (missing `items` / item missing `url` or `title`):
-  the item is skipped with a warning. Other items in the batch still process.
+- `httpx.HTTPError` during a poll: warning logged, this feed/site skipped,
+  loop continues.
+- Malformed JSON (missing `items` for RSS, `links` for HTML, etc.): the
+  payload is skipped with a warning. Other items in the batch still process.
+- 429 (host cooldown on /scrape): single warning log, item skipped.
 - `cycle.current_cycle_id()` unset: `LookupError` propagates — treat as
   programmer error (main.py must set it before any stage starts).
 
 **Non-goals.**
-- Twitter polling (TBD — wired via `/twitter` in a future PR).
-- Direct HTML scraping (TBD — the scraper's `/fetch` endpoint may be used by
-  downstream dedupe; ingest does not call it).
+- Twitter polling (TBD — wired via `/social/twitter` in a future PR).
+- Article body extraction (TBD — would call `/scrape mode=article` per
+  link; for now we just take the title from the link-set).
 - Feed parsing (the scraper does it; we just consume its JSON, so we do NOT
   import `feedparser`).
 """
@@ -100,6 +107,14 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_BOILERPLATE_TITLE_BLOCKLIST = {
+    "read more", "subscribe", "sign in", "log in", "newsletter",
+    "skip to content", "skip to main content", "menu", "search",
+    "home", "more", "share", "advertisement", "ad", "ads",
+    "see all", "view all", "next", "previous",
+}
+
+
 class IngestStage:
     def __init__(self, deps: StageDeps) -> None:
         self._db = deps.db
@@ -108,27 +123,38 @@ class IngestStage:
         self._scraper_timeout = deps.config.scraper.timeout_seconds
         self._feeds = list(deps.config.ingest.feeds)
         self._poll_seconds = deps.config.ingest.poll_seconds
+        self._html_sites = list(getattr(deps.config.ingest, "html_sites", []) or [])
+        self._html_poll_seconds = int(
+            getattr(deps.config.ingest, "html_poll_seconds", 300)
+        )
         self._client: Optional[httpx.AsyncClient] = None
-        self._task: Optional[asyncio.Task] = None
+        self._feed_task: Optional[asyncio.Task] = None
+        self._html_task: Optional[asyncio.Task] = None
         self._stopped = False
 
     async def start(self) -> None:
-        if self._task is not None:
+        if self._feed_task is not None or self._html_task is not None:
             return
         self._client = httpx.AsyncClient(timeout=self._scraper_timeout)
-        self._task = asyncio.create_task(self._run_feed_loop())
+        self._feed_task = asyncio.create_task(self._run_feed_loop())
+        # Only start the HTML loop when sites are configured; idle is fine.
+        if self._html_sites:
+            self._html_task = asyncio.create_task(self._run_html_loop())
 
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        if self._task is not None:
-            self._task.cancel()
+        for task in (self._feed_task, self._html_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._task = None
+        self._feed_task = None
+        self._html_task = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -201,6 +227,92 @@ class IngestStage:
             logger.warning("ingest: scraper /feed missing 'items' for %r", feed_url)
             return None
         return items
+
+    # ---- HTML watcher loop (cycle 4) ----------------------------------
+
+    async def _run_html_loop(self) -> None:
+        """Mirror of `_run_feed_loop` but for HTML homepages via /scrape."""
+        if not self._html_sites:
+            return
+        last_polled: dict[str, float] = {}
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        for site in self._html_sites:
+            last_polled[site] = now - random.uniform(0, self._html_poll_seconds)
+        while True:
+            for site in self._html_sites:
+                if loop.time() - last_polled[site] < self._html_poll_seconds:
+                    continue
+                last_polled[site] = loop.time()
+                try:
+                    await self._poll_html_site(site)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.exception("ingest: unexpected error polling site %r", site)
+            await asyncio.sleep(1.0)
+
+    async def _poll_html_site(self, site_url: str) -> None:
+        links = await self._fetch_html_links(site_url)
+        if links is None:
+            return
+        for link in links:
+            url = link.get("url")
+            text = link.get("text") or ""
+            if not isinstance(url, str) or not url:
+                continue
+            title = text.strip()
+            # Boilerplate filter — short or generic UI strings that
+            # trafilatura sometimes lets through.
+            if len(title) < 15 or title.lower() in _BOILERPLATE_TITLE_BLOCKLIST:
+                continue
+            await self._ingest_item(
+                source="html",
+                source_detail=site_url,
+                item={"url": url, "title": title},
+            )
+
+    async def _fetch_html_links(self, site_url: str) -> Optional[list[dict[str, Any]]]:
+        """POST {scraper.url}/scrape with `{"url": site, "mode": "links"}`.
+        Returns the link-set, or None on any HTTP-layer error."""
+        assert self._client is not None
+        try:
+            resp = await self._client.post(
+                f"{self._scraper_url}/scrape",
+                json={"url": site_url, "mode": "links"},
+            )
+            # 429 = scraper-v2 host cooldown; log once and move on.
+            if resp.status_code == 429:
+                logger.warning(
+                    "ingest: scraper /scrape 429 (cooldown) for %r — skipping",
+                    site_url,
+                )
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "ingest: scraper /scrape failed for %r (%s) — skipping",
+                site_url,
+                exc.__class__.__name__,
+            )
+            return None
+        except ValueError as exc:
+            logger.warning(
+                "ingest: scraper /scrape returned non-JSON for %r (%s) — skipping",
+                site_url,
+                exc,
+            )
+            return None
+        if not isinstance(data, dict):
+            return None
+        # Defensive: only `kind=="links"` carries headline link items.
+        if data.get("kind") != "links":
+            return None
+        links = data.get("links")
+        if not isinstance(links, list):
+            return None
+        return links
 
     async def _ingest_item(
         self,

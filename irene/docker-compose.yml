@@ -30,7 +30,9 @@ services:
       - irene_model_cache:/root/.cache/torch/sentence_transformers
     environment:
       - IRENE_CONFIG=/config/config.yaml
-      - SCRAPER_URL=${SCRAPER_URL:-http://scraper:9000}
+      # Cycle 4: default to scraper-v2 (port 9001). Override via env
+      # if you want to point back at v1.
+      - SCRAPER_URL=${SCRAPER_URL:-http://jennie-scraper-v2:9001}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Per-cycle name. main.py calls db.ensure_current_cycle(name) on boot.
       - IRENE_CYCLE=${IRENE_CYCLE:-cycle-0}

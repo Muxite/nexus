@@ -46,11 +46,21 @@ class _FakeBus:
         pass
 
 
-def _make_config(feeds: list[str] | None = None, poll_seconds: int = 60) -> Config:
+def _make_config(
+    feeds: list[str] | None = None,
+    poll_seconds: int = 60,
+    html_sites: list[str] | None = None,
+    html_poll_seconds: int = 300,
+) -> Config:
     return Config(
         irene=IreneSection(),
-        scraper=ScraperSection(url="http://scraper:9000", timeout_seconds=5.0),
-        ingest=IngestSection(feeds=feeds or [], poll_seconds=poll_seconds),
+        scraper=ScraperSection(url="http://scraper-v2:9001", timeout_seconds=5.0),
+        ingest=IngestSection(
+            feeds=feeds or [],
+            poll_seconds=poll_seconds,
+            html_sites=html_sites or [],
+            html_poll_seconds=html_poll_seconds,
+        ),
     )
 
 
@@ -79,8 +89,16 @@ def bus() -> _FakeBus:
     return _FakeBus()
 
 
-def _make_stage(db: DB, bus: _FakeBus, feeds: list[str] | None = None) -> IngestStage:
-    deps = StageDeps(db=db, bus=bus, config=_make_config(feeds=feeds))
+def _make_stage(
+    db: DB,
+    bus: _FakeBus,
+    feeds: list[str] | None = None,
+    html_sites: list[str] | None = None,
+) -> IngestStage:
+    deps = StageDeps(
+        db=db, bus=bus,
+        config=_make_config(feeds=feeds, html_sites=html_sites),
+    )
     return IngestStage(deps)
 
 
@@ -229,6 +247,107 @@ async def test_item_missing_url_or_title_is_skipped(db_ready, bus, monkeypatch):
     rows = [r["url"] for r in await cur.fetchall()]
     assert rows == ["https://example.com/good"]
     assert len(bus.published) == 1
+
+
+async def test_html_path_inserts_articles_with_source_html(db_ready, bus, monkeypatch):
+    """Cycle 4: /scrape mode=links returns LinkItem rows; HTML watcher
+    converts them to source='html' article rows."""
+    stage = _make_stage(db_ready, bus, html_sites=["https://apnews.com"])
+
+    async def stub_fetch(self, site_url: str):
+        assert site_url == "https://apnews.com"
+        return [
+            {"url": "https://apnews.com/a", "text": "Senate passes spending bill in late-night vote"},
+            {"url": "https://apnews.com/b", "text": "Fed signals possible rate cut by year-end"},
+        ]
+
+    monkeypatch.setattr(IngestStage, "_fetch_html_links", stub_fetch)
+
+    with cycle_scope(1):
+        await stage._poll_html_site("https://apnews.com")
+
+    cur = await db_ready.conn.execute(
+        "SELECT source, source_detail, title FROM articles ORDER BY id"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    assert len(rows) == 2
+    assert all(r["source"] == "html" for r in rows)
+    assert all(r["source_detail"] == "https://apnews.com" for r in rows)
+    assert rows[0]["title"].startswith("Senate passes")
+    # Bus publishes one article.ingested per row.
+    assert len(bus.published) == 2
+
+
+async def test_html_path_filters_boilerplate_titles(db_ready, bus, monkeypatch):
+    """Boilerplate UI strings ('Subscribe', short links) MUST be skipped."""
+    stage = _make_stage(db_ready, bus, html_sites=["https://apnews.com"])
+
+    async def stub_fetch(self, site_url: str):
+        return [
+            {"url": "https://apnews.com/sub",   "text": "Subscribe"},          # blocked
+            {"url": "https://apnews.com/short", "text": "Hi"},                 # too short
+            {"url": "https://apnews.com/real",  "text": "Russia launches new attack on Kyiv overnight"},
+            {"url": "https://apnews.com/menu",  "text": "Menu"},               # blocked
+        ]
+
+    monkeypatch.setattr(IngestStage, "_fetch_html_links", stub_fetch)
+
+    with cycle_scope(1):
+        await stage._poll_html_site("https://apnews.com")
+
+    cur = await db_ready.conn.execute("SELECT title FROM articles")
+    rows = await cur.fetchall()
+    await cur.close()
+    titles = [r["title"] for r in rows]
+    assert len(titles) == 1
+    assert titles[0].startswith("Russia launches")
+
+
+async def test_html_path_handles_429_cooldown_gracefully(db_ready, bus, monkeypatch, caplog):
+    """When scraper-v2 returns 429 (host cooldown), log + skip — no crash."""
+    stage = _make_stage(db_ready, bus, html_sites=["https://apnews.com"])
+
+    class _Resp:
+        status_code = 429
+        def raise_for_status(self): pass
+        def json(self): return {}
+
+    class _Client:
+        async def post(self, url, json):
+            return _Resp()
+
+    stage._client = _Client()  # type: ignore[assignment]
+
+    with cycle_scope(1):
+        result = await stage._fetch_html_links("https://apnews.com")
+    assert result is None
+    # No articles inserted, no bus publishes.
+    cur = await db_ready.conn.execute("SELECT COUNT(*) FROM articles")
+    assert (await cur.fetchone())[0] == 0
+    assert bus.published == []
+
+
+async def test_html_path_skips_response_with_wrong_kind(db_ready, bus, monkeypatch):
+    """Defensive: if /scrape returns kind='empty' or 'article' (not 'links')
+    we drop the response — link extraction is only valid for kind='links'."""
+    stage = _make_stage(db_ready, bus, html_sites=["https://apnews.com"])
+
+    class _Resp:
+        status_code = 200
+        def raise_for_status(self): pass
+        def json(self):
+            return {"kind": "empty", "links": []}
+
+    class _Client:
+        async def post(self, url, json):
+            return _Resp()
+
+    stage._client = _Client()  # type: ignore[assignment]
+
+    with cycle_scope(1):
+        result = await stage._fetch_html_links("https://apnews.com")
+    assert result is None
 
 
 async def test_stop_is_idempotent(db_ready, bus):

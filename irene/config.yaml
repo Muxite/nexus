@@ -11,7 +11,10 @@ db:
   path: /data/irene.db
 
 scraper:
-  url: http://scraper:9000
+  # Cycle 4: switched from v1 (scraper:9000) to v2 (jennie-scraper-v2:9001).
+  # v2 keeps /feed shape-compatible and adds /scrape for HTML headline
+  # extraction with trafilatura boilerplate stripping.
+  url: http://jennie-scraper-v2:9001
   timeout_seconds: 12
 
 openrouter:
@@ -24,9 +27,8 @@ budget:
   poll_seconds: 60
 
 ingest:
-  # Hand-validated against scraper:9000 on 2026-05-24. Reuters/AP/WaPo
-  # have all dropped public RSS; HTML watcher is the path to recover
-  # those (deferred).
+  # Hand-validated against scraper:9000 on 2026-05-24. v2 /feed accepts
+  # the same shape so this list is unchanged.
   feeds:
     # Existing (seulgi mirror)
     - https://www.aljazeera.com/xml/rss/all.xml
@@ -50,6 +52,25 @@ ingest:
     # Politics
     - https://feeds.feedburner.com/politico
   poll_seconds: 60
+
+  # Cycle 4: HTML homepages — v2's /scrape mode=links returns the
+  # boilerplate-stripped headline link-set. Lit up Reuters/AP/WaPo and
+  # the rest of seulgi's watched_sites set since their RSS is dead or
+  # incomplete. Polled every 5 min (v2 caches by fingerprint so this
+  # is cheap when nothing changed).
+  html_sites:
+    - https://apnews.com
+    - https://www.reuters.com
+    - https://www.bbc.com/news
+    - https://www.politico.com
+    - https://www.axios.com
+    - https://www.aljazeera.com
+    - https://www.theguardian.com/world
+    - https://www.wsj.com
+    - https://www.ft.com
+    - https://www.nytimes.com
+    - https://www.washingtonpost.com
+  html_poll_seconds: 300
 
 trade:
   balance_usdc: 1000.0

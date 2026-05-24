@@ -105,10 +105,21 @@ class BudgetSection(BaseModel):
 
 
 class IngestSection(BaseModel):
-    """News ingest poller — feed URLs and cadence. See stages/ingest.py."""
+    """News ingest poller — feed + HTML site URLs and cadence.
+    See stages/ingest.py.
+
+    Cycle 4: irene migrated from scraper:9000 to jennie-scraper-v2:9001.
+    The /feed endpoint is shape-compatible; new in v2 is /scrape which
+    extracts headline link-sets from HTML homepages (trafilatura
+    boilerplate-stripped). `html_sites` drives the new HTML watcher
+    loop. Empty list → loop is a no-op (RSS-only mode).
+    """
 
     feeds: list[str] = Field(default_factory=list)
     poll_seconds: int = Field(default=60, ge=5)
+    # HTML homepages polled via /scrape mode=links.
+    html_sites: list[str] = Field(default_factory=list)
+    html_poll_seconds: int = Field(default=300, ge=30)
 
 
 class DedupeSection(BaseModel):
