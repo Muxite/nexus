@@ -86,6 +86,12 @@ logger = logging.getLogger(__name__)
 
 _OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 _VALID_DIRECTIONS = ("YES", "NO", "NEUTRAL")
+# v5: raw single-character labels emitted by the LLM. The trade-side
+# `direction` column collapses these into 3 buckets (Y→YES, N→NO,
+# P/U/R→NEUTRAL) so the gate cascade is unchanged. The raw label lives
+# on `predictions.label` for diagnostics — it distinguishes
+# "weak evidence" (P), "uncertain" (U), and "retrieval mismatch" (R).
+_VALID_LABELS = ("Y", "N", "P", "U", "R")
 
 # Per `docs/philosophy.md`: irene is a speed bot, not a forecaster. The
 # system prompt below is intentionally tiny + STATIC so providers that
@@ -98,12 +104,14 @@ _VALID_DIRECTIONS = ("YES", "NO", "NEUTRAL")
 # path are dominated by tokens-out: ~250 → ~1, cutting time-to-final-
 # token by roughly an order of magnitude.
 _SYSTEM_MESSAGE = (
-    "You are a fast-trading market evaluator. Read the News and decide "
-    "which way it pushes the Market Condition.\n"
+    "You are a fast-trading market evaluator. Read the News and choose "
+    "one label for the Market Condition.\n"
     "Reply with JSON only:\n"
-    '  {"a":"Y"}  if the news STRONGLY SUPPORTS the condition being TRUE.\n'
-    '  {"a":"N"}  if the news STRONGLY SUPPORTS the condition being FALSE.\n'
-    '  {"a":"U"}  if the news is UNRELATED, AMBIGUOUS, or only weakly relevant.\n'
+    '  {"a":"Y"}  trade YES — news strongly supports condition is TRUE.\n'
+    '  {"a":"N"}  trade NO  — news strongly supports condition is FALSE.\n'
+    '  {"a":"P"}  pass     — news IS about this market but evidence is weak.\n'
+    '  {"a":"U"}  uncertain — you can\'t tell which way this news cuts.\n'
+    '  {"a":"R"}  mismatch — news is NOT actually about this market.\n'
     "No prose, no explanation — JSON only."
 )
 
@@ -111,7 +119,9 @@ _SYSTEM_MESSAGE = (
 # providers we pass the bare characters and rely on the provider to map
 # them. Providers that don't honour `logit_bias` ignore the field; the
 # `max_tokens=1` + `temperature=0` constraints are universal.
-_LOGIT_BIAS_YNU = {"Y": 100, "N": 100, "U": 100}
+# Best-effort token forcing — most providers ignore logit_bias.
+# Concentrates probability on all 5 v5 labels.
+_LOGIT_BIAS_YNU = {"Y": 100, "N": 100, "P": 100, "U": 100, "R": 100}
 
 
 _AI_DDL = [
@@ -152,6 +162,10 @@ _AI_DDL = [
         confidence      REAL NOT NULL CHECK(confidence >= 0.0 AND confidence <= 1.0),
         cached          INTEGER NOT NULL DEFAULT 0,
         raw_response    TEXT,
+        -- v5: raw single-char label (Y/N/P/U/R). '?' for parse failures
+        -- that still write a NEUTRAL prediction. Nullable for back-compat
+        -- with the v4-and-earlier rows that don't have it.
+        label           TEXT,
         cycle_id        INTEGER NOT NULL,
         is_tracer       INTEGER NOT NULL DEFAULT 0,
         tracer_id       TEXT,
@@ -160,6 +174,7 @@ _AI_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_predictions_signal_id ON predictions(signal_id)",
     "CREATE INDEX IF NOT EXISTS idx_predictions_cycle_id ON predictions(cycle_id)",
+    "CREATE INDEX IF NOT EXISTS idx_predictions_label ON predictions(label)",
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_predictions_signal_model_version "
     "ON predictions(signal_id, model, prompt_version) "
     "WHERE signal_id IS NOT NULL",
@@ -184,11 +199,14 @@ db_module.register_schema("app/ai.py", _AI_DDL)
 
 @dataclass(frozen=True)
 class DirectionResult:
-    direction: str
+    direction: str       # "YES" | "NO" | "NEUTRAL" — what the gate cascade reads
     confidence: float
     prediction_id: int
     cached: bool
     raw_response: str
+    # Raw v5 label (Y/N/P/U/R/?). Defaults to "?" so test fakes built
+    # before v5 keep working — production paths always pass a real label.
+    label: str = "?"
 
 
 def _sha1(s: str) -> str:
@@ -199,8 +217,20 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _parse_response(raw: str) -> tuple[str, float] | None:
-    """Return (direction, confidence) on success, None on parse error.
+_LABEL_TO_DIRECTION = {
+    "Y": ("YES", 1.0),
+    "N": ("NO", 1.0),
+    # Pass / Uncertain / Mismatch all reduce to NEUTRAL for the gate
+    # cascade — the raw letter lives on `predictions.label` for the
+    # dashboard + chunk analysis to read.
+    "P": ("NEUTRAL", 0.0),
+    "U": ("NEUTRAL", 0.0),
+    "R": ("NEUTRAL", 0.0),
+}
+
+
+def _parse_response(raw: str) -> tuple[str, float, str] | None:
+    """Return (direction, confidence, label) on success, None on parse error.
 
     The LLM is supposed to emit a single character: Y / N / U.
     In practice some providers (notably Gemini-2.5-flash over OpenRouter)
@@ -230,21 +260,15 @@ def _parse_response(raw: str) -> tuple[str, float] | None:
         for v in obj.values():
             if isinstance(v, str) and v.strip():
                 ch = v.strip()[0].upper()
-                if ch == "Y":
-                    return "YES", 1.0
-                if ch == "N":
-                    return "NO", 1.0
-                if ch == "U":
-                    return "NEUTRAL", 0.0
+                if ch in _LABEL_TO_DIRECTION:
+                    direction, conf = _LABEL_TO_DIRECTION[ch]
+                    return direction, conf, ch
         return None
-    # Fallback: bare-char output (Y / N / U / "yes" / etc.). First char wins.
+    # Fallback: bare-char output (Y / N / P / U / R / "yes" / etc.). First char wins.
     ch = s[0].upper()
-    if ch == "Y":
-        return "YES", 1.0
-    if ch == "N":
-        return "NO", 1.0
-    if ch == "U":
-        return "NEUTRAL", 0.0
+    if ch in _LABEL_TO_DIRECTION:
+        direction, conf = _LABEL_TO_DIRECTION[ch]
+        return direction, conf, ch
     return None
 
 
@@ -254,7 +278,7 @@ class AIClient:
     # "strictly entails" to "strongly supports". Bumping the version
     # invalidates the llm_calls cache so the 47%-parse-failure rows from
     # v2-fast don't poison the new regime.
-    PROMPT_VERSION: str = "v4-json-answer"
+    PROMPT_VERSION: str = "v5-5label"
 
     def __init__(self, *, db: DB, budget: Budget, config: Config) -> None:
         self._db = db
@@ -425,7 +449,7 @@ class AIClient:
                 tracer_id=tracer_id,
                 llm_call_id=cached_row["id"],
             )
-        direction, confidence = parsed
+        direction, confidence, label = parsed
         pred_id = await self._insert_prediction(
             signal_id=signal_id,
             llm_call_id=cached_row["id"],
@@ -433,6 +457,7 @@ class AIClient:
             confidence=confidence,
             cached=True,
             raw_response=content,
+            label=label,
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
@@ -443,6 +468,7 @@ class AIClient:
             prediction_id=pred_id,
             cached=True,
             raw_response=content,
+            label=label,
         )
 
     async def _record_fresh_call(
@@ -520,7 +546,7 @@ class AIClient:
             )
 
         self._budget.note_ok()
-        direction, confidence = parsed
+        direction, confidence, label = parsed
         pred_id = await self._insert_prediction(
             signal_id=signal_id,
             llm_call_id=llm_call_id,
@@ -528,6 +554,7 @@ class AIClient:
             confidence=confidence,
             cached=False,
             raw_response=content,
+            label=label,
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
@@ -538,6 +565,7 @@ class AIClient:
             prediction_id=pred_id,
             cached=False,
             raw_response=content,
+            label=label,
         )
 
     async def _insert_llm_call(
@@ -592,6 +620,7 @@ class AIClient:
         confidence: float,
         cached: bool,
         raw_response: str,
+        label: str,
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
@@ -610,9 +639,9 @@ class AIClient:
                     """
                     INSERT INTO predictions
                         (signal_id, llm_call_id, model, prompt_version,
-                         direction, confidence, cached, raw_response,
+                         direction, confidence, cached, raw_response, label,
                          cycle_id, is_tracer, tracer_id, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         signal_id,
@@ -623,6 +652,7 @@ class AIClient:
                         confidence,
                         1 if cached else 0,
                         raw_response,
+                        label,
                         cycle_id,
                         1 if is_tracer else 0,
                         tracer_id,
@@ -639,9 +669,9 @@ class AIClient:
                 """
                 INSERT INTO predictions
                     (signal_id, llm_call_id, model, prompt_version,
-                     direction, confidence, cached, raw_response, cycle_id,
+                     direction, confidence, cached, raw_response, label, cycle_id,
                      is_tracer, tracer_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(signal_id, model, prompt_version)
                     WHERE signal_id IS NOT NULL
                     DO NOTHING
@@ -655,6 +685,7 @@ class AIClient:
                     confidence,
                     1 if cached else 0,
                     raw_response,
+                    label,
                     cycle_id,
                     1 if is_tracer else 0,
                     tracer_id,
@@ -709,6 +740,7 @@ class AIClient:
             confidence=0.0,
             cached=False,
             raw_response=raw_response,
+            label="?",                # '?' marks unparseable / failure / 402 / cache-reparse-err
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
@@ -719,6 +751,7 @@ class AIClient:
             prediction_id=pred_id,
             cached=False,
             raw_response=raw_response,
+            label="?",
         )
 
 

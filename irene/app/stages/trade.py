@@ -85,6 +85,7 @@ from typing import Optional
 from app import db as db_module
 from app.cycle import current_cycle_id
 from app.deps import StageDeps
+from app.stages._entity_overlap import article_entities_overlap_market
 from app.topics import TOPIC_TRADE_DECIDED
 
 logger = logging.getLogger(__name__)
@@ -321,6 +322,38 @@ class TradeStage:
                 tracer_id=tracer_id,
             )
             return
+
+        # 2.5 entity_overlap (stage-0 hard filter) ---------------------------
+        # Reject (article, market) pairs where the article's resolved
+        # entities don't appear in the market question. Saves an LLM
+        # call on obvious noise matches. Permissive when the extractor
+        # hasn't completed for this article yet — `n_entities == 0`
+        # means "no signal", not "no match".
+        overlaps, n_entities = await article_entities_overlap_market(
+            self._db, int(article_id), market["question"] or ""
+        )
+        if n_entities > 0 and not overlaps:
+            gate_history.append(
+                _gate_entry("entity_overlap", "reject", 0, n_entities)
+            )
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason="entity_mismatch",
+                gate_history=gate_history,
+                prediction_id=None,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
+        gate_history.append(
+            _gate_entry(
+                "entity_overlap",
+                "ok",
+                "match" if overlaps else "no_entities_yet",
+                n_entities,
+            )
+        )
 
         prompt = self._compose_prompt(article, market)
 

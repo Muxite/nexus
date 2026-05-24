@@ -265,7 +265,8 @@ async def test_happy_path_writes_trade_decision_and_features(db_seeded):
     assert t["decision_path"] == "mvp"
     snap = json.loads(t["features_snapshot"])
     assert snap["direction"] == "YES" and snap["confidence"] == 0.7
-    assert "gate_history" in snap and len(snap["gate_history"]) == 5
+    # 6 gates: similarity_floor, freshness, entity_overlap, direction, edge, size
+    assert "gate_history" in snap and len(snap["gate_history"]) == 6
 
     cur = await db_seeded.conn.execute(
         "SELECT feature_name FROM trade_features ORDER BY feature_name"
@@ -313,6 +314,96 @@ async def test_freshness_stale_rejects_without_ai_call(db_seeded):
     assert d["reason"] == "freshness_stale"
     assert ai.calls == []
     assert bus.published[0][1]["reason"] == "freshness_stale"
+
+
+async def _seed_entities_for_article(db, article_id: int, entity_names: list[str]) -> None:
+    """Helper: write entities + facts + entity_resolutions so the
+    stage-0 entity_overlap gate can read them."""
+    async with db.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO extraction_runs
+                (id, article_id, model, prompt_version, ontology_version, status,
+                 raw_response, latency_ms, cycle_id, is_tracer, tracer_id, created_at)
+            VALUES (1, ?, 'fake', 'v1', 'v1', 'ok',
+                    '{}', 10, 1, 0, NULL, '2026-05-23T00:00:00+00:00')
+            """,
+            (article_id,),
+        )
+        for i, name in enumerate(entity_names, start=1):
+            await cur.execute(
+                """
+                INSERT INTO entities
+                    (id, canonical_name, entity_type, first_seen_at, last_seen_at)
+                VALUES (?, ?, 'PERSON', '2026-05-23T00:00:00+00:00',
+                        '2026-05-23T00:00:00+00:00')
+                """,
+                (i, name),
+            )
+            await cur.execute(
+                """
+                INSERT INTO facts
+                    (id, article_id, extraction_run_id, subj_entity_id, relation,
+                     confidence, observed_at, evidence_span, cycle_id,
+                     is_tracer, tracer_id)
+                VALUES (?, ?, 1, ?, 'decides', 1.0,
+                        '2026-05-23T00:00:00+00:00', 'x', 1, 0, NULL)
+                """,
+                (i, article_id, i),
+            )
+            await cur.execute(
+                """
+                INSERT INTO entity_resolutions
+                    (entity_id, resolved_to_id, resolution_kind, confidence,
+                     resolver_version, created_at)
+                VALUES (?, ?, 'self', 1.0, 'v1', '2026-05-23T00:00:00+00:00')
+                """,
+                (i, i),
+            )
+
+
+async def test_entity_overlap_gate_rejects_when_no_match(db_seeded):
+    # Article has entity "Volodymyr Zelenskyy" but market.question is "Will X happen by end of year?" — no overlap.
+    await _seed_entities_for_article(db_seeded, 1, ["Volodymyr Zelenskyy"])
+    bus = _FakeBus()
+    ai = _FakeAI()
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "entity_mismatch"
+    assert ai.calls == []   # LLM never called — stage-0 gate saved a call
+
+
+async def test_entity_overlap_gate_permits_on_match(db_seeded):
+    # Article entity "Volodymyr Zelenskyy" appears in the market question.
+    async with db_seeded.batch() as cur:
+        await cur.execute(
+            "UPDATE markets SET question='Will Volodymyr Zelenskyy resign by 2026?' WHERE condition_id='m1'"
+        )
+    await _seed_entities_for_article(db_seeded, 1, ["Volodymyr Zelenskyy"])
+    bus = _FakeBus()
+    ai = _FakeAI()  # default YES → execute
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "execute"
+    assert ai.calls != []   # LLM was called
+
+
+async def test_entity_overlap_gate_permits_on_extraction_race(db_seeded):
+    # No entities seeded — extraction hasn't completed for this article.
+    # Gate should be permissive (don't reject), let the LLM call proceed.
+    bus = _FakeBus()
+    ai = _FakeAI()  # default YES → execute
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "execute"   # gate did NOT reject; LLM ran
+    assert ai.calls != []
 
 
 async def test_direction_neutral_rejects(db_seeded):

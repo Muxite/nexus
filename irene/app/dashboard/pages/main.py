@@ -62,27 +62,35 @@ async def render(dash) -> str:
             pass
     lines.append(f"  model: {model}    budget: {budget_state}    remaining: {remaining}")
 
-    # Direction distribution + parse failures (1h)
+    # 5-label distribution (1h) — v5 prompt taxonomy:
+    #   Y=trade-yes  N=trade-no  P=pass  U=uncertain  R=mismatch  ?=parse-fail
+    # Older v2/v3/v4 rows have label=NULL; we surface them as "(legacy)".
     cur = await dash.db.conn.execute(
-        "SELECT direction, COUNT(*) FROM predictions "
-        "WHERE created_at >= datetime('now','-1 hour') GROUP BY direction"
+        "SELECT label, COUNT(*) FROM predictions "
+        "WHERE created_at >= datetime('now','-1 hour') GROUP BY label"
     )
-    dist = {r[0]: int(r[1]) for r in await cur.fetchall()}
+    label_dist = {r[0]: int(r[1]) for r in await cur.fetchall()}
     await cur.close()
-    n_yes = dist.get("YES", 0)
-    n_no = dist.get("NO", 0)
-    n_neu = dist.get("NEUTRAL", 0)
-    n_parsed = n_yes + n_no + n_neu
+    n_y = label_dist.get("Y", 0)
+    n_n = label_dist.get("N", 0)
+    n_p = label_dist.get("P", 0)
+    n_u = label_dist.get("U", 0)
+    n_r = label_dist.get("R", 0)
+    n_q = label_dist.get("?", 0)
+    n_legacy = label_dist.get(None, 0)
     n_parse_fail = await scalar(
         dash.db,
         "SELECT COUNT(*) FROM llm_parse_failures "
         "WHERE created_at >= datetime('now','-1 hour')",
     )
-    pf_pct = (100.0 * n_parse_fail / max(n_parsed + n_parse_fail, 1))
+    n_total = n_y + n_n + n_p + n_u + n_r + n_q + n_legacy
+    pf_pct = 100.0 * n_parse_fail / max(n_total + n_parse_fail, 1)
     lines.append(
-        f"  predictions (1h): YES {n_yes:>4d}   NO {n_no:>4d}   "
-        f"NEUTRAL {n_neu:>5d}    parse_fail {n_parse_fail} ({pf_pct:.0f}%)"
+        f"  v5 labels  (1h): Y {n_y:>3d}  N {n_n:>3d}  P {n_p:>3d}  "
+        f"U {n_u:>3d}  R {n_r:>3d}  ? {n_q:>3d}    parse_fail {n_parse_fail} ({pf_pct:.0f}%)"
     )
+    if n_legacy:
+        lines.append(f"  legacy (v<=4):    {n_legacy} (no label column)")
 
     # Latency + tokens + cache (pooled across models, 1h)
     cur = await dash.db.conn.execute(

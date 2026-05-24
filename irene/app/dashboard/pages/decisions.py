@@ -103,6 +103,7 @@ async def render(dash) -> str:
             p.cached,
             p.prompt_version,
             p.raw_response,
+            p.label,
             t.edge,
             t.size_usdc,
             a.title    AS article_title,
@@ -159,7 +160,10 @@ async def render(dash) -> str:
         if raw or r["direction"]:
             cached_str = "yes" if r["cached"] else "no"
             prompt_v = r["prompt_version"] or "?"
-            lines.append(f"  ai:  raw={raw!r}  cached={cached_str}  prompt_v={prompt_v}")
+            label = r["label"] or "-"
+            lines.append(
+                f"  ai:  label={label}  raw={raw!r}  cached={cached_str}  prompt_v={prompt_v}"
+            )
 
         # Gate cascade — the deterministic thought process the trade
         # stage walked through. This is the answer to "WHY did this end

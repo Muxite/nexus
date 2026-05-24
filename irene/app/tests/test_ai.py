@@ -118,28 +118,33 @@ async def ai(db_ready, monkeypatch):
 
 
 def test_parse_response_happy():
-    # v3-fences-tolerant single-char outputs.
-    assert _parse_response("Y") == ("YES", 1.0)
-    assert _parse_response("N") == ("NO", 1.0)
-    assert _parse_response("U") == ("NEUTRAL", 0.0)
+    # v5-5label: returns (direction, confidence, label).
+    assert _parse_response("Y") == ("YES", 1.0, "Y")
+    assert _parse_response("N") == ("NO", 1.0, "N")
+    assert _parse_response("U") == ("NEUTRAL", 0.0, "U")
+    # New v5 labels: P (pass) and R (retrieval mismatch).
+    assert _parse_response("P") == ("NEUTRAL", 0.0, "P")
+    assert _parse_response("R") == ("NEUTRAL", 0.0, "R")
     # Case-insensitive + tolerates whitespace.
-    assert _parse_response("y") == ("YES", 1.0)
-    assert _parse_response(" Y ") == ("YES", 1.0)
-    assert _parse_response("u\n") == ("NEUTRAL", 0.0)
+    assert _parse_response("y") == ("YES", 1.0, "Y")
+    assert _parse_response(" Y ") == ("YES", 1.0, "Y")
+    assert _parse_response("u\n") == ("NEUTRAL", 0.0, "U")
     # First character wins (provider sometimes emits trailing text).
-    assert _parse_response("Yes, definitely") == ("YES", 1.0)
+    assert _parse_response("Yes, definitely") == ("YES", 1.0, "Y")
     # v3: tolerates markdown code fences (Gemini-2.5-flash prefixes ```).
-    assert _parse_response("```Y") == ("YES", 1.0)
-    assert _parse_response("```N\n```") == ("NO", 1.0)
-    assert _parse_response("```\nU\n```") == ("NEUTRAL", 0.0)
-    assert _parse_response("```u") == ("NEUTRAL", 0.0)
+    assert _parse_response("```Y") == ("YES", 1.0, "Y")
+    assert _parse_response("```N\n```") == ("NO", 1.0, "N")
+    assert _parse_response("```\nU\n```") == ("NEUTRAL", 0.0, "U")
+    assert _parse_response("```P") == ("NEUTRAL", 0.0, "P")
     # v4: JSON answer envelope per the new prompt contract.
-    assert _parse_response('{"a":"Y"}') == ("YES", 1.0)
-    assert _parse_response('{"a":"N"}') == ("NO", 1.0)
-    assert _parse_response('{"a":"U"}') == ("NEUTRAL", 0.0)
-    assert _parse_response('```json\n{"a":"Y"}\n```') == ("YES", 1.0)
-    assert _parse_response('```json\n{"answer":"Y"}\n```') == ("YES", 1.0)
-    assert _parse_response('{"answer":"NO"}') == ("NO", 1.0)
+    assert _parse_response('{"a":"Y"}') == ("YES", 1.0, "Y")
+    assert _parse_response('{"a":"N"}') == ("NO", 1.0, "N")
+    assert _parse_response('{"a":"P"}') == ("NEUTRAL", 0.0, "P")
+    assert _parse_response('{"a":"U"}') == ("NEUTRAL", 0.0, "U")
+    assert _parse_response('{"a":"R"}') == ("NEUTRAL", 0.0, "R")
+    assert _parse_response('```json\n{"a":"Y"}\n```') == ("YES", 1.0, "Y")
+    assert _parse_response('```json\n{"answer":"Y"}\n```') == ("YES", 1.0, "Y")
+    assert _parse_response('{"answer":"NO"}') == ("NO", 1.0, "N")
 
 
 @pytest.mark.parametrize(
