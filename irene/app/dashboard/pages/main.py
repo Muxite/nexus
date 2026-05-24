@@ -150,15 +150,23 @@ async def render(dash) -> str:
             title = (r["title"] or "")[:84]
             lines.append(f"  {r['ingested_at'][11:19]}  [{r['source']:<4}] {title}")
 
-    # Last 5 decisions (executes + rejects, both paths)
+    # Last 5 decisions — micro version of decisions.txt. Each shows the
+    # article + market + a one-line gate-cascade summary so the operator
+    # sees WHY without leaving this page.
     lines += ["", "last 5 decisions:"]
     cur = await dash.db.conn.execute(
         """
-        SELECT d.created_at, d.outcome, d.reason,
+        SELECT d.created_at, d.outcome, d.reason, d.gate_history,
                COALESCE(t.decision_path, 'mvp') AS path,
-               t.direction, t.size_usdc
+               t.direction, t.size_usdc, t.edge,
+               a.title    AS article,
+               m.question AS market
         FROM decisions d
-        LEFT JOIN trades t ON t.decision_id = d.id
+        LEFT JOIN signals  s ON s.id = d.signal_id
+        LEFT JOIN trades   t ON t.decision_id = d.id
+        LEFT JOIN articles a ON a.id = s.article_id
+        LEFT JOIN markets  m ON m.condition_id = s.market_id
+        WHERE d.is_tracer = 0
         ORDER BY d.created_at DESC
         LIMIT 5
         """
@@ -168,14 +176,49 @@ async def render(dash) -> str:
     if not rows:
         lines.append("  (none yet)")
     else:
+        import json as _json
         for r in rows:
             ts = (r["created_at"] or "")[11:19]
-            outcome = r["outcome"]
-            tail = ""
+            outcome = r["outcome"] or "?"
+            path = r["path"] or "?"
+            # Header line — outcome + reason/edge+size
             if outcome == "execute" and r["direction"]:
-                tail = f"{r['direction']:<3} ${r['size_usdc']:.2f}"
+                head = f"{outcome} {r['direction']:<3} ${r['size_usdc']:.2f} edge={r['edge']:+.3f}"
             else:
-                tail = r["reason"] or ""
-            lines.append(f"  {ts}  [{r['path']:<3}] {outcome:<7} {tail}")
+                head = f"{outcome:<7} {r['reason'] or '?'}"
+            lines.append(f"  [{ts}] {path:<3} {head}")
+            # News + market that triggered it
+            art = (r["article"] or "(missing)")[:60]
+            mkt = (r["market"] or "(missing)")[:50]
+            lines.append(f"        \"{art}\" → \"{mkt}\"")
+            # One-line gate cascade: e.g. "sim 0.36 ✓ · fresh ✓ · dir NEUTRAL ✗"
+            try:
+                gates = _json.loads(r["gate_history"] or "[]")
+            except (TypeError, ValueError):
+                gates = []
+            parts = []
+            for g in gates:
+                name = g.get("gate", "?")
+                ok = g.get("outcome") == "ok"
+                marker = "✓" if ok else "✗"
+                short = {
+                    "similarity_floor": "sim",
+                    "freshness": "fresh",
+                    "direction": "dir",
+                    "edge": "edge",
+                    "size": "size",
+                }.get(name, name)
+                v = g.get("value")
+                if isinstance(v, float):
+                    val = f"{v:.2f}"
+                elif v is None:
+                    val = ""
+                else:
+                    val = str(v)
+                parts.append(f"{short} {val} {marker}".strip())
+                if not ok:
+                    break  # cascade stopped here
+            if parts:
+                lines.append(f"        " + " · ".join(parts))
 
     return "\n".join(lines) + "\n"

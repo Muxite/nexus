@@ -123,16 +123,24 @@ class MatchStage:
         is_tracer = bool(payload.get("is_tracer", False))
         tracer_id = payload.get("tracer_id")
 
-        title = await self._fetch_title(int(article_id))
-        if title is None:
+        article = await self._fetch_title(int(article_id))
+        if article is None:
             logger.warning("match: article %s not found in articles table", article_id)
             return
+        title = article["title"]
 
         if self._index.size == 0:
             logger.debug("match: market_index empty, skipping article %s", article_id)
             return
 
-        query_vec = self._embedder.embed(title)
+        # Embed title + a slice of the summary. The headline alone often
+        # misses the real claim ("Pakistan PM hails Trump" doesn't say
+        # what about); the first ~300 chars of summary disambiguates.
+        query_text = title
+        summary = (article.get("summary") or "").strip()
+        if summary:
+            query_text = f"{title}. {summary[:300]}"
+        query_vec = self._embedder.embed(query_text)
         candidates = self._index.topk(query_vec, k=self._top_k, floor=self._floor)
         if not candidates:
             return
@@ -175,15 +183,15 @@ class MatchStage:
     # Internals
     # ------------------------------------------------------------------
 
-    async def _fetch_title(self, article_id: int) -> Optional[str]:
+    async def _fetch_title(self, article_id: int) -> Optional[dict]:
         cur = await self._db.conn.execute(
-            "SELECT title FROM articles WHERE id = ?", (article_id,)
+            "SELECT title, summary FROM articles WHERE id = ?", (article_id,)
         )
         row = await cur.fetchone()
         await cur.close()
         if row is None:
             return None
-        return row["title"]
+        return {"title": row["title"], "summary": row["summary"]}
 
     async def _insert_signal_with_capture(
         self,

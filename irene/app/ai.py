@@ -98,14 +98,13 @@ _VALID_DIRECTIONS = ("YES", "NO", "NEUTRAL")
 # path are dominated by tokens-out: ~250 → ~1, cutting time-to-final-
 # token by roughly an order of magnitude.
 _SYSTEM_MESSAGE = (
-    "You are a high-speed financial resolution engine. "
-    "Task: Determine if the News strictly entails the Market Condition. "
-    "Rules:\n"
-    "- Output exactly ONE character.\n"
-    "- Output 'Y' if the news proves the condition is TRUE.\n"
-    "- Output 'N' if the news proves the condition is FALSE.\n"
-    "- Output 'U' if the news is UNRELATED, AMBIGUOUS, or INCONCLUSIVE.\n"
-    "- Do not output any other text, whitespace, or punctuation."
+    "You are a fast-trading market evaluator. Read the News and decide "
+    "which way it pushes the Market Condition.\n"
+    "Reply with JSON only:\n"
+    '  {"a":"Y"}  if the news STRONGLY SUPPORTS the condition being TRUE.\n'
+    '  {"a":"N"}  if the news STRONGLY SUPPORTS the condition being FALSE.\n'
+    '  {"a":"U"}  if the news is UNRELATED, AMBIGUOUS, or only weakly relevant.\n'
+    "No prose, no explanation — JSON only."
 )
 
 # Token-level forcing. `logit_bias` keys are token IDs — for chat
@@ -203,22 +202,43 @@ def _now_iso() -> str:
 def _parse_response(raw: str) -> tuple[str, float] | None:
     """Return (direction, confidence) on success, None on parse error.
 
-    Post-v2-fast the LLM emits a single character: Y / N / U.
-    - 'Y' (any case) → ('YES', 1.0)
-    - 'N' (any case) → ('NO', 1.0)
-    - 'U' (any case) → ('NEUTRAL', 0.0)
-    Anything else (e.g. provider returned extra text) → None.
+    The LLM is supposed to emit a single character: Y / N / U.
+    In practice some providers (notably Gemini-2.5-flash over OpenRouter)
+    ignore `logit_bias` and prefix the answer with a markdown fence or
+    leading whitespace. v3 is tolerant: strip ``` / whitespace / control
+    chars, then scan for the first Y/N/U.
 
-    The `confidence` field stays in the contract surface for backward
-    compat with the gate cascade, but per `docs/philosophy.md` it
-    represents decisiveness (binary in the new regime), not probability.
+    - first 'Y' (any case) → ('YES', 1.0)
+    - first 'N' (any case) → ('NO', 1.0)
+    - first 'U' (any case) → ('NEUTRAL', 0.0)
+    - empty or none of Y/N/U found → None
     """
     if not isinstance(raw, str):
         return None
-    s = raw.strip().upper()
+    # Strip markdown fences (gemini-2.5-flash wraps in ```json ... ```)
+    # and any leading "json" language hint.
+    s = raw.replace("```json", "").replace("```", "").strip()
     if not s:
         return None
-    ch = s[0]
+    # Try JSON first — preferred path per v4 prompt: {"a":"Y|N|U"}.
+    # Accept any value field whose first character is Y/N/U.
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        obj = None
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, str) and v.strip():
+                ch = v.strip()[0].upper()
+                if ch == "Y":
+                    return "YES", 1.0
+                if ch == "N":
+                    return "NO", 1.0
+                if ch == "U":
+                    return "NEUTRAL", 0.0
+        return None
+    # Fallback: bare-char output (Y / N / U / "yes" / etc.). First char wins.
+    ch = s[0].upper()
     if ch == "Y":
         return "YES", 1.0
     if ch == "N":
@@ -229,10 +249,12 @@ def _parse_response(raw: str) -> tuple[str, float] | None:
 
 
 class AIClient:
-    # v2-fast: single-char Y/N/U output. Bump invalidates the llm_calls
-    # cache so old JSON-parse rows aren't mis-interpreted by the new
-    # single-char parser.
-    PROMPT_VERSION: str = "v2-fast"
+    # v3-fences-tolerant: max_tokens raised to 8, parser strips markdown
+    # fences before scanning for Y/N/U, system prompt broadened from
+    # "strictly entails" to "strongly supports". Bumping the version
+    # invalidates the llm_calls cache so the 47%-parse-failure rows from
+    # v2-fast don't poison the new regime.
+    PROMPT_VERSION: str = "v4-json-answer"
 
     def __init__(self, *, db: DB, budget: Budget, config: Config) -> None:
         self._db = db
@@ -345,7 +367,13 @@ class AIClient:
                         {"role": "system", "content": _SYSTEM_MESSAGE},
                         {"role": "user", "content": full_prompt},
                     ],
-                    "max_tokens": 1,
+                    # v4: gemini-2.5-flash insists on emitting
+                    # ```json\n{"answer":"..."}\n``` regardless of
+                    # logit_bias / prompt rules. So we embrace it:
+                    # prompt asks for {"a":"Y|N|U"}, parser strips fences
+                    # and JSON-parses. 32 tokens covers ```json\n
+                    # {"answer":"Y"}\n``` with headroom.
+                    "max_tokens": 32,
                     "temperature": 0,
                     "logit_bias": _LOGIT_BIAS_YNU,
                 },

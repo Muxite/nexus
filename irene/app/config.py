@@ -121,15 +121,15 @@ class DedupeSection(BaseModel):
 class MatchSection(BaseModel):
     """Match stage — cosine floor + top-k cap for article → market candidates.
 
-    `top_k` was 5 in P1; we bumped it to 25 once the ai.py prompt went
-    ultra-short (`max_tokens=1`, single-char Y/N/U) — see
-    `docs/philosophy.md`. Cheaper per-call enables fan-out across more
-    candidate markets per article, which is the right move when the
-    matcher's cosine floor is permissive.
+    Tightened 2026-05-24 after 350 decisions of soak inspection showed
+    the floor=0.35 + top_k=25 combo accepted obvious noise matches like
+    "Hyderabad street-racing" → "F1 Antonelli champion" at sim 0.354
+    and fanned 1 article to 15-25 LLM calls. floor=0.50 + top_k=8 keeps
+    signal-to-noise high and cuts LLM cost ~3-4×.
     """
 
-    similarity_floor: float = Field(default=0.35, gt=0.0, lt=1.0)
-    top_k: int = Field(default=25, ge=1, le=100)
+    similarity_floor: float = Field(default=0.50, gt=0.0, lt=1.0)
+    top_k: int = Field(default=8, ge=1, le=100)
 
 
 class ExtractSection(BaseModel):

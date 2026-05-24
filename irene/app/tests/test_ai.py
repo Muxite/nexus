@@ -118,7 +118,7 @@ async def ai(db_ready, monkeypatch):
 
 
 def test_parse_response_happy():
-    # v2-fast single-char outputs.
+    # v3-fences-tolerant single-char outputs.
     assert _parse_response("Y") == ("YES", 1.0)
     assert _parse_response("N") == ("NO", 1.0)
     assert _parse_response("U") == ("NEUTRAL", 0.0)
@@ -128,6 +128,18 @@ def test_parse_response_happy():
     assert _parse_response("u\n") == ("NEUTRAL", 0.0)
     # First character wins (provider sometimes emits trailing text).
     assert _parse_response("Yes, definitely") == ("YES", 1.0)
+    # v3: tolerates markdown code fences (Gemini-2.5-flash prefixes ```).
+    assert _parse_response("```Y") == ("YES", 1.0)
+    assert _parse_response("```N\n```") == ("NO", 1.0)
+    assert _parse_response("```\nU\n```") == ("NEUTRAL", 0.0)
+    assert _parse_response("```u") == ("NEUTRAL", 0.0)
+    # v4: JSON answer envelope per the new prompt contract.
+    assert _parse_response('{"a":"Y"}') == ("YES", 1.0)
+    assert _parse_response('{"a":"N"}') == ("NO", 1.0)
+    assert _parse_response('{"a":"U"}') == ("NEUTRAL", 0.0)
+    assert _parse_response('```json\n{"a":"Y"}\n```') == ("YES", 1.0)
+    assert _parse_response('```json\n{"answer":"Y"}\n```') == ("YES", 1.0)
+    assert _parse_response('{"answer":"NO"}') == ("NO", 1.0)
 
 
 @pytest.mark.parametrize(
