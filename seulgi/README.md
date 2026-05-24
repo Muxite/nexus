@@ -273,7 +273,7 @@ Log prefixes: `[watcher]` `[markets]` `[engine/<name>]` `[ai]`
 | `app/ai.py` | DirectionClassifier — OpenRouter LLM with retry |
 | `app/engine.py` | EngineRunner — applies trading rules, tracks per-engine state |
 | `app/trader.py` | Paper trade execution + position lifecycle |
-| `app/dashboard.py` | Writes all .txt dashboard files, manages event ring buffers |
+| `app/dashboard/` | Package: writes all .txt dashboard files + PNG plots, manages event ring buffers |
 | `app/db.py` | Thin aiosqlite wrapper |
 | `app/config.py` | YAML config loader with env var overrides |
 | `app/profiler.py` | Lightweight span profiler (`Profiler` class + `prof` singleton) |

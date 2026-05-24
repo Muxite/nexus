@@ -1,0 +1,47 @@
+# paper_accuracy_audit
+db=/home/muk/projects/jennie/seulgi/data/seulgi.db
+since=2026-04-22T00:00:00+00:00 until=2026-05-22T23:42:57.069663+00:00
+n_closed_trades=501
+close_reason_counts={'TRAIL': 67, 'TP': 135, 'engine_retired': 197, 'cycle_reset': 58, 'SL': 37, 'TIMEOUT_BLEED': 3, 'RESOLVE_LOSS': 4}
+
+CHECK                       TOTAL     PASS   FAIL   SKIP   PASS%  STATUS
+ENTRY_PRICE_TRUTH               4        4      0    497 100.00%  PASS
+SLIPPAGE_FIT                  501      497      4      0  99.20%  PASS
+FEE_SCHEDULE                  501      501      0      0 100.00%  PASS
+FEE_CONFIG_DRIFT              501       69    432      0  13.77%  FAIL
+EXIT_LOGIC                    501      493      8      0  98.40%  FAIL
+PNL_FORMULA                     4        4      0    497 100.00%  PASS
+BOOK_DEPTH_FEASIBILITY        501      501      0      0 100.00%  PASS
+
+SLIPPAGE_REALISED_DIAGNOSTIC: {'n': 13, 'mean_modelled': 0.0, 'mean_realised': 0.0, 'pct_within_20pct_of_realised': 100.0}
+
+--- SLIPPAGE_FIT failures (showing 4) ---
+{"trade_id": 6980011, "direction": "NO", "mid": 0.285, "size_usdc": 1.0298, "logged_entry_price": 0.2848, "modelled_entry_price": 0.285, "logged_walk": 0.00021, "modelled_walk": 0.0, "applied": false}
+{"trade_id": 6980012, "direction": "NO", "mid": 0.285, "size_usdc": 1.0298, "logged_entry_price": 0.2848, "modelled_entry_price": 0.285, "logged_walk": 0.00021, "modelled_walk": 0.0, "applied": false}
+{"trade_id": 6980013, "direction": "NO", "mid": 0.285, "size_usdc": 1.0298, "logged_entry_price": 0.2848, "modelled_entry_price": 0.285, "logged_walk": 0.00021, "modelled_walk": 0.0, "applied": false}
+{"trade_id": 6980014, "direction": "NO", "mid": 0.285, "size_usdc": 1.0298, "logged_entry_price": 0.2848, "modelled_entry_price": 0.285, "logged_walk": 0.00021, "modelled_walk": 0.0, "applied": false}
+  extra: {'tol_used': 0.0001, 'logged_walk_mean': 2e-06, 'modelled_walk_mean': 0.0}
+
+--- FEE_CONFIG_DRIFT failures (showing 8) ---
+{"trade_id": 431516, "decided_at": "2026-05-18T20:41:39.376464+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+{"trade_id": 431517, "decided_at": "2026-05-18T20:41:39.376548+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+{"trade_id": 431519, "decided_at": "2026-05-18T20:41:39.376686+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+{"trade_id": 431520, "decided_at": "2026-05-18T20:41:39.376760+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+{"trade_id": 431522, "decided_at": "2026-05-18T20:41:39.376887+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+{"trade_id": 431523, "decided_at": "2026-05-18T20:41:39.376958+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+{"trade_id": 431524, "decided_at": "2026-05-18T20:41:39.377026+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+{"trade_id": 431525, "decided_at": "2026-05-18T20:41:39.377093+00:00", "market_type": null, "historical_fee_rate": 0.04, "current_config_rate": 0.05}
+
+--- EXIT_LOGIC failures (showing 8) ---
+{"trade_id": 475197, "close_reason": "TRAIL", "engine_name": "aggressive/conf25_tp005_sl015_norail", "hold_secs": 6611.7, "entry_price": 0.59, "shares": 1.93, "exit_price_reconstructed": 0.56, "realized_pnl": -0.09675866536585498, "tp": 0.005, "sl": 0.015, "trail": 0.005, "min_hold": 0.0, "stop_loss_pct": 0.0, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0300"}
+{"trade_id": 500110, "close_reason": "TRAIL", "engine_name": "aggressive/conf25_tp005_sl015", "hold_secs": 6603.0, "entry_price": 0.59, "shares": 1.83, "exit_price_reconstructed": 0.56, "realized_pnl": -0.09384623609756182, "tp": 0.005, "sl": 0.015, "trail": 0.005, "min_hold": 0.0, "stop_loss_pct": 0.0, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0300"}
+{"trade_id": 500112, "close_reason": "TRAIL", "engine_name": "aggressive/conf25_tp005_sl015_slpct10", "hold_secs": 6602.6, "entry_price": 0.59, "shares": 1.83, "exit_price_reconstructed": 0.56, "realized_pnl": -0.09384623609756182, "tp": 0.005, "sl": 0.015, "trail": 0.005, "min_hold": 0.0, "stop_loss_pct": 0.1, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0300"}
+{"trade_id": 500113, "close_reason": "TRAIL", "engine_name": "aggressive/conf25_tp005_sl015_lowvol", "hold_secs": 6602.6, "entry_price": 0.59, "shares": 1.83, "exit_price_reconstructed": 0.56, "realized_pnl": -0.09384623609756182, "tp": 0.005, "sl": 0.015, "trail": 0.005, "min_hold": 0.0, "stop_loss_pct": 0.0, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0300"}
+{"trade_id": 550842, "close_reason": "TRAIL", "engine_name": "balanced/conf40_tp020_sl030_inv65", "hold_secs": 4502.0, "entry_price": 0.515, "shares": 2.18, "exit_price_reconstructed": 0.51, "realized_pnl": -0.05556708495431639, "tp": 0.02, "sl": 0.03, "trail": 0.01, "min_hold": 300.0, "stop_loss_pct": 0.0, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0050"}
+{"trade_id": 550843, "close_reason": "TRAIL", "engine_name": "inverted_highconf/conf40_tp020_sl030_inv65", "hold_secs": 4502.1, "entry_price": 0.515, "shares": 2.18, "exit_price_reconstructed": 0.51, "realized_pnl": -0.05556708495431639, "tp": 0.02, "sl": 0.03, "trail": 0.01, "min_hold": 300.0, "stop_loss_pct": 0.0, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0050"}
+{"trade_id": 998504, "close_reason": "TRAIL", "engine_name": "aggressive/conf25_tp005_sl015", "hold_secs": 85.5, "entry_price": 0.7515, "shares": 1.96, "exit_price_reconstructed": 0.692, "realized_pnl": -0.1538465355401002, "tp": 0.005, "sl": 0.015, "trail": 0.005, "min_hold": 0.0, "stop_loss_pct": 0.0, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0595"}
+{"trade_id": 998506, "close_reason": "TRAIL", "engine_name": "aggressive/conf25_tp005_sl015_slpct10", "hold_secs": 86.0, "entry_price": 0.7515, "shares": 1.97, "exit_price_reconstructed": 0.692, "realized_pnl": -0.15244664238886219, "tp": 0.005, "sl": 0.015, "trail": 0.005, "min_hold": 0.0, "stop_loss_pct": 0.1, "engine_threshold_found": true, "why": "TRAIL fired underwater mtm=-0.0595"}
+  extra: {'close_reason_counts': {'TRAIL': 67, 'TP': 135, 'engine_retired': 197, 'cycle_reset': 58, 'SL': 37, 'TIMEOUT_BLEED': 3, 'RESOLVE_LOSS': 4}, 'close_reason_fail_counts': {'TRAIL': 8}}
+
+wrote /tmp/a3-4-audit.json
+FAIL: 1 check(s) below 99% pass rate (informational checks excluded).

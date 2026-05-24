@@ -74,7 +74,7 @@ for Phase 2 A2.1.
  monitor_positions (every 60 s)
    │   → close_trade(exit_price)
    ▼
- dashboard.py (every 30 s) ──► data/dashboard/*.txt
+ dashboard/   (every 30 s txt, every 5 min png) ──► data/dashboard/*.txt + plots/*.png
  impact_tracker.py (continuous) ──► price_impacts / price_timeseries
 ```
 
@@ -100,7 +100,7 @@ sit in.
 | `budget.py` | 185 | no | KEEP AS-IS — new (cycle-2), small, well-tested. |
 | `config.py` | 733 | no | REFACTOR — collapse dataclass duplication; preserve override semantics. |
 | `config_validate.py` | 125 | no | KEEP — pure validation. |
-| `dashboard.py` | 1,980 | no | REFACTOR (heavy cull) — A0.7 plan targets ≥ 500 lines saved. |
+| `dashboard/` (pkg) | ~2,200 across 24 modules | per-page | LANDED (2026-05-24): split from 1,927-line monolith → `core.py`/`cache.py`/`io.py`/`events.py`/`registry.py` + 16 `pages/*.py` + 6 `plots/*.py`. Byte-equivalent text output; `engine_comparison.txt` capped at 25 rows (≤8 KB); matplotlib PNG tier on 5-min cadence. |
 | `db.py` | 2,929 | no | REFACTOR / EXTEND — never rewrite. Cycle-2 fixes are tribal. Drop `lessons`, archive skip rows, add indexes. |
 | `debug.py` | 392 | no | REFACTOR — diagnostic helpers; trim with the rest. |
 | `engine.py` | 1,147 | yes (L38) | REFACTOR + rename stages (INGRESS → SIGNAL → SIM_GATE → PREDICT → FAN_OUT → WRITE); delete dead branches D1-D9 from A0.5 report. |
