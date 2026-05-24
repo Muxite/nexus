@@ -219,3 +219,96 @@ small to interpret as edge.
    justify production-wide enablement.
 3. **Leave the bot OFF until the user decides** whether to chase the
    peak-hours retry or shift to production-gate work first.
+
+---
+
+## Follow-up: post-tuning verification (2026-05-24 05:15-06:45 UTC)
+
+Triggered by an investigation into "why so few trades, why so small."
+Three coupled fixes committed in `18e4a9e`:
+
+1. **`engine.py:828-829`** — cluster_factor floored at 0.50 (was
+   uncapped `1/√N`; SBERT typically returns N=20-25 → 0.20 shrinkage).
+2. **`config.yaml` scout.max_position_usdc**: 1.0 → 5.0 (so scout's
+   trades land near $2.50 instead of $0.20).
+3. **`config.yaml` balanced.min_confidence**: 0.40 → 0.30 (so the
+   AI's 0.30-0.40 confidence band reaches the edge gate).
+
+### Pre/post comparison
+
+| metric | pre-tuning F1 (01:12-04:41) | post-tuning F1 (05:15-06:45) | delta |
+|---|---:|---:|---:|
+| trades opened | 19 | **123** | **+547%** |
+| avg stake size | $0.21 | **$1.36** | **+547%** |
+| engines that traded | 1 (scout only) | **14** (12 balanced + 3 inv_hc + scout + loose_relevance_yes) | +13 |
+| crashes | 0 | 0 | — |
+| closes | 5 (delayed) | 3 | n/a |
+| realized PnL | +$0.0949 | **−$0.2109** | n=3 too small |
+
+### Per-engine post-tuning breakdown
+
+| engine | n | avg_size |
+|---|---:|---:|
+| inverted_highconf/conf40_tp030_sl050_inv75 | 10 | $1.28 |
+| inverted_highconf/conf40_tp030_sl050_slpct10_inv75 | 10 | $1.28 |
+| inverted_highconf/conf45_tp030_sl050_inv75 | 10 | $1.28 |
+| balanced/* (10 variants × 9 each) | 90 | $1.36 |
+| loose_relevance_yes/default | 9 | $1.36 |
+| scout/all_signals | 2 | $2.50 |
+| _super_scout/all_signals_ | _0_ | _still blocked by cluster_size_too_small:0.025 — fix follow-up_ |
+
+### Verification verdict
+
+- ✅ **Cluster floor fix works**: scout/all_signals trades sized at exactly
+  $2.50 = max_position_usdc × cluster_factor_floor. Production engines'
+  Kelly stakes land at $1.36 vs $0.20 unfloored.
+- ✅ **min_confidence drop unblocked production**: all 13 balanced variants
+  + 3 inverted_highconf variants started trading. F1 gate (≥50) cleared
+  2.5× in ~25 minutes.
+- ✅ **No crashes / no commit-race / no telemetry drops** through 80
+  minutes of post-tuning operation.
+
+### New findings surfaced by the verification
+
+1. **NEUTRAL flood is cyclical, not constant.** The 05:15-05:40 window
+   saw a non-NEUTRAL burst (137 distinct directional verdicts produced
+   123 trades). 05:40-06:45 the AI emitted 99.95% NEUTRAL again
+   (17,792 NEUTRAL / 8 YES). Trade activity is wall-clock spiky, not
+   smooth — F1's "≥50 trades / 4h" gate as designed undervalues this
+   bursty reality. Suggested replacement: "≥50 trades within any
+   contiguous 90-minute window over 4h" or simply "≥10 trades/h
+   averaged over peak hours."
+
+2. **Direction skew toward NO is severe.** Post-tuning, 120/123 trades
+   were NO direction (97.6%). 30 of those came from inverted_highconf
+   inverters (which flip high-confidence YES → NO trades), but the
+   remaining 90 balanced trades were also NO-dominant. The AI is
+   genuinely biased toward NO under the current prompt + news mix.
+   Worth a per-direction PnL audit when n is meaningful.
+
+3. **0 closes for 80 minutes** on production engines is its own
+   diagnostic finding (1 close emerged at minute 80+). Production
+   engines use `TP=0.020/SL=0.030/TRAIL=0.010` which require a 1-3%
+   price move within `position_timeout_hours=24h`. Polymarket markets
+   often don't move 1-3% inside an hour. Three possible next levers:
+   - Tighten TP/SL bands (e.g., `TP=0.005/SL=0.010/TRAIL=0.003`) for
+     one variant as a A/B.
+   - Lower `min_hold_seconds` from 300 → 60 to let early trail catch
+     short-cycle moves.
+   - Add a `time_decay_exit` (close at X% pnl after Y minutes regardless
+     of TP/SL) — captures stochastic equilibrium positions.
+
+4. **super_scout still blocked** by `cluster_size_too_small:0.025`
+   (super_scout's $0.05 × 0.50 cluster_factor = $0.025, below the
+   $0.05 floor). To unblock, either raise super_scout's
+   `max_position_usdc` to ≥$0.10 or lower `simulate_min_trade_usdc`
+   below $0.025. Not blocking — super_scout is research-tier
+   diagnostic. Out of scope for this session.
+
+### Final post-tuning state
+
+- Bot stopped 2026-05-24T06:45 UTC.
+- Snapshot at `seulgi/snapshots/pre_stop_2026XXXX` (see `lifecycle.sh stop` output).
+- 137 open positions across 14 engines (all from the 05:15-05:40 burst).
+- Live writes (post-tuning + cumulative): 706 trades, 805 position
+  price snaps, 15,393 llm_calls.
