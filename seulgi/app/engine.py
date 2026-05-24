@@ -825,8 +825,13 @@ class EngineRunner:
             engine, survivors, classify_results, pre_skips, freshness_label,
         )
         # E8 cluster-size sizing: N = pre-AI gate survivors for this engine.
+        # 2026-05-24: floored at 0.50 — SBERT cosine typically returns N=20-25
+        # markets per headline, which uncapped shrunk every stake 5× silently.
+        # The cap preserves the diversification intent for small clusters
+        # (N=2-4 still scale 0.71→0.50) while preventing the typical cluster
+        # from making research-tier ($1) and micro ($0.05) stakes unviable.
         n_cluster = max(len(eng_survivors), 1)
-        cluster_factor = 1.0 / math.sqrt(n_cluster) if n_cluster > 1 else 1.0
+        cluster_factor = max(0.50, 1.0 / math.sqrt(n_cluster)) if n_cluster > 1 else 1.0
         try:
             decisions = await engine.trader.evaluate(
                 signal_id, headline, eng_survivors, eng_classify,

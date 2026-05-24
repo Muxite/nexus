@@ -633,7 +633,11 @@ engines:
     min_edge: 0.03
     edge_increment: 0.12
     max_position_usdc: 100.0
-    min_confidence: 0.40
+    # 2026-05-24 F1 retry: was 0.40; lowered to admit the 0.30-0.40
+    # confidence band (~34 verdicts/F1 window). Edge gate (c>=0.625 or
+    # c<=0.375) still does the real filtering; this just stops the AI
+    # parent's dead-zone verdicts from short-circuiting before edge.
+    min_confidence: 0.30
     max_open_positions: 20
     take_profit:      0.020
     stop_loss:        0.030
@@ -828,7 +832,10 @@ engines:
     balance_usdc: 50.0
     min_edge: -10.0           # admit any signal (including negative-edge)
     edge_increment: 0.12
-    max_position_usdc: 1.0    # $1 stake per trade — high volume, low risk
+    max_position_usdc: 5.0    # 2026-05-24: was 1.0; lifted so cluster_factor
+                              # shrinkage (~0.50 floor post-fix) doesn't reduce
+                              # research stakes below close-noise. Bounded by
+                              # balance_usdc=50 ⇒ 10 concurrent at max stake.
     min_confidence: 0.0       # admit any AI signal, even very low p_alpha
     max_open_positions: 50    # cap total exposure but allow burst data
     take_profit:      0.05
