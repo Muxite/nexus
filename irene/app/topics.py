@@ -32,6 +32,7 @@ TOPIC_SIGNAL_CREATED = "signal.created"
 TOPIC_TRADE_DECIDED = "trade.decided"
 TOPIC_EXTRACTION_COMPLETED = "extraction.completed"
 TOPIC_RESOLUTION_COMPLETED = "resolution.completed"
+TOPIC_EVENT_UPDATED = "event.updated"
 
 # Telemetry topics (best-effort; dropped first under back-pressure) ---------
 

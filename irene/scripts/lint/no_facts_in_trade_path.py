@@ -52,7 +52,7 @@ TRADE_PATH_FILES = (
 # path may not read any of them.
 FORBIDDEN_TABLES = (
     "facts", "entities", "entity_aliases", "extraction_runs",
-    "entity_resolutions",
+    "entity_resolutions", "events", "event_edges",
 )
 
 # A line containing this token is intentionally allowed (e.g. a comment
