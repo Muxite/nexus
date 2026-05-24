@@ -114,6 +114,19 @@ _BOILERPLATE_TITLE_BLOCKLIST = {
     "see all", "view all", "next", "previous",
 }
 
+# URLs whose path matches ANY of these substrings are NOT news articles.
+# Catches NYT puzzles/crosswords/games, podcasts, account/help/about
+# pages, jobs boards, etc. Match is plain substring, case-insensitive.
+_NON_ARTICLE_URL_PATTERNS = (
+    "/puzzles/", "/crosswords/", "/crossword/", "/games/", "/wordle",
+    "/spelling-bee", "/connections", "/video/", "/videos/", "/podcasts/",
+    "/podcast/", "/audio/", "/newsletter", "/newsletters/",
+    "/account/", "/accounts/", "/login", "/signin", "/sign-in",
+    "/signup", "/sign-up", "/subscribe", "/help/", "/about/",
+    "/contact", "/cookies", "/privacy", "/terms", "/jobs/", "/careers/",
+    "/store/", "/shop/", "/games", "/cooking/", "/recipes/", "/games?",
+)
+
 
 class IngestStage:
     def __init__(self, deps: StageDeps) -> None:
@@ -262,9 +275,14 @@ class IngestStage:
             if not isinstance(url, str) or not url:
                 continue
             title = text.strip()
-            # Boilerplate filter — short or generic UI strings that
-            # trafilatura sometimes lets through.
-            if len(title) < 15 or title.lower() in _BOILERPLATE_TITLE_BLOCKLIST:
+            # Boilerplate filter — three guards:
+            # 1. minimum length (30 chars catches short labels)
+            # 2. title blocklist (UI strings like "Subscribe")
+            # 3. URL pattern blocklist (puzzles/games/podcasts/account/...)
+            if len(title) < 30 or title.lower() in _BOILERPLATE_TITLE_BLOCKLIST:
+                continue
+            url_lower = url.lower()
+            if any(pat in url_lower for pat in _NON_ARTICLE_URL_PATTERNS):
                 continue
             await self._ingest_item(
                 source="html",

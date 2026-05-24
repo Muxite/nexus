@@ -285,10 +285,15 @@ async def test_html_path_filters_boilerplate_titles(db_ready, bus, monkeypatch):
 
     async def stub_fetch(self, site_url: str):
         return [
-            {"url": "https://apnews.com/sub",   "text": "Subscribe"},          # blocked
-            {"url": "https://apnews.com/short", "text": "Hi"},                 # too short
+            {"url": "https://apnews.com/sub",   "text": "Subscribe"},                     # blocked: blocklist
+            {"url": "https://apnews.com/short", "text": "Hi"},                            # blocked: too short
+            {"url": "https://apnews.com/nav",   "text": "FT Leaders Academy"},            # blocked: 30-char floor
+            # URL pattern blocks (titles look real but URL is a non-article path):
+            {"url": "https://www.nytimes.com/crosswords/abc", "text": "The Crossword Get clued in with wordplay every day"},
+            {"url": "https://www.nytimes.com/podcasts/ezra-klein", "text": "Listen to the latest podcast episodes here on demand"},
+            {"url": "https://www.example.com/account/settings",  "text": "Manage your account settings and notification preferences"},
             {"url": "https://apnews.com/real",  "text": "Russia launches new attack on Kyiv overnight"},
-            {"url": "https://apnews.com/menu",  "text": "Menu"},               # blocked
+            {"url": "https://apnews.com/menu",  "text": "Menu"},                          # blocked: blocklist
         ]
 
     monkeypatch.setattr(IngestStage, "_fetch_html_links", stub_fetch)
