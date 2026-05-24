@@ -16,3 +16,5 @@ sentence-transformers>=3.0,<4.0
 # without build-essential. Once we bake that in, re-pin to 0.4.24.
 chromadb>=0.5,<1.0
 structlog>=24.1,<25.0
+# Dashboard PNG plots (data/dashboard/plots/*.png). Headless Agg backend.
+matplotlib>=3.8,<4.0

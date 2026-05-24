@@ -144,13 +144,14 @@ async def test_dashboard_with_data(db_ready, tmp_path):
 
 
 async def test_one_bad_panel_does_not_break_others(db_ready, tmp_path, monkeypatch):
-    """If the funnel query raises, every other file still writes."""
+    """If the funnel page raises, every other file still writes."""
     dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)
 
-    async def boom() -> str:
+    async def boom(_dash) -> str:
         raise RuntimeError("query exploded")
 
-    monkeypatch.setattr(dash, "_render_funnel", boom)
+    from app.dashboard.pages import funnel as funnel_page
+    monkeypatch.setattr(funnel_page, "render", boom)
     await dash.tick()
     assert (tmp_path / "dashboard.txt").exists()
     assert (tmp_path / "latency.txt").exists()

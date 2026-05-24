@@ -628,3 +628,94 @@ def test_event_index_dim_inferred_lazily():
                  last_seen_at_iso="2026-05-20T12:00:00+00:00")
     assert idx._dim == 4
 
+
+# ---------------------------------------------------------------------------
+# Live-bus integration (P3 chunk 3 workstream A)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_eventize_live_bus_on_resolution_completed(irene_db_path):
+    """End-to-end via the live InProcBus: publishing
+    `TOPIC_RESOLUTION_COMPLETED` makes the subscribed `EventizeStage`
+    create an `events` row and republish `TOPIC_EVENT_UPDATED`.
+
+    This is the wiring contract that `app.main.wire_pipeline()` is now
+    expected to honour for every newly-ingested article. Reproduced
+    here without spinning up the whole pipeline so the test stays
+    focused on eventize-on-the-bus behaviour."""
+    from app.bus import InProcBus
+    from app.topics import TOPIC_EVENT_UPDATED, TOPIC_RESOLUTION_COMPLETED
+
+    # Seed: 1 article + 1 fact ready for eventize to find.
+    sync = sqlite3.connect(irene_db_path, isolation_level=None)
+    ids = _seed_minimal_dkg(sync)
+    run_id = _insert_extraction_run(sync, article_id=ids["article1"])
+    _insert_fact(
+        sync, run_id=run_id, article_id=ids["article1"],
+        subj_id=ids["fda"], relation="decides", obj_id=ids["pfizer"],
+        observed_at="2026-05-20T12:00:00+00:00",
+    )
+    sync.close()
+
+    db = DB(path=irene_db_path)
+    await db.connect()
+    bus = InProcBus()
+    deps = StageDeps(db=db, bus=bus, config=_StubConfig(),
+                     embedder=_FakeEmbedder())
+    stage = EventizeStage(deps)
+
+    # Capture event.updated publications via a downstream subscriber so
+    # we also verify the chain that link.handle would receive.
+    received: list[dict] = []
+
+    async def _downstream(payload: dict) -> None:
+        received.append(payload)
+
+    # Subscriptions MUST be registered before bus.start() — same rule
+    # main.py enforces.
+    bus.subscribe(TOPIC_RESOLUTION_COMPLETED, stage.handle)
+    bus.subscribe(TOPIC_EVENT_UPDATED, _downstream)
+
+    await stage.start()
+    await bus.start()
+    try:
+        await bus.publish(
+            TOPIC_RESOLUTION_COMPLETED,
+            {
+                "article_id": ids["article1"],
+                "extraction_run_id": run_id,
+                "is_tracer": False,
+                "tracer_id": None,
+            },
+        )
+        # Drain — give the subscriber task a chance to run handle().
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.02)
+        assert received, "eventize did not publish event.updated on the live bus"
+        payload = received[0]
+        assert payload["article_id"] == ids["article1"]
+        assert payload["events_created"] == 1
+        cur = await db.conn.execute("SELECT COUNT(*) FROM events")
+        n_events = (await cur.fetchone())[0]
+        await cur.close()
+        assert n_events == 1
+        assert bus.counters.handler_exceptions == 0
+    finally:
+        await bus.stop()
+        await stage.stop()
+        await db.close()
+
+
+def test_wire_pipeline_subscribes_eventize_to_resolution_completed():
+    """The wiring contract: `app.main.wire_pipeline()` must register
+    `EventizeStage.handle` on `TOPIC_RESOLUTION_COMPLETED`. Source-level
+    assertion so the test is robust to runtime config — main.py is the
+    single point that flips eventize from batch-only to live."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent.parent.parent
+           / "app" / "main.py").read_text()
+    assert "bus.subscribe(TOPIC_RESOLUTION_COMPLETED, eventize.handle)" in src
+

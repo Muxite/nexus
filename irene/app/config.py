@@ -174,6 +174,22 @@ class ImpactSection(BaseModel):
     max_age_hours: float = Field(default=2.0, gt=0)
 
 
+class DKGTradeSection(BaseModel):
+    """DKG trade stage — fires paper trades off `market_links.final_score`.
+
+    P3 chunk 3 adds a second decision_path ('dkg') alongside the MVP
+    matcher → trade path. Sizing reuses TradeSection (Kelly, balance,
+    min_position_usdc) so the two paths stay in lockstep unless someone
+    explicitly drifts them apart.
+    """
+
+    enabled: bool = True
+    score_floor: float = Field(default=0.8, ge=0.0, le=1.0)
+    # When True, reuse TradeSection's edge/size gates verbatim. Flip to
+    # False only if you want a DKG-specific gate set (none in P3 ch3).
+    inherit_trade_gates: bool = True
+
+
 class TradeSection(BaseModel):
     """Trade stage — gate cascade thresholds + sizing config (paper only)."""
 
@@ -209,6 +225,7 @@ class Config(BaseModel):
     dedupe: DedupeSection = Field(default_factory=DedupeSection)
     match: MatchSection = Field(default_factory=MatchSection)
     trade: TradeSection = Field(default_factory=TradeSection)
+    dkg_trade: DKGTradeSection = Field(default_factory=DKGTradeSection)
     clob: CLOBSection = Field(default_factory=CLOBSection)
     closer: CloserSection = Field(default_factory=CloserSection)
     extract: ExtractSection = Field(default_factory=ExtractSection)

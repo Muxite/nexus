@@ -91,10 +91,16 @@ logger = logging.getLogger(__name__)
 
 
 _TRADE_DDL = [
+    # NOTE (P3 chunk 3): `signal_id` is nullable on both `decisions` and
+    # `trades` so DKG-path rows (which have no signal backing them) can
+    # land. The MVP path's idempotency is enforced by the partial unique
+    # indexes below — `UNIQUE(signal_id) WHERE signal_id IS NOT NULL`.
+    # DKG-path idempotency lives in `dkg_trade_links` (owned by
+    # `app/stages/dkg_trade.py`).
     """
     CREATE TABLE IF NOT EXISTS decisions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        signal_id       INTEGER NOT NULL,
+        signal_id       INTEGER,
         outcome         TEXT NOT NULL CHECK(outcome IN ('execute','reject')),
         reason          TEXT NOT NULL,
         gate_history    TEXT NOT NULL,
@@ -102,17 +108,24 @@ _TRADE_DDL = [
         cycle_id        INTEGER NOT NULL,
         is_tracer       INTEGER NOT NULL DEFAULT 0,
         tracer_id       TEXT,
-        created_at      TEXT NOT NULL,
-        UNIQUE(signal_id)
+        created_at      TEXT NOT NULL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_decisions_outcome ON decisions(outcome)",
     "CREATE INDEX IF NOT EXISTS idx_decisions_reason ON decisions(reason)",
     "CREATE INDEX IF NOT EXISTS idx_decisions_cycle_id ON decisions(cycle_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_decisions_signal_id "
+    "ON decisions(signal_id) WHERE signal_id IS NOT NULL",
+    # NOTE (P3 chunk 3): `signal_id` was MVP-only — DKG trades have no
+    # signal row backing them. We broadened the column to nullable +
+    # dropped the table-level UNIQUE; the MVP path's per-signal
+    # idempotency is now enforced by a partial unique index
+    # (`signal_id IS NOT NULL`). The DKG path's idempotency lives in
+    # `dkg_trade_links` (owned by `app/stages/dkg_trade.py`).
     """
     CREATE TABLE IF NOT EXISTS trades (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        signal_id       INTEGER NOT NULL UNIQUE,
+        signal_id       INTEGER,
         decision_id     INTEGER NOT NULL REFERENCES decisions(id),
         prediction_id   INTEGER NOT NULL,
         market_id       TEXT NOT NULL,
@@ -137,6 +150,11 @@ _TRADE_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id)",
     "CREATE INDEX IF NOT EXISTS idx_trades_cycle_id ON trades(cycle_id)",
+    # Partial unique index replaces the old `signal_id UNIQUE` constraint.
+    # MVP rows have a non-NULL signal_id; DKG rows leave it NULL, so the
+    # index simply doesn't apply to them.
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_trades_signal_id "
+    "ON trades(signal_id) WHERE signal_id IS NOT NULL",
     """
     CREATE TABLE IF NOT EXISTS trade_features (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,6 +178,45 @@ def _now_iso() -> str:
 
 def _gate_entry(name: str, outcome: str, value, threshold) -> dict:
     return {"gate": name, "outcome": outcome, "value": value, "threshold": threshold}
+
+
+def compose_direction_prompt(article: dict, market: dict) -> str:
+    """Shared LLM-direction prompt builder for the MVP + DKG trade paths.
+
+    Both paths read the news as plain language and ask whether it
+    decisively resolves the market — see `docs/philosophy.md`. The
+    function is module-level so `app/stages/dkg_trade.py` can call it
+    without inheriting any state from `TradeStage`.
+    """
+    title = article.get("title") or ""
+    summary = article.get("summary") or "(none)"
+    question = market.get("question") or ""
+    description = market.get("description") or "(none)"
+    return (
+        f"NEWS HEADLINE: {title}\n"
+        f"NEWS SUMMARY:  {summary}\n"
+        f"\n"
+        f"MARKET QUESTION: {question}\n"
+        f"MARKET DETAILS:  {description}\n"
+        f"\n"
+        f"Read the news as plain language. Does the news DECISIVELY\n"
+        f"resolve this market?\n"
+        f"\n"
+        f"  YES     — the news plainly says the market's YES outcome\n"
+        f"            will happen or has just happened.\n"
+        f"  NO      — the news plainly says the market's NO outcome\n"
+        f"            will happen or has just happened.\n"
+        f"  NEUTRAL — the news is unrelated, ambiguous, or doesn't\n"
+        f"            clearly push the market either way. Default to\n"
+        f"            this whenever you're unsure.\n"
+        f"\n"
+        f"`confidence` is how CLEARLY the news resolves the market\n"
+        f"(not a probability of YES). 0.9 = the article spells out\n"
+        f"the resolution; 0.5 = related but ambiguous; below the gate\n"
+        f"falls through to NEUTRAL anyway.\n"
+        f"\n"
+        f"Output JSON ONLY."
+    )
 
 
 class TradeStage:
@@ -439,35 +496,12 @@ class TradeStage:
         # the article DECISIVELY resolves the market, not to estimate the
         # probability of YES. `confidence` here is "how clearly the news
         # resolves it", not P(YES).
-        title = article["title"] or ""
-        summary = article["summary"] or "(none)"
-        question = market["question"] or ""
-        description = market["description"] or "(none)"
-        return (
-            f"NEWS HEADLINE: {title}\n"
-            f"NEWS SUMMARY:  {summary}\n"
-            f"\n"
-            f"MARKET QUESTION: {question}\n"
-            f"MARKET DETAILS:  {description}\n"
-            f"\n"
-            f"Read the news as plain language. Does the news DECISIVELY\n"
-            f"resolve this market?\n"
-            f"\n"
-            f"  YES     — the news plainly says the market's YES outcome\n"
-            f"            will happen or has just happened.\n"
-            f"  NO      — the news plainly says the market's NO outcome\n"
-            f"            will happen or has just happened.\n"
-            f"  NEUTRAL — the news is unrelated, ambiguous, or doesn't\n"
-            f"            clearly push the market either way. Default to\n"
-            f"            this whenever you're unsure.\n"
-            f"\n"
-            f"`confidence` is how CLEARLY the news resolves the market\n"
-            f"(not a probability of YES). 0.9 = the article spells out\n"
-            f"the resolution; 0.5 = related but ambiguous; below the gate\n"
-            f"falls through to NEUTRAL anyway.\n"
-            f"\n"
-            f"Output JSON ONLY."
-        )
+        # Implementation lives at module scope (`compose_direction_prompt`)
+        # so the DKG path (`app/stages/dkg_trade.py`) can call exactly the
+        # same prompt without inheriting state from this class — the LLM
+        # cache then stays warm across both paths for the same
+        # (article, market) pair.
+        return compose_direction_prompt(article, market)
 
     async def _resolve_mid(self, *, direction: str, market: Optional[dict]) -> float:
         """Return the mid-price for the side we're betting on.

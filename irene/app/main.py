@@ -62,7 +62,16 @@ from app.embed import Embedder
 from app.dashboard import Dashboard
 from app.stages.closer import CloserStage
 from app.stages.dedupe import DedupeStage
+from app.stages.dkg_trade import DKGTradeStage
+# Import order matters: extract.py owns `facts`; eventize.py's DDL contains
+# an ALTER TABLE facts ADD COLUMN event_id. Schema apply runs in
+# registration order, so extract MUST register before eventize. (Mirror
+# constraint for link.py — it references events(id) via FK, so eventize
+# must register before link.) Keep the explicit ordering below; do not
+# resort alphabetically.
 from app.stages.extract import ExtractStage
+from app.stages.eventize import EventizeStage
+from app.stages.link import LinkerStage
 from app.stages.impact_tracker import ImpactTrackerStage
 from app.stages.ingest import IngestStage
 from app.stages.markets import MarketIndex, MarketsStage
@@ -72,7 +81,10 @@ from app.stages.trade import TradeStage
 from app.topics import (
     TOPIC_ARTICLE_DEDUPED,
     TOPIC_ARTICLE_INGESTED,
+    TOPIC_EVENT_UPDATED,
     TOPIC_EXTRACTION_COMPLETED,
+    TOPIC_MARKET_LINKS_UPDATED,
+    TOPIC_RESOLUTION_COMPLETED,
     TOPIC_SIGNAL_CREATED,
     TOPIC_TRADE_DECIDED,
 )
@@ -145,7 +157,10 @@ class Pipeline:
         closer: CloserStage,
         extract: ExtractStage,
         resolve: ResolveStage,
+        eventize: EventizeStage,
+        link: LinkerStage,
         impact_tracker: ImpactTrackerStage,
+        dkg_trade: Optional["DKGTradeStage"] = None,
     ) -> None:
         self.markets = markets
         self.ingest = ingest
@@ -155,21 +170,40 @@ class Pipeline:
         self.closer = closer
         self.extract = extract
         self.resolve = resolve
+        self.eventize = eventize
+        self.link = link
         self.impact_tracker = impact_tracker
+        # P3 chunk 3 (workstream B): DKG trade path. Optional in the
+        # ctor so older test wirings that pre-date this param keep
+        # working; production wiring (wire_pipeline) always sets it.
+        self.dkg_trade = dkg_trade
 
     @property
     def start_order(self) -> tuple:
         # P2: extract is wired alongside match on article.deduped.
         # P3 chunk 1: resolve subscribes to extraction.completed.
+        # P3 chunk 3 (workstream A): eventize subscribes to
+        # resolution.completed; link subscribes to event.updated. Together
+        # they finish the DKG pipeline live (extract → resolve → eventize
+        # → link → market_links). Trade path does not read market_links
+        # yet (workstream B wires that).
         # Impact tracker (observability): subscribes to trade.decided and
         # polls CLOB at +1m/5m/15m/30m/60m. Pure diagnostic — never feeds
         # the trade path (docs/philosophy.md "we don't predict; we
         # verify the speed thesis holds via this data").
-        return (
+        # P3 chunk 3 (workstream B): dkg_trade is started AFTER link so
+        # `market_links.updated` has a producer before the subscriber
+        # turns on. Filtered out when unset so older test wirings that
+        # don't construct it continue to boot.
+        stages = (
             self.markets, self.ingest, self.dedupe, self.match,
             self.trade, self.closer, self.extract, self.resolve,
+            self.eventize, self.link,
             self.impact_tracker,
         )
+        if self.dkg_trade is not None:
+            stages = stages + (self.dkg_trade,)
+        return stages
 
     @property
     def stop_order(self) -> tuple:
@@ -226,10 +260,26 @@ def wire_pipeline(
     # Resolve (P3 chunk 1) subscribes to extraction.completed. It owns
     # the entity_resolutions overlay; never mutates extract's tables.
     resolve = ResolveStage(full_deps)
+    # Eventize (P3 chunk 2a) subscribes to resolution.completed. Clusters
+    # facts into canonical `events`; writes `event_edges` + stamps
+    # `facts.event_id`. Publishes `event.updated` for the linker.
+    eventize = EventizeStage(full_deps)
+    # Linker (P3 chunk 2b) subscribes to event.updated. Scores each
+    # updated event against every active market and persists the top-K
+    # candidates to `market_links`. `start()` loads ALL market embeddings
+    # into memory — takes a beat at boot. Owns `market_links`.
+    link = LinkerStage(full_deps)
     # Impact tracker (observability): subscribes to trade.decided. Polls
     # CLOB at +1m/5m/15m/30m/60m to measure whether the price moved the
     # way we bet. Pure diagnostic; never reads back into the trade path.
     impact_tracker = ImpactTrackerStage(full_deps)
+    # DKG trade (P3 chunk 3 workstream B). Subscribes to
+    # `market_links.updated`; for every link above
+    # `cfg.dkg_trade.score_floor` re-runs the LLM direction call against
+    # the article behind the event and writes a `trades` row with
+    # `decision_path='dkg'`. Sister of TradeStage; both feed the impact
+    # tracker via TOPIC_TRADE_DECIDED.
+    dkg_trade = DKGTradeStage(full_deps)
 
     # Subscriptions MUST be registered before bus.start() — the bus
     # rejects late subscribers (catches the wiring bug where a stage
@@ -239,7 +289,10 @@ def wire_pipeline(
     bus.subscribe(TOPIC_ARTICLE_DEDUPED, extract.handle)
     bus.subscribe(TOPIC_SIGNAL_CREATED, trade.handle)
     bus.subscribe(TOPIC_EXTRACTION_COMPLETED, resolve.handle)
+    bus.subscribe(TOPIC_RESOLUTION_COMPLETED, eventize.handle)
+    bus.subscribe(TOPIC_EVENT_UPDATED, link.handle)
     bus.subscribe(TOPIC_TRADE_DECIDED, impact_tracker.handle)
+    bus.subscribe(TOPIC_MARKET_LINKS_UPDATED, dkg_trade.handle)
 
     return Pipeline(
         markets=markets,
@@ -250,6 +303,9 @@ def wire_pipeline(
         closer=closer,
         extract=extract,
         resolve=resolve,
+        eventize=eventize,
+        link=link,
+        dkg_trade=dkg_trade,
         impact_tracker=impact_tracker,
     )
 
@@ -314,7 +370,7 @@ async def main() -> int:
     dashboard._task = asyncio.create_task(dashboard.run())
 
     logger.info(
-        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow resolve=shadow impact=tracking)",
+        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow resolve=shadow eventize=shadow link=shadow impact=tracking)",
         len(pipeline.start_order),
         cfg.irene.cycle,
         cycle_id,

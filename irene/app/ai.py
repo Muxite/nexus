@@ -134,10 +134,18 @@ _AI_DDL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_llm_calls_prompt_sha ON llm_calls(prompt_sha)",
+    # NOTE (P3 chunk 3): `signal_id` is nullable because the DKG trade
+    # path has no signal backing it (`app/stages/dkg_trade.py`). The
+    # MVP path's per-signal idempotency is enforced by a partial
+    # unique index on (signal_id, model, prompt_version) WHERE
+    # signal_id IS NOT NULL. DKG calls don't dedupe at the
+    # predictions level — they get a fresh row per (event, market)
+    # pair, and the LLM cache (`llm_calls.prompt_sha`) avoids the
+    # actual HTTP round-trip.
     """
     CREATE TABLE IF NOT EXISTS predictions (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        signal_id       INTEGER NOT NULL,
+        signal_id       INTEGER,
         llm_call_id     INTEGER REFERENCES llm_calls(id),
         model           TEXT NOT NULL,
         prompt_version  TEXT NOT NULL,
@@ -148,12 +156,14 @@ _AI_DDL = [
         cycle_id        INTEGER NOT NULL,
         is_tracer       INTEGER NOT NULL DEFAULT 0,
         tracer_id       TEXT,
-        created_at      TEXT NOT NULL,
-        UNIQUE(signal_id, model, prompt_version)
+        created_at      TEXT NOT NULL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_predictions_signal_id ON predictions(signal_id)",
     "CREATE INDEX IF NOT EXISTS idx_predictions_cycle_id ON predictions(cycle_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_predictions_signal_model_version "
+    "ON predictions(signal_id, model, prompt_version) "
+    "WHERE signal_id IS NOT NULL",
     """
     CREATE TABLE IF NOT EXISTS llm_parse_failures (
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,11 +253,17 @@ class AIClient:
     async def direction(
         self,
         *,
-        signal_id: int,
+        signal_id: Optional[int],
         prompt: str,
         is_tracer: bool = False,
         tracer_id: Optional[str] = None,
     ) -> DirectionResult:
+        """Call the direction model; `signal_id=None` is legal for the
+        DKG trade path which has no signal backing it. With a NULL
+        signal_id the per-signal predictions UNIQUE no longer applies,
+        so every DKG call inserts a fresh `predictions` row — but the
+        `llm_calls` cache (prompt_sha) still suppresses the actual HTTP
+        round-trip when the prompt repeats."""
         cycle_id = current_cycle_id()
         # `prompt` here is just the user content (Condition + News). The
         # system message is appended to the cache key so a future change
@@ -362,7 +378,7 @@ class AIClient:
     async def _record_from_cache(
         self,
         *,
-        signal_id: int,
+        signal_id: Optional[int],
         cached_row: dict,
         cycle_id: int,
         is_tracer: bool,
@@ -404,7 +420,7 @@ class AIClient:
     async def _record_fresh_call(
         self,
         *,
-        signal_id: int,
+        signal_id: Optional[int],
         prompt_sha: str,
         full_prompt: str,
         response: dict,
@@ -542,7 +558,7 @@ class AIClient:
     async def _insert_prediction(
         self,
         *,
-        signal_id: int,
+        signal_id: Optional[int],
         llm_call_id: Optional[int],
         direction: str,
         confidence: float,
@@ -552,7 +568,45 @@ class AIClient:
         is_tracer: bool,
         tracer_id: Optional[str],
     ) -> int:
+        # MVP path (signal_id != None): use the partial unique index
+        # uq_predictions_signal_model_version for per-signal idempotency,
+        # then look the row up by (signal_id, model, prompt_version).
+        # DKG path (signal_id IS None): the partial unique no longer
+        # applies, so every call inserts a fresh row and we return
+        # `lastrowid` directly. Cost of an extra `predictions` row per
+        # repeat DKG call is acceptable; the `llm_calls` cache still
+        # suppresses the actual HTTP round-trip.
         async with self._db.batch() as cur:
+            if signal_id is None:
+                await cur.execute(
+                    """
+                    INSERT INTO predictions
+                        (signal_id, llm_call_id, model, prompt_version,
+                         direction, confidence, cached, raw_response,
+                         cycle_id, is_tracer, tracer_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        signal_id,
+                        llm_call_id,
+                        self._model,
+                        self.PROMPT_VERSION,
+                        direction,
+                        confidence,
+                        1 if cached else 0,
+                        raw_response,
+                        cycle_id,
+                        1 if is_tracer else 0,
+                        tracer_id,
+                        _now_iso(),
+                    ),
+                )
+                rid = cur.lastrowid
+                if rid is None:
+                    raise RuntimeError(
+                        "predictions insert failed for DKG path (signal_id=None)"
+                    )
+                return int(rid)
             await cur.execute(
                 """
                 INSERT INTO predictions
@@ -560,7 +614,9 @@ class AIClient:
                      direction, confidence, cached, raw_response, cycle_id,
                      is_tracer, tracer_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(signal_id, model, prompt_version) DO NOTHING
+                ON CONFLICT(signal_id, model, prompt_version)
+                    WHERE signal_id IS NOT NULL
+                    DO NOTHING
                 """,
                 (
                     signal_id,
@@ -589,7 +645,7 @@ class AIClient:
     async def _neutral_with_failure(
         self,
         *,
-        signal_id: int,
+        signal_id: Optional[int],
         prompt_sha: Optional[str],
         reason: str,
         raw_response: str,

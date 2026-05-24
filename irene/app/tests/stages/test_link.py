@@ -335,3 +335,86 @@ def test_market_links_in_forbidden_lint_for_now():
     # lint scope was last reviewed in P3 ch2a. Keep this test as a
     # tripwire that flags the decision when someone tries to add it.
     assert "market_links" not in FORBIDDEN_TABLES
+
+
+# ---------------------------------------------------------------------------
+# Live-bus integration (P3 chunk 3 workstream A)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_link_live_bus_on_event_updated(irene_db_path):
+    """End-to-end via the live InProcBus: publishing
+    `TOPIC_EVENT_UPDATED` makes the subscribed `LinkerStage` score the
+    event against active markets and write `market_links` rows. Also
+    asserts the downstream `TOPIC_MARKET_LINKS_UPDATED` publication so
+    the dkg trader (workstream B) has the signal it'll later
+    subscribe to."""
+    from app.bus import InProcBus
+    from app.topics import TOPIC_EVENT_UPDATED
+
+    sync = sqlite3.connect(irene_db_path, isolation_level=None)
+    _seed_markets(sync)
+    eid = _seed_event(sync, summary="Trump decides Iran strike")
+    sync.close()
+
+    db = DB(path=irene_db_path)
+    await db.connect()
+    bus = InProcBus()
+    deps = StageDeps(db=db, bus=bus, config=_StubConfig(),
+                     embedder=_FakeEmbedder())
+    stage = LinkerStage(deps)
+
+    received: list[dict] = []
+
+    async def _downstream(payload: dict) -> None:
+        received.append(payload)
+
+    # Subscriptions BEFORE bus.start() — same invariant main.py enforces.
+    bus.subscribe(TOPIC_EVENT_UPDATED, stage.handle)
+    bus.subscribe(TOPIC_MARKET_LINKS_UPDATED, _downstream)
+
+    await stage.start()
+    await bus.start()
+    try:
+        await bus.publish(
+            TOPIC_EVENT_UPDATED,
+            {
+                "extraction_run_id": None,
+                "article_id": 1,
+                "events_created": 1,
+                "events_confirmed": 0,
+                "is_tracer": False,
+                "tracer_id": None,
+            },
+        )
+        for _ in range(50):
+            if received:
+                break
+            await asyncio.sleep(0.02)
+        assert received, "linker did not publish market_links.updated on the live bus"
+        payload = received[0]
+        assert payload["event_id"] == eid
+        assert payload["links_written"] >= 1
+        cur = await db.conn.execute(
+            "SELECT COUNT(*) FROM market_links WHERE event_id = ?", (eid,),
+        )
+        n_links = (await cur.fetchone())[0]
+        await cur.close()
+        assert n_links >= 1
+        assert bus.counters.handler_exceptions == 0
+    finally:
+        await bus.stop()
+        await stage.stop()
+        await db.close()
+
+
+def test_wire_pipeline_subscribes_link_to_event_updated():
+    """The wiring contract: `app.main.wire_pipeline()` must register
+    `LinkerStage.handle` on `TOPIC_EVENT_UPDATED`. Source-level
+    assertion so the test is robust to runtime config — main.py is the
+    single point that flips link from batch-only to live."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent.parent.parent
+           / "app" / "main.py").read_text()
+    assert "bus.subscribe(TOPIC_EVENT_UPDATED, link.handle)" in src

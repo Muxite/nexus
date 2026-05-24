@@ -196,7 +196,9 @@ class _TracerAI:
                      direction, confidence, cached, raw_response, cycle_id,
                      is_tracer, tracer_id, created_at)
                 VALUES (?, NULL, ?, ?, 'YES', 0.7, 0, ?, ?, ?, ?, ?)
-                ON CONFLICT(signal_id, model, prompt_version) DO NOTHING
+                ON CONFLICT(signal_id, model, prompt_version)
+                    WHERE signal_id IS NOT NULL
+                    DO NOTHING
                 """,
                 (
                     signal_id,
