@@ -2,8 +2,8 @@
 
 > The canonical roadmap. For current state, see [`architecture.md`](architecture.md). For the design north star, see [`docs/dkg_spec.md`](docs/dkg_spec.md). The full plan that authorised this build lives at `~/.claude/plans/based-on-the-new-lovely-coral.md` — this file is the in-repo working copy.
 
-- **Last updated:** 2026-05-24 (**P3 chunk 2 research session done** — eventize design locked; implementation pending)
-- **Current phase:** P3 chunk 2 — eventize + linker. Research session deliverable ([`docs/papers/eventization/notes.md`](docs/papers/eventization/notes.md)) locks the clustering algorithm, time window, tie-break rule, and scoring formulas. Schema + topic + contract-first stage stub landed; implementation is the next ramp. P3 chunk 1.5 (between ch1 and ch2) added the production DKG data pipeline + the SBERT EntityIndex perf work + the seulgi→irene one-time migration.
+- **Last updated:** 2026-05-24 (**P3 chunk 3 + 4 complete** — dual-path trader is live, scraper-v2 with HTML ingestion wired, accounting + per-cycle isolation shipped; long soak in progress)
+- **Current phase:** post-P3-ch4 long soak under `cycle3-fresh`. Next session picks a cycle from `handoffs/2026-05-24.md` §"Open follow-ups", implements it in full, then runs a 4h+ soak before re-planning. The user's directive this session was **implement-then-soak-long, gather the most data possible** — not many small mid-soak iterations.
 
 ---
 
@@ -132,8 +132,10 @@ Each phase ends with: (a) code merged, (b) a dated `reports/YYYY-MM-DD-phase-N.m
 | **P2** | Extraction layer (shadow) | `stages/extract.py` + entities/facts tables. Trade path STILL uses MVP. Reports compare extraction precision/recall on held-out samples. | **✓ complete 2026-05-23** ([extraction report](reports/2026-05-23-irene-p2-extraction.md)) |
 | **P3 ch1** | Entity resolver | `stages/resolve.py` + alias-aware metric. Acronym/alias/suffix/self rule chain over the extracted entities. | **✓ complete 2026-05-23** ([resolver report](reports/2026-05-23-irene-p3-resolver.md)) |
 | **P3 ch1.5** | DKG data fill | seulgi → irene one-time migration (27,914 articles + 10,462 markets); production DKG update pipeline (`scripts/dkg/extract_to_irene.py`); SBERT EntityIndex for hot-path dedup; SampledTimer for sampled critical-path latency. | **✓ complete 2026-05-24** ([migration report](reports/2026-05-23-irene-seulgi-migration.md)) |
-| **P3 ch2** | Eventize + linker | `stages/eventize.py` + `stages/link.py`. Schema + topic + stage stub landed; research session deliverable ([`docs/papers/eventization/notes.md`](docs/papers/eventization/notes.md)) locks the clustering algorithm. Implementation pending. | **research done 2026-05-24**, code pending |
-| **P3 ch3** | Dual-path trader | Introduces `decision_path='dkg'` alongside `'mvp'` in `trades`. End-of-chunk report measures (article, market) overlap; >85% with no PnL lift → kill DKG path. | sketch |
+| **P3 ch2** | Eventize + linker | `stages/eventize.py` + `stages/link.py`. Clustering algorithm locked in [`docs/papers/eventization/notes.md`](docs/papers/eventization/notes.md). Live in `wire_pipeline()`. | **✓ complete 2026-05-24** ([linker report](reports/2026-05-24-irene-link-backfill.md)) |
+| **P3 ch3** | Dual-path trader + wallet + closer | `decision_path='dkg'` wired alongside `'mvp'`. Paper-trade wallet with cash + equity + identity check. Closer rules: edge_decay → take_profit → stop_loss → stagnation → timeout. Real Kelly via v6 confidence digit. Per-cycle dashboard isolation. | **✓ complete 2026-05-24** ([handoff](handoffs/2026-05-24.md)) |
+| **P3 ch4** | scraper-v2 migration + HTML ingestion | Switched to `jennie-scraper-v2:9001`. `/feed` is shape-compatible; new `_run_html_loop` polls `/scrape mode=links` for 11 HTML homepages (apnews, reuters, bbc, etc.). Three-guard boilerplate filter. | **✓ complete 2026-05-24** ([handoff](handoffs/2026-05-24.md)) |
+| **P3 ch5+** | Iterative cycle loop | Next session picks one of: DKG path firing, reranker on matcher top-K, /scrape mode=article body extraction, graph-driven invalidation, missed-edge review. **Implement then long-soak (4h+).** | open — see `handoffs/2026-05-24.md` §"Open follow-ups" |
 | **P4** | Dual-write comparison + Postgres draft | Reports quantify mvp vs dkg per-trade-path. Postgres DDL drafted (not run). Schema-reviewer agent owns this. | sketch |
 | **P5** | Cutover candidates | One non-critical read (market context) routed through DKG. Then candidate filtering. Final trade decision only after ≥5 consecutive 24h windows of DKG ≥ MVP. | TBD |
 
@@ -236,3 +238,26 @@ Never delegate understanding. The plan, the verification, the phase report — t
 3. **Single-decision-per-headline.** No variant fan-out in v1.
 4. **Tracers and live trades cannot mix.** `is_tracer=1 AND paper=0` is a hard write rejection.
 5. **Capture lives inside the live batch.** `decision_inputs` and `llm_calls` writes share `db.batch()`.
+6. **(2026-05-24) Implement-then-soak-long.** Don't ship multiple changes mid-soak. Land a cycle, restart, soak ≥4h, then re-plan from the data — not from the previous plan.
+7. **(2026-05-24) Per-cycle data hygiene.** `articles`/`markets`/`entities`/`facts`/`events`/`signals`/`market_links` are SHARED across cycles (news universe). `trades`/`decisions`/`predictions`/`trade_closures`/`llm_calls`/`llm_parse_failures`/`decision_inputs`/`trade_features` are PER-CYCLE; snapshot via `scripts/analysis/snapshot_cycle.py` before recycling.
+
+---
+
+## Cycle history (chunk-3 onwards — iterative loop)
+
+Each row = one implementation cycle the user explicitly scoped. Detail in commit messages; full state-of-system snapshot at the start of every session in `handoffs/`.
+
+| Date | Cycle | Headline change | Soak result |
+|---|---|---|---|
+| 2026-05-24 | chunk-3 base | Dual-path trader (`decision_path='dkg'`), live eventize+link in `wire_pipeline()`, dashboard PnL page. | 0 trades — ingest stage was broken (GET instead of POST on /feed). |
+| 2026-05-24 | follow-up #1 | Ingest GET→POST, `MarketIndex.load()` on start (silent "irene never traded" bug), eventize COALESCE for null published_at. Dashboard observability (AI panel, decisions audit, fewer files). | 18 trades fired, all stuck open (CLOB integration broken — `/book/<id>` 404s). |
+| 2026-05-24 | follow-up #2 | Prompt v4 (JSON envelope), matcher tightened (0.5 floor / top-K 8), Tighten title+summary embed, chunker tool. | 350 decisions, parser bug discovered: `{"decision":"NEUTRAL"}` misread as NO. |
+| 2026-05-24 | cycle 1 | v5 5-label taxonomy (Y/N/P/U/R), entity-overlap stage-0 gate. | Healthy label spread (Y 2, N 40, P 9, U 21, R 10 in 82). |
+| 2026-05-24 | cycle 2 | Wallet (cash/equity/identity), closer stop/target rules, cash-aware sizing, dashboard wallet panel. | Cash went negative immediately (cycle-1 over-allocation), exposed CLOB bug — all trades at 0.5 stub. |
+| 2026-05-24 | CLOB fix | `/midpoint?token_id=<id>` is the real endpoint, not `/book/<id>`. | 14 trades closed in seconds; 5 target / 9 stop / -$600 net (cycle-1 mess unwound). |
+| 2026-05-24 | cycle 3 | Parser bug fix (strict-match), `target_mid` + `edge_decay` rule, real Kelly via `c` digit, cash clips instead of rejects, 15s poll, stagnation rule, per-cycle dashboard isolation, missed-edge plot. | `cycle3-fresh` boots clean (cycle_id=20). |
+| 2026-05-24 | target_mid fix | NO trades had a double-flip sign bug → `target = p_hat + fee_buffer` (was `(1-p_hat) + fee_buffer`). | Locked in by regression test. |
+| 2026-05-24 | snapshot tool | `scripts/analysis/snapshot_cycle.py` archives per-cycle data to `data/snapshots/cycle_<id>/`. | cycle_0003 snapshot baseline: equity $435, realized -$565. |
+| 2026-05-24 | chunk-4 | scraper-v2 migration — `/feed` shape-compatible; new HTML watcher via `/scrape mode=links` for 11 homepages. Three-guard boilerplate filter. | Live: 316 HTML + 1266 RSS articles in first 30 min (~10× cycle-1 ingest rate). |
+
+**380 tests pass.** See `handoffs/2026-05-24.md` for the open-follow-up list and the implement-then-soak-long cadence the user wants for cycle 5+.
