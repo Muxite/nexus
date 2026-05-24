@@ -189,8 +189,10 @@ class CloserStage:
     async def run_close_cycle(self) -> int:
         """Run one close-poll pass. Returns the number of closures written.
 
-        Exposed as a method (not nested inside `_poll_loop`) so tests can
-        drive the loop body deterministically without sleeping.
+        Cycle 2: evaluation order is take_profit → stop_loss → timeout.
+        take_profit + stop_loss need a fresh CLOB mid to compare against
+        entry; we fetch it once per open trade and reuse it as the exit
+        mid if the rule fires (no double round-trip).
         """
         open_trades = await self._fetch_open_trades()
         if not open_trades:
@@ -200,10 +202,26 @@ class CloserStage:
         timeout = timedelta(hours=float(self._cfg.timeout_hours))
         written = 0
         for trade in open_trades:
-            rule = self._evaluate_rules(trade, now=now, timeout=timeout)
+            # Try the price-aware rules first — they require a CLOB call.
+            tokens = await self._fetch_tokens(trade["market_id"])
+            current_mid: Optional[float] = None
+            if tokens is not None:
+                token_id = tokens["token_yes"] if trade["direction"] == "YES" else tokens["token_no"]
+                if token_id:
+                    current_mid = await self._clob.get_mid(token_id)
+            rule = self._evaluate_rules(
+                trade, now=now, timeout=timeout, current_mid=current_mid
+            )
             if rule is None:
                 continue
-            if await self._close_trade(trade, close_reason=rule, now_iso=now.isoformat()):
+            # Re-use the current_mid we just fetched (saves a 2nd CLOB
+            # round-trip in `_close_trade`).
+            if await self._close_trade(
+                trade,
+                close_reason=rule,
+                now_iso=now.isoformat(),
+                exit_mid_hint=current_mid,
+            ):
                 written += 1
         return written
 
@@ -215,13 +233,27 @@ class CloserStage:
         *,
         now: datetime,
         timeout: timedelta,
+        current_mid: Optional[float],
     ) -> Optional[str]:
-        """Walk the close-rule list in order and return the first rule that
-        fires, or None if the trade should stay open."""
+        """Walk the close-rule list in order, return the first match.
+
+        Order (cycle 2): take_profit, stop_loss, timeout. Price-based
+        rules are skipped when CLOB hasn't returned a mid (no signal).
+        """
+        size = float(trade["size_usdc"])
+        entry = float(trade["mid_price"])
+        if current_mid is not None and size > 0.0:
+            # PnL fraction = unrealized_pnl / size — uses the same Polymarket
+            # math as `_compute_pnl` so the close threshold matches what gets
+            # logged when the rule fires.
+            pnl_frac = _compute_pnl(trade["direction"], entry, float(current_mid), 1.0)
+            if self._cfg.take_profit_pct > 0.0 and pnl_frac >= self._cfg.take_profit_pct:
+                return "target"
+            if self._cfg.stop_loss_pct > 0.0 and pnl_frac <= -self._cfg.stop_loss_pct:
+                return "stop"
         decided_at = _parse_iso(trade["decided_at"])
         if decided_at is not None and now - decided_at >= timeout:
             return "timeout"
-        # P2+ rules slot in here, in order.
         return None
 
     async def _fetch_open_trades(self) -> list[dict]:
@@ -268,23 +300,30 @@ class CloserStage:
         *,
         close_reason: str,
         now_iso: str,
+        exit_mid_hint: Optional[float] = None,
     ) -> bool:
         """Resolve exit mid + write the closure row. Returns True iff a
         closure row was actually inserted (i.e. UNIQUE(trade_id) did not
-        kick in)."""
-        tokens = await self._fetch_tokens(trade["market_id"])
-        if tokens is None:
-            logger.warning(
-                "closer: trade_id=%d market %s missing from markets — skipping",
-                trade["id"], trade["market_id"],
-            )
-            return False
+        kick in).
 
+        Cycle 2: callers that already fetched a fresh CLOB mid (the
+        take_profit / stop_loss rules) pass it as `exit_mid_hint` so we
+        don't pay for a second round-trip. Timeout rule passes None and
+        we fetch fresh — its exit mid wasn't needed to evaluate the rule.
+        """
         direction = trade["direction"]
-        token_id = tokens["token_yes"] if direction == "YES" else tokens["token_no"]
-        exit_mid: Optional[float] = None
-        if token_id:
-            exit_mid = await self._clob.get_mid(token_id)
+        exit_mid: Optional[float] = exit_mid_hint
+        if exit_mid is None:
+            tokens = await self._fetch_tokens(trade["market_id"])
+            if tokens is None:
+                logger.warning(
+                    "closer: trade_id=%d market %s missing from markets — skipping",
+                    trade["id"], trade["market_id"],
+                )
+                return False
+            token_id = tokens["token_yes"] if direction == "YES" else tokens["token_no"]
+            if token_id:
+                exit_mid = await self._clob.get_mid(token_id)
 
         if exit_mid is None:
             if self._cfg.skip_on_missing_mid:

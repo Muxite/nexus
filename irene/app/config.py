@@ -152,7 +152,12 @@ class CLOBSection(BaseModel):
 
 
 class CloserSection(BaseModel):
-    """Position-closer poll cadence + close rules (P1: timeout only)."""
+    """Position-closer poll cadence + close rules.
+
+    Cycle-2 added stop_loss + take_profit; original timeout stays as the
+    fallback. Rules evaluate in order: take_profit, stop_loss, timeout —
+    first one that fires wins.
+    """
 
     poll_seconds: int = Field(default=60, ge=1)
     # `0.0` is a legitimate value (used by the soak harness to fire the
@@ -162,6 +167,11 @@ class CloserSection(BaseModel):
     # When CLOB can't return a mid for an open trade, hold the position
     # rather than close it at the default; closer just skips this cycle.
     skip_on_missing_mid: bool = True
+    # take_profit / stop_loss are fractions of the trade's `size_usdc`.
+    # 0.0 disables the rule. Defaults: lock in a 50% gain or cut a 30%
+    # loss. Tunable per soak.
+    take_profit_pct: float = Field(default=0.50, ge=0.0, le=10.0)
+    stop_loss_pct: float = Field(default=0.30, ge=0.0, le=1.0)
 
 
 class ImpactSection(BaseModel):

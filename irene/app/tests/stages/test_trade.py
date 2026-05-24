@@ -265,8 +265,9 @@ async def test_happy_path_writes_trade_decision_and_features(db_seeded):
     assert t["decision_path"] == "mvp"
     snap = json.loads(t["features_snapshot"])
     assert snap["direction"] == "YES" and snap["confidence"] == 0.7
-    # 6 gates: similarity_floor, freshness, entity_overlap, direction, edge, size
-    assert "gate_history" in snap and len(snap["gate_history"]) == 6
+    # 7 gates: similarity_floor, freshness, entity_overlap, direction,
+    # edge, size, cash
+    assert "gate_history" in snap and len(snap["gate_history"]) == 7
 
     cur = await db_seeded.conn.execute(
         "SELECT feature_name FROM trade_features ORDER BY feature_name"
@@ -391,6 +392,59 @@ async def test_entity_overlap_gate_permits_on_match(db_seeded):
     d = await _single_decision(db_seeded)
     assert d["outcome"] == "execute"
     assert ai.calls != []   # LLM was called
+
+
+async def test_insufficient_cash_rejects(db_seeded):
+    # Pre-seed a prediction + decision + open trade that consumes most
+    # of the wallet — only $5 of cash left. New trade tries to size
+    # ~$99 → rejected with insufficient_cash.
+    async with db_seeded.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO predictions
+                (id, signal_id, llm_call_id, model, prompt_version, direction,
+                 confidence, cached, raw_response, label, cycle_id, is_tracer,
+                 tracer_id, created_at)
+            VALUES (99, NULL, NULL, 'fake', 'v1', 'YES', 0.9, 0, 'Y', 'Y', 1, 0,
+                    NULL, '2026-05-23T00:00:00+00:00')
+            """,
+        )
+        await cur.execute(
+            """
+            INSERT INTO decisions
+                (id, signal_id, outcome, reason, gate_history, prediction_id,
+                 cycle_id, is_tracer, tracer_id, created_at)
+            VALUES (99, NULL, 'execute', 'ok', '[]', 99, 1, 0, NULL,
+                    '2026-05-23T00:00:00+00:00')
+            """,
+        )
+        await cur.execute(
+            """
+            INSERT INTO trades
+                (id, signal_id, decision_id, prediction_id, market_id, direction,
+                 confidence, similarity, freshness, p_hat, mid_price, edge,
+                 kelly_fraction, size_usdc, decision_path, features_snapshot,
+                 cycle_id, is_tracer, tracer_id, decided_at)
+            VALUES (99, NULL, 99, 99, 'm1', 'YES', 0.9, 0.8, 'BREAKING', 0.9,
+                    0.4, 0.1, 0.1, 995.0, 'mvp', '{}', 1, 0, NULL,
+                    '2026-05-23T00:00:00+00:00')
+            """,
+        )
+    bus = _FakeBus()
+    ai = _FakeAI()  # YES@0.7 → would size ~$99 by default config
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    # The pre-seeded decision (id=99) is already in the table; look up
+    # the new one by signal_id=1 (the seeded fresh signal).
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, reason FROM decisions WHERE signal_id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row["outcome"] == "reject"
+    assert row["reason"] == "insufficient_cash"
 
 
 async def test_entity_overlap_gate_permits_on_extraction_race(db_seeded):

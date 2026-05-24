@@ -68,6 +68,10 @@ class _CloserCfg:
     poll_seconds: int = 60
     timeout_hours: float = 24.0
     skip_on_missing_mid: bool = True
+    # Cycle 2 rules — disabled by default in tests so existing timeout
+    # cases don't change behaviour. New tests set these explicitly.
+    take_profit_pct: float = 0.0
+    stop_loss_pct: float = 0.0
 
 
 @dataclass
@@ -238,8 +242,61 @@ async def test_trade_not_yet_timed_out_stays_open(db):
 
     assert written == 0
     assert await _closures(db) == []
-    # The token shouldn't even be queried — no rule fired.
-    assert clob.calls == []
+    # Cycle 2: CLOB is queried to evaluate take_profit/stop_loss even
+    # when no rule fires. The token IS queried; we just don't close.
+    assert clob.calls == ["tY"]
+
+
+async def test_take_profit_fires_when_gain_exceeds_pct(db):
+    # YES bought at 0.4, current 0.7 → pnl_frac = (0.7-0.4)/0.4 = 0.75 (75%).
+    # take_profit_pct=0.50 should fire. timeout_hours stays at 24h, decided 1h ago.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(hours=1)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.4, size_usdc=10.0)
+    clob = _FakeCLOB(mids={"tY": 0.7})
+    cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    assert n == 1
+    rows = await _closures(db)
+    assert rows[0]["close_reason"] == "target"
+    assert rows[0]["exit_mid_price"] == pytest.approx(0.7)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(7.5)  # 10 * 0.75
+
+
+async def test_stop_loss_fires_when_loss_exceeds_pct(db):
+    # YES bought at 0.5, current 0.2 → pnl_frac = (0.2-0.5)/0.5 = -0.60.
+    # stop_loss_pct=0.30 should fire.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(hours=1)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.5, size_usdc=10.0)
+    clob = _FakeCLOB(mids={"tY": 0.2})
+    cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    assert n == 1
+    rows = await _closures(db)
+    assert rows[0]["close_reason"] == "stop"
+
+
+async def test_neither_rule_fires_when_pnl_within_band(db):
+    # YES at 0.5, current 0.55 → pnl_frac = +10%; neither rule triggers.
+    # Trade decided 1h ago so timeout (24h) also doesn't trigger.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(hours=1)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.5, size_usdc=10.0)
+    clob = _FakeCLOB(mids={"tY": 0.55})
+    cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    assert n == 0
+    assert await _closures(db) == []
 
 
 async def test_pnl_yes_formula(db):

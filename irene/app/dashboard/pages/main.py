@@ -11,8 +11,67 @@ from __future__ import annotations
 
 import time
 
+from app import wallet
+
 from ..db_helpers import end_to_end_latency_ms, scalar
 from ..io import _now, _percentiles
+
+
+async def _fetch_open_trades(dash) -> list[dict]:
+    cur = await dash.db.conn.execute(
+        """
+        SELECT t.id, t.market_id, t.direction, t.mid_price AS entry_mid,
+               t.size_usdc, t.decided_at, t.decision_path,
+               m.token_yes, m.token_no, m.question
+        FROM trades t
+        LEFT JOIN trade_closures c ON c.trade_id = t.id
+        LEFT JOIN markets m ON m.condition_id = t.market_id
+        WHERE c.id IS NULL AND t.is_tracer = 0
+        ORDER BY t.decided_at DESC
+        """
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [dict(r) for r in rows]
+
+
+async def _fetch_closed_pairs(dash) -> tuple[list[dict], list[dict], list[dict]]:
+    """Returns (closed_trades, closed_pairs_for_exit_value, closures)."""
+    cur = await dash.db.conn.execute(
+        """
+        SELECT t.id, t.size_usdc, t.direction, t.mid_price AS entry_mid,
+               c.exit_mid_price, c.realized_pnl_usdc, c.close_reason
+        FROM trades t
+        JOIN trade_closures c ON c.trade_id = t.id
+        WHERE t.is_tracer = 0
+        """
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    rows = [dict(r) for r in rows]
+    return rows, rows, rows  # same row shape works for all three callers
+
+
+async def _current_mid_for_trade(dash, t: dict) -> float | None:
+    """Best-effort current CLOB mid for an open trade. Returns None on
+    miss; the wallet helpers treat None as entry_mid (unrealized PnL = 0)."""
+    if dash.cfg is None:
+        # No CLOB threaded → can't price open positions.
+        return None
+    token_id = t.get("token_yes") if t["direction"] == "YES" else t.get("token_no")
+    if not token_id:
+        return None
+    clob = getattr(dash, "_clob_for_dashboard", None)
+    if clob is None:
+        # Lazily build a CLOB client. Reuse across the page so we don't
+        # spin up a new httpx.AsyncClient per open position.
+        from app.clob import CLOBClient
+        clob = CLOBClient(
+            base_url=dash.cfg.clob.base_url,
+            timeout_seconds=dash.cfg.clob.timeout_seconds,
+        )
+        dash._clob_for_dashboard = clob
+    return await clob.get_mid(token_id)
 
 FILENAME = "dashboard.txt"
 
@@ -116,7 +175,7 @@ async def render(dash) -> str:
             "SELECT COUNT(*) FROM predictions WHERE cached = 1 "
             "AND created_at >= datetime('now','-1 hour')",
         )
-        cache_pct = 100.0 * n_cached / max(n_parsed, 1)
+        cache_pct = 100.0 * n_cached / max(n_total, 1)
         lines.append(
             f"  tokens (1h):      in {toks_in:>6d}   out {toks_out:>5d}    "
             f"cache_hit {cache_pct:.0f}%"
@@ -137,6 +196,104 @@ async def render(dash) -> str:
         ]
     else:
         lines.append("end-to-end latency: no completed trades in the last hour.")
+
+    # ── WALLET ──────────────────────────────────────────────────────────
+    # Paper-trading wallet: cash + open-position value + realized PnL.
+    # Accounting identity: equity == initial_balance + realized + unrealized.
+    initial_balance = 1000.0
+    if dash.cfg is not None:
+        try:
+            initial_balance = float(dash.cfg.trade.balance_usdc)
+        except Exception:  # noqa: BLE001
+            pass
+
+    open_trades_raw = await _fetch_open_trades(dash)
+    closed_trades, closed_pairs, closures = await _fetch_closed_pairs(dash)
+    # Mark-to-market every open position via a fresh CLOB mid.
+    open_with_mid: list[dict] = []
+    for t in open_trades_raw:
+        cur_mid = await _current_mid_for_trade(dash, t)
+        open_with_mid.append({
+            "direction": t["direction"],
+            "entry_mid": float(t["entry_mid"]),
+            "current_mid": cur_mid,
+            "size_usdc": float(t["size_usdc"]),
+            "decision_path": t["decision_path"],
+            "market_id": t["market_id"],
+            "decided_at": t["decided_at"],
+            "question": t.get("question"),
+            "id": t["id"],
+        })
+
+    open_size = wallet.sum_open_size_invested(open_trades_raw)
+    closed_size = wallet.sum_closed_size_invested(closed_trades)
+    closed_exit_value = wallet.sum_closed_exit_value(closed_pairs)
+    realized = wallet.sum_realized_pnl(closures)
+    open_value = wallet.sum_open_positions_value(open_with_mid)
+    unreal = wallet.sum_unrealized_pnl(open_with_mid)
+    cash = wallet.cash_balance(initial_balance, open_size, closed_exit_value, closed_size)
+    eq = wallet.equity(cash, open_value)
+    ok, drift = wallet.accounting_identity_check(
+        initial_balance, realized, unreal, eq, tol=0.05
+    )
+
+    n_open = len(open_with_mid)
+    n_closed = len(closed_trades)
+    n_pricable = sum(1 for t in open_with_mid if t["current_mid"] is not None)
+
+    lines += [
+        "",
+        "WALLET (paper):",
+        f"  initial:   ${initial_balance:>9.2f}",
+        f"  cash:      ${cash:>9.2f}    "
+        f"open positions ({n_open}, {n_pricable} priced): "
+        f"invested ${open_size:>8.2f} → current ${open_value:>8.2f}",
+        f"  realized:  {realized:>+9.2f}    unrealized: {unreal:>+9.2f}    "
+        f"closed: {n_closed}",
+        f"  EQUITY:    ${eq:>9.2f}    "
+        f"identity {'OK' if ok else 'DRIFT'}{f' ({drift:+.2f})' if not ok else ''}",
+    ]
+    # Per-path attribution
+    by_path_open = {}
+    by_path_closed = {}
+    for t in open_with_mid:
+        by_path_open.setdefault(t["decision_path"] or "mvp", []).append(t)
+    for c in closures:
+        # closures don't carry decision_path; join via trades for the rollup.
+        pass
+    # Per-path open invested
+    for path in sorted(by_path_open):
+        rows = by_path_open[path]
+        inv = sum(r["size_usdc"] for r in rows)
+        val = sum(
+            wallet.position_value(r["direction"], r["entry_mid"],
+                                  r["current_mid"] if r["current_mid"] is not None else r["entry_mid"],
+                                  r["size_usdc"])
+            for r in rows
+        )
+        lines.append(f"    {path:<4} {len(rows):>2d} open  invested ${inv:>7.2f}  current ${val:>7.2f}")
+
+    # Recent open positions detail (5 newest)
+    if open_with_mid:
+        lines += ["", "open positions (5 newest):"]
+        for t in open_with_mid[:5]:
+            q = (t.get("question") or "(?)")[:50]
+            cur_mid = t["current_mid"]
+            if cur_mid is None:
+                priced = "  no mid "
+                upnl_str = "    -   "
+            else:
+                upnl_t = wallet.unrealized_pnl(
+                    t["direction"], t["entry_mid"], cur_mid, t["size_usdc"]
+                )
+                priced = f"mid {cur_mid:>5.3f}"
+                upnl_str = f"{upnl_t:>+7.3f}"
+            decided = (t["decided_at"] or "")[11:19]
+            lines.append(
+                f"  [{decided}] {t['decision_path']:<3} {t['direction']:<3} "
+                f"${t['size_usdc']:>5.2f} @ {t['entry_mid']:>5.3f} → {priced}  upnl {upnl_str}  "
+                f'"{q}"'
+            )
 
     # Last 5 news articles seen (RSS, non-migrated)
     lines += ["", "last 5 articles ingested:"]

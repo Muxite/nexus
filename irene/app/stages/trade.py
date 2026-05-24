@@ -447,6 +447,35 @@ class TradeStage:
             return
         gate_history.append(_gate_entry("size", "ok", size, self._cfg.min_position_usdc))
 
+        # 6. cash (paper wallet) ---------------------------------------------
+        # Don't open a position larger than what's left in the wallet —
+        # this keeps the accounting identity sane and matches what a real
+        # wallet would do. Cash = initial - sum(open trade sizes).
+        cur = await self._db.conn.execute(
+            "SELECT COALESCE(SUM(t.size_usdc), 0) "
+            "FROM trades t LEFT JOIN trade_closures c ON c.trade_id=t.id "
+            "WHERE c.id IS NULL AND t.is_tracer=0"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        open_invested = float(row[0] or 0.0)
+        cash_available = self._cfg.balance_usdc - open_invested
+        if size > cash_available:
+            gate_history.append(
+                _gate_entry("cash", "reject", size, cash_available)
+            )
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason="insufficient_cash",
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
+        gate_history.append(_gate_entry("cash", "ok", size, cash_available))
+
         # Execute path --------------------------------------------------------
         features_snapshot = {
             "gate_history": gate_history,
