@@ -57,6 +57,7 @@ from typing import Any, Optional
 # Register schemas + import stage modules.
 import app.main  # noqa: F401
 import app.stages.dedupe  # noqa: F401
+import app.stages.eventize  # noqa: F401 — registers events/event_edges DDL
 import app.stages.extract  # noqa: F401
 import app.stages.ingest  # noqa: F401
 import app.stages.markets  # noqa: F401

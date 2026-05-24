@@ -2,8 +2,8 @@
 
 > The canonical roadmap. For current state, see [`architecture.md`](architecture.md). For the design north star, see [`docs/dkg_spec.md`](docs/dkg_spec.md). The full plan that authorised this build lives at `~/.claude/plans/based-on-the-new-lovely-coral.md` — this file is the in-repo working copy.
 
-- **Last updated:** 2026-05-23 (**P3 chunk 1 landed** — entity resolver + alias-aware metric; chunk-1 report shipped)
-- **Current phase:** P1 + P2 sealed; **P3 chunk 1 wrapped** ([resolver report](reports/2026-05-23-irene-p3-resolver.md)). Median real-LLM alias-aware fact P/R = 0.71 / 0.65 across 3 runs (best 0.73 / 0.70); below the 0.75 gate but the gap is dominated by gold-set ambiguity. Chunk-1 ships; chunk 2 (eventize + linker + dual-path trader) is the next ramp.
+- **Last updated:** 2026-05-24 (**P3 chunk 2 research session done** — eventize design locked; implementation pending)
+- **Current phase:** P3 chunk 2 — eventize + linker. Research session deliverable ([`docs/papers/eventization/notes.md`](docs/papers/eventization/notes.md)) locks the clustering algorithm, time window, tie-break rule, and scoring formulas. Schema + topic + contract-first stage stub landed; implementation is the next ramp. P3 chunk 1.5 (between ch1 and ch2) added the production DKG data pipeline + the SBERT EntityIndex perf work + the seulgi→irene one-time migration.
 
 ---
 
@@ -130,8 +130,10 @@ Each phase ends with: (a) code merged, (b) a dated `reports/YYYY-MM-DD-phase-N.m
 | **P0** | Scaffold + docs | `irene/` directory tree, 5 root docs, dkg_spec verbatim, first handoff | **✓ complete 2026-05-23** |
 | **P1** | MVP pipeline + tracer + replay | Dockerfile, compose entry, schema, all P1 modules, `scripts/tracer/`, `scripts/replay/accuracy.py`. Runs in parallel with seulgi. | **✓ complete 2026-05-23** ([soak report](reports/2026-05-23-irene-p1-soak.md)) |
 | **P2** | Extraction layer (shadow) | `stages/extract.py` + entities/facts tables. Trade path STILL uses MVP. Reports compare extraction precision/recall on held-out samples. | **✓ complete 2026-05-23** ([extraction report](reports/2026-05-23-irene-p2-extraction.md)) |
-| **P3** | Event + linker | Three chunks: **(1) entity resolver** ✓ ([resolver report](reports/2026-05-23-irene-p3-resolver.md)); (2) eventize + link; (3) dual-path trader. Open-research session before each chunk. | **chunk 1 done 2026-05-23**; chunks 2-3 pending |
-| **P3** | Event + linker (high-risk) | `stages/eventize.py` + `stages/link.py`. Introduces `decision_path='dkg'` alongside `'mvp'`. Research-session-first per critique. | sketch |
+| **P3 ch1** | Entity resolver | `stages/resolve.py` + alias-aware metric. Acronym/alias/suffix/self rule chain over the extracted entities. | **✓ complete 2026-05-23** ([resolver report](reports/2026-05-23-irene-p3-resolver.md)) |
+| **P3 ch1.5** | DKG data fill | seulgi → irene one-time migration (27,914 articles + 10,462 markets); production DKG update pipeline (`scripts/dkg/extract_to_irene.py`); SBERT EntityIndex for hot-path dedup; SampledTimer for sampled critical-path latency. | **✓ complete 2026-05-24** ([migration report](reports/2026-05-23-irene-seulgi-migration.md)) |
+| **P3 ch2** | Eventize + linker | `stages/eventize.py` + `stages/link.py`. Schema + topic + stage stub landed; research session deliverable ([`docs/papers/eventization/notes.md`](docs/papers/eventization/notes.md)) locks the clustering algorithm. Implementation pending. | **research done 2026-05-24**, code pending |
+| **P3 ch3** | Dual-path trader | Introduces `decision_path='dkg'` alongside `'mvp'` in `trades`. End-of-chunk report measures (article, market) overlap; >85% with no PnL lift → kill DKG path. | sketch |
 | **P4** | Dual-write comparison + Postgres draft | Reports quantify mvp vs dkg per-trade-path. Postgres DDL drafted (not run). Schema-reviewer agent owns this. | sketch |
 | **P5** | Cutover candidates | One non-critical read (market context) routed through DKG. Then candidate filtering. Final trade decision only after ≥5 consecutive 24h windows of DKG ≥ MVP. | TBD |
 

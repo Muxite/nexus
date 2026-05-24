@@ -141,30 +141,14 @@ _EVENTIZE_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_event_edges_from ON event_edges(from_event_id)",
     "CREATE INDEX IF NOT EXISTS idx_event_edges_to ON event_edges(to_event_id)",
     "CREATE INDEX IF NOT EXISTS idx_event_edges_kind ON event_edges(edge_kind)",
-    # facts.event_id is a column-add on extract.py's table. We add it
-    # here (idempotent CREATE-then-ALTER pattern). Two-step so the
-    # schema_migrations row tracks it independently.
-    """
-    CREATE TABLE IF NOT EXISTS _eventize_facts_column_marker (
-        applied INTEGER PRIMARY KEY DEFAULT 1
-    )
-    """,
+    # facts.event_id is a column-add on extract.py's `facts` table.
+    # ALTER ADD COLUMN is NOT idempotent in SQLite (raises on re-run),
+    # but the schema_migrations machinery sha-keys each statement and
+    # only runs it the first time — exactly what we need. extract.py
+    # owns `facts`; eventize owns the column-add documented here.
+    "ALTER TABLE facts ADD COLUMN event_id INTEGER REFERENCES events(id)",
+    "CREATE INDEX IF NOT EXISTS idx_facts_event_id ON facts(event_id)",
 ]
-
-
-def _maybe_add_facts_event_id(conn) -> None:
-    """ALTER facts ADD COLUMN event_id idempotently.
-
-    Called from `register_schema`'s applier path. The marker table above
-    only exists if this migration ran at least once; we still check the
-    actual column to handle the case where the marker was lost.
-    """
-    cur = conn.execute("PRAGMA table_info(facts)")
-    cols = [row[1] for row in cur.fetchall()]
-    if "event_id" in cols:
-        return
-    conn.execute("ALTER TABLE facts ADD COLUMN event_id INTEGER REFERENCES events(id)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_facts_event_id ON facts(event_id)")
 
 
 db_module.register_schema("app/stages/eventize.py", _EVENTIZE_DDL)
@@ -191,21 +175,10 @@ class EventizeStage:
         self._stopped = False
 
     async def start(self) -> None:
-        # Belt-and-braces: also fire the ALTER on start in case the
-        # registry-based applier order doesn't catch every situation
-        # (e.g. ephemeral test DBs that bypass it).
-        if self._db.conn is not None:
-            cur = await self._db.conn.execute("PRAGMA table_info(facts)")
-            cols = [row[1] async for row in cur]
-            await cur.close()
-            if "event_id" not in cols:
-                await self._db.conn.execute(
-                    "ALTER TABLE facts ADD COLUMN event_id INTEGER REFERENCES events(id)"
-                )
-                await self._db.conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_facts_event_id ON facts(event_id)"
-                )
-                await self._db.conn.commit()
+        # No-op. The DDL registered at module import time (including
+        # the facts.event_id column-add) is applied by `DB.connect()`
+        # before any stage starts.
+        return
 
     async def stop(self) -> None:
         self._stopped = True
