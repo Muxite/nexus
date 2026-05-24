@@ -23,12 +23,13 @@ _REASON_COLOURS = {
 
 
 async def render(dash, *, loop) -> bytes:
+    cs = f"AND cycle_id = {int(dash.current_cycle_id)}" if dash.current_cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT strftime('%Y-%m-%dT%H:00', created_at) AS hour,
                reason, COUNT(*) AS n
         FROM decisions
-        WHERE created_at >= datetime('now','-24 hours')
+        WHERE datetime(created_at) >= datetime('now','-24 hours') {cs}
         GROUP BY hour, reason
         ORDER BY hour ASC
         """

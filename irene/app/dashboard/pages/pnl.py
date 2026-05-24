@@ -18,21 +18,27 @@ FILENAME = "pnl.txt"
 
 
 async def render(dash) -> str:
+    # Cycle 4: pnl.txt was aggregating lifetime trades across every cycle,
+    # so historical force-closes from cycle 1/2 made the sum look like
+    # -$428 even when the live cycle was +$157. Filter by current cycle
+    # to match dashboard.txt's behaviour (see main.py:22-24).
+    cycle_id = dash.current_cycle_id
+    cycle_sql = f"AND t.cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     lines = [
         f"# irene pnl ({_now().isoformat()})",
-        "  realised pnl per decision_path; closed trades only; non-tracer",
+        f"  realised pnl per decision_path; closed trades only; non-tracer; cycle_id={cycle_id}",
         "",
     ]
 
     # ---- per-path summary: counts + PnL on closed trades --------------------
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT t.decision_path     AS path,
                t.id                AS trade_id,
                c.realized_pnl_usdc AS pnl
         FROM trades t
         LEFT JOIN trade_closures c ON c.trade_id = t.id
-        WHERE t.is_tracer = 0
+        WHERE t.is_tracer = 0 {cycle_sql}
         """
     )
     rows = await cur.fetchall()
@@ -77,12 +83,12 @@ async def render(dash) -> str:
 
     # ---- open positions per path -------------------------------------------
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT t.decision_path AS path,
                (julianday('now') - julianday(t.decided_at)) * 24.0 AS age_h
         FROM trades t
         LEFT JOIN trade_closures c ON c.trade_id = t.id
-        WHERE t.is_tracer = 0 AND c.trade_id IS NULL
+        WHERE t.is_tracer = 0 AND c.trade_id IS NULL {cycle_sql}
         """
     )
     open_rows = await cur.fetchall()
@@ -106,12 +112,12 @@ async def render(dash) -> str:
 
     # ---- recent dkg trades --------------------------------------------------
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT t.decided_at, t.market_id, t.direction, t.mid_price, t.edge,
                t.size_usdc, c.realized_pnl_usdc AS pnl, c.trade_id AS closed
         FROM trades t
         LEFT JOIN trade_closures c ON c.trade_id = t.id
-        WHERE t.is_tracer = 0 AND t.decision_path = 'dkg'
+        WHERE t.is_tracer = 0 AND t.decision_path = 'dkg' {cycle_sql}
         ORDER BY t.decided_at DESC
         LIMIT 5
         """

@@ -10,13 +10,14 @@ FILENAME = "news_staleness.png"
 
 
 async def render(dash, *, loop) -> bytes:
+    cs = f"AND t.cycle_id = {int(dash.current_cycle_id)}" if dash.current_cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT (julianday(t.decided_at) - julianday(a.published_at)) * 86400.0 AS sec
         FROM trades t
         JOIN signals s ON s.id = t.signal_id
         JOIN articles a ON a.id = s.article_id
-        WHERE t.decided_at >= datetime('now','-24 hours')
+        WHERE datetime(t.decided_at) >= datetime('now','-24 hours') {cs}
           AND a.published_at IS NOT NULL
         """
     )

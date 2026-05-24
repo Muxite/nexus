@@ -14,14 +14,16 @@ async def render(dash) -> str:
         "  last 1h",
         "",
     ]
-    # Run-level counts by status
+    # Run-level counts by status — scoped to current cycle
+    cycle_id = dash.current_cycle_id
+    cs = f"AND cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT status, COUNT(*) AS n,
                SUM(COALESCE(fact_count, 0))   AS facts,
                SUM(COALESCE(entity_count, 0)) AS ents
         FROM extraction_runs
-        WHERE created_at >= datetime('now','-1 hour')
+        WHERE datetime(created_at) >= datetime('now','-1 hour') {cs}
         GROUP BY status
         ORDER BY n DESC
         """

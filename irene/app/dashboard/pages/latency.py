@@ -11,10 +11,10 @@ FILENAME = "latency.txt"
 async def render(dash) -> str:
     lines = [
         f"# irene latency ({_now().isoformat()})",
-        "  per-stage diff p50 / p95 / p99 (ms), last 1h",
+        f"  per-stage diff p50 / p95 / p99 (ms), last 1h (cycle_id={dash.current_cycle_id})",
         "",
     ]
-    for label, sql in latency_panel_sqls():
+    for label, sql in latency_panel_sqls(cycle_id=dash.current_cycle_id):
         samples = await fetch_ms(dash.db, sql)
         p = _percentiles(samples)
         lines.append(

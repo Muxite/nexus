@@ -407,6 +407,21 @@ class TradeStage:
         confidence = result.confidence
         p_hat = confidence if direction == "YES" else (1.0 - confidence)
         mid = await self._resolve_mid(direction=direction, market=market)
+        # 4a. degenerate-mid guard — markets at mid <= min_mid or >= max_mid
+        # are essentially resolved. Cycle 3 surfaced PnL=0 trades on these
+        # because the closer would force-close at entry_mid. Block at entry.
+        if mid <= self._cfg.min_mid or mid >= self._cfg.max_mid:
+            gate_history.append(_gate_entry("edge", "reject", mid, "mid_degenerate"))
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason="mid_degenerate",
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
         if direction == "YES":
             edge = p_hat - mid - self._cfg.fee_buffer
         else:

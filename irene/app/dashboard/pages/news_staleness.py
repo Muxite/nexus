@@ -12,14 +12,16 @@ FILENAME = "news_staleness.txt"
 
 
 async def render(dash) -> str:
+    cycle_id = dash.current_cycle_id
+    cs = f"AND t.cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT (julianday(t.decided_at) - julianday(a.published_at)) * 86400.0 AS sec
         FROM trades t
         JOIN signals s ON s.id = t.signal_id
         JOIN articles a ON a.id = s.article_id
-        WHERE t.decided_at >= datetime('now','-1 hour')
-          AND a.published_at IS NOT NULL
+        WHERE datetime(t.decided_at) >= datetime('now','-1 hour')
+          AND a.published_at IS NOT NULL {cs}
         """
     )
     rows = await cur.fetchall()

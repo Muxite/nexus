@@ -95,6 +95,8 @@ class _TradeCfg:
     max_position_fraction: float = 0.20
     min_position_usdc: float = 1.0
     default_mid_price: float = 0.5
+    min_mid: float = 0.02
+    max_mid: float = 0.98
     accept_freshness: list = field(default_factory=lambda: ["BREAKING", "EVOLVING"])
 
 
@@ -625,6 +627,49 @@ async def test_direction_lowconf_rejects(db_seeded):
     assert d["reason"] == "direction_lowconf"
     assert d["prediction_id"] == 8
     assert bus.published[0][1]["reason"] == "direction_lowconf"
+
+
+async def test_mid_degenerate_rejects_yes_at_low_mid(db_seeded):
+    # CLOB returns mid=0.011 for the YES token — market essentially resolved
+    # NO. Trader should reject before edge calc, no trade row written.
+    clob = _FakeCLOB({"ty": 0.011, "tn": 0.989})
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=20,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "mid_degenerate"
+    assert bus.published[0][1]["reason"] == "mid_degenerate"
+    cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM trades")
+    assert (await cur.fetchone())[0] == 0
+    await cur.close()
+
+
+async def test_mid_degenerate_rejects_no_at_high_mid(db_seeded):
+    # CLOB returns mid=0.995 for the NO token — market essentially resolved
+    # NO already (NO bet at 0.995 buys NO at almost-full price). Reject.
+    clob = _FakeCLOB({"ty": 0.005, "tn": 0.995})
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="NO", confidence=0.7, prediction_id=21,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "mid_degenerate"
+    cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM trades")
+    assert (await cur.fetchone())[0] == 0
+    await cur.close()
 
 
 async def test_edge_below_min_rejects(db_seeded):

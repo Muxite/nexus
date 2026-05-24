@@ -225,6 +225,12 @@ class TradeSection(BaseModel):
     min_confidence: float = Field(default=0.55, gt=0.0, le=1.0)
     min_edge: float = Field(default=0.04, gt=0.0, lt=1.0)
     fee_buffer: float = Field(default=0.02, ge=0.0, lt=1.0)
+    # Cycle 4: reject entries when CLOB mid is in degenerate range — the
+    # market is essentially resolved and any "edge" the model thinks it
+    # sees is mostly fees + spread. Threshold 0.02/0.98 lets 0.946-type
+    # trades through (they can still profit) but blocks 0.01/0.99 extremes.
+    min_mid: float = Field(default=0.02, ge=0.0, lt=0.5)
+    max_mid: float = Field(default=0.98, gt=0.5, le=1.0)
     kelly_fraction: float = Field(default=0.25, gt=0.0, le=1.0)
     max_position_fraction: float = Field(default=0.20, gt=0.0, le=1.0)
     min_position_usdc: float = Field(default=1.0, gt=0)

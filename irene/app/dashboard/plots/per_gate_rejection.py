@@ -8,12 +8,13 @@ FILENAME = "per_gate_rejection.png"
 
 
 async def render(dash, *, loop) -> bytes:
+    cs = f"AND cycle_id = {int(dash.current_cycle_id)}" if dash.current_cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT reason, COUNT(*) AS n
         FROM decisions
         WHERE outcome = 'reject'
-          AND created_at >= datetime('now','-24 hours')
+          AND datetime(created_at) >= datetime('now','-24 hours') {cs}
         GROUP BY reason
         ORDER BY n DESC
         LIMIT 18

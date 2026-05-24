@@ -144,6 +144,37 @@ async def test_pnl_page_smoke(db_ready, tmp_path):
     assert "recent dkg trades" in body
 
 
+async def test_pnl_page_filters_by_current_cycle(db_ready, tmp_path):
+    """Cycle 4: pnl.render must restrict to dash.current_cycle_id so
+    historical closures from prior cycles don't bleed into the live
+    `sum`. Seed two cycles, set current to cycle 2, expect only
+    cycle-2 trades to appear in the summary."""
+    async with db_ready.batch() as cur:
+        await _seed_market(cur)
+        # Cycle 1 (old): one closed loser
+        await _seed_trade(
+            cur, trade_id=10, decision_path="mvp", closed=True, realized_pnl=-99.0,
+        )
+        await cur.execute("UPDATE trades SET cycle_id=1 WHERE id=10")
+        await cur.execute("UPDATE trade_closures SET cycle_id=1 WHERE trade_id=10")
+        # Cycle 2 (current): one closed winner
+        await _seed_trade(
+            cur, trade_id=11, decision_path="mvp", closed=True, realized_pnl=+0.42,
+        )
+        await cur.execute("UPDATE trades SET cycle_id=2 WHERE id=11")
+        await cur.execute("UPDATE trade_closures SET cycle_id=2 WHERE trade_id=11")
+
+    dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)
+    dash.current_cycle_id = 2
+    body = await pnl_page.render(dash)
+
+    # cycle-2 winner shown, cycle-1 loser absent
+    assert "+0.420" in body or "+0.42" in body
+    assert "-99.000" not in body and "-99.00" not in body
+    # Header advertises the cycle scope
+    assert "cycle_id=2" in body
+
+
 async def test_pnl_page_empty_db(db_ready, tmp_path):
     """Empty DB renders cleanly without raising."""
     dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)

@@ -8,16 +8,20 @@ FILENAME = "funnel.txt"
 
 
 async def render(dash) -> str:
+    # Cycle 4: scope by current_cycle_id so the funnel reflects THIS
+    # cycle's behaviour, not lifetime decisions.
+    cycle_id = dash.current_cycle_id
+    cycle_sql = f"AND cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     lines = [
         f"# irene funnel ({_now().isoformat()})",
-        "  decision outcomes in the last 1h",
+        f"  decision outcomes in the last 1h (cycle_id={cycle_id})",
         "",
     ]
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT reason, COUNT(*) AS n
         FROM decisions
-        WHERE created_at >= datetime('now','-1 hour')
+        WHERE datetime(created_at) >= datetime('now','-1 hour') {cycle_sql}
         GROUP BY reason
         ORDER BY n DESC
         """

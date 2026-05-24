@@ -11,7 +11,7 @@ FILENAME = "latency_histogram.png"
 
 
 async def render(dash, *, loop) -> bytes:
-    samples = await end_to_end_latency_ms(dash.db)
+    samples = await end_to_end_latency_ms(dash.db, cycle_id=dash.current_cycle_id)
     if not samples:
         return b""
     return await loop.run_in_executor(None, _draw, samples)

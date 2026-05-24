@@ -9,23 +9,29 @@ FILENAME = "throughput.txt"
 
 
 async def render(dash) -> str:
+    # Cycle 4: wrap timestamp cols with datetime() so the comparison
+    # parses both sides instead of doing a lex match (see main.py).
+    # Add cycle filter for tables that have cycle_id (per-cycle rows);
+    # leave clusters/entity_resolutions unscoped (shared across cycles).
+    cycle_id = dash.current_cycle_id
+    cs = f" AND cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     stages = [
         ("ingest  (articles)        ",
-         "SELECT COUNT(*) FROM articles WHERE ingested_at >= datetime('now','-1 hour')"),
+         f"SELECT COUNT(*) FROM articles WHERE datetime(ingested_at) >= datetime('now','-1 hour'){cs}"),
         ("dedupe  (clusters)        ",
-         "SELECT COUNT(*) FROM article_clusters WHERE created_at >= datetime('now','-1 hour')"),
+         "SELECT COUNT(*) FROM article_clusters WHERE datetime(created_at) >= datetime('now','-1 hour')"),
         ("match   (signals)         ",
-         "SELECT COUNT(*) FROM signals WHERE created_at >= datetime('now','-1 hour')"),
+         f"SELECT COUNT(*) FROM signals WHERE datetime(created_at) >= datetime('now','-1 hour'){cs}"),
         ("extract (runs)            ",
-         "SELECT COUNT(*) FROM extraction_runs WHERE created_at >= datetime('now','-1 hour')"),
+         f"SELECT COUNT(*) FROM extraction_runs WHERE datetime(created_at) >= datetime('now','-1 hour'){cs}"),
         ("resolve (entity_resolutions)",
-         "SELECT COUNT(*) FROM entity_resolutions WHERE created_at >= datetime('now','-1 hour')"),
+         "SELECT COUNT(*) FROM entity_resolutions WHERE datetime(created_at) >= datetime('now','-1 hour')"),
         ("decide  (decisions)       ",
-         "SELECT COUNT(*) FROM decisions WHERE created_at >= datetime('now','-1 hour')"),
+         f"SELECT COUNT(*) FROM decisions WHERE datetime(created_at) >= datetime('now','-1 hour'){cs}"),
         ("trade   (trades)          ",
-         "SELECT COUNT(*) FROM trades WHERE decided_at >= datetime('now','-1 hour')"),
+         f"SELECT COUNT(*) FROM trades WHERE datetime(decided_at) >= datetime('now','-1 hour'){cs}"),
         ("close   (trade_closures)  ",
-         "SELECT COUNT(*) FROM trade_closures WHERE closed_at >= datetime('now','-1 hour')"),
+         f"SELECT COUNT(*) FROM trade_closures WHERE datetime(closed_at) >= datetime('now','-1 hour'){cs}"),
     ]
     lines = [
         f"# irene throughput ({_now().isoformat()})",

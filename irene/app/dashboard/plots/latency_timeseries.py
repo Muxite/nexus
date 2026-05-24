@@ -9,14 +9,15 @@ FILENAME = "latency_timeseries.png"
 
 
 async def render(dash, *, loop) -> bytes:
+    cs = f"AND t.cycle_id = {int(dash.current_cycle_id)}" if dash.current_cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT strftime('%Y-%m-%dT%H:00', t.decided_at) AS hour,
                (julianday(t.decided_at) - julianday(a.ingested_at)) * 86400000.0 AS ms
         FROM trades t
         JOIN signals s ON s.id = t.signal_id
         JOIN articles a ON a.id = s.article_id
-        WHERE t.decided_at >= datetime('now','-24 hours')
+        WHERE datetime(t.decided_at) >= datetime('now','-24 hours') {cs}
         """
     )
     rows = await cur.fetchall()

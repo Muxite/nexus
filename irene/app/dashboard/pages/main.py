@@ -94,18 +94,24 @@ async def render(dash) -> str:
         f"uptime: {uptime:.0f}s    cycle_id: {cycle_id if cycle_id is not None else '?'}",
         "",
     ]
+    # Cycle 4: timestamps are stored as ISO-8601 with 'T' + offset
+    # ('2026-05-24T21:20:39.397799+00:00'), but `datetime('now',...)`
+    # returns 'YYYY-MM-DD HH:MM:SS' (space separator). String comparison
+    # always passes for T-formatted rows on the same date, so the
+    # "(1h)" filter silently expands to "since midnight". Wrap both
+    # sides with datetime() so the parser normalises them before compare.
     for sql, label in (
-        (f"SELECT COUNT(*) FROM articles WHERE ingested_at >= datetime('now','-1 hour') {cycle_filter}",
+        (f"SELECT COUNT(*) FROM articles WHERE datetime(ingested_at) >= datetime('now','-1 hour') {cycle_filter}",
          "articles ingested (1h)"),
-        (f"SELECT COUNT(*) FROM signals  WHERE created_at  >= datetime('now','-1 hour') {cycle_filter}",
+        (f"SELECT COUNT(*) FROM signals  WHERE datetime(created_at)  >= datetime('now','-1 hour') {cycle_filter}",
          "signals matched   (1h)"),
-        (f"SELECT COUNT(*) FROM trades   WHERE decided_at  >= datetime('now','-1 hour') {cycle_filter}",
+        (f"SELECT COUNT(*) FROM trades   WHERE datetime(decided_at)  >= datetime('now','-1 hour') {cycle_filter}",
          "trades decided    (1h)"),
         (f"SELECT COUNT(*) FROM decisions WHERE outcome='execute' AND "
-         f"created_at >= datetime('now','-1 hour') {cycle_filter}",
+         f"datetime(created_at) >= datetime('now','-1 hour') {cycle_filter}",
          "trades executed   (1h)"),
         (f"SELECT COUNT(*) FROM decisions WHERE outcome='reject'  AND "
-         f"created_at >= datetime('now','-1 hour') {cycle_filter}",
+         f"datetime(created_at) >= datetime('now','-1 hour') {cycle_filter}",
          "trades rejected   (1h)"),
     ):
         n = await scalar(dash.db, sql)
@@ -135,9 +141,12 @@ async def render(dash) -> str:
     # 5-label distribution (1h) — v5 prompt taxonomy:
     #   Y=trade-yes  N=trade-no  P=pass  U=uncertain  R=mismatch  ?=parse-fail
     # Older v2/v3/v4 rows have label=NULL; we surface them as "(legacy)".
+    # Cycle 4: cycle-scope the label distribution so cycle 20's R/U rate
+    # doesn't bleed into cycle 25's headline metric.
     cur = await dash.db.conn.execute(
-        "SELECT label, COUNT(*) FROM predictions "
-        "WHERE created_at >= datetime('now','-1 hour') GROUP BY label"
+        f"SELECT label, COUNT(*) FROM predictions "
+        f"WHERE datetime(created_at) >= datetime('now','-1 hour') {cycle_filter} "
+        f"GROUP BY label"
     )
     label_dist = {r[0]: int(r[1]) for r in await cur.fetchall()}
     await cur.close()
@@ -150,8 +159,8 @@ async def render(dash) -> str:
     n_legacy = label_dist.get(None, 0)
     n_parse_fail = await scalar(
         dash.db,
-        "SELECT COUNT(*) FROM llm_parse_failures "
-        "WHERE created_at >= datetime('now','-1 hour')",
+        f"SELECT COUNT(*) FROM llm_parse_failures "
+        f"WHERE datetime(created_at) >= datetime('now','-1 hour') {cycle_filter}",
     )
     n_total = n_y + n_n + n_p + n_u + n_r + n_q + n_legacy
     pf_pct = 100.0 * n_parse_fail / max(n_total + n_parse_fail, 1)
@@ -163,9 +172,25 @@ async def render(dash) -> str:
         lines.append(f"  legacy (v<=4):    {n_legacy} (no label column)")
 
     # Latency + tokens + cache (pooled across models, 1h)
+    # llm_calls has no cycle_id column; join to predictions (which does) to
+    # scope the latency/token metrics to the current cycle. Use DISTINCT
+    # because a single llm_call can have multiple prediction rows for the
+    # cached-reparse path; we count each llm_call once.
+    cycle_join_filter = (
+        f"AND p.cycle_id = {int(dash.current_cycle_id)}"
+        if dash.current_cycle_id is not None
+        else ""
+    )
     cur = await dash.db.conn.execute(
-        "SELECT latency_ms, tokens_in, tokens_out, status_code FROM llm_calls "
-        "WHERE created_at >= datetime('now','-1 hour')"
+        f"""
+        SELECT lc.latency_ms, lc.tokens_in, lc.tokens_out, lc.status_code
+        FROM llm_calls lc
+        WHERE datetime(lc.created_at) >= datetime('now','-1 hour')
+          AND EXISTS (
+            SELECT 1 FROM predictions p
+            WHERE p.llm_call_id = lc.id {cycle_join_filter}
+          )
+        """
     )
     call_rows = await cur.fetchall()
     await cur.close()
@@ -183,8 +208,8 @@ async def render(dash) -> str:
         # cache hit %: ratio of predictions.cached=1 to total predictions in window
         n_cached = await scalar(
             dash.db,
-            "SELECT COUNT(*) FROM predictions WHERE cached = 1 "
-            "AND created_at >= datetime('now','-1 hour')",
+            f"SELECT COUNT(*) FROM predictions WHERE cached = 1 "
+            f"AND datetime(created_at) >= datetime('now','-1 hour') {cycle_filter}",
         )
         cache_pct = 100.0 * n_cached / max(n_total, 1)
         lines.append(
@@ -195,7 +220,7 @@ async def render(dash) -> str:
         lines.append("  (no LLM calls in last hour)")
 
     lines.append("")
-    samples = await end_to_end_latency_ms(dash.db)
+    samples = await end_to_end_latency_ms(dash.db, cycle_id=dash.current_cycle_id)
     p = _percentiles(samples)
     if p["count"]:
         lines += [
@@ -347,7 +372,7 @@ async def render(dash) -> str:
     # sees WHY without leaving this page.
     lines += ["", "last 5 decisions:"]
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT d.created_at, d.outcome, d.reason, d.gate_history,
                COALESCE(t.decision_path, 'mvp') AS path,
                t.direction, t.size_usdc, t.edge,
@@ -359,6 +384,7 @@ async def render(dash) -> str:
         LEFT JOIN articles a ON a.id = s.article_id
         LEFT JOIN markets  m ON m.condition_id = s.market_id
         WHERE d.is_tracer = 0
+          {("AND d.cycle_id = " + str(int(cycle_id))) if cycle_id is not None else ""}
         ORDER BY d.created_at DESC
         LIMIT 5
         """
