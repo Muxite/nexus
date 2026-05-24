@@ -9,9 +9,9 @@ import pytest
 from app.clob import CLOBClient
 
 
-def _ok_book(bid: float, ask: float) -> dict:
-    return {"bids": [{"price": str(bid), "size": "100"}],
-            "asks": [{"price": str(ask), "size": "100"}]}
+def _ok_midpoint(mid: float | str) -> dict:
+    """Response shape from `GET /midpoint?token_id=...` is `{"mid":"0.545"}`."""
+    return {"mid": str(mid)}
 
 
 class _Mock:
@@ -19,10 +19,10 @@ class _Mock:
         self.status = status
         self.body = body if body is not None else {}
         self.raise_exc = raise_exc
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, dict | None]] = []
 
-    async def get(self, url):
-        self.calls.append(url)
+    async def get(self, url, params=None):
+        self.calls.append((url, params))
         if self.raise_exc:
             raise self.raise_exc
         r = httpx.Response(self.status, json=self.body, request=httpx.Request("GET", url))
@@ -38,13 +38,16 @@ def _install(client: CLOBClient, mock: _Mock) -> None:
 
 async def test_get_mid_happy_path():
     c = CLOBClient(base_url="http://x")
-    _install(c, _Mock(body=_ok_book(0.48, 0.52)))
-    assert await c.get_mid("tk1") == pytest.approx(0.50)
+    m = _Mock(body=_ok_midpoint(0.545))
+    _install(c, m)
+    assert await c.get_mid("tk1") == pytest.approx(0.545)
+    # Sanity-check we hit /midpoint with token_id in the query, not /book/<id>.
+    assert m.calls == [("http://x/midpoint", {"token_id": "tk1"})]
 
 
 async def test_get_mid_empty_token_returns_none():
     c = CLOBClient(base_url="http://x")
-    _install(c, _Mock(body=_ok_book(0.5, 0.5)))
+    _install(c, _Mock(body=_ok_midpoint(0.5)))
     assert await c.get_mid("") is None
 
 
@@ -56,25 +59,25 @@ async def test_get_mid_http_error_returns_none():
 
 async def test_get_mid_non_2xx_returns_none():
     c = CLOBClient(base_url="http://x")
-    _install(c, _Mock(status=503, body={}))
+    _install(c, _Mock(status=404, body={}))
     assert await c.get_mid("tk1") is None
 
 
-async def test_get_mid_empty_book_returns_none():
+async def test_get_mid_missing_field_returns_none():
     c = CLOBClient(base_url="http://x")
-    _install(c, _Mock(body={"bids": [], "asks": []}))
+    _install(c, _Mock(body={"not_mid": "0.5"}))
     assert await c.get_mid("tk1") is None
 
 
-async def test_get_mid_malformed_book_returns_none():
+async def test_get_mid_unparseable_value_returns_none():
     c = CLOBClient(base_url="http://x")
-    _install(c, _Mock(body={"bids": [{"oops": 1}], "asks": [{"oops": 2}]}))
+    _install(c, _Mock(body={"mid": "n/a"}))
     assert await c.get_mid("tk1") is None
 
 
 async def test_get_mid_out_of_range_returns_none():
     c = CLOBClient(base_url="http://x")
-    _install(c, _Mock(body=_ok_book(1.5, 2.0)))
+    _install(c, _Mock(body=_ok_midpoint(1.5)))
     assert await c.get_mid("tk1") is None
 
 
