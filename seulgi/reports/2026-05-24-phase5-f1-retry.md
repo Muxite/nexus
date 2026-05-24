@@ -102,13 +102,120 @@ bash seulgi/scripts/lifecycle.sh stop   # snapshots + stops
 
 ---
 
-## F1 outcome (FILL IN AT T+4h)
+## F1 outcome — early stop
 
-- Bot stopped at: `___`
-- Trades executed in window: `___ / 50`
-- Sum PnL: `$___`
-- Per-engine: `___`
-- Crashes / errors: `___`
-- Calibration Brier (post-window): YES `___` / NO `___`
-- **Verdict: PASS / FAIL**
-- Next action: `___`
+**Window:** 2026-05-24T01:12 → 04:41 UTC (3h 29min — stopped 31min before
+the 4h mark; outcome was already determined and continued LLM spend
+would not have changed it).
+
+**Bot stopped at:** 2026-05-24T04:41 UTC, snapshot saved at
+`seulgi/snapshots/pre_stop_20260524T044149Z`.
+
+### F1 escalation timeline
+
+| event | T | trades | closes | PnL | note |
+|---|---|---:|---:|---:|---|
+| initial restart | 23:58 (prior) | 0 | 0 | 0 | original Phase E start |
+| escalation (rules retired, floor 1.0→0.05) | 01:12 | 0 | 0 | 0 | committed `c1ea2e3` |
+| first trade burst | 01:12–02:27 | 17 | 0 | 0 | sustained ~13 trades/h |
+| first closes | 02:50–03:30 | 17 | 4 | +0.0261 | 2 TP + 2 TRAIL |
+| trade rate stalls | 02:27 onward | 19 | 4 | +0.0261 | news drought; engine_results 21× drop |
+| early stop | 04:41 | **19** | **4** | **+$0.0261** | F1 gate missed |
+
+### F1 gates
+
+| gate | target | actual | verdict |
+|---|---|---|---|
+| Trade count | ≥50 in 4h | **19 in 3h 29min** | ❌ FAIL |
+| No crashes / commit-races | 0 Tracebacks | 0 | ✅ PASS |
+| Telemetry queue drained | depth=0 between batches | drained | ✅ PASS |
+| Brier negative (calibration improving) | YES,NO < 0 | _not computed_ | n/a (n=4 closes is below the calibrator's MIN_SAMPLES) |
+
+### Per-direction PnL (closed trades only)
+
+| direction | n_open | n_closed | sum_pnl | avg_size |
+|---|---:|---:|---:|---|
+| NO  | 15 | 2 | **+$0.0692** | $0.21 |
+| YES |  4 | 2 | **−$0.0431** | $0.20 |
+
+NO-direction closes (2 TP) drove the marginal positive PnL; YES-direction
+closes (2 TRAIL exits) cost it back roughly evenly. n=4 is statistically
+meaningless for a profitability call — read this as "the new flow is
+trading, with a slight directional skew worth tracking" not "the
+strategy has edge."
+
+### Pipeline volume (escalation window)
+
+| signal | value |
+|---|---:|
+| engine_results | 123,240 |
+| llm_calls | 2,331 |
+| llm tokens (prompt + completion) | 4.64 M |
+| decision_inputs written | 699 (1648 total ⇒ writer continues to scale) |
+| open positions at stop | 15 |
+
+### What worked (escalation attribution)
+
+1. **Pre-AI rule retirement (`mid_below_065` + `extreme_low_price`)** —
+   moved 79% of the prior funnel's bottleneck off the critical path.
+   With them gone, the production engines now see "edge gate" / "low_confidence"
+   as their dominant skips instead of static-rule skips. They still don't
+   trade (0/19), but the funnel attribution is now meaningful.
+2. **`simulate_min_trade_usdc` 1.0 → 0.05** — unblocked super_scout's
+   $0.05 micro-stake math. super_scout still didn't trade post-escalation
+   (now blocked by `cluster_size_too_small:0.01`, a *separate* post-AI
+   filter — out of scope for this plan).
+3. **scout/all_signals** is the only engine that traded — all 19 trades.
+   Its broad `min_edge: -10.0` + `min_confidence: 0.0` config admits every
+   directional verdict, and its scope (`max_position_usdc=1.0`) made it
+   the natural beneficiary of the floor change.
+4. **Matchers chain (cosine + cross-encoder + learned_mlp)** ran
+   throughout with 0 errors. Cross-encoder loaded once (~50 MB), MLP
+   stayed in neutral-0.5 mode (still 0 training samples by stop —
+   decision_inputs ↔ closed-trades join needs more time).
+
+### What didn't move (deferred to next plan)
+
+1. **Production engines (balanced/*, inverted_highconf/*, loose_relevance_yes)
+   produced 0 trades** even after the pre-AI rule retirement. The post-AI
+   gates (`min_confidence: 0.40`, `min_edge: 0.03`, `use_true_ev_formula: false`
+   per A4B.4 phased rollout) still refuse production-engine signals. Three
+   next levers (in increasing scope):
+   - `composite_score_floor` activation — `scoring.py` ships AUC ~0.75
+     and is gated off (`= 0.0`). One-line config change.
+   - Loosen `min_confidence` from 0.40 → 0.30 for one variant to see if
+     production can hit any volume.
+   - Re-enable `use_true_ev_formula: true` with calibration on (A4B.4
+     said this kills volume to 0; revisit when calibration has more
+     samples).
+2. **News-volume drought** — the F1 window straddled a quiet UTC period.
+   Future F1 retries should target peak news hours (~12-22 UTC US
+   business hours) for a fair trade-count gate.
+3. **YES vs NO direction asymmetry** — 4/19 trades were YES (21%). NO
+   was the only profitable side in this micro-sample. Worth a per-
+   direction calibration audit once n is meaningful.
+4. **irene KG matcher** — still parked at the reserved slot. Plug-in
+   when the parallel session ships `KnowledgeGraphMatcher`.
+
+### Verdict
+
+**❌ F1 FAIL on trade-count gate (19 / 50 in 3h 29min) but ✅ PASS on
+infrastructure stability (0 crashes, queue drained, writes balanced).**
+
+The escalation was the right call — it unblocked the funnel that the
+prior 50-min smoke proved was stuck at 0 trades. The remaining 31 trades
+to hit the gate were not blocked by config; they were blocked by news
+volume, which we don't control. PnL signal (+$0.026 over 4 closes) is too
+small to interpret as edge.
+
+### Next action
+
+1. **Schedule a peak-hours F1 retry** (12-22 UTC) on the same config to
+   isolate whether the trade-count gate is reachable when news flow is
+   normal. If yes → F1 PASS, proceed to F2 (24h regression). If no →
+   the post-AI gates are the next lever.
+2. **Activate `composite_score_floor: 0.5`** as a controlled test —
+   one variant only, see if it improves PnL/decision ratio enough to
+   justify production-wide enablement.
+3. **Leave the bot OFF until the user decides** whether to chase the
+   peak-hours retry or shift to production-gate work first.
