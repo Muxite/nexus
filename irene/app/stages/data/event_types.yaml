@@ -1,0 +1,74 @@
+# Event-type classification rules + per-type window/staleness config.
+#
+# See docs/papers/eventization/notes.md §"Problem 1" + §"Decisions
+# locked" for the design rationale. Loaded once by EventizeStage at
+# start(); changes here require a stage restart to take effect.
+#
+# `default_window_hours` / `default_stale_hours`: applied to any
+# event_type not listed under `event_types`. Window = clustering
+# horizon (new facts within this much of an event's last_seen_at can
+# attach). Stale = exclusion horizon (events older than this stop
+# accepting new facts entirely).
+#
+# `type_rules`: matched in order against each fact's
+# (subj_entity_type, relation, obj_entity_type) triple. First match
+# wins. `*` is a wildcard. If no rule matches the fact's event_type
+# is UNCLASSIFIED — that's not a bug; the linker downstream can
+# still score it.
+
+version: v1
+created_at: 2026-05-24
+
+default_window_hours: 24
+default_stale_hours: 72
+
+event_types:
+  - {type: ELECTION,             window_hours: 168, stale_hours: 720}
+  - {type: TRIAL,                window_hours: 168, stale_hours: 720}
+  - {type: REGULATORY_DECISION,  window_hours: 72,  stale_hours: 240}
+  - {type: MERGER,               window_hours: 168, stale_hours: 720}
+  - {type: RATE_CHANGE,          window_hours: 6,   stale_hours: 24}
+  - {type: EARNINGS,             window_hours: 24,  stale_hours: 72}
+  - {type: NOMINATION,           window_hours: 72,  stale_hours: 240}
+  - {type: RESIGNATION,          window_hours: 24,  stale_hours: 72}
+  - {type: PRODUCT_LAUNCH,       window_hours: 48,  stale_hours: 168}
+  - {type: LAWSUIT,              window_hours: 72,  stale_hours: 720}
+
+type_rules:
+  # Regulatory / executive decisions.
+  - {subj: ORG,     relation: decides,    obj: COMPANY,        type: REGULATORY_DECISION}
+  - {subj: ORG,     relation: decides,    obj: PERSON,         type: REGULATORY_DECISION}
+  - {subj: ORG,     relation: decides,    obj: COUNTRY,        type: REGULATORY_DECISION}
+  - {subj: COUNTRY, relation: decides,    obj: COUNTRY,        type: REGULATORY_DECISION}
+  - {subj: COUNTRY, relation: decides,    obj: COMPANY,        type: REGULATORY_DECISION}
+  - {subj: PERSON,  relation: decides,    obj: '*',            type: REGULATORY_DECISION}
+
+  # Personnel.
+  - {subj: PERSON,  relation: nominates,  obj: PERSON,         type: NOMINATION}
+  - {subj: ORG,     relation: nominates,  obj: PERSON,         type: NOMINATION}
+  - {subj: PERSON,  relation: resigns,    obj: '*',            type: RESIGNATION}
+  - {subj: PERSON,  relation: elects,     obj: COUNTRY,        type: ELECTION}
+  - {subj: COUNTRY, relation: elects,     obj: PERSON,         type: ELECTION}
+  - {subj: ORG,     relation: elects,     obj: PERSON,         type: ELECTION}
+
+  # Monetary policy.
+  - {subj: ORG,     relation: changes,    obj: ECON_INDICATOR, type: RATE_CHANGE}
+  - {subj: COUNTRY, relation: changes,    obj: ECON_INDICATOR, type: RATE_CHANGE}
+
+  # Product / corporate.
+  - {subj: COMPANY, relation: launches,   obj: '*',            type: PRODUCT_LAUNCH}
+  - {subj: ORG,     relation: launches,   obj: '*',            type: PRODUCT_LAUNCH}
+  - {subj: COUNTRY, relation: launches,   obj: '*',            type: PRODUCT_LAUNCH}
+  - {subj: COMPANY, relation: acquires,   obj: COMPANY,        type: MERGER}
+  - {subj: COMPANY, relation: signs,      obj: COMPANY,        type: MERGER}
+
+  # Legal.
+  - {subj: ORG,     relation: accuses,    obj: PERSON,         type: LAWSUIT}
+  - {subj: ORG,     relation: accuses,    obj: COMPANY,        type: LAWSUIT}
+  - {subj: PERSON,  relation: accuses,    obj: PERSON,         type: LAWSUIT}
+  - {subj: PERSON,  relation: accuses,    obj: COMPANY,        type: LAWSUIT}
+  - {subj: COUNTRY, relation: accuses,    obj: COUNTRY,        type: LAWSUIT}
+
+  # Catch-all announcements.
+  - {subj: '*',     relation: announces,  obj: '*',            type: ANNOUNCEMENT}
+  - {subj: '*',     relation: signs,      obj: '*',            type: ANNOUNCEMENT}

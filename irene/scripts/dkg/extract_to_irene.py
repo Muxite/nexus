@@ -332,7 +332,8 @@ def _select_articles_to_process(
         where.append(f"({source_filter})")
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
     sql = f"""
-        SELECT a.id, a.title, a.summary, a.cycle_id, a.is_tracer, a.tracer_id
+        SELECT a.id, a.title, a.summary, a.published_at, a.cycle_id,
+               a.is_tracer, a.tracer_id
         FROM articles a
         LEFT JOIN extraction_runs er ON er.article_id = a.id
             AND er.model = ?
@@ -359,6 +360,7 @@ def _persist_extraction(
     embedder: Embedder,
     entity_index: Optional[EntityIndex],
     article_id: int,
+    article_published_at: Optional[str],
     cycle_id: int,
     is_tracer: int,
     tracer_id: Optional[str],
@@ -369,8 +371,14 @@ def _persist_extraction(
 ) -> int:
     """Write extraction_runs + entities + facts for one article.
     Returns the extraction_runs.id (or 0 on duplicate/skip).
+
+    `article_published_at` is stamped on `facts.observed_at` so the
+    downstream eventize time-window math is anchored to when the article
+    was published, not when extraction ran. Falls back to `now` if the
+    article row has no published_at (e.g. tracer rows).
     """
     now = _now_iso()
+    fact_observed_at = article_published_at or now
     status = result.status
     dropped = 0
     kept_facts: list[dict] = []
@@ -446,7 +454,7 @@ def _persist_extraction(
                         run_id, article_id, subj_eid,
                         f["relation"], obj_eid, f["obj_value"],
                         1.0,  # v3 prompt doesn't emit confidence; default
-                        now,
+                        fact_observed_at,
                         f"{f['subj']} {f['relation']} {f['obj'] or ''}".strip(),
                         cycle_id, is_tracer, tracer_id,
                     ),
@@ -555,6 +563,7 @@ async def _worker(
                     embedder=embedder,
                     entity_index=entity_index,
                     article_id=int(row["id"]),
+                    article_published_at=row["published_at"],
                     cycle_id=int(row["cycle_id"]),
                     is_tracer=int(row["is_tracer"] or 0),
                     tracer_id=row["tracer_id"],

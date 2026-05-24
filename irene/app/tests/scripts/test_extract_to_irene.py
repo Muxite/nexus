@@ -249,7 +249,7 @@ def test_persist_ok_writes_entities_and_facts(irene_conn):
     sbert, db = _make_timers()
     run_id = _persist_extraction(
         irene_conn, embedder=_FakeEmbedder(), entity_index=None,
-        article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
+        article_id=aid, article_published_at="2026-05-23T12:00:00+00:00", cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
     )
@@ -286,7 +286,7 @@ def test_persist_duplicate_returns_zero_and_no_writes(irene_conn):
     sbert, db = _make_timers()
     run_id_1 = _persist_extraction(
         irene_conn, embedder=_FakeEmbedder(), entity_index=None,
-        article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
+        article_id=aid, article_published_at="2026-05-23T12:00:00+00:00", cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
     )
@@ -294,7 +294,7 @@ def test_persist_duplicate_returns_zero_and_no_writes(irene_conn):
     # Second call with same (article, model, prompt_v, ontology_v) is a no-op.
     run_id_2 = _persist_extraction(
         irene_conn, embedder=_FakeEmbedder(), entity_index=None,
-        article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
+        article_id=aid, article_published_at="2026-05-23T12:00:00+00:00", cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
     )
@@ -310,7 +310,7 @@ def test_persist_empty_status_writes_run_no_facts(irene_conn):
     sbert, db = _make_timers()
     run_id = _persist_extraction(
         irene_conn, embedder=_FakeEmbedder(), entity_index=None,
-        article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
+        article_id=aid, article_published_at="2026-05-23T12:00:00+00:00", cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
     )
@@ -344,7 +344,7 @@ def test_persist_with_index_warms_and_registers(irene_conn):
     index = EntityIndex()
     _persist_extraction(
         irene_conn, embedder=_FakeEmbedder(), entity_index=index,
-        article_id=aid1, cycle_id=1, is_tracer=0, tracer_id=None,
+        article_id=aid1, article_published_at="2026-05-23T12:00:00+00:00", cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result_a,
         sbert_timer=sbert, db_timer=db,
     )
@@ -354,7 +354,7 @@ def test_persist_with_index_warms_and_registers(irene_conn):
     # Second article re-uses FDA.
     _persist_extraction(
         irene_conn, embedder=_FakeEmbedder(), entity_index=index,
-        article_id=aid2, cycle_id=1, is_tracer=0, tracer_id=None,
+        article_id=aid2, article_published_at="2026-05-23T12:00:00+00:00", cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result_b,
         sbert_timer=sbert, db_timer=db,
     )
@@ -375,7 +375,7 @@ def test_persist_parse_error_writes_only_run(irene_conn):
     sbert, db = _make_timers()
     run_id = _persist_extraction(
         irene_conn, embedder=_FakeEmbedder(), entity_index=None,
-        article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
+        article_id=aid, article_published_at="2026-05-23T12:00:00+00:00", cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
     )

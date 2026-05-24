@@ -198,10 +198,10 @@ def test_eventize_requires_embedder(irene_db_path):
 
 
 @pytest.mark.asyncio
-async def test_handle_raises_not_implemented_until_research_lands(irene_db_path):
-    """Documents the contract-first stub: until the research session
-    deliverable lands, handle() must error rather than silently no-op
-    and accumulate stale state."""
+async def test_handle_missing_article_id_no_crash(irene_db_path):
+    """A malformed payload (missing article_id) is logged and ignored,
+    not raised — the bus dispatcher would otherwise lose the whole
+    chain on one bad message."""
     db = DB(path=irene_db_path)
     await db.connect()
     deps = StageDeps(db=db, bus=_StubBus(), config=_StubConfig(),
@@ -209,12 +209,11 @@ async def test_handle_raises_not_implemented_until_research_lands(irene_db_path)
     stage = EventizeStage(deps)
     await stage.start()
     try:
-        with pytest.raises(NotImplementedError, match="research-session"):
-            await stage.handle({
-                "extraction_run_id": 1, "article_id": 1,
-                "entities_resolved": 0, "merges": 0,
-                "is_tracer": False, "tracer_id": None,
-            })
+        await stage.handle({})  # no article_id
+        # No event row should have been written.
+        cur = await db.conn.execute("SELECT COUNT(*) FROM events")
+        assert (await cur.fetchone())[0] == 0
+        await cur.close()
     finally:
         await stage.stop()
         await db.close()
@@ -226,3 +225,406 @@ def test_eventize_tables_in_forbidden_lint_list():
     from scripts.lint.no_facts_in_trade_path import FORBIDDEN_TABLES
     assert "events" in FORBIDDEN_TABLES
     assert "event_edges" in FORBIDDEN_TABLES
+
+
+# ---------------------------------------------------------------------------
+# Real-world clustering behaviour
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedEmbedder:
+    """Test embedder that returns hand-controlled vectors keyed by text.
+    Falls back to one-hot-by-hash for unknown text."""
+
+    embedder_id = "scripted@4"
+
+    def __init__(self, mapping: dict[str, np.ndarray], dim: int = 4) -> None:
+        self._mapping = mapping
+        self._dim = dim
+
+    def embed(self, text: str) -> np.ndarray:
+        if text in self._mapping:
+            return self._mapping[text].astype(np.float32)
+        v = np.zeros(self._dim, dtype=np.float32)
+        v[abs(hash(text)) % self._dim] = 1.0
+        return v
+
+    def embed_batch(self, texts: list[str]) -> np.ndarray:
+        return np.stack([self.embed(t) for t in texts])
+
+
+def _seed_minimal_dkg(conn) -> dict:
+    """Seeds: 1 cycle, 2 articles (different published_at), 3 entities
+    (FDA, Pfizer, Apple), and the FK glue. Returns the ids."""
+    conn.execute(
+        "INSERT INTO cycles (name, opened_at) VALUES ('t', '2026-05-23T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO articles (source, url, title, ingested_at, cycle_id, published_at) "
+        "VALUES ('test', 'http://a/1', 'A1', '2026-05-23T00:00:00+00:00', 1, "
+        "'2026-05-20T12:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO articles (source, url, title, ingested_at, cycle_id, published_at) "
+        "VALUES ('test', 'http://a/2', 'A2', '2026-05-23T00:00:00+00:00', 1, "
+        "'2026-05-20T18:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO entities (entity_type, canonical_name, first_seen_at, last_seen_at) "
+        "VALUES ('ORG', 'FDA', '2026-05-20T00:00:00+00:00', '2026-05-20T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO entities (entity_type, canonical_name, first_seen_at, last_seen_at) "
+        "VALUES ('COMPANY', 'Pfizer', '2026-05-20T00:00:00+00:00', '2026-05-20T00:00:00+00:00')"
+    )
+    conn.execute(
+        "INSERT INTO entities (entity_type, canonical_name, first_seen_at, last_seen_at) "
+        "VALUES ('COMPANY', 'Apple', '2026-05-20T00:00:00+00:00', '2026-05-20T00:00:00+00:00')"
+    )
+    return {"article1": 1, "article2": 2, "fda": 1, "pfizer": 2, "apple": 3}
+
+
+def _insert_fact(conn, *, run_id, article_id, subj_id, relation, obj_id, observed_at, obj_value=None):
+    conn.execute(
+        """
+        INSERT INTO facts
+            (extraction_run_id, article_id, subj_entity_id, relation,
+             obj_entity_id, obj_value, confidence, observed_at,
+             evidence_span, cycle_id)
+        VALUES (?, ?, ?, ?, ?, ?, 1.0, ?, 'span', 1)
+        """,
+        (run_id, article_id, subj_id, relation, obj_id, obj_value, observed_at),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+def _insert_extraction_run(conn, *, article_id, cycle_id=1):
+    conn.execute(
+        """
+        INSERT INTO extraction_runs
+            (article_id, model, prompt_version, ontology_version, status,
+             fact_count, entity_count, dropped_fact_count, cycle_id, created_at)
+        VALUES (?, 'm', 'v3', 'v1', 'ok', 1, 1, 0, ?, '2026-05-23T00:00:00+00:00')
+        """,
+        (article_id, cycle_id),
+    )
+    return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+
+@pytest.mark.asyncio
+async def test_handle_creates_event_on_cluster_miss(irene_db_path):
+    """First fact in an empty DKG → one new event, fact carries event_id."""
+    sync = sqlite3.connect(irene_db_path, isolation_level=None)
+    ids = _seed_minimal_dkg(sync)
+    run_id = _insert_extraction_run(sync, article_id=ids["article1"])
+    _insert_fact(
+        sync, run_id=run_id, article_id=ids["article1"],
+        subj_id=ids["fda"], relation="decides", obj_id=ids["pfizer"],
+        observed_at="2026-05-20T12:00:00+00:00",
+    )
+    sync.close()
+
+    db = DB(path=irene_db_path)
+    await db.connect()
+    deps = StageDeps(db=db, bus=_StubBus(), config=_StubConfig(),
+                     embedder=_FakeEmbedder())
+    stage = EventizeStage(deps)
+    await stage.start()
+    try:
+        await stage.handle({
+            "article_id": ids["article1"], "extraction_run_id": run_id,
+            "is_tracer": False, "tracer_id": None,
+        })
+        cur = await db.conn.execute("SELECT COUNT(*) FROM events")
+        assert (await cur.fetchone())[0] == 1
+        await cur.close()
+        cur = await db.conn.execute(
+            "SELECT event_id FROM facts WHERE article_id=?", (ids["article1"],),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        assert row[0] is not None
+        # Event type lookup: (ORG, decides, COMPANY) → REGULATORY_DECISION
+        cur = await db.conn.execute("SELECT event_type FROM events LIMIT 1")
+        assert (await cur.fetchone())[0] == "REGULATORY_DECISION"
+        await cur.close()
+    finally:
+        await stage.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_confirms_when_clusters_match(irene_db_path):
+    """Two facts with overlapping entities + same templated triple →
+    one event with support_count=2 + a confirms edge."""
+    sync = sqlite3.connect(irene_db_path, isolation_level=None)
+    ids = _seed_minimal_dkg(sync)
+    run1 = _insert_extraction_run(sync, article_id=ids["article1"])
+    _insert_fact(
+        sync, run_id=run1, article_id=ids["article1"],
+        subj_id=ids["fda"], relation="decides", obj_id=ids["pfizer"],
+        observed_at="2026-05-20T12:00:00+00:00",
+    )
+    run2 = _insert_extraction_run(sync, article_id=ids["article2"])
+    _insert_fact(
+        sync, run_id=run2, article_id=ids["article2"],
+        subj_id=ids["fda"], relation="decides", obj_id=ids["pfizer"],
+        observed_at="2026-05-20T18:00:00+00:00",
+    )
+    sync.close()
+
+    db = DB(path=irene_db_path)
+    await db.connect()
+    deps = StageDeps(db=db, bus=_StubBus(), config=_StubConfig(),
+                     embedder=_FakeEmbedder())
+    stage = EventizeStage(deps)
+    await stage.start()
+    try:
+        await stage.handle({"article_id": ids["article1"], "extraction_run_id": run1,
+                            "is_tracer": False, "tracer_id": None})
+        await stage.handle({"article_id": ids["article2"], "extraction_run_id": run2,
+                            "is_tracer": False, "tracer_id": None})
+        cur = await db.conn.execute("SELECT COUNT(*), MAX(support_count) FROM events")
+        n_events, max_support = await cur.fetchone()
+        await cur.close()
+        assert n_events == 1
+        assert max_support == 2
+        # A confirms self-edge should exist.
+        cur = await db.conn.execute("SELECT COUNT(*) FROM event_edges WHERE edge_kind='confirms'")
+        assert (await cur.fetchone())[0] == 1
+        await cur.close()
+    finally:
+        await stage.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_does_not_cluster_without_entity_overlap(irene_db_path):
+    """Disjoint entity sets → two events even with identical cosine."""
+    sync = sqlite3.connect(irene_db_path, isolation_level=None)
+    ids = _seed_minimal_dkg(sync)
+    # Add a 4th entity (SEC) so we can build two facts that share NO
+    # entities at all.
+    sync.execute(
+        "INSERT INTO entities (entity_type, canonical_name, first_seen_at, last_seen_at) "
+        "VALUES ('ORG', 'SEC', '2026-05-20T00:00:00+00:00', '2026-05-20T00:00:00+00:00')"
+    )
+    sec_id = sync.execute(
+        "SELECT id FROM entities WHERE canonical_name='SEC'"
+    ).fetchone()[0]
+    run1 = _insert_extraction_run(sync, article_id=ids["article1"])
+    _insert_fact(
+        sync, run_id=run1, article_id=ids["article1"],
+        subj_id=ids["fda"], relation="decides", obj_id=ids["pfizer"],
+        observed_at="2026-05-20T12:00:00+00:00",
+    )
+    run2 = _insert_extraction_run(sync, article_id=ids["article2"])
+    _insert_fact(
+        sync, run_id=run2, article_id=ids["article2"],
+        subj_id=sec_id, relation="decides", obj_id=ids["apple"],
+        observed_at="2026-05-20T18:00:00+00:00",
+    )
+    sync.close()
+
+    db = DB(path=irene_db_path)
+    await db.connect()
+    # Custom embedder that maps the two triples to the SAME vector so we
+    # know the only thing preventing the merge is entity overlap.
+    same_vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    emb = _ScriptedEmbedder({
+        "FDA decides Pfizer": same_vec,
+        "SEC decides Apple": same_vec,
+    }, dim=4)
+    deps = StageDeps(db=db, bus=_StubBus(), config=_StubConfig(), embedder=emb)
+    stage = EventizeStage(deps)
+    await stage.start()
+    try:
+        await stage.handle({"article_id": ids["article1"], "extraction_run_id": run1,
+                            "is_tracer": False, "tracer_id": None})
+        await stage.handle({"article_id": ids["article2"], "extraction_run_id": run2,
+                            "is_tracer": False, "tracer_id": None})
+        cur = await db.conn.execute("SELECT COUNT(*) FROM events")
+        assert (await cur.fetchone())[0] == 2
+        await cur.close()
+    finally:
+        await stage.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_idempotent_on_already_eventized_fact(irene_db_path):
+    """Re-firing the same article with a fact whose event_id is set
+    creates no new events and no new edges."""
+    sync = sqlite3.connect(irene_db_path, isolation_level=None)
+    ids = _seed_minimal_dkg(sync)
+    run_id = _insert_extraction_run(sync, article_id=ids["article1"])
+    _insert_fact(
+        sync, run_id=run_id, article_id=ids["article1"],
+        subj_id=ids["fda"], relation="decides", obj_id=ids["pfizer"],
+        observed_at="2026-05-20T12:00:00+00:00",
+    )
+    sync.close()
+
+    db = DB(path=irene_db_path)
+    await db.connect()
+    deps = StageDeps(db=db, bus=_StubBus(), config=_StubConfig(),
+                     embedder=_FakeEmbedder())
+    stage = EventizeStage(deps)
+    await stage.start()
+    try:
+        await stage.handle({"article_id": ids["article1"], "extraction_run_id": run_id,
+                            "is_tracer": False, "tracer_id": None})
+        await stage.handle({"article_id": ids["article1"], "extraction_run_id": run_id,
+                            "is_tracer": False, "tracer_id": None})
+        cur = await db.conn.execute("SELECT COUNT(*) FROM events")
+        assert (await cur.fetchone())[0] == 1
+        await cur.close()
+        cur = await db.conn.execute("SELECT COUNT(*) FROM event_edges")
+        assert (await cur.fetchone())[0] == 0  # no second-pass confirm
+        await cur.close()
+    finally:
+        await stage.stop()
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_handle_publishes_event_updated(irene_db_path):
+    sync = sqlite3.connect(irene_db_path, isolation_level=None)
+    ids = _seed_minimal_dkg(sync)
+    run_id = _insert_extraction_run(sync, article_id=ids["article1"])
+    _insert_fact(
+        sync, run_id=run_id, article_id=ids["article1"],
+        subj_id=ids["fda"], relation="decides", obj_id=ids["pfizer"],
+        observed_at="2026-05-20T12:00:00+00:00",
+    )
+    sync.close()
+
+    class RecordingBus(_StubBus):
+        def __init__(self): self.published = []
+        async def publish(self, topic, payload): self.published.append((topic, payload))
+
+    db = DB(path=irene_db_path)
+    await db.connect()
+    bus = RecordingBus()
+    deps = StageDeps(db=db, bus=bus, config=_StubConfig(),
+                     embedder=_FakeEmbedder())
+    stage = EventizeStage(deps)
+    await stage.start()
+    try:
+        await stage.handle({"article_id": ids["article1"], "extraction_run_id": run_id,
+                            "is_tracer": False, "tracer_id": None})
+        assert len(bus.published) == 1
+        topic, payload = bus.published[0]
+        assert topic == TOPIC_EVENT_UPDATED
+        assert payload["article_id"] == ids["article1"]
+        assert payload["events_created"] == 1
+        assert payload["events_confirmed"] == 0
+    finally:
+        await stage.stop()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# YAML classification
+# ---------------------------------------------------------------------------
+
+
+def test_classify_org_decides_company_is_regulatory_decision():
+    from app.stages.eventize import _classify
+    rules = [
+        {"subj": "ORG", "relation": "decides", "obj": "COMPANY",
+         "type": "REGULATORY_DECISION"},
+    ]
+    assert _classify(rules, "ORG", "decides", "COMPANY") == "REGULATORY_DECISION"
+
+
+def test_classify_wildcard_subj():
+    from app.stages.eventize import _classify
+    rules = [{"subj": "*", "relation": "announces", "obj": "*", "type": "ANNOUNCEMENT"}]
+    assert _classify(rules, "PERSON", "announces", "COUNTRY") == "ANNOUNCEMENT"
+
+
+def test_classify_null_obj_requires_no_obj():
+    from app.stages.eventize import _classify
+    rules = [{"subj": "PERSON", "relation": "resigns", "obj": None,
+              "type": "RESIGNATION"}]
+    assert _classify(rules, "PERSON", "resigns", None) == "RESIGNATION"
+    # If there's an obj, the rule doesn't match.
+    assert _classify(rules, "PERSON", "resigns", "ORG") == "UNCLASSIFIED"
+
+
+def test_classify_unmatched_returns_unclassified():
+    from app.stages.eventize import _classify
+    rules = [{"subj": "ORG", "relation": "decides", "obj": "COMPANY",
+              "type": "REGULATORY_DECISION"}]
+    assert _classify(rules, "PERSON", "decides", "COUNTRY") == "UNCLASSIFIED"
+
+
+def test_event_types_yaml_loads_cleanly():
+    """The shipped event_types.yaml parses without exception."""
+    from app.stages.eventize import _load_event_types_yaml
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
+    config = _load_event_types_yaml(repo_root / "app/stages/data/event_types.yaml")
+    assert config["default_window_hours"] == 24
+    assert config["default_stale_hours"] == 72
+    assert len(config["rules"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# EventIndex
+# ---------------------------------------------------------------------------
+
+
+def test_event_index_register_and_best_match():
+    from app.stages.eventize import EventIndex
+    idx = EventIndex()
+    v1 = np.array([1.0, 0.0], dtype=np.float32)
+    v2 = np.array([0.0, 1.0], dtype=np.float32)
+    idx.register(event_id=10, event_type="REGULATORY_DECISION",
+                 centroid=v1, last_seen_at_iso="2026-05-20T12:00:00+00:00")
+    idx.register(event_id=11, event_type="REGULATORY_DECISION",
+                 centroid=v2, last_seen_at_iso="2026-05-20T18:00:00+00:00")
+    eid, cos = idx.best_match("REGULATORY_DECISION", v1,
+                              staleness_cutoff_iso="2026-05-19T00:00:00+00:00")
+    assert eid == 10
+    assert cos == pytest.approx(1.0)
+
+
+def test_event_index_stale_exclusion():
+    from app.stages.eventize import EventIndex
+    idx = EventIndex()
+    v = np.array([1.0, 0.0], dtype=np.float32)
+    idx.register(event_id=10, event_type="X", centroid=v,
+                 last_seen_at_iso="2026-05-15T00:00:00+00:00")
+    # Cutoff after the registered event's last_seen → excluded.
+    eid, _cos = idx.best_match("X", v,
+                               staleness_cutoff_iso="2026-05-20T00:00:00+00:00")
+    assert eid is None
+
+
+def test_event_index_update_on_confirm_bumps_support():
+    from app.stages.eventize import EventIndex
+    idx = EventIndex()
+    v1 = np.array([1.0, 0.0], dtype=np.float32)
+    v2 = np.array([0.0, 1.0], dtype=np.float32)
+    idx.register(event_id=5, event_type="X", centroid=v1,
+                 last_seen_at_iso="2026-05-20T12:00:00+00:00")
+    idx.update_on_confirm(event_id=5, event_type="X",
+                          new_fact_vec=v2,
+                          new_last_seen_at_iso="2026-05-20T18:00:00+00:00")
+    assert idx._support_counts_by_type["X"][0] == 2
+    # Centroid is now (v1 + v2)/2 normalised → roughly (0.707, 0.707).
+    centroid = idx._centroids_by_type["X"][0]
+    assert centroid[0] == pytest.approx(0.7071, abs=0.01)
+    assert centroid[1] == pytest.approx(0.7071, abs=0.01)
+
+
+def test_event_index_dim_inferred_lazily():
+    from app.stages.eventize import EventIndex
+    idx = EventIndex()
+    assert idx._dim is None
+    idx.register(event_id=1, event_type="X",
+                 centroid=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+                 last_seen_at_iso="2026-05-20T12:00:00+00:00")
+    assert idx._dim == 4
+
