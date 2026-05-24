@@ -359,6 +359,7 @@ async def main() -> int:
         interval_secs=30,
         budget=budget,
         cfg=cfg,
+        current_cycle_id=cycle_id,
     )
 
     # Only start the OpenRouter poll if we have a credential — a blank

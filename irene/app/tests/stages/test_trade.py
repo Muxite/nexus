@@ -394,10 +394,10 @@ async def test_entity_overlap_gate_permits_on_match(db_seeded):
     assert ai.calls != []   # LLM was called
 
 
-async def test_insufficient_cash_rejects(db_seeded):
-    # Pre-seed a prediction + decision + open trade that consumes most
-    # of the wallet — only $5 of cash left. New trade tries to size
-    # ~$99 → rejected with insufficient_cash.
+async def test_cash_clips_when_cash_below_requested_size(db_seeded):
+    # Pre-seed a $995 open trade. Only $5 cash left.
+    # New trade requests ~$99 → cycle-3 cash gate CLIPS to $5, still
+    # executes because $5 > min_position_usdc ($1).
     async with db_seeded.batch() as cur:
         await cur.execute(
             """
@@ -437,6 +437,62 @@ async def test_insufficient_cash_rejects(db_seeded):
         await stage.handle(_payload())
     # The pre-seeded decision (id=99) is already in the table; look up
     # the new one by signal_id=1 (the seeded fresh signal).
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, reason FROM decisions WHERE signal_id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row["outcome"] == "execute"   # clipped, not rejected
+    assert row["reason"] == "ok"
+    # Verify the executed trade is sized at the clip (~$5), not the requested $99.
+    cur = await db_seeded.conn.execute(
+        "SELECT size_usdc FROM trades WHERE signal_id=1"
+    )
+    trow = await cur.fetchone()
+    await cur.close()
+    assert 4.0 <= trow["size_usdc"] <= 5.5  # clip is $5 ± float jitter
+
+
+async def test_insufficient_cash_rejects_when_overdrawn(db_seeded):
+    # cash_available <= 0 still rejects (never overdraw the wallet).
+    async with db_seeded.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO predictions
+                (id, signal_id, llm_call_id, model, prompt_version, direction,
+                 confidence, cached, raw_response, label, cycle_id, is_tracer,
+                 tracer_id, created_at)
+            VALUES (99, NULL, NULL, 'fake', 'v1', 'YES', 0.9, 0, 'Y', 'Y', 1, 0,
+                    NULL, '2026-05-23T00:00:00+00:00')
+            """,
+        )
+        await cur.execute(
+            """
+            INSERT INTO decisions
+                (id, signal_id, outcome, reason, gate_history, prediction_id,
+                 cycle_id, is_tracer, tracer_id, created_at)
+            VALUES (99, NULL, 'execute', 'ok', '[]', 99, 1, 0, NULL,
+                    '2026-05-23T00:00:00+00:00')
+            """,
+        )
+        await cur.execute(
+            """
+            INSERT INTO trades
+                (id, signal_id, decision_id, prediction_id, market_id, direction,
+                 confidence, similarity, freshness, p_hat, mid_price, edge,
+                 kelly_fraction, size_usdc, decision_path, features_snapshot,
+                 cycle_id, is_tracer, tracer_id, decided_at)
+            VALUES (99, NULL, 99, 99, 'm1', 'YES', 0.9, 0.8, 'BREAKING', 0.9,
+                    0.4, 0.1, 0.1, 1100.0, 'mvp', '{}', 1, 0, NULL,
+                    '2026-05-23T00:00:00+00:00')
+            """,
+        )
+    bus = _FakeBus()
+    ai = _FakeAI()
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
     cur = await db_seeded.conn.execute(
         "SELECT outcome, reason FROM decisions WHERE signal_id=1"
     )

@@ -68,10 +68,12 @@ class _CloserCfg:
     poll_seconds: int = 60
     timeout_hours: float = 24.0
     skip_on_missing_mid: bool = True
-    # Cycle 2 rules — disabled by default in tests so existing timeout
-    # cases don't change behaviour. New tests set these explicitly.
+    # Cycle 2 rules — disabled by default in tests.
     take_profit_pct: float = 0.0
     stop_loss_pct: float = 0.0
+    # Cycle 3 rules — disabled by default in tests (set per-test where needed).
+    stagnation_minutes: int = 0
+    stagnation_drift: float = 0.02
 
 
 @dataclass
@@ -129,6 +131,7 @@ async def _seed_trade(
     decided_at: Optional[datetime] = None,
     is_tracer: int = 0,
     tracer_id: Optional[str] = None,
+    target_mid: Optional[float] = None,
 ) -> None:
     if decided_at is None:
         decided_at = datetime.now(timezone.utc)
@@ -153,14 +156,14 @@ async def _seed_trade(
                 (id, signal_id, decision_id, prediction_id, market_id, direction,
                  confidence, similarity, freshness, p_hat, mid_price, edge,
                  kelly_fraction, size_usdc, decision_path, features_snapshot,
-                 cycle_id, is_tracer, tracer_id, decided_at)
+                 cycle_id, is_tracer, tracer_id, decided_at, target_mid)
             VALUES (?, ?, ?, 1, ?, ?, 0.7, 0.8, 'BREAKING', 0.7, ?, 0.1, 0.1,
-                    ?, 'mvp', '{}', 1, ?, ?, ?)
+                    ?, 'mvp', '{}', 1, ?, ?, ?, ?)
             """,
             (
                 trade_id, signal_id, decision_id, market_id, direction,
                 mid_price, size_usdc, is_tracer, tracer_id,
-                decided_at.isoformat(),
+                decided_at.isoformat(), target_mid,
             ),
         )
 
@@ -297,6 +300,89 @@ async def test_neither_rule_fires_when_pnl_within_band(db):
         n = await stage.run_close_cycle()
     assert n == 0
     assert await _closures(db) == []
+
+
+async def test_edge_decay_fires_when_yes_mid_reaches_target(db):
+    # YES bought at 0.4 with target_mid=0.65. Current 0.66 → edge_decay.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(minutes=10)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.4, size_usdc=10.0,
+                      target_mid=0.65)
+    clob = _FakeCLOB(mids={"tY": 0.66})
+    cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    assert n == 1
+    rows = await _closures(db)
+    assert rows[0]["close_reason"] == "edge_decay"
+
+
+async def test_edge_decay_fires_when_no_mid_reaches_target(db):
+    # NO bought at 0.6 (i.e. we bet against YES). target_mid=0.40 (price falls).
+    # Current 0.38 → edge_decay.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(minutes=10)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="NO", mid_price=0.6, size_usdc=10.0,
+                      target_mid=0.40)
+    clob = _FakeCLOB(mids={"tN": 0.38})
+    cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    assert n == 1
+    rows = await _closures(db)
+    assert rows[0]["close_reason"] == "edge_decay"
+
+
+async def test_edge_decay_skipped_when_target_mid_is_null(db):
+    # Legacy trade without target_mid — fall through to other rules.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(minutes=10)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.4, size_usdc=10.0,
+                      target_mid=None)
+    clob = _FakeCLOB(mids={"tY": 0.66})   # would otherwise trip edge_decay
+    cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    rows = await _closures(db)
+    # Should fire take_profit (gain ~65%), NOT edge_decay.
+    assert rows[0]["close_reason"] == "target"
+
+
+async def test_stagnation_fires_after_minutes_without_movement(db):
+    # Price hasn't moved (entry 0.50, current 0.51) and trade is 45 min old.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(minutes=45)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.50, size_usdc=10.0,
+                      target_mid=0.70)
+    clob = _FakeCLOB(mids={"tY": 0.51})
+    cfg = _Config(closer=_CloserCfg(stagnation_minutes=30, stagnation_drift=0.02))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    rows = await _closures(db)
+    assert rows[0]["close_reason"] == "stagnation"
+
+
+async def test_stagnation_skipped_when_price_did_move(db):
+    # 45 min old, but price moved 0.50 → 0.55 (> 0.02 drift).
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(minutes=45)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.50, size_usdc=10.0,
+                      target_mid=0.70)
+    clob = _FakeCLOB(mids={"tY": 0.55})
+    cfg = _Config(closer=_CloserCfg(stagnation_minutes=30, stagnation_drift=0.02))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    assert n == 0
 
 
 async def test_pnl_yes_formula(db):

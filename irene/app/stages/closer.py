@@ -94,7 +94,7 @@ _CLOSER_DDL = [
         id              INTEGER PRIMARY KEY AUTOINCREMENT,
         trade_id        INTEGER NOT NULL UNIQUE REFERENCES trades(id),
         closed_at       TEXT NOT NULL,
-        close_reason    TEXT NOT NULL CHECK(close_reason IN ('timeout','target','stop','market_resolved','manual')),
+        close_reason    TEXT NOT NULL CHECK(close_reason IN ('timeout','target','stop','market_resolved','manual','edge_decay','stagnation')),
         exit_mid_price  REAL NOT NULL CHECK(exit_mid_price >= 0.0 AND exit_mid_price <= 1.0),
         realized_pnl_usdc REAL NOT NULL,
         cycle_id        INTEGER NOT NULL,
@@ -237,30 +237,54 @@ class CloserStage:
     ) -> Optional[str]:
         """Walk the close-rule list in order, return the first match.
 
-        Order (cycle 2): take_profit, stop_loss, timeout. Price-based
-        rules are skipped when CLOB hasn't returned a mid (no signal).
+        Order (cycle 3): edge_decay → take_profit → stop_loss →
+        stagnation → timeout. edge_decay is the primary exit — once the
+        live mid reaches the model's target_mid, the original Kelly edge
+        is gone and capital should rotate. The rest are safety nets.
         """
         size = float(trade["size_usdc"])
         entry = float(trade["mid_price"])
+        direction = trade["direction"]
+        target = trade.get("target_mid")
+
         if current_mid is not None and size > 0.0:
-            # PnL fraction = unrealized_pnl / size — uses the same Polymarket
-            # math as `_compute_pnl` so the close threshold matches what gets
-            # logged when the rule fires.
-            pnl_frac = _compute_pnl(trade["direction"], entry, float(current_mid), 1.0)
+            cur = float(current_mid)
+            # 1. edge_decay — Kelly target reached. For YES the price
+            # rose to >= target; for NO it fell to <= target. Both
+            # directions: edge = 0, sell.
+            if target is not None:
+                if direction == "YES" and cur >= float(target):
+                    return "edge_decay"
+                if direction == "NO" and cur <= float(target):
+                    return "edge_decay"
+            # 2/3. take_profit + stop_loss — absolute %age thresholds.
+            pnl_frac = _compute_pnl(direction, entry, cur, 1.0)
             if self._cfg.take_profit_pct > 0.0 and pnl_frac >= self._cfg.take_profit_pct:
                 return "target"
             if self._cfg.stop_loss_pct > 0.0 and pnl_frac <= -self._cfg.stop_loss_pct:
                 return "stop"
+
+        # 4. stagnation — aged past stagnation_minutes AND mid hasn't
+        # moved by more than stagnation_drift. Catalyst was priced in
+        # or wasn't real; free the cash.
         decided_at = _parse_iso(trade["decided_at"])
-        if decided_at is not None and now - decided_at >= timeout:
-            return "timeout"
+        if decided_at is not None:
+            age = now - decided_at
+            if current_mid is not None and self._cfg.stagnation_minutes > 0:
+                stag_age = timedelta(minutes=int(self._cfg.stagnation_minutes))
+                if age >= stag_age and abs(float(current_mid) - entry) < float(self._cfg.stagnation_drift):
+                    return "stagnation"
+            # 5. timeout — catchall.
+            if age >= timeout:
+                return "timeout"
         return None
 
     async def _fetch_open_trades(self) -> list[dict]:
         cur = await self._db.conn.execute(
             """
             SELECT t.id, t.signal_id, t.market_id, t.direction, t.mid_price,
-                   t.size_usdc, t.decided_at, t.is_tracer, t.tracer_id
+                   t.size_usdc, t.decided_at, t.is_tracer, t.tracer_id,
+                   t.target_mid
             FROM trades t
             LEFT JOIN trade_closures c ON c.trade_id = t.id
             WHERE c.id IS NULL
@@ -279,6 +303,7 @@ class CloserStage:
                 "decided_at": r["decided_at"],
                 "is_tracer": int(r["is_tracer"] or 0),
                 "tracer_id": r["tracer_id"],
+                "target_mid": (float(r["target_mid"]) if r["target_mid"] is not None else None),
             }
             for r in rows
         ]

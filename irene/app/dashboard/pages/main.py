@@ -18,15 +18,18 @@ from ..io import _now, _percentiles
 
 
 async def _fetch_open_trades(dash) -> list[dict]:
+    # Cycle 3: per-cycle isolation — only current-cycle trades.
+    cycle_id = dash.current_cycle_id
+    cycle_sql = f"AND t.cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT t.id, t.market_id, t.direction, t.mid_price AS entry_mid,
-               t.size_usdc, t.decided_at, t.decision_path,
+               t.size_usdc, t.decided_at, t.decision_path, t.target_mid,
                m.token_yes, m.token_no, m.question
         FROM trades t
         LEFT JOIN trade_closures c ON c.trade_id = t.id
         LEFT JOIN markets m ON m.condition_id = t.market_id
-        WHERE c.id IS NULL AND t.is_tracer = 0
+        WHERE c.id IS NULL AND t.is_tracer = 0 {cycle_sql}
         ORDER BY t.decided_at DESC
         """
     )
@@ -37,13 +40,16 @@ async def _fetch_open_trades(dash) -> list[dict]:
 
 async def _fetch_closed_pairs(dash) -> tuple[list[dict], list[dict], list[dict]]:
     """Returns (closed_trades, closed_pairs_for_exit_value, closures)."""
+    cycle_id = dash.current_cycle_id
+    cycle_sql = f"AND t.cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT t.id, t.size_usdc, t.direction, t.mid_price AS entry_mid,
+               t.decision_path,
                c.exit_mid_price, c.realized_pnl_usdc, c.close_reason
         FROM trades t
         JOIN trade_closures c ON c.trade_id = t.id
-        WHERE t.is_tracer = 0
+        WHERE t.is_tracer = 0 {cycle_sql}
         """
     )
     rows = await cur.fetchall()
@@ -78,23 +84,28 @@ FILENAME = "dashboard.txt"
 
 async def render(dash) -> str:
     uptime = time.monotonic() - dash._t_boot
+    # Cycle 3: filter live counts by current cycle so the dashboard
+    # looks fresh per cycle. Old cycles' data stays in the DB for
+    # chunker analysis but never bleeds into the live numbers.
+    cycle_id = dash.current_cycle_id
+    cycle_filter = f"AND cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     lines = [
         f"# irene dashboard ({_now().isoformat()})",
-        f"uptime: {uptime:.0f}s",
+        f"uptime: {uptime:.0f}s    cycle_id: {cycle_id if cycle_id is not None else '?'}",
         "",
     ]
     for sql, label in (
-        ("SELECT COUNT(*) FROM articles WHERE ingested_at >= datetime('now','-1 hour')",
+        (f"SELECT COUNT(*) FROM articles WHERE ingested_at >= datetime('now','-1 hour') {cycle_filter}",
          "articles ingested (1h)"),
-        ("SELECT COUNT(*) FROM signals  WHERE created_at  >= datetime('now','-1 hour')",
+        (f"SELECT COUNT(*) FROM signals  WHERE created_at  >= datetime('now','-1 hour') {cycle_filter}",
          "signals matched   (1h)"),
-        ("SELECT COUNT(*) FROM trades   WHERE decided_at  >= datetime('now','-1 hour')",
+        (f"SELECT COUNT(*) FROM trades   WHERE decided_at  >= datetime('now','-1 hour') {cycle_filter}",
          "trades decided    (1h)"),
-        ("SELECT COUNT(*) FROM decisions WHERE outcome='execute' AND "
-         "created_at >= datetime('now','-1 hour')",
+        (f"SELECT COUNT(*) FROM decisions WHERE outcome='execute' AND "
+         f"created_at >= datetime('now','-1 hour') {cycle_filter}",
          "trades executed   (1h)"),
-        ("SELECT COUNT(*) FROM decisions WHERE outcome='reject'  AND "
-         "created_at >= datetime('now','-1 hour')",
+        (f"SELECT COUNT(*) FROM decisions WHERE outcome='reject'  AND "
+         f"created_at >= datetime('now','-1 hour') {cycle_filter}",
          "trades rejected   (1h)"),
     ):
         n = await scalar(dash.db, sql)
@@ -145,7 +156,7 @@ async def render(dash) -> str:
     n_total = n_y + n_n + n_p + n_u + n_r + n_q + n_legacy
     pf_pct = 100.0 * n_parse_fail / max(n_total + n_parse_fail, 1)
     lines.append(
-        f"  v5 labels  (1h): Y {n_y:>3d}  N {n_n:>3d}  P {n_p:>3d}  "
+        f"  labels (1h): Y {n_y:>3d}  N {n_n:>3d}  P {n_p:>3d}  "
         f"U {n_u:>3d}  R {n_r:>3d}  ? {n_q:>3d}    parse_fail {n_parse_fail} ({pf_pct:.0f}%)"
     )
     if n_legacy:
@@ -217,6 +228,7 @@ async def render(dash) -> str:
             "direction": t["direction"],
             "entry_mid": float(t["entry_mid"]),
             "current_mid": cur_mid,
+            "target_mid": (float(t["target_mid"]) if t.get("target_mid") is not None else None),
             "size_usdc": float(t["size_usdc"]),
             "decision_path": t["decision_path"],
             "market_id": t["market_id"],
@@ -261,9 +273,15 @@ async def render(dash) -> str:
     for c in closures:
         # closures don't carry decision_path; join via trades for the rollup.
         pass
-    # Per-path open invested
-    for path in sorted(by_path_open):
-        rows = by_path_open[path]
+    # Per-path closure rollup (cycle 3).
+    by_path_closed_pnl: dict[str, list[float]] = {}
+    for c in closures:
+        path = (c.get("decision_path") or "mvp")
+        by_path_closed_pnl.setdefault(path, []).append(float(c["realized_pnl_usdc"]))
+    # Per-path attribution: open invested+current + closed n + realized PnL.
+    paths = sorted(set(by_path_open) | set(by_path_closed_pnl))
+    for path in paths:
+        rows = by_path_open.get(path, [])
         inv = sum(r["size_usdc"] for r in rows)
         val = sum(
             wallet.position_value(r["direction"], r["entry_mid"],
@@ -271,7 +289,13 @@ async def render(dash) -> str:
                                   r["size_usdc"])
             for r in rows
         )
-        lines.append(f"    {path:<4} {len(rows):>2d} open  invested ${inv:>7.2f}  current ${val:>7.2f}")
+        closed_pnls = by_path_closed_pnl.get(path, [])
+        closed_n = len(closed_pnls)
+        closed_realized = sum(closed_pnls)
+        lines.append(
+            f"    {path:<4} open {len(rows):>2d}  inv ${inv:>7.2f}  cur ${val:>7.2f}  "
+            f"closed {closed_n:>3d}  realized {closed_realized:>+8.2f}"
+        )
 
     # Recent open positions detail (5 newest)
     if open_with_mid:
@@ -289,9 +313,12 @@ async def render(dash) -> str:
                 priced = f"mid {cur_mid:>5.3f}"
                 upnl_str = f"{upnl_t:>+7.3f}"
             decided = (t["decided_at"] or "")[11:19]
+            tgt = t.get("target_mid")
+            tgt_str = f"target {tgt:>5.3f}" if tgt is not None else "target  -   "
             lines.append(
                 f"  [{decided}] {t['decision_path']:<3} {t['direction']:<3} "
-                f"${t['size_usdc']:>5.2f} @ {t['entry_mid']:>5.3f} → {priced}  upnl {upnl_str}  "
+                f"${t['size_usdc']:>5.2f} @ {t['entry_mid']:>5.3f} → {priced}  "
+                f"{tgt_str}  upnl {upnl_str}  "
                 f'"{q}"'
             )
 

@@ -10,6 +10,7 @@ from . import (
     funnel_dropoff,
     latency_histogram,
     latency_timeseries,
+    missed_edge,
     news_staleness,
     per_gate_rejection,
     pnl_cumulative,
@@ -22,4 +23,5 @@ PLOTS = [
     news_staleness,
     per_gate_rejection,
     pnl_cumulative,
+    missed_edge,
 ]

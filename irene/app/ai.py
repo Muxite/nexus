@@ -106,12 +106,13 @@ _VALID_LABELS = ("Y", "N", "P", "U", "R")
 _SYSTEM_MESSAGE = (
     "You are a fast-trading market evaluator. Read the News and choose "
     "one label for the Market Condition.\n"
-    "Reply with JSON only:\n"
-    '  {"a":"Y"}  trade YES — news strongly supports condition is TRUE.\n'
-    '  {"a":"N"}  trade NO  — news strongly supports condition is FALSE.\n'
-    '  {"a":"P"}  pass     — news IS about this market but evidence is weak.\n'
-    '  {"a":"U"}  uncertain — you can\'t tell which way this news cuts.\n'
-    '  {"a":"R"}  mismatch — news is NOT actually about this market.\n'
+    "Reply with JSON only — exactly one of:\n"
+    '  {"a":"Y","c":<0-9>}  trade YES — news strongly supports condition is TRUE. c=0 weakest, c=9 strongest.\n'
+    '  {"a":"N","c":<0-9>}  trade NO  — news strongly supports condition is FALSE. c=0 weakest, c=9 strongest.\n'
+    '  {"a":"P"}            pass     — news IS about this market but evidence is weak.\n'
+    '  {"a":"U"}            uncertain — you can\'t tell which way this news cuts.\n'
+    '  {"a":"R"}            mismatch — news is NOT actually about this market.\n'
+    "Use the field 'a' for the letter (Y/N/P/U/R) and 'c' for the confidence digit on Y/N.\n"
     "No prose, no explanation — JSON only."
 )
 
@@ -218,8 +219,8 @@ def _now_iso() -> str:
 
 
 _LABEL_TO_DIRECTION = {
-    "Y": ("YES", 1.0),
-    "N": ("NO", 1.0),
+    "Y": ("YES", 0.80),       # default conf; raised by digit 'c' if present
+    "N": ("NO", 0.80),
     # Pass / Uncertain / Mismatch all reduce to NEUTRAL for the gate
     # cascade — the raw letter lives on `predictions.label` for the
     # dashboard + chunk analysis to read.
@@ -227,6 +228,57 @@ _LABEL_TO_DIRECTION = {
     "U": ("NEUTRAL", 0.0),
     "R": ("NEUTRAL", 0.0),
 }
+
+# Multi-letter words the model is most likely to write instead of the
+# single-char label. ANY OTHER VALUE rejects with None — this is what
+# fixes the v5 bug where {"decision":"NEUTRAL"} got misread as NO
+# (first char 'N' of the value).
+_WORD_TO_LABEL = {
+    "YES": "Y",
+    "NO": "N",
+    "PASS": "P",
+    "UNCERTAIN": "U",
+    "NEUTRAL": "U",  # alias — model often says NEUTRAL meaning U
+    "MISMATCH": "R",
+    "RETRIEVAL": "R",
+}
+
+
+def _confidence_from_digit(c) -> float:
+    """Map 0-9 → [0.55, 0.95] so Kelly actually varies. None / out-of-range
+    → default 0.80 so v6-without-digit answers still trade.
+    """
+    if c is None:
+        return 0.80
+    try:
+        n = int(c)
+    except (TypeError, ValueError):
+        return 0.80
+    if n < 0 or n > 9:
+        return 0.80
+    val = 0.50 + n * 0.05
+    return max(0.55, min(0.95, val))
+
+
+def _interpret_value(s: str) -> str | None:
+    """Return a normalised single-char label (Y/N/P/U/R) or None.
+
+    Strictly:
+    - exact 1 char, case-insensitive, in {Y, N, P, U, R}
+    - OR exact full word matching _WORD_TO_LABEL (case-insensitive)
+    Any other string → None. This is what stopped the v5 parser from
+    misreading {"decision":"NEUTRAL"} as a NO trade.
+    """
+    if not isinstance(s, str):
+        return None
+    t = s.strip().upper()
+    if not t:
+        return None
+    if len(t) == 1 and t in _LABEL_TO_DIRECTION:
+        return t
+    if t in _WORD_TO_LABEL:
+        return _WORD_TO_LABEL[t]
+    return None
 
 
 def _parse_response(raw: str) -> tuple[str, float, str] | None:
@@ -257,19 +309,35 @@ def _parse_response(raw: str) -> tuple[str, float, str] | None:
     except (json.JSONDecodeError, ValueError):
         obj = None
     if isinstance(obj, dict):
-        for v in obj.values():
-            if isinstance(v, str) and v.strip():
-                ch = v.strip()[0].upper()
-                if ch in _LABEL_TO_DIRECTION:
-                    direction, conf = _LABEL_TO_DIRECTION[ch]
-                    return direction, conf, ch
+        # v6 strict: look for the answer in a preferred field ('a' or 'answer'),
+        # else any value matching _interpret_value. Then look for 'c' digit.
+        label: str | None = None
+        for key in ("a", "answer", "decision", "resolution", "result"):
+            if key in obj:
+                label = _interpret_value(obj[key])
+                if label is not None:
+                    break
+        if label is None:
+            for v in obj.values():
+                label = _interpret_value(v if isinstance(v, str) else "")
+                if label is not None:
+                    break
+        if label is None:
+            return None
+        direction, default_conf = _LABEL_TO_DIRECTION[label]
+        # Y/N can be paired with a confidence digit; P/U/R stay at 0.0.
+        if direction in ("YES", "NO"):
+            conf = _confidence_from_digit(obj.get("c"))
+        else:
+            conf = default_conf
+        return direction, conf, label
+    # Fallback: bare-string output without JSON envelope. Must be an
+    # exact single-letter or exact full word — no scanning.
+    label = _interpret_value(s)
+    if label is None:
         return None
-    # Fallback: bare-char output (Y / N / P / U / R / "yes" / etc.). First char wins.
-    ch = s[0].upper()
-    if ch in _LABEL_TO_DIRECTION:
-        direction, conf = _LABEL_TO_DIRECTION[ch]
-        return direction, conf, ch
-    return None
+    direction, conf = _LABEL_TO_DIRECTION[label]
+    return direction, conf, label
 
 
 class AIClient:
@@ -278,7 +346,7 @@ class AIClient:
     # "strictly entails" to "strongly supports". Bumping the version
     # invalidates the llm_calls cache so the 47%-parse-failure rows from
     # v2-fast don't poison the new regime.
-    PROMPT_VERSION: str = "v5-5label"
+    PROMPT_VERSION: str = "v6-strict"
 
     def __init__(self, *, db: DB, budget: Budget, config: Config) -> None:
         self._db = db

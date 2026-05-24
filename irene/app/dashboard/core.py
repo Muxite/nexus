@@ -33,6 +33,10 @@ class Dashboard:
     # check for None.
     budget: Optional[object] = None
     cfg: Optional[object] = None
+    # Cycle 3: dashboard pages filter all "live" data by current_cycle_id
+    # so each cycle looks fresh. Old data stays in the DB for chunker /
+    # post-mortem analysis but never appears on the live dashboard.
+    current_cycle_id: Optional[int] = None
     _task: Optional[asyncio.Task] = None
     _plot_task: Optional[asyncio.Task] = None
     _stopped: bool = False

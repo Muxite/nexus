@@ -146,7 +146,13 @@ _TRADE_DDL = [
         tracer_id       TEXT,
         decided_at      TEXT NOT NULL,
         closed_at       TEXT,
-        realized_pnl    REAL
+        realized_pnl    REAL,
+        -- v6 (cycle 3): the model-implied "edge collapses to here" price.
+        -- Closer's edge_decay rule fires when current_mid crosses it.
+        -- For YES: target_mid = p_hat - fee_buffer.
+        -- For NO:  target_mid = (1 - p_hat) + fee_buffer.
+        -- NULL on legacy rows; rule skips when NULL.
+        target_mid      REAL
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_trades_market_id ON trades(market_id)",
@@ -448,9 +454,11 @@ class TradeStage:
         gate_history.append(_gate_entry("size", "ok", size, self._cfg.min_position_usdc))
 
         # 6. cash (paper wallet) ---------------------------------------------
-        # Don't open a position larger than what's left in the wallet —
-        # this keeps the accounting identity sane and matches what a real
-        # wallet would do. Cash = initial - sum(open trade sizes).
+        # Cycle 3: CLIP size to fit available cash instead of rejecting
+        # outright. Multiple concurrent signals on the same market can
+        # add to exposure up to whatever cash allows. Only when even the
+        # clipped size falls below min_position_usdc do we reject.
+        # Cash = initial - sum(open trade sizes), never negative.
         cur = await self._db.conn.execute(
             "SELECT COALESCE(SUM(t.size_usdc), 0) "
             "FROM trades t LEFT JOIN trade_closures c ON c.trade_id=t.id "
@@ -460,7 +468,7 @@ class TradeStage:
         await cur.close()
         open_invested = float(row[0] or 0.0)
         cash_available = self._cfg.balance_usdc - open_invested
-        if size > cash_available:
+        if cash_available <= 0.0:
             gate_history.append(
                 _gate_entry("cash", "reject", size, cash_available)
             )
@@ -474,7 +482,28 @@ class TradeStage:
                 tracer_id=tracer_id,
             )
             return
-        gate_history.append(_gate_entry("cash", "ok", size, cash_available))
+        if size > cash_available:
+            # Clip — note the original requested size in gate_history.
+            gate_history.append(
+                _gate_entry("cash", "clip", size, cash_available)
+            )
+            size = cash_available
+            if size < self._cfg.min_position_usdc:
+                gate_history.append(
+                    _gate_entry("size_after_clip", "reject", size, self._cfg.min_position_usdc)
+                )
+                await self._record_reject(
+                    signal_id=int(signal_id),
+                    reason="size_below_min",
+                    gate_history=gate_history,
+                    prediction_id=result.prediction_id,
+                    cycle_id=cycle_id,
+                    is_tracer=is_tracer,
+                    tracer_id=tracer_id,
+                )
+                return
+        else:
+            gate_history.append(_gate_entry("cash", "ok", size, cash_available))
 
         # Execute path --------------------------------------------------------
         features_snapshot = {
@@ -758,6 +787,15 @@ class TradeStage:
         is_tracer: bool,
         tracer_id: Optional[str],
     ) -> Optional[int]:
+        # v6: derive the target_mid where the model's edge collapses.
+        # For YES the price moves UP toward our p_hat; for NO it moves DOWN
+        # toward (1 - p_hat). fee_buffer is the cushion below the model's
+        # estimate to leave a margin for spread+fees.
+        fee_buffer = float(self._cfg.fee_buffer)
+        if direction == "YES":
+            target_mid = max(0.0, min(1.0, float(p_hat) - fee_buffer))
+        else:  # NO
+            target_mid = max(0.0, min(1.0, (1.0 - float(p_hat)) + fee_buffer))
         async with self._db.batch() as cur:
             await cur.execute(
                 """
@@ -765,8 +803,8 @@ class TradeStage:
                     (signal_id, decision_id, prediction_id, market_id, direction,
                      confidence, similarity, freshness, p_hat, mid_price, edge,
                      kelly_fraction, size_usdc, decision_path, features_snapshot,
-                     cycle_id, is_tracer, tracer_id, decided_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?)
+                     cycle_id, is_tracer, tracer_id, decided_at, target_mid)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal_id,
@@ -787,6 +825,7 @@ class TradeStage:
                     1 if is_tracer else 0,
                     tracer_id,
                     _now_iso(),
+                    target_mid,
                 ),
             )
             if cur.rowcount != 1:

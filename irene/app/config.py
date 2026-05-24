@@ -154,30 +154,36 @@ class CLOBSection(BaseModel):
 class CloserSection(BaseModel):
     """Position-closer poll cadence + close rules.
 
-    Cycle-2 added stop_loss + take_profit; original timeout stays as the
-    fallback. Rules evaluate in order: take_profit, stop_loss, timeout —
-    first one that fires wins.
+    Rule eval order (cycle 3): edge_decay → take_profit → stop_loss →
+    stagnation → timeout. First match wins. edge_decay uses the
+    model's target_mid (written by trade.py at execute time); the
+    others are absolute thresholds.
     """
 
-    poll_seconds: int = Field(default=60, ge=1)
-    # `0.0` is a legitimate value (used by the soak harness to fire the
-    # timeout rule on every poll). Production configs should never set
-    # this lower than ~1 hour.
-    timeout_hours: float = Field(default=24.0, ge=0.0)
+    poll_seconds: int = Field(default=15, ge=1)
+    # Catchall. Cycle 3 dropped from 24h to 1.5h — news-shock
+    # arbitrage windows close in minutes; 90 min is the dead-money cutoff.
+    timeout_hours: float = Field(default=1.5, ge=0.0)
     # When CLOB can't return a mid for an open trade, hold the position
     # rather than close it at the default; closer just skips this cycle.
     skip_on_missing_mid: bool = True
     # take_profit / stop_loss are fractions of the trade's `size_usdc`.
-    # 0.0 disables the rule. Defaults: lock in a 50% gain or cut a 30%
-    # loss. Tunable per soak.
+    # 0.0 disables the rule. edge_decay (target_mid hit) covers normal
+    # exits; these are the safety net for blown predictions.
     take_profit_pct: float = Field(default=0.50, ge=0.0, le=10.0)
     stop_loss_pct: float = Field(default=0.30, ge=0.0, le=1.0)
+    # Cycle 3: stagnation rule. If position has aged past
+    # stagnation_minutes AND the mid hasn't moved by more than
+    # stagnation_drift, close — the catalyst either priced in instantly
+    # or wasn't real; free the cash for the next signal.
+    stagnation_minutes: int = Field(default=30, ge=1)
+    stagnation_drift: float = Field(default=0.02, ge=0.0, le=1.0)
 
 
 class ImpactSection(BaseModel):
     """Impact-tracker poll cadence."""
 
-    poll_seconds: int = Field(default=30, ge=5)
+    poll_seconds: int = Field(default=15, ge=5)
     # Maximum age (hours) we keep polling a price_impacts row. After this
     # we stop polling even if some buckets are NULL — the t=3600s bucket
     # is the last interesting one anyway.

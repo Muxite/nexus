@@ -89,8 +89,11 @@ async def render(dash) -> str:
         f"  all non-tracer decisions (cap {LIMIT}), newest first — full audit trail",
         "",
     ]
+    # Cycle 3: filter by current cycle_id so the dashboard looks fresh.
+    cycle_id = dash.current_cycle_id
+    cycle_sql = f"AND d.cycle_id = {int(cycle_id)}" if cycle_id is not None else ""
     cur = await dash.db.conn.execute(
-        """
+        f"""
         SELECT
             d.created_at,
             d.outcome,
@@ -115,7 +118,7 @@ async def render(dash) -> str:
         LEFT JOIN trades      t ON t.decision_id = d.id
         LEFT JOIN articles    a ON a.id = s.article_id
         LEFT JOIN markets     m ON m.condition_id = s.market_id
-        WHERE d.is_tracer = 0
+        WHERE d.is_tracer = 0 {cycle_sql}
         ORDER BY d.created_at DESC
         LIMIT ?
         """,

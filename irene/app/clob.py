@@ -54,6 +54,60 @@ class CLOBClient:
             await self._client.aclose()
             self._client = None
 
+    async def get_price_history(
+        self,
+        token_id: str,
+        *,
+        interval: str = "1h",
+        fidelity: int = 10,
+    ) -> Optional[list[tuple[int, float]]]:
+        """Fetch the price-history time series for a token from
+        `GET /prices-history?market=<id>&interval=<i>&fidelity=<f>`.
+        Returns a list of `(unix_ts, mid_price)` tuples, newest last.
+        `None` on any failure (network, non-2xx, malformed body).
+
+        Polymarket rejects `interval=1m` with the error
+        `"minimum 'fidelity' for '1m' range is 10"` — use `1h` or `6h`
+        for the missed-edge plot window.
+        """
+        if not token_id:
+            return None
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        url = f"{self._base_url}/prices-history"
+        try:
+            resp = await self._client.get(
+                url, params={"market": token_id, "interval": interval, "fidelity": fidelity}
+            )
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "clob: get_price_history(%s) network error: %s",
+                token_id, exc.__class__.__name__,
+            )
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "clob: get_price_history(%s) status %d", token_id, resp.status_code,
+            )
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            logger.warning("clob: get_price_history(%s) unparseable JSON", token_id)
+            return None
+        history = body.get("history")
+        if not isinstance(history, list):
+            return None
+        out: list[tuple[int, float]] = []
+        for pt in history:
+            t = pt.get("t")
+            p = pt.get("p")
+            try:
+                out.append((int(t), float(p)))
+            except (TypeError, ValueError):
+                continue
+        return out or None
+
     async def get_mid(self, token_id: str) -> Optional[float]:
         if not token_id:
             return None

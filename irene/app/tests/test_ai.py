@@ -118,33 +118,62 @@ async def ai(db_ready, monkeypatch):
 
 
 def test_parse_response_happy():
-    # v5-5label: returns (direction, confidence, label).
-    assert _parse_response("Y") == ("YES", 1.0, "Y")
-    assert _parse_response("N") == ("NO", 1.0, "N")
+    # v6-strict: returns (direction, confidence, label). Default conf 0.80 for Y/N
+    # without a digit; P/U/R always 0.0.
+    assert _parse_response("Y") == ("YES", 0.80, "Y")
+    assert _parse_response("N") == ("NO", 0.80, "N")
     assert _parse_response("U") == ("NEUTRAL", 0.0, "U")
-    # New v5 labels: P (pass) and R (retrieval mismatch).
     assert _parse_response("P") == ("NEUTRAL", 0.0, "P")
     assert _parse_response("R") == ("NEUTRAL", 0.0, "R")
     # Case-insensitive + tolerates whitespace.
-    assert _parse_response("y") == ("YES", 1.0, "Y")
-    assert _parse_response(" Y ") == ("YES", 1.0, "Y")
+    assert _parse_response("y") == ("YES", 0.80, "Y")
+    assert _parse_response(" Y ") == ("YES", 0.80, "Y")
     assert _parse_response("u\n") == ("NEUTRAL", 0.0, "U")
-    # First character wins (provider sometimes emits trailing text).
-    assert _parse_response("Yes, definitely") == ("YES", 1.0, "Y")
-    # v3: tolerates markdown code fences (Gemini-2.5-flash prefixes ```).
-    assert _parse_response("```Y") == ("YES", 1.0, "Y")
-    assert _parse_response("```N\n```") == ("NO", 1.0, "N")
+    # v3: markdown code fences stripped first.
+    assert _parse_response("```Y") == ("YES", 0.80, "Y")
+    assert _parse_response("```N\n```") == ("NO", 0.80, "N")
     assert _parse_response("```\nU\n```") == ("NEUTRAL", 0.0, "U")
-    assert _parse_response("```P") == ("NEUTRAL", 0.0, "P")
-    # v4: JSON answer envelope per the new prompt contract.
-    assert _parse_response('{"a":"Y"}') == ("YES", 1.0, "Y")
-    assert _parse_response('{"a":"N"}') == ("NO", 1.0, "N")
+    # v4: JSON answer envelope.
+    assert _parse_response('{"a":"Y"}') == ("YES", 0.80, "Y")
+    assert _parse_response('{"a":"N"}') == ("NO", 0.80, "N")
     assert _parse_response('{"a":"P"}') == ("NEUTRAL", 0.0, "P")
     assert _parse_response('{"a":"U"}') == ("NEUTRAL", 0.0, "U")
     assert _parse_response('{"a":"R"}') == ("NEUTRAL", 0.0, "R")
-    assert _parse_response('```json\n{"a":"Y"}\n```') == ("YES", 1.0, "Y")
-    assert _parse_response('```json\n{"answer":"Y"}\n```') == ("YES", 1.0, "Y")
-    assert _parse_response('{"answer":"NO"}') == ("NO", 1.0, "N")
+    # JSON with full-word values (the v5-bug regression test):
+    # {"decision":"NEUTRAL"} MUST map to U/NEUTRAL, NOT to N/NO.
+    assert _parse_response('{"decision":"NEUTRAL"}') == ("NEUTRAL", 0.0, "U")
+    assert _parse_response('{"resolution":"NEUTRAL"}') == ("NEUTRAL", 0.0, "U")
+    assert _parse_response('{"answer":"YES"}') == ("YES", 0.80, "Y")
+    assert _parse_response('{"answer":"NO"}') == ("NO", 0.80, "N")
+    assert _parse_response('{"a":"PASS"}') == ("NEUTRAL", 0.0, "P")
+    # Fenced wrap still works.
+    assert _parse_response('```json\n{"a":"Y"}\n```') == ("YES", 0.80, "Y")
+    # Multi-char garbage values reject (NOT classified by first char).
+    assert _parse_response('{"a":"Maybe"}') is None
+    assert _parse_response('{"a":"YESsir"}') is None
+    # Bare strings: exact match or word required (no first-char scan).
+    assert _parse_response("YES") == ("YES", 0.80, "Y")
+    assert _parse_response("Maybe") is None
+    assert _parse_response("Yes, definitely") is None
+
+
+def test_parse_response_confidence_digit():
+    # c=9 → conf=0.95 (max), c=0 → conf=0.55 (min after clamp).
+    assert _parse_response('{"a":"Y","c":9}') == ("YES", 0.95, "Y")
+    assert _parse_response('{"a":"Y","c":0}') == ("NEUTRAL", 0.0, "Y") or \
+           _parse_response('{"a":"Y","c":0}')[1] == pytest.approx(0.55)
+    # c=5 → conf=0.75
+    d, conf, label = _parse_response('{"a":"N","c":5}')
+    assert d == "NO" and label == "N" and conf == pytest.approx(0.75)
+    # c missing on Y/N → default 0.80
+    assert _parse_response('{"a":"Y"}')[1] == 0.80
+    # P/U/R ignore the digit entirely (always conf=0.0)
+    assert _parse_response('{"a":"P","c":9}') == ("NEUTRAL", 0.0, "P")
+    # Out-of-range digit → default 0.80
+    assert _parse_response('{"a":"Y","c":99}')[1] == 0.80
+    assert _parse_response('{"a":"Y","c":-1}')[1] == 0.80
+    # Garbage digit type → default 0.80
+    assert _parse_response('{"a":"Y","c":"high"}')[1] == 0.80
 
 
 @pytest.mark.parametrize(
@@ -174,9 +203,9 @@ async def test_direction_happy_path_writes_call_and_prediction(ai, db_ready):
         result = await client.direction(signal_id=10, prompt="news X market Y")
     assert isinstance(result, DirectionResult)
     assert result.direction == "YES"
-    # v2-fast: confidence is fixed (Y/N → 1.0, U → 0.0). The arg to
-    # _ok_response is preserved for ergonomics but no longer round-trips.
-    assert result.confidence == 1.0
+    # v6-strict: Y/N default confidence is 0.80 (no 'c' digit in response).
+    # P/U/R fixed at 0.0. The arg to _ok_response is ignored at parse time.
+    assert result.confidence == 0.80
     assert result.cached is False
     assert budget.ok_count == 1
     assert budget.f402_count == 0
@@ -186,7 +215,7 @@ async def test_direction_happy_path_writes_call_and_prediction(ai, db_ready):
     cur = await db_ready.conn.execute("SELECT direction, confidence, cached FROM predictions WHERE signal_id=10")
     row = await cur.fetchone()
     assert row["direction"] == "YES"
-    assert row["confidence"] == 1.0
+    assert row["confidence"] == 0.80
     assert row["cached"] == 0
     cur = await db_ready.conn.execute("SELECT COUNT(*) FROM llm_parse_failures")
     assert (await cur.fetchone())[0] == 0
@@ -203,7 +232,7 @@ async def test_direction_second_call_same_prompt_is_cache_hit(ai, db_ready):
     assert first.direction == "NO"
     assert first.cached is False
     assert second.direction == "NO"           # cache served the original
-    assert second.confidence == 1.0           # v2-fast: NO → 1.0 fixed
+    assert second.confidence == 0.80          # v6-strict: NO default conf 0.80
     assert second.cached is True
 
     cur = await db_ready.conn.execute("SELECT COUNT(*) FROM llm_calls")
