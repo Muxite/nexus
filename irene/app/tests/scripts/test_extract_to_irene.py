@@ -33,6 +33,7 @@ import app.stages.trade  # noqa: F401
 import app.ai  # noqa: F401
 from app.db import DB
 from app.timing import ProfileStore, SampledTimer
+from app.sbert_dedupe import EntityIndex
 from scripts.dkg.extract_to_irene import (
     CallResult,
     _extract_content,
@@ -247,7 +248,7 @@ def test_persist_ok_writes_entities_and_facts(irene_conn):
     )
     sbert, db = _make_timers()
     run_id = _persist_extraction(
-        irene_conn, embedder=_FakeEmbedder(),
+        irene_conn, embedder=_FakeEmbedder(), entity_index=None,
         article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
@@ -284,7 +285,7 @@ def test_persist_duplicate_returns_zero_and_no_writes(irene_conn):
     )
     sbert, db = _make_timers()
     run_id_1 = _persist_extraction(
-        irene_conn, embedder=_FakeEmbedder(),
+        irene_conn, embedder=_FakeEmbedder(), entity_index=None,
         article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
@@ -292,7 +293,7 @@ def test_persist_duplicate_returns_zero_and_no_writes(irene_conn):
     assert run_id_1 > 0
     # Second call with same (article, model, prompt_v, ontology_v) is a no-op.
     run_id_2 = _persist_extraction(
-        irene_conn, embedder=_FakeEmbedder(),
+        irene_conn, embedder=_FakeEmbedder(), entity_index=None,
         article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
@@ -308,7 +309,7 @@ def test_persist_empty_status_writes_run_no_facts(irene_conn):
     result = CallResult(status="empty", parsed_facts=[])
     sbert, db = _make_timers()
     run_id = _persist_extraction(
-        irene_conn, embedder=_FakeEmbedder(),
+        irene_conn, embedder=_FakeEmbedder(), entity_index=None,
         article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,
@@ -317,6 +318,51 @@ def test_persist_empty_status_writes_run_no_facts(irene_conn):
     assert irene_conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0] == 0
     er = irene_conn.execute("SELECT status FROM extraction_runs WHERE article_id=?", (aid,)).fetchone()
     assert er["status"] == "empty"
+
+
+def test_persist_with_index_warms_and_registers(irene_conn):
+    """When an EntityIndex is passed in, new entities land in both the
+    DB and the in-memory index — and subsequent persist calls hit the
+    index fast path instead of the SQL."""
+    aid1 = _insert_article(irene_conn, url="http://a.example", title="A")
+    aid2 = _insert_article(irene_conn, url="http://b.example", title="B")
+    result_a = CallResult(
+        status="ok",
+        parsed_facts=[
+            {"subj": "FDA", "subj_type": "ORG", "relation": "decides",
+             "obj": "Pfizer", "obj_type": "COMPANY", "obj_value": None},
+        ],
+    )
+    result_b = CallResult(
+        status="ok",
+        parsed_facts=[
+            {"subj": "FDA", "subj_type": "ORG", "relation": "announces",
+             "obj": None, "obj_type": None, "obj_value": None},
+        ],
+    )
+    sbert, db = _make_timers()
+    index = EntityIndex()
+    _persist_extraction(
+        irene_conn, embedder=_FakeEmbedder(), entity_index=index,
+        article_id=aid1, cycle_id=1, is_tracer=0, tracer_id=None,
+        model="m-1", result=result_a,
+        sbert_timer=sbert, db_timer=db,
+    )
+    # Index now contains FDA and Pfizer.
+    assert index.by_canonical("ORG", "FDA") is not None
+    assert index.by_canonical("COMPANY", "Pfizer") is not None
+    # Second article re-uses FDA.
+    _persist_extraction(
+        irene_conn, embedder=_FakeEmbedder(), entity_index=index,
+        article_id=aid2, cycle_id=1, is_tracer=0, tracer_id=None,
+        model="m-1", result=result_b,
+        sbert_timer=sbert, db_timer=db,
+    )
+    # Still only one FDA row in the DB.
+    n = irene_conn.execute(
+        "SELECT COUNT(*) FROM entities WHERE entity_type='ORG' AND canonical_name='FDA'"
+    ).fetchone()[0]
+    assert n == 1
 
 
 def test_persist_parse_error_writes_only_run(irene_conn):
@@ -328,7 +374,7 @@ def test_persist_parse_error_writes_only_run(irene_conn):
     )
     sbert, db = _make_timers()
     run_id = _persist_extraction(
-        irene_conn, embedder=_FakeEmbedder(),
+        irene_conn, embedder=_FakeEmbedder(), entity_index=None,
         article_id=aid, cycle_id=1, is_tracer=0, tracer_id=None,
         model="m-1", result=result,
         sbert_timer=sbert, db_timer=db,

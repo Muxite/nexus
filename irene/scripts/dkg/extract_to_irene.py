@@ -76,7 +76,7 @@ import app.stages.trade  # noqa: F401
 import app.ai  # noqa: F401
 from app.db import DB
 from app.embed import Embedder
-from app.sbert_dedupe import find_or_create_entity
+from app.sbert_dedupe import EntityIndex, find_or_create_entity
 from app.timing import (
     ProfileStore,
     SampledTimer,
@@ -356,6 +356,7 @@ def _persist_extraction(
     irene_conn: sqlite3.Connection,
     *,
     embedder: Embedder,
+    entity_index: Optional[EntityIndex],
     article_id: int,
     cycle_id: int,
     is_tracer: int,
@@ -420,6 +421,7 @@ def _persist_extraction(
                     surface_name=surface,
                     embedder=embedder,
                     now_iso=now,
+                    index=entity_index,
                 )
             ent_id_by_surface[(etype, surface)] = eid
 
@@ -502,6 +504,7 @@ async def _worker(
     db_lock: asyncio.Lock,
     irene_conn: sqlite3.Connection,
     embedder: Embedder,
+    entity_index: Optional[EntityIndex],
     state: RunState,
     progress_every: int,
     llm_timer: SampledTimer,
@@ -549,6 +552,7 @@ async def _worker(
                 run_id = _persist_extraction(
                     irene_conn,
                     embedder=embedder,
+                    entity_index=entity_index,
                     article_id=int(row["id"]),
                     cycle_id=int(row["cycle_id"]),
                     is_tracer=int(row["is_tracer"] or 0),
@@ -636,6 +640,23 @@ async def _run_async(
         # one-shot model load — that would be a huge outlier in p50.
         _ = embedder.embed("warmup")
 
+        # EntityIndex: lazy per-type in-memory matrix. Pre-warm every type
+        # the LLM might emit so the first article doesn't pay the load cost
+        # under the timer.
+        entity_index = EntityIndex()
+        for etype in (
+            "COMPANY", "PERSON", "ORG", "COUNTRY",
+            "ECON_INDICATOR", "ASSET", "EVENT",
+        ):
+            entity_index.load(irene_conn.cursor(), etype)
+        logger.info(
+            "extract_to_irene: entity index warmed (%s)",
+            ", ".join(f"{t}={entity_index.size(t)}" for t in (
+                "COMPANY", "PERSON", "ORG", "COUNTRY",
+                "ECON_INDICATOR", "ASSET", "EVENT",
+            )),
+        )
+
         state = RunState(target=len(articles), budget_cap=budget_cap_usd)
         queue: asyncio.Queue = asyncio.Queue(maxsize=concurrency * 4)
         db_lock = asyncio.Lock()
@@ -645,7 +666,8 @@ async def _run_async(
                 asyncio.create_task(_worker(
                     client=client, api_key=api_key, model=model,
                     queue=queue, db_lock=db_lock, irene_conn=irene_conn,
-                    embedder=embedder, state=state,
+                    embedder=embedder, entity_index=entity_index,
+                    state=state,
                     progress_every=max(50, len(articles) // 100),
                     llm_timer=llm_timer, sbert_timer=sbert_timer,
                     db_timer=db_timer, e2e_timer=e2e_timer,

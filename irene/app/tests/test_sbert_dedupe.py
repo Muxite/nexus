@@ -23,6 +23,7 @@ import pytest
 import app.stages.extract  # noqa: F401
 from app.embed import Embedder
 from app.sbert_dedupe import (
+    EntityIndex,
     find_or_create_entity,
     score_against_existing,
 )
@@ -391,6 +392,140 @@ def test_empty_entity_type_raises(conn, monkeypatch):
 # ---------------------------------------------------------------------------
 # Mixed-dim safety
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# EntityIndex — in-memory cache + indexed find_or_create_entity
+# ---------------------------------------------------------------------------
+
+
+def test_entity_index_load_empty(conn):
+    idx = EntityIndex()
+    idx.load(conn.cursor(), "COMPANY")
+    assert idx.size("COMPANY") == 0
+    eid_match, canonical, cos = idx.best_match("COMPANY", np.zeros(4, dtype=np.float32))
+    assert eid_match is None
+    assert canonical == ""
+    assert cos == 0.0
+
+
+def test_entity_index_load_from_seeded_rows(conn):
+    v = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO entities (entity_type, canonical_name, embedding, embedder_id, "
+        "first_seen_at, last_seen_at) "
+        "VALUES ('COMPANY', 'Apple', ?, 'fake@4', '2026-01-01', '2026-01-01')",
+        (v.tobytes(),),
+    )
+    idx = EntityIndex()
+    idx.load(cur, "COMPANY")
+    assert idx.size("COMPANY") == 1
+    assert idx.by_canonical("COMPANY", "Apple") is not None
+    eid, name, cos = idx.best_match("COMPANY", v)
+    assert name == "Apple"
+    assert cos == pytest.approx(1.0)
+
+
+def test_entity_index_register_appends_and_searchable(conn):
+    idx = EntityIndex()
+    idx.load(conn.cursor(), "PERSON")
+    v1 = np.array([1.0, 0.0], dtype=np.float32)
+    v2 = np.array([0.0, 1.0], dtype=np.float32)
+    idx.register(entity_id=10, entity_type="PERSON",
+                 canonical_name="Putin", embedding=v1)
+    idx.register(entity_id=11, entity_type="PERSON",
+                 canonical_name="Trump", embedding=v2)
+    assert idx.size("PERSON") == 2
+    eid, name, _cos = idx.best_match("PERSON", v1)
+    assert eid == 10 and name == "Putin"
+    eid2, name2, _cos2 = idx.best_match("PERSON", v2)
+    assert eid2 == 11 and name2 == "Trump"
+
+
+def test_entity_index_dim_mismatch_on_register_raises(conn):
+    idx = EntityIndex()
+    idx.register(entity_id=1, entity_type="ORG",
+                 canonical_name="A", embedding=np.zeros(4, dtype=np.float32))
+    with pytest.raises(RuntimeError, match="dim mismatch"):
+        idx.register(entity_id=2, entity_type="ORG",
+                     canonical_name="B", embedding=np.zeros(8, dtype=np.float32))
+
+
+def test_find_or_create_with_index_exact_canonical(conn, monkeypatch):
+    emb = _install_fake_embedder(monkeypatch, out_dim=16)
+    cur = conn.cursor()
+    idx = EntityIndex()
+    # First call: insert + register.
+    eid1, kind1 = find_or_create_entity(
+        cur, entity_type="ORG", surface_name="FDA",
+        embedder=emb, now_iso="2026-05-24T00:00:00+00:00", index=idx,
+    )
+    assert kind1 == "inserted_new"
+    # Second call same surface: hits the index fast path, no SBERT, no SQL SELECT.
+    eid2, kind2 = find_or_create_entity(
+        cur, entity_type="ORG", surface_name="FDA",
+        embedder=emb, now_iso="2026-05-24T00:00:01+00:00", index=idx,
+    )
+    assert eid1 == eid2
+    assert kind2 == "exact_canonical"
+
+
+def test_find_or_create_with_index_sbert_merge(conn):
+    vp = np.array([0.9, 0.4, 0.0, 0.0], dtype=np.float32)
+    vp /= np.linalg.norm(vp)
+    vvp = np.array([0.95, 0.31, 0.0, 0.0], dtype=np.float32)
+    vvp /= np.linalg.norm(vvp)
+    emb = _ScriptedEmbedder(4, {"Putin": vp, "Vladimir Putin": vvp})
+    cur = conn.cursor()
+    idx = EntityIndex()
+    eid1, _ = find_or_create_entity(
+        cur, entity_type="PERSON", surface_name="Putin",
+        embedder=emb, now_iso="2026-05-24T00:00:00+00:00", index=idx,
+    )
+    eid2, kind2 = find_or_create_entity(
+        cur, entity_type="PERSON", surface_name="Vladimir Putin",
+        embedder=emb, now_iso="2026-05-24T00:00:01+00:00", index=idx,
+    )
+    assert kind2 == "sbert_merge"
+    assert eid2 == eid1
+    # Alias persists in entity_aliases.
+    rows = cur.execute(
+        "SELECT alias FROM entity_aliases WHERE entity_id = ?", (eid1,)
+    ).fetchall()
+    assert ("Vladimir Putin",) in rows
+
+
+def test_indexed_and_unindexed_agree(conn):
+    """Indexed and unindexed paths must produce the same final state for
+    the same sequence of inserts. (Behavioural equivalence guard.)"""
+    cur = conn.cursor()
+    vecs = {
+        "A": np.array([1.0, 0.0], dtype=np.float32),
+        "B": np.array([0.0, 1.0], dtype=np.float32),
+        "C": np.array([0.8, 0.6], dtype=np.float32) / np.linalg.norm([0.8, 0.6]),
+    }
+    emb = _ScriptedEmbedder(2, vecs)
+    idx = EntityIndex()
+    for surface in ("A", "B", "C", "A"):
+        find_or_create_entity(
+            cur, entity_type="COMPANY", surface_name=surface,
+            embedder=emb, now_iso="2026-05-24T00:00:00+00:00", index=idx,
+        )
+    cur.execute("SELECT canonical_name FROM entities WHERE entity_type='COMPANY' ORDER BY id")
+    indexed_names = [r[0] for r in cur.fetchall()]
+
+    # Reset, run again without the index.
+    cur.execute("DELETE FROM entities")
+    cur.execute("DELETE FROM entity_aliases")
+    for surface in ("A", "B", "C", "A"):
+        find_or_create_entity(
+            cur, entity_type="COMPANY", surface_name=surface,
+            embedder=emb, now_iso="2026-05-24T00:00:00+00:00", index=None,
+        )
+    cur.execute("SELECT canonical_name FROM entities WHERE entity_type='COMPANY' ORDER BY id")
+    unindexed_names = [r[0] for r in cur.fetchall()]
+    assert indexed_names == unindexed_names
 
 
 def test_mixed_dim_existing_rows_raises(conn):

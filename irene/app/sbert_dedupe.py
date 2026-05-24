@@ -165,6 +165,128 @@ def _fetch_candidates(
     return ids, names, np.stack(vec_list)
 
 
+class EntityIndex:
+    """Per-type in-memory cache of (entity_id, canonical_name, embedding)
+    rows for cosine search and exact-canonical lookup.
+
+    Mirrors `app/stages/markets.py`'s `MarketIndex`: load lazily on first
+    touch of a type, update in-place on insert. The motivation is hot-
+    path SBERT-dedup speed — the SELECT-per-call path in `_fetch_candidates`
+    measured ~8ms p50 even at 83 entities (smoke 2026-05-24); an
+    in-memory matrix turns the same query into a single dot product
+    that benchmarks in the tens-of-µs range.
+
+    Concurrency model: this index is meant to be used INSIDE the same
+    lock that guards DB writes (e.g. extract_to_irene.py's `db_lock`).
+    Reads and writes to the internal dicts/matrices are NOT made
+    thread/task-safe at this layer.
+
+    Memory footprint: at 50k entities × 384-d float32 ≈ 76 MB per type.
+    Across 7 entity types the worst-case ceiling is roughly 500 MB,
+    which is fine for the foreseeable scale. If we ever blow past
+    ~100k entities per type, the next move is an HNSW index
+    (ChromaDB or sqlite-vec) — not a deeper in-memory hack.
+    """
+
+    __slots__ = (
+        "_entries_by_type", "_canonical_by_type", "_matrix_by_type",
+        "_loaded_types", "_dim",
+    )
+
+    def __init__(self) -> None:
+        # entity_type -> list of (entity_id, canonical_name, vec)
+        self._entries_by_type: dict[str, list[tuple[int, str, np.ndarray]]] = {}
+        # entity_type -> {canonical_name: entity_id} for the exact-name fast path
+        self._canonical_by_type: dict[str, dict[str, int]] = {}
+        # entity_type -> stacked (N, dim) matrix for cosine search
+        self._matrix_by_type: dict[str, np.ndarray] = {}
+        self._loaded_types: set[str] = set()
+        self._dim: Optional[int] = None
+
+    def load(self, cur: sqlite3.Cursor, entity_type: str) -> None:
+        """Idempotently warm the cache for `entity_type` from the DB.
+        Safe to call repeatedly; first call hits the DB, subsequent
+        calls are a dict-lookup no-op."""
+        if entity_type in self._loaded_types:
+            return
+        ids, names, matrix = _fetch_candidates(cur, entity_type)
+        entries: list[tuple[int, str, np.ndarray]] = []
+        canonical_map: dict[str, int] = {}
+        for eid, name, vec in zip(ids, names, matrix if matrix.shape[0] else []):
+            entries.append((eid, name, np.asarray(vec, dtype=np.float32)))
+            canonical_map[name] = eid
+        self._entries_by_type[entity_type] = entries
+        self._canonical_by_type[entity_type] = canonical_map
+        self._matrix_by_type[entity_type] = (
+            matrix if matrix.shape[0] else np.zeros((0, 0), dtype=np.float32)
+        )
+        if matrix.shape[0] and self._dim is None:
+            self._dim = int(matrix.shape[1])
+        self._loaded_types.add(entity_type)
+
+    def by_canonical(self, entity_type: str, canonical_name: str) -> Optional[int]:
+        """Returns the entity_id of an exact (type, canonical) match, or
+        None. Assumes `load(cur, entity_type)` has already been called."""
+        return self._canonical_by_type.get(entity_type, {}).get(canonical_name)
+
+    def best_match(
+        self, entity_type: str, query_vec: np.ndarray
+    ) -> tuple[Optional[int], str, float]:
+        """Returns `(entity_id, canonical_name, cosine)` of the closest
+        same-type entity, or `(None, '', 0.0)` if the type's pool is
+        empty. Assumes `load(...)` has been called and `query_vec` is
+        the embedder's normalised float32 output."""
+        matrix = self._matrix_by_type.get(entity_type)
+        if matrix is None or matrix.shape[0] == 0:
+            return None, "", 0.0
+        if query_vec.shape[0] != matrix.shape[1]:
+            raise RuntimeError(
+                f"EntityIndex dim mismatch for {entity_type!r}: "
+                f"query {query_vec.shape[0]} vs index {matrix.shape[1]}"
+            )
+        sims = matrix @ query_vec
+        best_idx = int(np.argmax(sims))
+        eid, name, _vec = self._entries_by_type[entity_type][best_idx]
+        return eid, name, float(sims[best_idx])
+
+    def register(
+        self,
+        *,
+        entity_id: int,
+        entity_type: str,
+        canonical_name: str,
+        embedding: np.ndarray,
+    ) -> None:
+        """Add a freshly-inserted entity to the index. Caller is
+        responsible for calling this AFTER the DB insert succeeds (and
+        inside the same lock that guards concurrent writers)."""
+        vec = np.asarray(embedding, dtype=np.float32).reshape(-1)
+        if self._dim is None:
+            self._dim = int(vec.shape[0])
+        elif vec.shape[0] != self._dim:
+            raise RuntimeError(
+                f"EntityIndex dim mismatch: new embedding {vec.shape[0]} "
+                f"vs index dim {self._dim}"
+            )
+        if entity_type not in self._loaded_types:
+            self._entries_by_type[entity_type] = []
+            self._canonical_by_type[entity_type] = {}
+            self._matrix_by_type[entity_type] = np.zeros((0, self._dim), dtype=np.float32)
+            self._loaded_types.add(entity_type)
+        self._entries_by_type[entity_type].append((entity_id, canonical_name, vec))
+        self._canonical_by_type[entity_type][canonical_name] = entity_id
+        current = self._matrix_by_type[entity_type]
+        if current.shape[0] == 0:
+            self._matrix_by_type[entity_type] = vec.reshape(1, -1)
+        else:
+            self._matrix_by_type[entity_type] = np.vstack([current, vec.reshape(1, -1)])
+
+    def size(self, entity_type: str) -> int:
+        """Number of entities cached for this type. Mostly for tests +
+        smoke logging."""
+        return len(self._entries_by_type.get(entity_type, []))
+
+
 def find_or_create_entity(
     cur: sqlite3.Cursor,
     *,
@@ -174,52 +296,85 @@ def find_or_create_entity(
     now_iso: str,
     threshold: float = 0.85,
     alias_kind: str = "synonym",
+    index: Optional[EntityIndex] = None,
 ) -> tuple[int, MatchKind]:
     """Resolve `surface_name` to an existing `entities.id` or insert a new row.
 
     See module docstring for full semantics. The caller owns the
-    transaction (no commit here)."""
+    transaction (no commit here).
+
+    When `index` is provided, the function uses the cache for both the
+    exact-canonical fast-path AND the cosine pool, eliminating the
+    SELECT-per-call cost of the unindexed path. The caller is
+    responsible for keeping the index correctly populated relative to
+    the DB (typically: load on first use, register after insert)."""
     if not entity_type:
         raise ValueError("entity_type must be non-empty")
     name = surface_name.strip()
     if not name:
         raise ValueError("surface_name must be non-empty after strip")
 
-    # ---- fast path: exact canonical_name within this type --------------
-    cur.execute(
-        "SELECT id FROM entities WHERE entity_type = ? AND canonical_name = ?",
-        (entity_type, name),
-    )
-    row = cur.fetchone()
-    if row is not None:
-        eid = int(row[0])
-        cur.execute(
-            "UPDATE entities SET last_seen_at = ? WHERE id = ?",
-            (now_iso, eid),
-        )
-        return eid, "exact_canonical"
+    if index is not None:
+        # Warm the per-type cache; idempotent.
+        index.load(cur, entity_type)
 
-    # ---- SBERT path: embed + cosine vs same-type pool ------------------
-    query_vec = embedder.embed(name).astype(np.float32, copy=False)
-    ids, names, candidate_vecs = _fetch_candidates(cur, entity_type)
-    if candidate_vecs.shape[0] > 0:
-        best_idx, best_cos = score_against_existing(query_vec, candidate_vecs)
-        if best_cos >= threshold:
-            eid = ids[best_idx]
+    # ---- fast path: exact canonical_name within this type --------------
+    if index is not None:
+        cached_eid = index.by_canonical(entity_type, name)
+        if cached_eid is not None:
+            cur.execute(
+                "UPDATE entities SET last_seen_at = ? WHERE id = ?",
+                (now_iso, cached_eid),
+            )
+            return cached_eid, "exact_canonical"
+    else:
+        cur.execute(
+            "SELECT id FROM entities WHERE entity_type = ? AND canonical_name = ?",
+            (entity_type, name),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            eid = int(row[0])
             cur.execute(
                 "UPDATE entities SET last_seen_at = ? WHERE id = ?",
                 (now_iso, eid),
             )
-            # Surface form differs from the canonical → preserve it as an
-            # alias so future strict (non-SBERT) lookups still resolve.
-            canonical = names[best_idx]
-            if name != canonical:
+            return eid, "exact_canonical"
+
+    # ---- SBERT path: embed + cosine vs same-type pool ------------------
+    query_vec = embedder.embed(name).astype(np.float32, copy=False)
+    if index is not None:
+        eid_match, canonical_match, best_cos = index.best_match(entity_type, query_vec)
+        if eid_match is not None and best_cos >= threshold:
+            cur.execute(
+                "UPDATE entities SET last_seen_at = ? WHERE id = ?",
+                (now_iso, eid_match),
+            )
+            if name != canonical_match:
                 cur.execute(
                     "INSERT OR IGNORE INTO entity_aliases "
                     "(entity_id, alias, alias_kind) VALUES (?, ?, ?)",
-                    (eid, name, alias_kind),
+                    (eid_match, name, alias_kind),
                 )
-            return eid, "sbert_merge"
+            return eid_match, "sbert_merge"
+    else:
+        ids, names, candidate_vecs = _fetch_candidates(cur, entity_type)
+        if candidate_vecs.shape[0] > 0:
+            best_idx, best_cos = score_against_existing(query_vec, candidate_vecs)
+            if best_cos >= threshold:
+                eid = ids[best_idx]
+                cur.execute(
+                    "UPDATE entities SET last_seen_at = ? WHERE id = ?",
+                    (now_iso, eid),
+                )
+                canonical = names[best_idx]
+                if name != canonical:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO entity_aliases "
+                        "(entity_id, alias, alias_kind) VALUES (?, ?, ?)",
+                        (eid, name, alias_kind),
+                    )
+                return eid, "sbert_merge"
 
     # ---- no match → insert -------------------------------------------
     cur.execute(
@@ -244,5 +399,12 @@ def find_or_create_entity(
         raise RuntimeError(
             f"INSERT into entities returned no rowid for "
             f"({entity_type!r}, {name!r})"
+        )
+    if index is not None:
+        index.register(
+            entity_id=int(new_id),
+            entity_type=entity_type,
+            canonical_name=name,
+            embedding=query_vec,
         )
     return int(new_id), "inserted_new"
