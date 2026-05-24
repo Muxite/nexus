@@ -570,7 +570,11 @@ trading:
   # Total: 14 production × $100 + scout $50 + super_scout $50
   #        + loose_relevance_yes $100 = $1600.
   simulate_total_usdc: 1600.0
-  simulate_min_trade_usdc: 1.0
+  # 2026-05-24 F1 escalation: was 1.0 — collided with super_scout's
+  # max_position_usdc=0.05 (size_too_small skips). Lowered so super_scout's
+  # micro-stakes can land as visible trades. A3.1 baseline §6 row 3 flagged
+  # this mismatch explicitly. Re-raise after micro-stake diagnostics complete.
+  simulate_min_trade_usdc: 0.05
   # Soft rail-skip: reject trades when the entry-side mid is within this
   # distance of 0/1. 6h backtest: 99% of p≥0.95 entries were no_signal — the
   # market is pinned and the headline can't move it. Per-engine override
