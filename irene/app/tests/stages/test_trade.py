@@ -317,6 +317,82 @@ async def test_freshness_stale_rejects_without_ai_call(db_seeded):
     assert bus.published[0][1]["reason"] == "freshness_stale"
 
 
+async def test_target_mid_computed_correctly_for_yes_and_no(db_seeded):
+    """Regression for the cycle-3 sign bug. target_mid is always in YES-mid
+    terms (Polymarket's primary price). p_hat is the model's implied
+    P(YES). fee_buffer is the cushion to lock profit before fees.
+
+      - YES bet → sell when YES rises to p_hat - fee_buffer
+      - NO  bet → sell when YES falls to p_hat + fee_buffer
+
+    The original v6 code had `target = (1 - p_hat) + fee_buffer` for NO,
+    which double-flipped the probability and made edge_decay fire on
+    every NO trade's first poll. This test locks the correct formula.
+    """
+    # Default _Config has fee_buffer=0.02, min_confidence=0.55.
+    # _FakeAI default = YES @ confidence 0.7 → p_hat=0.7 → target=0.68.
+    bus = _FakeBus()
+    ai = _FakeAI()  # YES @ 0.7
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload(signal_id=1))
+
+    cur = await db_seeded.conn.execute(
+        "SELECT direction, p_hat, target_mid FROM trades WHERE signal_id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row["direction"] == "YES"
+    assert row["p_hat"] == pytest.approx(0.7)
+    assert row["target_mid"] == pytest.approx(0.68)   # 0.70 - 0.02 fee buffer
+
+    # Now fire a NO trade on a different (article, market). p_hat for NO = 1 - conf = 0.3.
+    # Correct target = p_hat + fee_buffer = 0.32.
+    # WRONG target would be (1 - p_hat) + fee = 0.72.
+    async with db_seeded.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO markets
+                (condition_id, slug, question, description, category, end_date,
+                 volume_usdc, token_yes, token_no, embedding, embedder_id,
+                 embedding_dim, embedding_updated_at, active, closed_at,
+                 first_seen_at, updated_at)
+            VALUES ('m2', 'slug-2', 'Will Y happen?', 'd2', 'p', '2026-12-31',
+                    1000.0, 'tY2', 'tN2', NULL, NULL, NULL, NULL, 1, NULL,
+                    '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
+            """
+        )
+        await cur.execute(
+            """
+            INSERT INTO signals
+                (id, article_id, market_id, similarity, cluster_id, freshness,
+                 embedder_id, cycle_id, is_tracer, tracer_id, created_at)
+            VALUES (2, 1, 'm2', 0.80, NULL, 'BREAKING', 'fake@4', 1, 0, NULL,
+                    '2026-05-23T00:00:00+00:00')
+            """
+        )
+    bus2 = _FakeBus()
+    ai2 = _FakeAI(next_result=DirectionResult(
+        direction="NO", confidence=0.7, prediction_id=99,
+        cached=False, raw_response="N",
+    ))
+    stage2 = _make_stage(db_seeded, bus2, ai2)
+    with cycle_scope(1):
+        await stage2.handle(_payload(signal_id=2, market_id="m2"))
+    cur = await db_seeded.conn.execute(
+        "SELECT direction, p_hat, target_mid FROM trades WHERE signal_id=2"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row["direction"] == "NO"
+    assert row["p_hat"] == pytest.approx(0.3)         # 1 - 0.7
+    assert row["target_mid"] == pytest.approx(0.32)   # 0.30 + 0.02 fee buffer
+    # If the bug were back, target_mid would be 0.72 (= 0.70 + 0.02).
+    assert row["target_mid"] != pytest.approx(0.72)
+
+
 async def _seed_entities_for_article(db, article_id: int, entity_names: list[str]) -> None:
     """Helper: write entities + facts + entity_resolutions so the
     stage-0 entity_overlap gate can read them."""

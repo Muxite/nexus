@@ -788,14 +788,19 @@ class TradeStage:
         tracer_id: Optional[str],
     ) -> Optional[int]:
         # v6: derive the target_mid where the model's edge collapses.
-        # For YES the price moves UP toward our p_hat; for NO it moves DOWN
-        # toward (1 - p_hat). fee_buffer is the cushion below the model's
-        # estimate to leave a margin for spread+fees.
+        # `p_hat` is the model's implied P(YES). The target is always
+        # expressed in YES-mid terms (Polymarket's primary price).
+        # For YES we bought low expecting YES to rise toward p_hat —
+        # sell just BELOW p_hat (-fee_buffer) to lock profit before fees.
+        # For NO we bought expecting YES to fall toward p_hat — sell just
+        # ABOVE p_hat (+fee_buffer) by the same logic. (Cycle 3 had a
+        # sign bug here: target was 1-p_hat+fee, double-flipping and
+        # firing edge_decay on every NO trade's first poll.)
         fee_buffer = float(self._cfg.fee_buffer)
         if direction == "YES":
             target_mid = max(0.0, min(1.0, float(p_hat) - fee_buffer))
         else:  # NO
-            target_mid = max(0.0, min(1.0, (1.0 - float(p_hat)) + fee_buffer))
+            target_mid = max(0.0, min(1.0, float(p_hat) + fee_buffer))
         async with self._db.batch() as cur:
             await cur.execute(
                 """
