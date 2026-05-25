@@ -534,6 +534,203 @@ async def test_first_seen_market_populates_min_order_size_from_clob(
     assert clob.info_calls == []
 
 
+# ---------------------------------------------------------------------------
+# Cycle 15: per-market info refresh cadence
+# ---------------------------------------------------------------------------
+
+
+async def _seed_market_with_fee(
+    db: DB,
+    condition_id: str,
+    *,
+    fee_rate: Optional[float],
+    fetched_at: Optional[str],
+) -> None:
+    """Insert a minimal markets row with an explicit fee_rate /
+    fee_rate_fetched_at pair. Cycle-15 tests use this to fast-forward
+    a row past first-seen without going through `poll_once`."""
+    now = "2026-05-25T00:00:00+00:00"
+    async with db.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO markets (
+                condition_id, question, slug, description, category,
+                end_date, volume_usdc, token_yes, token_no, active,
+                first_seen_at, updated_at, fee_rate, fee_rate_fetched_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+            """,
+            (
+                condition_id, f"Q for {condition_id}", condition_id.lower(),
+                "desc", "Politics", "2026-12-31T23:59:59Z",
+                1000.0, f"{condition_id}-yes", f"{condition_id}-no",
+                now, now, fee_rate, fetched_at,
+            ),
+        )
+
+
+async def test_market_info_refreshes_when_stale(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 15: a market whose `fee_rate_fetched_at` is older than
+    `cfg.markets.market_info_refresh_hours` (default 168h) MUST get
+    re-fetched on the next poll, even though `fee_rate IS NOT NULL`.
+    On success, `fee_rate_fetched_at` advances to the new `now`."""
+    from datetime import datetime, timedelta, timezone
+
+    stale_ts = (
+        datetime.now(timezone.utc) - timedelta(hours=192)
+    ).isoformat()  # 8 days ago, well past the 168h default
+    await _seed_market_with_fee(
+        db_ready, "0xstale", fee_rate=0.01, fetched_at=stale_ts,
+    )
+    # The fetch returns a *different* fee so the refresh is observable.
+    clob = _FakeCLOB(
+        fee_by_id={"0xstale": 0.05},
+        min_order_size_by_id={"0xstale": 7.0},
+    )
+    stage = _make_stage(db_ready, bus, embedder, clob=clob)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xstale", "Q")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    assert clob.info_calls == ["0xstale"]
+    cur = await db_ready.conn.execute(
+        "SELECT fee_rate, min_order_size, fee_rate_fetched_at "
+        "FROM markets WHERE condition_id='0xstale'"
+    )
+    row = await cur.fetchone()
+    assert row["fee_rate"] == pytest.approx(0.05)
+    assert row["min_order_size"] == pytest.approx(7.0)
+    # Timestamp advanced — was 8d ago, must now be within the last minute.
+    assert row["fee_rate_fetched_at"] is not None
+    new_ts = datetime.fromisoformat(
+        row["fee_rate_fetched_at"].replace("Z", "+00:00")
+    )
+    age_seconds = (datetime.now(timezone.utc) - new_ts).total_seconds()
+    assert 0 <= age_seconds < 60
+
+
+async def test_market_info_skips_when_fresh(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 15: a market whose `fee_rate_fetched_at` is well within
+    the refresh window (1h ago vs 168h default) MUST NOT trigger a
+    CLOB fetch — the cadence avoids hammering the CLOB on every poll."""
+    from datetime import datetime, timedelta, timezone
+
+    fresh_ts = (
+        datetime.now(timezone.utc) - timedelta(hours=1)
+    ).isoformat()
+    await _seed_market_with_fee(
+        db_ready, "0xfresh", fee_rate=0.01, fetched_at=fresh_ts,
+    )
+    clob = _FakeCLOB(fee_by_id={"0xfresh": 0.99})  # would be obvious if called
+    stage = _make_stage(db_ready, bus, embedder, clob=clob)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xfresh", "Q")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    assert clob.info_calls == []
+    assert clob.fee_calls == []
+    cur = await db_ready.conn.execute(
+        "SELECT fee_rate, fee_rate_fetched_at FROM markets "
+        "WHERE condition_id='0xfresh'"
+    )
+    row = await cur.fetchone()
+    # Untouched.
+    assert row["fee_rate"] == pytest.approx(0.01)
+    assert row["fee_rate_fetched_at"] == fresh_ts
+
+
+async def test_market_info_first_seen_still_works(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 15 preserves the cycle-10/13 first-seen contract: a row
+    with `fee_rate IS NULL` triggers a fetch regardless of timestamp.
+    Here we seed the row with `fee_rate=NULL` but a *fresh* (would-be
+    skip) `fetched_at` to prove the NULL-fee path still fires."""
+    from datetime import datetime, timedelta, timezone
+
+    fresh_ts = (
+        datetime.now(timezone.utc) - timedelta(hours=1)
+    ).isoformat()
+    await _seed_market_with_fee(
+        db_ready, "0xfirst", fee_rate=None, fetched_at=fresh_ts,
+    )
+    clob = _FakeCLOB(fee_by_id={"0xfirst": 0.03})
+    stage = _make_stage(db_ready, bus, embedder, clob=clob)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xfirst", "Q")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    assert clob.info_calls == ["0xfirst"]
+    cur = await db_ready.conn.execute(
+        "SELECT fee_rate FROM markets WHERE condition_id='0xfirst'"
+    )
+    row = await cur.fetchone()
+    assert row["fee_rate"] == pytest.approx(0.03)
+
+
+class _NoneReturningCLOB:
+    """CLOB stub that always returns None from `get_market_info`,
+    simulating any failure mode that lands the helper at None
+    (network error, non-2xx, unparseable JSON). Records calls so
+    tests can assert the fetch was attempted."""
+
+    def __init__(self) -> None:
+        self.info_calls: list[str] = []
+        self.fee_calls: list[str] = []
+
+    async def get_market_info(self, condition_id: str) -> Optional[dict]:
+        self.info_calls.append(condition_id)
+        return None
+
+    async def get_market_fee_rate(self, condition_id: str) -> Optional[float]:
+        self.fee_calls.append(condition_id)
+        return None
+
+
+async def test_market_info_failure_does_not_advance_timestamp(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 15 fetch-failure discipline: when the CLOB returns None
+    (network blip, 5xx, unparseable JSON, etc.) we MUST leave
+    `fee_rate_fetched_at` unchanged so the next poll retries instead
+    of waiting another full refresh window. For a legacy row whose
+    prior value was NULL, that means it stays NULL."""
+    await _seed_market_with_fee(
+        db_ready, "0xfail", fee_rate=0.02, fetched_at=None,
+    )
+    clob = _NoneReturningCLOB()
+    stage = _make_stage(db_ready, bus, embedder, clob=clob)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xfail", "Q")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    # NULL fetched_at qualified as stale → fetch was attempted.
+    assert clob.info_calls == ["0xfail"]
+    cur = await db_ready.conn.execute(
+        "SELECT fee_rate, fee_rate_fetched_at FROM markets "
+        "WHERE condition_id='0xfail'"
+    )
+    row = await cur.fetchone()
+    # fee_rate untouched, fetched_at NOT advanced — next cycle retries.
+    assert row["fee_rate"] == pytest.approx(0.02)
+    assert row["fee_rate_fetched_at"] is None
+
+
 async def test_fee_rate_column_stays_null_when_clob_absent(
     db_ready, bus, embedder, monkeypatch,
 ):

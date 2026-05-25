@@ -109,6 +109,14 @@ _DEFAULT_EMBED_REFRESH_SECONDS = 3600
 # the 2h UMA challenge window early, coarse enough that we don't
 # hammer Gamma per market. See plans/resolution-oracle.md.
 _DEFAULT_RESOLUTION_POLL_SECONDS = 600
+# Cycle 15: refresh cadence for per-market `fee_rate` / `min_order_size`.
+# Polymarket has historically shipped fee-schedule changes (the cycle-10
+# survey caught one market at 1000 bps when most are 0); cycles 10/13 only
+# fetched on first-seen, so any change after that point was invisible to
+# us. Default 168h = 7 days: long enough to keep the CLOB HTTP budget
+# bounded (one call per market per week), short enough that a real fee
+# change is caught within a trading week.
+_DEFAULT_MARKET_INFO_REFRESH_HOURS = 168.0
 
 _ENV_POLL_SECONDS = "IRENE__MARKETS__POLL_SECONDS"
 _ENV_EMBED_REFRESH_SECONDS = "IRENE__MARKETS__EMBED_REFRESH_SECONDS"
@@ -163,6 +171,17 @@ _MARKETS_DDL = [
     # falls back to `cfg.trade.min_position_usdc` only (no per-market
     # floor enforced). See plans/order-execution-spreads.md proposal #4.
     "ALTER TABLE markets ADD COLUMN min_order_size REAL",
+    # Cycle 15: UTC ISO timestamp of the LAST successful
+    # `clob.get_market_info(condition_id)` call. NULL = never fetched.
+    # Powers the per-market info refresh cadence (see
+    # `_maybe_fetch_market_info` + `cfg.markets.market_info_refresh_hours`):
+    # cycles 10/13 only fetched on first-seen (`fee_rate IS NULL`), which
+    # meant a market whose Polymarket fee schedule changed mid-life would
+    # keep the stale value forever. Idempotent via `schema_migrations`.
+    # Legacy rows pre-cycle-15 have NULL `fee_rate_fetched_at`; they all
+    # qualify for the next refresh — see the comment in
+    # `_maybe_fetch_market_info` about the one-time burst.
+    "ALTER TABLE markets ADD COLUMN fee_rate_fetched_at TEXT",
     # Cycle 11: three-state UMA close machine state (plans/resolution-oracle.md
     # D1). The Gamma close flag (`closed=true`) is NOT finality —
     # Polymarket settles through UMA's Optimistic Oracle with a 2h
@@ -550,13 +569,15 @@ class MarketsStage:
         self._bus = deps.bus
         self._config = deps.config
         self._embedder = deps.embedder
-        # Cycle 10: CLOB client is OPTIONAL on MarketsStage. When present,
-        # `_upsert_market` triggers a per-market fee_rate fetch for rows
-        # that have a NULL fee_rate (first-seen only — refresh cadence for
-        # already-populated rows is a separate decision documented in
-        # plans/markets-gamma.md). When absent (e.g. minimal test wirings
-        # that don't pass `clob=`), the fee_rate stays NULL and closer.py
-        # falls back to the category lookup in `config.polymarket_fee_rates`.
+        # Cycle 10/15: CLOB client is OPTIONAL on MarketsStage. When
+        # present, `_upsert_market` triggers a per-market fee_rate /
+        # min_order_size fetch on first-seen (cycles 10/13) AND on a
+        # configurable refresh cadence (cycle 15 — see
+        # `_maybe_fetch_market_info` and
+        # `cfg.markets.market_info_refresh_hours`, default 168h).
+        # When absent (e.g. minimal test wirings that don't pass
+        # `clob=`), `fee_rate` stays NULL and closer.py falls back to
+        # the category lookup in `config.polymarket_fee_rates`.
         self._clob = deps.clob
 
         self._poll_seconds = _read_int_env(
@@ -580,6 +601,15 @@ class MarketsStage:
                 _DEFAULT_RESOLUTION_POLL_SECONDS,
             )),
         )
+        # Cycle 15: refresh window for per-market `fee_rate` /
+        # `min_order_size`. See `_maybe_fetch_market_info` for the
+        # fire-conditions. Cast through float because the config may carry
+        # an int (`168`) or a float (`168.0`).
+        self._market_info_refresh_hours = float(_config_get(
+            deps.config,
+            "market_info_refresh_hours",
+            _DEFAULT_MARKET_INFO_REFRESH_HOURS,
+        ))
 
         # MarketIndex lives on the stage instance — not at module scope —
         # so the rule-5 exception is bounded to a single object lifetime.
@@ -1036,13 +1066,13 @@ class MarketsStage:
         await self._maybe_stamp_resolution_transition(
             row["condition_id"], row.get("uma_resolution_status"),
         )
-        # Cycle 10/13: per-market fee_rate + min_order_size fetch.
-        # **First-seen only** for this cycle — we read the current
-        # fee_rate after the upsert and only call the CLOB if EITHER
-        # column is still NULL. One HTTP per net-new market populates
-        # both via `clob.get_market_info` (cycle-13 helper that returns
-        # a dict). Existing-row refresh cadence is a separate decision
-        # (see plans/markets-gamma.md).
+        # Cycle 10/13/15: per-market fee_rate + min_order_size fetch.
+        # Cycles 10/13 fired only on first-seen (`fee_rate IS NULL`);
+        # cycle 15 extends this to ALSO refresh rows whose
+        # `fee_rate_fetched_at` is older than
+        # `cfg.markets.market_info_refresh_hours` (default 168h). See
+        # `_maybe_fetch_market_info` for the exact fire-conditions and
+        # the legacy-row backfill note.
         await self._maybe_fetch_market_info(row["condition_id"])
 
     async def _maybe_stamp_resolution_transition(
@@ -1077,56 +1107,79 @@ class MarketsStage:
             )
 
     async def _maybe_fetch_market_info(self, condition_id: str) -> None:
-        """If the CLOB client is wired and this market's `fee_rate` is
-        still NULL, fetch `GET /markets/<conditionId>` once and persist
-        whichever fields the response yielded (`fee_rate` and/or
-        `min_order_size`). Silent no-op on any failure: closer.py falls
-        back to the category lookup in `config.polymarket_fee_rates`
-        and the trade-stage size gate falls back to
-        `cfg.trade.min_position_usdc` only.
+        """If the CLOB client is wired and this market is either
+        first-seen (`fee_rate IS NULL`) OR overdue for a refresh
+        (`fee_rate_fetched_at` older than
+        `cfg.markets.market_info_refresh_hours`, default 168h), fetch
+        `GET /markets/<conditionId>` and persist whichever fields the
+        response yielded (`fee_rate` and/or `min_order_size`). Silent
+        no-op on any failure: closer.py falls back to the category
+        lookup in `config.polymarket_fee_rates` and the trade-stage
+        size gate falls back to `cfg.trade.min_position_usdc` only.
 
-        Cycle 13: extends the cycle-10 fee-rate-first-seen-only path
-        to ALSO populate `min_order_size`. **`fee_rate IS NULL` is the
-        first-seen marker for the whole call** — once we've tried (and
-        gotten a fee back), we don't refetch even if `min_order_size`
-        came back NULL. This keeps the HTTP budget at one-per-net-new-
-        market and matches the cycle-10 contract; refresh cadence for
-        already-populated rows remains deferred. If a parallel cycle-13
-        backfill later finds rows with `fee_rate` populated but
-        `min_order_size` NULL, a separate backfill task can handle
-        them — this hot path stays single-fetch.
+        Cycle 15 — refresh cadence. Cycles 10/13 only fired on
+        first-seen, so a market whose Polymarket fee schedule changed
+        mid-life would stay stale forever. We now ALSO fire when the
+        row's `fee_rate_fetched_at` is NULL or older than the configured
+        window. On a successful CLOB hit we stamp `fee_rate_fetched_at
+        = now`; on a CLOB miss (None / fully-empty payload) we leave
+        the timestamp UNCHANGED so the next poll cycle retries — this
+        matches the "fetch failure shouldn't burn the budget" discipline
+        from the cycle-10 contract.
+
+        **Backfill consideration.** Legacy rows pre-cycle-15 have NULL
+        `fetched_at`; they all qualify for the next refresh. That's a
+        one-time burst of CLOB calls (one per existing market) on the
+        first post-deploy poll. Acceptable: `get_market_info` hits the
+        CLOB (NOT Gamma), which has no Cloudflare-fronted 429 path
+        (see `clob.get_market_info` — it just logs and returns None on
+        any non-2xx), so the cycle-13 `_gamma_get_with_backoff` helper
+        is not relevant here. The CLOB calls run sequentially per
+        upsert inside the existing poll loop, so the burst is naturally
+        rate-shaped by the loop's own pace.
+
+        Cycle 13 carry-over: prefer the unified `get_market_info`
+        helper (returns both fields from one HTTP). Fall back to the
+        cycle-10 single-purpose method if a CLOB stub doesn't expose
+        the new method — keeps legacy test stubs and any custom
+        wirings working.
         """
         if self._clob is None:
             return
         cur = await self._db.conn.execute(
-            "SELECT fee_rate FROM markets WHERE condition_id = ?",
+            "SELECT fee_rate, fee_rate_fetched_at "
+            "FROM markets WHERE condition_id = ?",
             (condition_id,),
         )
         row = await cur.fetchone()
         await cur.close()
-        if row is None or row["fee_rate"] is not None:
-            return  # not first-seen, skip per cycle-10/13 scope
-        # Cycle 13: prefer the unified `get_market_info` helper (returns
-        # both fields from one HTTP). Fall back to the cycle-10 single-
-        # purpose method if a CLOB stub doesn't expose the new method
-        # — keeps legacy test stubs and any custom wirings working.
+        if row is None:
+            return
+        first_seen = row["fee_rate"] is None
+        stale = self._is_market_info_stale(row["fee_rate_fetched_at"])
+        if not (first_seen or stale):
+            return
         fee_rate: Optional[float]
         min_order_size: Optional[float] = None
         if hasattr(self._clob, "get_market_info"):
             info = await self._clob.get_market_info(condition_id)
             if info is None:
-                return  # CLOB miss; leave NULL so a future cycle can retry
+                return  # CLOB miss; leave fetched_at unchanged so we retry
             fee_rate = info.get("fee_rate")
             min_order_size = info.get("min_order_size")
         else:
             fee_rate = await self._clob.get_market_fee_rate(condition_id)
         if fee_rate is None and min_order_size is None:
-            return  # nothing usable came back
+            # Got a 200 but no usable fields — treat as a fetch failure
+            # for refresh purposes (don't advance `fetched_at`), so the
+            # next poll retries instead of waiting another full window.
+            return
         now = _now_iso()
         # Build a partial UPDATE that only touches the columns we
         # actually have values for; preserves any already-populated
-        # column on the row (defensive — `fee_rate IS NULL` is checked
-        # above but min_order_size could have been backfilled).
+        # column on the row. `fee_rate_fetched_at` is stamped whenever
+        # we got at least one usable field back — this is what marks
+        # the refresh as successful for cadence purposes.
         set_clauses = []
         params: list = []
         if fee_rate is not None:
@@ -1135,6 +1188,8 @@ class MarketsStage:
         if min_order_size is not None:
             set_clauses.append("min_order_size = ?")
             params.append(min_order_size)
+        set_clauses.append("fee_rate_fetched_at = ?")
+        params.append(now)
         set_clauses.append("updated_at = ?")
         params.append(now)
         params.append(condition_id)
@@ -1144,6 +1199,25 @@ class MarketsStage:
                 f"WHERE condition_id = ?",
                 tuple(params),
             )
+
+    def _is_market_info_stale(self, fetched_at_iso: Optional[str]) -> bool:
+        """True when `fetched_at_iso` is missing or older than
+        `cfg.markets.market_info_refresh_hours`. NULL fetched_at counts
+        as stale so legacy pre-cycle-15 rows get refreshed on the next
+        poll (see backfill note in `_maybe_fetch_market_info`).
+        """
+        if not fetched_at_iso:
+            return True
+        try:
+            ts = datetime.fromisoformat(fetched_at_iso.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            # Malformed timestamp — treat as stale and let the next
+            # successful fetch overwrite it with a well-formed ISO.
+            return True
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_hours = (datetime.now(timezone.utc) - ts).total_seconds() / 3600.0
+        return age_hours >= self._market_info_refresh_hours
 
     async def _deactivate_missing(self, open_ids: set[str]) -> int:
         """Mark every active row whose condition_id is NOT in the fresh

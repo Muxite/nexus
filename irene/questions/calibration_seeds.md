@@ -14,6 +14,41 @@
 
 ---
 
+## A2 — Per-market `taker_base_fee` distribution
+
+```
+# Seed: category-mapped rates (crypto 7.2%, finance/politics/tech 4%, sports 3%, etc.)
+# Source: unstructured answers.md 2026-05-25-unstructured-1 lines 7-14
+#         + 2026-05-25 cycle-10 1000-market survey returning {0: 999, 200: 1}
+# Measured (2026-05-25, cycle 15 top-500 by volume24hr survey via /markets/<cid>):
+#   fee_rate distribution (n=500):
+#     0.0000 (0% taker):   89 / 500  = 17.8%
+#     0.1000 (10% taker): 411 / 500  = 82.2%
+#   ALL 500 sampled markets had minimum_order_size = 5 shares (uniform).
+#   USDC floor (= 5 × yes_price): median $0.10, p90 $3.52, max $5.00.
+#   Markets with per-market USDC floor > our $25: 0 / 500 = 0%.
+# Producing: irene/reports/2026-05-25-cycle15-market-floor-audit.md
+# Sample comparison: the cycle-10 survey saw {0: 999, 200: 1} — most likely
+# hit random/low-volume markets via default Gamma pagination order. The
+# cycle-15 explicit `order=volume24hr&descending=true` survey of the TOP
+# 500 shows a fundamentally different picture: the high-volume tail is
+# DOMINATED by 10% taker, not 0% or category-tier rates.
+# Action items (in order):
+#   1. Cycles 10+13 already fetch fee_rate per-market on first-seen, so
+#      production trades use the real 10% (not the 5% category default)
+#      automatically. THIS IS A RELIEF — the bug we'd otherwise have is
+#      already plugged.
+#   2. The category-fallback table in config.polymarket_fee_rates (default
+#      0.05) materially understates the true mean fee on the trading tail.
+#      Recommend raising default_fee_rate from 0.05 -> 0.10, and noting in
+#      the docstring that the table is a fallback for unfetched markets
+#      only (per-market fetch is the source of truth post-cycle-10).
+#   3. min_order_size is uniform at 5 shares; the cycle-13 per-market gate
+#      is well-designed but the worst-case USDC floor ($5) is well under
+#      our config floor ($25), so the per-market check basically never
+#      binds in practice. Keep the gate for defense-in-depth.
+```
+
 ## C1 — Bid-ask spread distribution by volume tier
 
 ```
