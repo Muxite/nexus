@@ -107,25 +107,12 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-_BOILERPLATE_TITLE_BLOCKLIST = {
-    "read more", "subscribe", "sign in", "log in", "newsletter",
-    "skip to content", "skip to main content", "menu", "search",
-    "home", "more", "share", "advertisement", "ad", "ads",
-    "see all", "view all", "next", "previous",
-}
-
-# URLs whose path matches ANY of these substrings are NOT news articles.
-# Catches NYT puzzles/crosswords/games, podcasts, account/help/about
-# pages, jobs boards, etc. Match is plain substring, case-insensitive.
-_NON_ARTICLE_URL_PATTERNS = (
-    "/puzzles/", "/crosswords/", "/crossword/", "/games/", "/wordle",
-    "/spelling-bee", "/connections", "/video/", "/videos/", "/podcasts/",
-    "/podcast/", "/audio/", "/newsletter", "/newsletters/",
-    "/account/", "/accounts/", "/login", "/signin", "/sign-in",
-    "/signup", "/sign-up", "/subscribe", "/help/", "/about/",
-    "/contact", "/cookies", "/privacy", "/terms", "/jobs/", "/careers/",
-    "/store/", "/shop/", "/games", "/cooking/", "/recipes/", "/games?",
-)
+# Cycle 5.1: title boilerplate filter + non-article URL pattern filter
+# moved INTO scraper-v2 (services/scraper-v2/app/extract/links.py). The
+# scraper is the single source of truth for "is this a real headline";
+# this stage just trusts its output. The previous _BOILERPLATE_TITLE_BLOCKLIST
+# and _NON_ARTICLE_URL_PATTERNS constants are now redundant — see
+# scraper's _BOILERPLATE_TEXTS + _SLOP_PATH_SEGMENTS + _MIN_HEADLINE_CHARS.
 
 
 class IngestStage:
@@ -293,15 +280,9 @@ class IngestStage:
             if not isinstance(url, str) or not url:
                 continue
             title = text.strip()
-            # Boilerplate filter — three guards:
-            # 1. minimum length (30 chars catches short labels)
-            # 2. title blocklist (UI strings like "Subscribe")
-            # 3. URL pattern blocklist (puzzles/games/podcasts/account/...)
-            if len(title) < 30 or title.lower() in _BOILERPLATE_TITLE_BLOCKLIST:
-                continue
-            url_lower = url.lower()
-            if any(pat in url_lower for pat in _NON_ARTICLE_URL_PATTERNS):
-                continue
+            # Cycle 5.1: title + URL filters now live in the scraper —
+            # the link-set we receive is already cleaned. We only guard
+            # against missing fields here.
             await self._ingest_item(
                 source="html",
                 source_detail=site_url,
@@ -389,14 +370,8 @@ class IngestStage:
             if not isinstance(url, str) or not url:
                 continue
             title = text.strip()
-            # Boilerplate filter — same triple guard as the HTML loop:
-            # length + title blocklist + URL pattern blocklist. The
-            # scraper already drops most cruft, but defence in depth.
-            if len(title) < 30 or title.lower() in _BOILERPLATE_TITLE_BLOCKLIST:
-                continue
-            url_lower = url.lower()
-            if any(pat in url_lower for pat in _NON_ARTICLE_URL_PATTERNS):
-                continue
+            # Cycle 5.1: title + URL filters live in scraper-v2 — we trust
+            # its output here. Only guard against missing fields below.
             summary = link.get("summary") or None
             published = link.get("published") or None
             seen_in = link.get("seen_in") or []

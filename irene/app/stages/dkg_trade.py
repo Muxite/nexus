@@ -322,6 +322,23 @@ class DKGTradeStage:
         confidence = result.confidence
         p_hat = confidence if direction == "YES" else (1.0 - confidence)
         mid = await self._resolve_mid(direction=direction, market=market)
+        # 4a. degenerate-mid guard — mirrors trade.py:405 (cycle 4 fix).
+        # cycle 5.1: applied to the DKG path too. The dashboard caught a
+        # dkg trade opened at mid=0.998 on a "Will X drop out?" market
+        # that the MVP path's same guard would have rejected.
+        if mid <= self._trade_cfg.min_mid or mid >= self._trade_cfg.max_mid:
+            gate_history.append(_gate_entry("edge", "reject", mid, "mid_degenerate"))
+            await self._record_reject(
+                event_id=event_id,
+                market_condition_id=market_condition_id,
+                reason="mid_degenerate",
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
         if direction == "YES":
             edge = p_hat - mid - self._trade_cfg.fee_buffer
         else:

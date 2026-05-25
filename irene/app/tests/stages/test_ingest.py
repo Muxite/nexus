@@ -289,21 +289,20 @@ async def test_html_path_inserts_articles_with_source_html(db_ready, bus, monkey
     assert len(bus.published) == 2
 
 
-async def test_html_path_filters_boilerplate_titles(db_ready, bus, monkeypatch):
-    """Boilerplate UI strings ('Subscribe', short links) MUST be skipped."""
+async def test_html_path_trusts_scraper_filtered_output(db_ready, bus, monkeypatch):
+    """Cycle 5.1: title + URL filters live in scraper-v2. The ingest
+    stage's only responsibility is to insert whatever the scraper
+    returns (missing-field guards aside). This test mocks the scraper
+    returning ALREADY-CLEAN output and asserts no extra filtering happens."""
     stage = _make_stage(db_ready, bus, html_sites=["https://apnews.com"])
 
     async def stub_fetch(self, site_url: str):
+        # Scraper returns these — they passed its boilerplate/URL filters.
         return [
-            {"url": "https://apnews.com/sub",   "text": "Subscribe"},                     # blocked: blocklist
-            {"url": "https://apnews.com/short", "text": "Hi"},                            # blocked: too short
-            {"url": "https://apnews.com/nav",   "text": "FT Leaders Academy"},            # blocked: 30-char floor
-            # URL pattern blocks (titles look real but URL is a non-article path):
-            {"url": "https://www.nytimes.com/crosswords/abc", "text": "The Crossword Get clued in with wordplay every day"},
-            {"url": "https://www.nytimes.com/podcasts/ezra-klein", "text": "Listen to the latest podcast episodes here on demand"},
-            {"url": "https://www.example.com/account/settings",  "text": "Manage your account settings and notification preferences"},
-            {"url": "https://apnews.com/real",  "text": "Russia launches new attack on Kyiv overnight"},
-            {"url": "https://apnews.com/menu",  "text": "Menu"},                          # blocked: blocklist
+            {"url": "https://apnews.com/a",
+             "text": "Russia launches new attack on Kyiv overnight today"},
+            {"url": "https://apnews.com/b",
+             "text": "Fed signals possible rate cut by year-end said Powell"},
         ]
 
     monkeypatch.setattr(IngestStage, "_fetch_html_links", stub_fetch)
@@ -311,12 +310,13 @@ async def test_html_path_filters_boilerplate_titles(db_ready, bus, monkeypatch):
     with cycle_scope(1):
         await stage._poll_html_site("https://apnews.com")
 
-    cur = await db_ready.conn.execute("SELECT title FROM articles")
+    cur = await db_ready.conn.execute("SELECT title FROM articles ORDER BY id")
     rows = await cur.fetchall()
     await cur.close()
     titles = [r["title"] for r in rows]
-    assert len(titles) == 1
+    assert len(titles) == 2
     assert titles[0].startswith("Russia launches")
+    assert titles[1].startswith("Fed signals")
 
 
 async def test_html_path_handles_429_cooldown_gracefully(db_ready, bus, monkeypatch, caplog):
@@ -419,21 +419,22 @@ async def test_combined_path_inserts_articles_with_source_combined(db_ready, bus
     assert len(bus.published) == 2
 
 
-async def test_combined_path_filters_boilerplate_and_non_articles(db_ready, bus, monkeypatch):
-    """Same triple guard the html path uses: length, blocklist, URL pattern."""
+async def test_combined_path_trusts_scraper_filtered_output(db_ready, bus, monkeypatch):
+    """Cycle 5.1: combined path also relies on the scraper for filtering.
+    We only guard against rows with missing url/title fields."""
     stage = _make_stage(db_ready, bus, combined_sources=["https://apnews.com"])
 
     async def stub_fetch(self, source_url: str):
+        # All entries already passed the scraper's boilerplate gate.
         return [
-            {"url": "https://apnews.com/sub", "text": "Subscribe", "seen_in": ["html"]},
-            {"url": "https://apnews.com/short", "text": "Hi", "seen_in": ["html"]},
-            {"url": "https://www.nytimes.com/crosswords/abc",
-             "text": "The Crossword Get clued in with wordplay every day",
-             "seen_in": ["html"]},
             {"url": "https://apnews.com/real",
              "text": "Russia launches new attack on Kyiv overnight tonight",
              "summary": "Air-raid sirens sounded across the capital after the strike began.",
              "seen_in": ["rss", "html"]},
+            {"url": "", "text": "should be skipped due to missing url",
+             "seen_in": ["html"]},
+            {"url": "https://apnews.com/no-title", "text": "",
+             "seen_in": ["html"]},
         ]
 
     monkeypatch.setattr(IngestStage, "_fetch_combined_links", stub_fetch)

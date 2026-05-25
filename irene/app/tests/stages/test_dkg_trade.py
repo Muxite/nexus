@@ -95,6 +95,8 @@ class _TradeCfg:
     max_position_fraction: float = 0.20
     min_position_usdc: float = 1.0
     default_mid_price: float = 0.5
+    min_mid: float = 0.02
+    max_mid: float = 0.98
     accept_freshness: list = field(default_factory=lambda: ["BREAKING", "EVOLVING"])
 
 
@@ -412,6 +414,69 @@ async def test_direction_reuse_calls_ai_with_article_prompt(db_seeded):
     # Prompt contains the article title + market question.
     assert "Trump strikes Iran" in call["prompt"]
     assert "Will Trump strike Iran?" in call["prompt"]
+
+
+class _FakeCLOB:
+    """Async CLOB stand-in for DKG tests — same shape as test_trade.py."""
+
+    def __init__(self, prices: dict[str, float]) -> None:
+        self.prices = dict(prices)
+
+    async def get_mid(self, token_id: str):
+        return self.prices.get(token_id)
+
+
+async def test_mid_degenerate_rejects_yes_at_low_mid(db_seeded):
+    """Cycle 5.1: DKG path now shares the mid-degenerate gate that the
+    MVP trade path added in cycle 4. A market priced at mid <= min_mid
+    is essentially resolved — opening would close at PnL ~ 0."""
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=301,
+        cached=False, raw_response="{}",
+    ))
+    clob = _FakeCLOB({"ty": 0.011, "tn": 0.989})
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, reason, prediction_id FROM decisions"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "reject"
+    assert rows[0]["reason"] == "mid_degenerate"
+
+    cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM trades")
+    assert (await cur.fetchone())[0] == 0
+    await cur.close()
+
+    assert len(bus.published) == 1
+    assert bus.published[0][1]["reason"] == "mid_degenerate"
+
+
+async def test_mid_degenerate_rejects_no_at_high_mid(db_seeded):
+    """Same as above but NO-side at mid >= max_mid (e.g. 0.995)."""
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="NO", confidence=0.7, prediction_id=302,
+        cached=False, raw_response="{}",
+    ))
+    clob = _FakeCLOB({"ty": 0.005, "tn": 0.995})
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, reason FROM decisions"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "reject"
+    assert rows[0]["reason"] == "mid_degenerate"
 
 
 async def test_direction_neutral_writes_reject_decision(db_seeded):
