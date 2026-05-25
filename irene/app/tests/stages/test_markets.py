@@ -999,3 +999,270 @@ def test_parse_gamma_row_handles_missing_uma_fields():
     assert row["resolved_by"] is None
     assert row["accepting_orders"] is None
     assert row["outcome_prices"] == []
+
+
+# ---------------------------------------------------------------------------
+# Cycle 12: resolution re-poll orchestration
+# (plans/resolution-oracle.md — closes the "orchestration gap" flagged in
+# cycle 11; without this task the three-state machine only sees State 1.)
+# ---------------------------------------------------------------------------
+
+
+def _recent_closed_at() -> str:
+    """ISO timestamp ~1 minute ago, so the closed_at filter in the
+    poll query treats the market as 'still inside the human-review
+    window' for the default timeout (168h)."""
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+
+
+def _ancient_closed_at() -> str:
+    """ISO timestamp years in the past — used to assert the poll
+    walks PAST markets that breached the human-review window."""
+    return "2020-01-01T00:00:00+00:00"
+
+
+async def test_resolved_poll_state2_records_proposed_at_but_does_not_close(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 12: closed market with no UMA status initially. The
+    re-poll fetches the Gamma row, which now carries
+    `umaResolutionStatus='proposed'`. The upsert stamps
+    `uma_proposed_at`; the close-machine call sees State 2 and waits
+    — no trade_closures row written."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xRP2",
+        last_resolution_status=None,
+        closed_at=_recent_closed_at(),
+        active=0,
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=301, market_id="0xRP2", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+
+    async def fake_fetch_single(self, condition_id):
+        assert condition_id == "0xRP2"
+        row = _gamma_row("0xRP2", "Q proposed via re-poll")
+        row["umaResolutionStatus"] = "proposed"
+        row["resolvedBy"] = "0xORACLE"
+        row["acceptingOrders"] = False
+        return row
+
+    monkeypatch.setattr(MarketsStage, "_fetch_single_market", fake_fetch_single)
+
+    with cycle_scope(1):
+        n = await stage.poll_resolved_markets_once()
+    assert n == 1
+
+    # uma_proposed_at stamped by the upsert path (cycle-11 transition stamp).
+    cur = await db_ready.conn.execute(
+        "SELECT uma_proposed_at, last_resolution_status "
+        "FROM markets WHERE condition_id='0xRP2'"
+    )
+    row = await cur.fetchone()
+    assert row["last_resolution_status"] == "proposed"
+    assert row["uma_proposed_at"] is not None
+
+    # No closure: State 2 waits.
+    cur = await db_ready.conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=301"
+    )
+    assert (await cur.fetchone())["n"] == 0
+
+
+async def test_resolved_poll_state3_resolved_yes_closes(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 12: closed market with no UMA status initially. The
+    re-poll fetches Gamma and sees `umaResolutionStatus='resolved'`
+    with `outcomePrices=["1","0"]`. The state machine closes the
+    trade at the YES payout (exit_mid=1.0). Verifies the orchestration
+    end-to-end."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xRP3",
+        last_resolution_status=None,
+        closed_at=_recent_closed_at(),
+        active=0,
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=302, market_id="0xRP3", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+
+    async def fake_fetch_single(self, condition_id):
+        assert condition_id == "0xRP3"
+        row = _gamma_row("0xRP3", "Q resolved via re-poll")
+        row["umaResolutionStatus"] = "resolved"
+        row["outcomePrices"] = ["1", "0"]
+        row["acceptingOrders"] = False
+        return row
+
+    monkeypatch.setattr(MarketsStage, "_fetch_single_market", fake_fetch_single)
+
+    with cycle_scope(1):
+        n = await stage.poll_resolved_markets_once()
+    assert n == 1
+
+    # Closure recorded at exit_mid=1.0 (YES payout from outcomePrices[0]).
+    cur = await db_ready.conn.execute(
+        "SELECT close_reason, exit_mid_price "
+        "FROM trade_closures WHERE trade_id=302"
+    )
+    row = await cur.fetchone()
+    assert row is not None, "expected a trade_closures row for trade 302"
+    assert row["close_reason"] == "market_resolved"
+    assert row["exit_mid_price"] == pytest.approx(1.0)
+
+    # uma_finalized_at stamped by the upsert path.
+    cur = await db_ready.conn.execute(
+        "SELECT uma_finalized_at FROM markets WHERE condition_id='0xRP3'"
+    )
+    row = await cur.fetchone()
+    assert row["uma_finalized_at"] is not None
+
+
+async def test_resolved_poll_skips_markets_past_timeout(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 12: a closed market whose `closed_at` is older than
+    `cfg.markets.resolution_timeout_hours` is OUT of the human-review
+    window — leave it for a human, do NOT refetch (saves Gamma quota,
+    and matches the cycle-11 contract that we never auto-close past
+    the timeout). The poll query must filter it out so
+    `_fetch_single_market` is never called."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    # Default timeout is 168h; closed_at in 2020 is well past that.
+    await _seed_market_row(
+        db_ready, condition_id="0xRPT",
+        last_resolution_status=None,
+        closed_at=_ancient_closed_at(),
+        active=0,
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=303, market_id="0xRPT", direction="YES",
+        decided_at="2020-01-01T00:02:00+00:00", cycle_id=1,
+    )
+
+    calls: list[str] = []
+
+    async def fake_fetch_single(self, condition_id):
+        calls.append(condition_id)
+        return None  # would no-op anyway; the assertion is on `calls`
+
+    monkeypatch.setattr(MarketsStage, "_fetch_single_market", fake_fetch_single)
+
+    with cycle_scope(1):
+        n = await stage.poll_resolved_markets_once()
+    assert n == 0
+    # Critically: the timed-out market is NOT refetched.
+    assert calls == []
+
+
+async def test_resolved_poll_only_walks_open_trades(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 12: a closed-but-not-finalized market with NO open
+    trade on it does NOT get refetched. This bounds Gamma quota
+    usage to markets we actually care about (don't waste budget on
+    the long-tail universe). Two markets are seeded: one with an
+    open trade, one without; only the former should be fetched."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xRPA",  # has an open trade
+        last_resolution_status=None,
+        closed_at=_recent_closed_at(),
+        active=0,
+    )
+    await _seed_market_row(
+        db_ready, condition_id="0xRPB",  # no open trade — should NOT be fetched
+        last_resolution_status=None,
+        closed_at=_recent_closed_at(),
+        active=0,
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=304, market_id="0xRPA", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+
+    calls: list[str] = []
+
+    async def fake_fetch_single(self, condition_id):
+        calls.append(condition_id)
+        return None
+
+    monkeypatch.setattr(MarketsStage, "_fetch_single_market", fake_fetch_single)
+
+    with cycle_scope(1):
+        n = await stage.poll_resolved_markets_once()
+    assert n == 1
+    assert calls == ["0xRPA"]
+
+
+async def test_resolved_poll_handles_gamma_failure_gracefully(
+    db_ready, bus, embedder, monkeypatch, caplog,
+):
+    """Cycle 12: a single-market Gamma fetch returning None (network
+    error, unknown id, malformed JSON) does NOT crash the poll loop.
+    The close machine still runs against the existing DB state, and
+    a subsequent market in the same cycle is processed normally."""
+    import logging
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    # Seed two markets so we can verify the cycle continues past the
+    # failing one. Both have open trades and recent closed_at.
+    await _seed_market_row(
+        db_ready, condition_id="0xRPF1",  # fetch will return None
+        last_resolution_status=None,
+        closed_at=_recent_closed_at(),
+        active=0,
+    )
+    await _seed_market_row(
+        db_ready, condition_id="0xRPF2",  # fetch will succeed (still proposed)
+        last_resolution_status=None,
+        closed_at=_recent_closed_at(),
+        active=0,
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=305, market_id="0xRPF1", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=306, market_id="0xRPF2", direction="YES",
+        decided_at="2026-05-25T00:03:00+00:00", cycle_id=1,
+    )
+
+    async def fake_fetch_single(self, condition_id):
+        if condition_id == "0xRPF1":
+            return None  # simulate fetch failure
+        row = _gamma_row(condition_id, "Q recoverable")
+        row["umaResolutionStatus"] = "proposed"
+        return row
+
+    monkeypatch.setattr(MarketsStage, "_fetch_single_market", fake_fetch_single)
+
+    with caplog.at_level(logging.WARNING, logger="app.stages.markets"):
+        with cycle_scope(1):
+            n = await stage.poll_resolved_markets_once()
+
+    # Both markets evaluated (the failing fetch is non-fatal — the
+    # close machine still runs against the existing DB row).
+    assert n == 2
+    # Neither trade closed: 0xRPF1 stayed in State 1 (no Gamma update);
+    # 0xRPF2 transitioned to State 2 (proposed) but that's a wait state.
+    cur = await db_ready.conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id IN (305, 306)"
+    )
+    assert (await cur.fetchone())["n"] == 0
+    # 0xRPF2 still got its uma_proposed_at stamped from the successful
+    # refetch — proves the loop did not bail out after the first failure.
+    cur = await db_ready.conn.execute(
+        "SELECT uma_proposed_at FROM markets WHERE condition_id='0xRPF2'"
+    )
+    assert (await cur.fetchone())["uma_proposed_at"] is not None

@@ -96,9 +96,15 @@ _GAMMA_TIMEOUT_SECONDS = 15.0
 
 _DEFAULT_POLL_SECONDS = 120
 _DEFAULT_EMBED_REFRESH_SECONDS = 3600
+# Cycle 12: orchestration cadence for the closed-but-not-finalized
+# market re-poll. Default 10 min — fine-grained enough that we catch
+# the 2h UMA challenge window early, coarse enough that we don't
+# hammer Gamma per market. See plans/resolution-oracle.md.
+_DEFAULT_RESOLUTION_POLL_SECONDS = 600
 
 _ENV_POLL_SECONDS = "IRENE__MARKETS__POLL_SECONDS"
 _ENV_EMBED_REFRESH_SECONDS = "IRENE__MARKETS__EMBED_REFRESH_SECONDS"
+_ENV_RESOLUTION_POLL_SECONDS = "IRENE__MARKETS__RESOLUTION_POLL_SECONDS"
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +551,17 @@ class MarketsStage:
                 deps.config, "embed_refresh_seconds", _DEFAULT_EMBED_REFRESH_SECONDS
             )),
         )
+        # Cycle 12: cadence for the resolution-re-poll task. Defaults to
+        # 600s (10 min) — fast enough to catch the 2h UMA challenge
+        # window early, slow enough to keep Gamma quota usage bounded.
+        self._resolution_poll_seconds = _read_int_env(
+            _ENV_RESOLUTION_POLL_SECONDS,
+            int(_config_get(
+                deps.config,
+                "resolution_poll_seconds",
+                _DEFAULT_RESOLUTION_POLL_SECONDS,
+            )),
+        )
 
         # MarketIndex lives on the stage instance — not at module scope —
         # so the rule-5 exception is bounded to a single object lifetime.
@@ -558,6 +575,13 @@ class MarketsStage:
         self._client: Optional[httpx.AsyncClient] = None
         self._poll_task: Optional[asyncio.Task] = None
         self._embed_task: Optional[asyncio.Task] = None
+        # Cycle 12: separate task that re-polls markets sitting in
+        # State 1/2 (closed, not yet finalized) so the three-state
+        # close machine actually fires on the proposed/resolved
+        # transitions instead of being stuck at State 1 forever
+        # (Gamma drops them from the active list at `closed=true`,
+        # BEFORE UMA proposes — so the main poll never re-sees them).
+        self._resolution_poll_task: Optional[asyncio.Task] = None
         self._stopped = False
 
     # ---- lifecycle ------------------------------------------------------
@@ -573,15 +597,24 @@ class MarketsStage:
         logger.info("markets: index warmed (%d rows)", loaded)
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._embed_task = asyncio.create_task(self._embed_loop())
+        # Cycle 12: closed-but-not-finalized re-poll task.
+        self._resolution_poll_task = asyncio.create_task(
+            self._resolution_poll_loop()
+        )
 
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        for task in (self._poll_task, self._embed_task):
+        tasks = (
+            self._poll_task,
+            self._embed_task,
+            self._resolution_poll_task,
+        )
+        for task in tasks:
             if task is not None:
                 task.cancel()
-        for task in (self._poll_task, self._embed_task):
+        for task in tasks:
             if task is not None:
                 try:
                     await task
@@ -589,6 +622,7 @@ class MarketsStage:
                     pass
         self._poll_task = None
         self._embed_task = None
+        self._resolution_poll_task = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -617,6 +651,24 @@ class MarketsStage:
             except Exception:  # noqa: BLE001
                 logger.exception("markets embedding refresh failed; continuing")
             await asyncio.sleep(self._embed_refresh_seconds)
+
+    async def _resolution_poll_loop(self) -> None:
+        """Cycle 12: drive the three-state UMA close machine on markets
+        that Gamma already dropped (`closed=true`) but UMA has not yet
+        finalized. The main `_poll_loop` only walks the active list, so
+        without this task those markets never get re-evaluated and the
+        close machine stays stuck at State 1 forever. See
+        `plans/resolution-oracle.md` "orchestration gap"."""
+        while True:
+            try:
+                await self.poll_resolved_markets_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — keep the loop alive
+                logger.exception(
+                    "markets resolution-poll cycle failed; continuing"
+                )
+            await asyncio.sleep(self._resolution_poll_seconds)
 
     # ---- single-cycle entry points (also called directly in tests) ----
 
@@ -698,6 +750,90 @@ class MarketsStage:
         await self.index.load(self._db)
         return len(rows)
 
+    async def poll_resolved_markets_once(self) -> int:
+        """Cycle 12: walk markets where Gamma flipped `closed=true` but
+        UMA has NOT yet finalized AND we have at least one open trade
+        sitting on them. For each unique market_id, refetch the Gamma
+        row, re-run the upsert (which stamps `last_resolution_status`
+        / `last_outcome_prices` / `uma_proposed_at` / `uma_finalized_at`
+        per cycle 11), then invoke `_close_orphaned_trades_for` so the
+        existing State-2/State-3 machine runs.
+
+        Returns the number of unique markets re-evaluated. Errors on
+        any single market are caught and logged so one bad market
+        cannot abort the cycle (per the loop's failure contract).
+        """
+        timeout_hours = float(
+            _config_get(self._config, "resolution_timeout_hours", 168.0)
+        )
+        # Filter to open trades on markets that are inside the human-
+        # review window. The cutoff is computed as an ISO string so the
+        # comparison happens entirely in SQLite (avoids pulling every
+        # row into Python just to filter on a timestamp). We accept the
+        # tiny implicit assumption that closed_at and "now" share the
+        # same iso8601 / UTC convention (markets.py writes them via the
+        # same `_now_iso()` helper).
+        from datetime import timedelta
+        now_dt = datetime.now(timezone.utc)
+        cutoff_iso = (now_dt - timedelta(hours=timeout_hours)).isoformat()
+        cur = await self._db.conn.execute(
+            """
+            SELECT DISTINCT t.market_id AS market_id
+            FROM trades t
+            LEFT JOIN trade_closures c ON c.trade_id = t.id
+            JOIN markets m ON m.condition_id = t.market_id
+            WHERE c.id IS NULL
+              AND m.closed_at IS NOT NULL
+              AND m.uma_finalized_at IS NULL
+              AND m.closed_at >= ?
+            """,
+            (cutoff_iso,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        if not rows:
+            return 0
+        condition_ids = [r["market_id"] for r in rows]
+        logger.info(
+            "markets: resolution-poll walking %d closed-but-not-finalized "
+            "market(s) with open trades",
+            len(condition_ids),
+        )
+        evaluated = 0
+        for cid in condition_ids:
+            try:
+                raw = await self._fetch_single_market(cid)
+                if raw is not None:
+                    parsed = _parse_gamma_row(raw)
+                    if parsed is not None:
+                        # `_upsert_market` insists `active=1` on insert/
+                        # conflict (intent: "still in the open list"),
+                        # which would re-activate the row. That's
+                        # actually OK here — a market that's already
+                        # been deactivated by `_deactivate_missing`
+                        # will be re-deactivated on the next regular
+                        # poll cycle if Gamma still doesn't list it.
+                        # The fields we care about (uma_* and
+                        # last_outcome_prices) are written by the
+                        # upsert + stamp path regardless.
+                        await self._upsert_market(parsed)
+                # Drive the state machine on this single market
+                # regardless of fetch outcome — if the refetch failed
+                # but the row already carries a `'resolved'` status
+                # from a prior cycle, the close machine should still
+                # be invoked so we don't get stuck.
+                await self._close_orphaned_trades_for([cid])
+                evaluated += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — per-market isolation
+                logger.exception(
+                    "markets: resolution-poll for market %s failed; "
+                    "continuing with the rest of the cycle",
+                    cid,
+                )
+        return evaluated
+
     # ---- helpers --------------------------------------------------------
 
     async def _fetch_all_gamma(self) -> list[dict]:
@@ -731,6 +867,50 @@ class MarketsStage:
                 break
         logger.info("markets: fetched %d markets from Gamma", len(markets))
         return markets
+
+    async def _fetch_single_market(self, condition_id: str) -> Optional[dict]:
+        """Cycle 12: fetch a single market by condition_id from Gamma.
+
+        Endpoint verified 2026-05-25 (curl from this host):
+        ``GET https://gamma-api.polymarket.com/markets?condition_ids=<cid>``
+        returns a JSON array with the single matching row (or `[]` if
+        the id is unknown). Same URL as `_fetch_all_gamma`, just
+        narrowed by `condition_ids` instead of paged. This shape works
+        for markets that are no longer in the active list (drops the
+        `active=true&closed=false` filter), which is exactly the case
+        we need for the resolution re-poll.
+
+        Returns the parsed row dict from Gamma, or `None` if the
+        market is unknown / the response is malformed / the network
+        fails. Caller is expected to feed the result back through
+        `_parse_gamma_row` + `_upsert_market`.
+        """
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=_GAMMA_TIMEOUT_SECONDS)
+        params = {"condition_ids": condition_id}
+        try:
+            resp = await self._client.get(_GAMMA_URL, params=params)
+            resp.raise_for_status()
+            body = resp.json()
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "markets: single-market Gamma fetch failed for %s (%s)",
+                condition_id, exc,
+            )
+            return None
+        except ValueError as exc:  # JSON decode
+            logger.warning(
+                "markets: single-market Gamma response not JSON for %s (%s)",
+                condition_id, exc,
+            )
+            return None
+        if not isinstance(body, list) or not body:
+            # Gamma returns [] for unknown / fully-archived markets.
+            return None
+        first = body[0]
+        if not isinstance(first, dict):
+            return None
+        return first
 
     async def _upsert_market(self, row: dict) -> None:
         now = _now_iso()
