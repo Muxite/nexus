@@ -14,6 +14,8 @@ from . import (
     news_staleness,
     per_gate_rejection,
     pnl_cumulative,
+    speed_overlay,
+    throughput_overlay,
 )
 
 PLOTS = [
@@ -24,4 +26,6 @@ PLOTS = [
     per_gate_rejection,
     pnl_cumulative,
     missed_edge,
+    throughput_overlay,
+    speed_overlay,
 ]
