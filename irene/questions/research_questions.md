@@ -194,7 +194,8 @@ docs, Gamma reference, academic papers, market-microstructure blogs.
   - **unblocks:** defensibility of `cfg.trade.min_edge`.
 
 - **O-F3.** Is there prior academic or industry work on news-to-event matching thresholds — specifically on the right cosine floor and the right "new event" distance cutoff? ↔ i-F1.
-  - **unblocks:** defensibility of `cfg.match.min_similarity` and `cfg.dedupe.breaking_distance`.
+  - **unblocks:** defensibility of `cfg.match.similarity_floor` (recall gate, similarity units) and `cfg.dedupe.breaking_distance` (precision gate, **distance** units).
+  - **units note (2026-05-25):** the candidate-pool floor lives on MatchSection as `similarity_floor` (0.50, cosine similarity); the trade-stage floor lives on TradeSection as `min_similarity` (0.35, cosine similarity, currently dead in production because of the upstream 0.50). The dedupe knob `breaking_distance` (0.55) is in cosine **distance**, not similarity — equivalent similarity ≈ 0.45. Any RAG-sourced "0.85–0.90 cosine similarity" recommendation maps to a distance of 0.10–0.15, not to 0.85. See [`docs/similarity_thresholds.md`](../docs/similarity_thresholds.md) for the full mapping and the do-not-raise warning.
 
 - **O-F4.** Is news-arb a low-variance grinding strategy or a power-law heavy-tailed one, and how long a soak does the literature suggest before claiming profitability with confidence?
   - **unblocks:** design of the cycle-8+ profitability test.

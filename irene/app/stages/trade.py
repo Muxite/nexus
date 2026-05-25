@@ -79,8 +79,10 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+import re
+from datetime import datetime, time as dt_time, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from app import db as db_module
 from app.cycle import current_cycle_id
@@ -662,20 +664,154 @@ class TradeStage:
             return 1
         return max(1, int(row["n"]))
 
-    @staticmethod
-    def _days_to(end_date_iso: Optional[str]) -> Optional[int]:
-        """Days from now (UTC) to a Polymarket end_date string. Returns
-        None if the timestamp can't be parsed. Negative for past dates."""
-        if not end_date_iso:
+    # Eastern Time is the operative clock on Polymarket — the frontend and
+    # API surface deadlines in ET, and a DST-related platform incident
+    # confirmed ET as the canonical zone. So a naïve timestamp from Gamma
+    # (no `Z`, no `+HH:MM` suffix) must be interpreted as ET, not UTC.
+    # Source: `irene/questions/unstructured answers.md` lines 183-185.
+    _ET_ZONE = ZoneInfo("America/New_York")
+
+    # Match a title-string deadline like "by June 30" / "by June 30, 2026".
+    # The year is optional — when missing we assume the current ET year.
+    # Only fires as a true last resort when Gamma's `end_date` is absent.
+    _TITLE_DEADLINE_RE = re.compile(
+        r"by\s+"
+        r"(?P<month>"
+        r"january|february|march|april|may|june|july|"
+        r"august|september|october|november|december"
+        r")\s+"
+        r"(?P<day>\d{1,2})"
+        r"(?:,\s*(?P<year>\d{4}))?",
+        re.IGNORECASE,
+    )
+    _MONTHS = {
+        "january": 1, "february": 2, "march": 3, "april": 4,
+        "may": 5, "june": 6, "july": 7, "august": 8,
+        "september": 9, "october": 10, "november": 11, "december": 12,
+    }
+
+    @classmethod
+    def _parse_market_deadline(cls, market: Optional[dict]) -> Optional[datetime]:
+        """Parse a market's deadline into a UTC-aware ``datetime`` or None.
+
+        Resolution order:
+          1. Gamma's ``end_date`` field. Explicit-UTC suffixes (``Z``,
+             ``+00:00``, ``+0000``) parse as UTC. Other explicit offsets
+             are respected verbatim. **Naïve** timestamps are interpreted
+             as Eastern Time, then converted to UTC.
+          2. Title-string fallback (``by <Month> <Day>[, <Year>]``) →
+             that day 23:59:59 ET. Only fires when ``end_date`` is
+             missing or unparseable.
+
+        Returns None when neither source yields a usable timestamp; the
+        caller's existing ``days is None`` defensives skip the sub-rule.
+        """
+        if not isinstance(market, dict):
             return None
-        from datetime import datetime, timezone
-        s = end_date_iso.replace("Z", "+00:00")
+
+        end_iso = market.get("end_date")
+        if isinstance(end_iso, str) and end_iso:
+            parsed = cls._parse_end_date_string(end_iso)
+            if parsed is not None:
+                return parsed
+
+        for key in ("question", "description"):
+            text = market.get(key)
+            if isinstance(text, str) and text:
+                title_parsed = cls._parse_title_deadline(text)
+                if title_parsed is not None:
+                    return title_parsed
+        return None
+
+    @classmethod
+    def _parse_end_date_string(cls, end_date_iso: str) -> Optional[datetime]:
+        """Parse an ISO-ish end_date string into UTC.
+
+        - ``...Z`` / ``...+00:00`` / ``...+0000`` → UTC (preserved).
+        - Other explicit offsets (``...+02:00``, ``...-05:00``) → respected.
+        - Naïve (no tz) → interpreted as America/New_York, converted to UTC.
+        """
+        s = end_date_iso.strip()
+        if not s:
+            return None
+        # `fromisoformat` accepts `+HHMM` only on Python 3.11+; normalise
+        # the bare-Z form which is by far the most common Gamma payload.
+        normalised = s
+        if normalised.endswith("Z"):
+            normalised = normalised[:-1] + "+00:00"
+        elif normalised.endswith("+0000"):
+            normalised = normalised[:-5] + "+00:00"
+        elif normalised.endswith("-0000"):
+            normalised = normalised[:-5] + "+00:00"
         try:
-            end = datetime.fromisoformat(s)
+            parsed = datetime.fromisoformat(normalised)
         except (TypeError, ValueError):
             return None
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
+        if parsed.tzinfo is None:
+            # Naïve → ET (NOT UTC). This is the key behaviour shift.
+            parsed = parsed.replace(tzinfo=cls._ET_ZONE)
+        return parsed.astimezone(timezone.utc)
+
+    @classmethod
+    def _parse_title_deadline(cls, text: str) -> Optional[datetime]:
+        """Extract ``by <Month> <Day>[, <Year>]`` → that day 23:59:59 ET.
+
+        End-of-day ET — NOT UTC midnight — because Polymarket's docs say
+        the market rules page (not the English phrase alone) is the source
+        of truth, and the platform's operative clock is ET. Source:
+        ``irene/questions/unstructured answers.md`` lines 183-185.
+        """
+        match = cls._TITLE_DEADLINE_RE.search(text)
+        if not match:
+            return None
+        month = cls._MONTHS.get(match.group("month").lower())
+        if month is None:
+            return None
+        try:
+            day = int(match.group("day"))
+        except (TypeError, ValueError):
+            return None
+        year_str = match.group("year")
+        if year_str:
+            try:
+                year = int(year_str)
+            except (TypeError, ValueError):
+                return None
+        else:
+            # No year in the phrase → assume current ET year. Reasonable
+            # for live trading; will need a re-eval if we ever backfill
+            # historical markets through this path.
+            year = datetime.now(cls._ET_ZONE).year
+        try:
+            naive = datetime.combine(
+                datetime(year, month, day).date(),
+                dt_time(23, 59, 59),
+            )
+        except ValueError:
+            return None
+        et_local = naive.replace(tzinfo=cls._ET_ZONE)
+        return et_local.astimezone(timezone.utc)
+
+    @classmethod
+    def _days_to(cls, end_date_or_market) -> Optional[int]:
+        """Days from now (UTC) to a Polymarket deadline. Negative for past.
+
+        Accepts either a market dict (preferred — enables title-fallback)
+        or a raw ``end_date`` string (legacy callers / tests). Returns
+        None if the deadline can't be resolved.
+        """
+        if end_date_or_market is None:
+            return None
+        if isinstance(end_date_or_market, dict):
+            end = cls._parse_market_deadline(end_date_or_market)
+        elif isinstance(end_date_or_market, str):
+            if not end_date_or_market:
+                return None
+            end = cls._parse_end_date_string(end_date_or_market)
+        else:
+            return None
+        if end is None:
+            return None
         now = datetime.now(timezone.utc)
         return int((end - now).total_seconds() // 86400)
 
@@ -708,8 +844,10 @@ class TradeStage:
             if mid <= cfg.extreme_mid_low or mid >= cfg.extreme_mid_high:
                 return ("extreme_mid_no_breaking", mid)
 
-        # Sub-rules 3 & 4: time-to-expiry.
-        days = self._days_to(market.get("end_date"))
+        # Sub-rules 3 & 4: time-to-expiry. Pass the whole market dict so
+        # the deadline parser can fall back to the title-string when
+        # Gamma's `end_date` is missing (per resolution-oracle plan D2).
+        days = self._days_to(market)
         if days is not None:
             if days < cfg.min_days_to_expiry:
                 return ("near_expiry", days)
