@@ -264,6 +264,101 @@ def test_parse_gamma_row_missing_volume24hr_is_zero_not_lifetime():
     assert row["volume_usdc"] == 0.0
 
 
+def test_parse_gamma_row_surfaces_closed_and_closedtime():
+    """Cycle 18: parser surfaces `closed` and `closedTime` so the
+    upsert can prefer the platform timestamp over our first-observation
+    `now()` stamp."""
+    raw = _gamma_row("0xf", "Q")
+    raw["closed"] = True
+    raw["closedTime"] = "2026-05-25 09:09:00+00"
+    row = _parse_gamma_row(raw)
+    assert row["closed"] is True
+    assert row["closed_time"] == "2026-05-25 09:09:00+00"
+
+
+def test_parse_gamma_row_default_closed_is_false_when_missing():
+    raw = _gamma_row("0xg", "Q")
+    row = _parse_gamma_row(raw)
+    assert row["closed"] is False
+    assert row["closed_time"] is None
+
+
+async def test_upsert_closed_market_uses_closedtime_and_sets_inactive(
+    db_ready, bus, embedder,
+):
+    """Cycle 18: when Gamma returns closed=true with a closedTime, the
+    upsert MUST land active=0 and prefer the platform timestamp over
+    our first-observation now(). Fixes the cycle-12 active-flicker bug
+    where the resolution re-poll path used to re-set active=1 on already-
+    closed markets."""
+    stage = _make_stage(db_ready, bus, embedder)
+    raw = _gamma_row("0xclosed1", "Will X be closed?")
+    raw["closed"] = True
+    raw["closedTime"] = "2026-05-25T09:09:00+00:00"
+    parsed = _parse_gamma_row(raw)
+    await stage._upsert_market(parsed)
+
+    cur = await db_ready.conn.execute(
+        "SELECT active, closed_at FROM markets WHERE condition_id='0xclosed1'"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row["active"] == 0
+    assert row["closed_at"] == "2026-05-25T09:09:00+00:00"
+
+
+async def test_upsert_closed_market_without_closedtime_falls_back_to_now(
+    db_ready, bus, embedder,
+):
+    """closed=true with no closedTime → fall back to _now_iso() rather
+    than leaving closed_at NULL."""
+    stage = _make_stage(db_ready, bus, embedder)
+    raw = _gamma_row("0xclosed2", "Q")
+    raw["closed"] = True
+    # no closedTime
+    parsed = _parse_gamma_row(raw)
+    await stage._upsert_market(parsed)
+
+    cur = await db_ready.conn.execute(
+        "SELECT active, closed_at FROM markets WHERE condition_id='0xclosed2'"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row["active"] == 0
+    assert row["closed_at"] is not None
+    # Should look like an ISO timestamp, not the literal "now".
+    assert "T" in row["closed_at"] or " " in row["closed_at"]
+
+
+async def test_upsert_preserves_earlier_closedtime_via_coalesce(
+    db_ready, bus, embedder,
+):
+    """If we observed closedTime once and Gamma later transiently drops
+    it, the COALESCE in the UPDATE clause must preserve the earlier
+    authoritative timestamp."""
+    stage = _make_stage(db_ready, bus, embedder)
+
+    # First observation: closed with platform timestamp.
+    raw1 = _gamma_row("0xclosed3", "Q")
+    raw1["closed"] = True
+    raw1["closedTime"] = "2026-05-25T08:00:00+00:00"
+    await stage._upsert_market(_parse_gamma_row(raw1))
+
+    # Second observation: still closed but Gamma drops closedTime.
+    raw2 = _gamma_row("0xclosed3", "Q")
+    raw2["closed"] = True
+    # no closedTime — would otherwise stamp now()
+    await stage._upsert_market(_parse_gamma_row(raw2))
+
+    cur = await db_ready.conn.execute(
+        "SELECT closed_at FROM markets WHERE condition_id='0xclosed3'"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    # COALESCE preserves the original timestamp, not the second-obs now().
+    assert row["closed_at"] == "2026-05-25T08:00:00+00:00"
+
+
 # ---------------------------------------------------------------------------
 # DDL registration
 # ---------------------------------------------------------------------------

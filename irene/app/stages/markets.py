@@ -369,6 +369,19 @@ def _parse_gamma_row(raw: dict) -> Optional[dict]:
         except (json.JSONDecodeError, ValueError):
             outcome_prices = []
 
+    # Cycle 18: Gamma's `closed` flag + `closedTime` (precise platform
+    # timestamp when the market entered closed state). Verified live
+    # 2026-05-25 — `closedTime` is present on ~100% of recently-closed
+    # markets and is more authoritative than our first-observation
+    # `_now_iso()` stamp. When `closed=true` AND closedTime present,
+    # `_upsert_market` will prefer it over `now`. See
+    # `reports/2026-05-25-cycle17-resolved-schema-verification.md`.
+    closed_raw = raw.get("closed")
+    closed_flag = bool(closed_raw) if closed_raw is not None else False
+    closed_time = raw.get("closedTime") or None
+    if closed_time and not isinstance(closed_time, str):
+        closed_time = str(closed_time)
+
     return {
         "condition_id": str(condition_id),
         "slug": raw.get("slug") or None,
@@ -383,6 +396,8 @@ def _parse_gamma_row(raw: dict) -> Optional[dict]:
         "resolved_by": resolved_by,
         "accepting_orders": accepting_orders,
         "outcome_prices": outcome_prices,
+        "closed": closed_flag,
+        "closed_time": closed_time,
     }
 
 
@@ -1009,6 +1024,23 @@ class MarketsStage:
         # transiently drop the field between polls).
         outcome_prices = row.get("outcome_prices") or []
         outcome_json = json.dumps(outcome_prices) if outcome_prices else None
+        # Cycle 18: closed=true rows (which arrive via the cycle-12 single-
+        # market re-poll for resolution finalization) MUST land as
+        # `active=0`, not `active=1`. The previous unconditional `active=1`
+        # caused intermittent active-flickering: cycle-12 refetch sets
+        # active=1, next regular poll's _deactivate_missing fires it back
+        # to 0 — and stamps `closed_at = now()`, overwriting any
+        # authoritative `closedTime` we observed. Also: prefer the
+        # platform `closedTime` over our first-observation `now`.
+        closed_flag = bool(row.get("closed", False))
+        closed_time = row.get("closed_time") or None
+        active_value = 0 if closed_flag else 1
+        # closed_at: NULL when active; closedTime when present; else now.
+        closed_at_value: Optional[str]
+        if closed_flag:
+            closed_at_value = closed_time if closed_time else now
+        else:
+            closed_at_value = None
         async with self._db.batch() as cur:
             await cur.execute(
                 """
@@ -1017,7 +1049,7 @@ class MarketsStage:
                     end_date, volume_usdc, token_yes, token_no,
                     active, closed_at, first_seen_at, updated_at,
                     last_resolution_status, last_outcome_prices
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_id) DO UPDATE SET
                     slug = excluded.slug,
                     question = excluded.question,
@@ -1027,8 +1059,11 @@ class MarketsStage:
                     volume_usdc = excluded.volume_usdc,
                     token_yes = excluded.token_yes,
                     token_no = excluded.token_no,
-                    active = 1,
-                    closed_at = NULL,
+                    active = excluded.active,
+                    -- Cycle 18: COALESCE preserves an earlier authoritative
+                    -- closedTime if Gamma later transiently drops it. Only
+                    -- overwrite NULL → non-NULL; never non-NULL → different.
+                    closed_at = COALESCE(markets.closed_at, excluded.closed_at),
                     updated_at = excluded.updated_at,
                     last_resolution_status = excluded.last_resolution_status,
                     -- Only overwrite when the new observation is non-NULL:
@@ -1049,6 +1084,8 @@ class MarketsStage:
                     row["volume_usdc"],
                     row["token_yes"],
                     row["token_no"],
+                    active_value,
+                    closed_at_value,
                     now,
                     now,
                     row.get("uma_resolution_status"),
