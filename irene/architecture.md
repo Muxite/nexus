@@ -4,7 +4,7 @@
 >
 > **Discipline.** Updated at the end of every phase (not every PR — that aspiration kills momentum; per-PR notes go to `changelogs/cycles.md` instead).
 
-- **Last updated:** 2026-05-23 (**philosophy locked + observability port + v2-fast prompt**)
+- **Last updated:** 2026-05-25 (**cycles 4-7 shipped: accounting fixes, scraper-v2 combined mode, ingest expansion, fees-in-PnL, market-news weight gate**)
 - **Synthesized from:** the approved plan, the seulgi audit reports, the user's DKG spec at `docs/dkg_spec.md`, the irene ontology at `docs/ontology.md`, and the P3 contracts at `docs/p3_contracts.md`.
 - **Status:** P1 + P2 sealed. **P3 chunk 1 landed.** `app/stages/resolve.py` subscribes to `extraction.completed`, runs deterministic acronym → alias → suffix → self rule chain, owns the `entity_resolutions` overlay (facts stay immutable). Acronym table covers 37 common name-pairs. `--alias-aware` metric in `extraction_quality.py` extends with expansion-overlap matching. **Median alias-aware fact P/R = 0.71 / 0.65** across 3 real-LLM runs; the [P3 chunk 1 report](reports/2026-05-23-irene-p3-resolver.md) recommends chunk 2 (eventize + linker) proceeds — most of the gap to the 0.75 gate is gold-set ambiguity, not extractor failure, and chunk 2's actual success criterion is dual-path PnL parity not absolute P/R. **8 stages wired**, 247 tests green, P1 ship-gate still passing.
 
@@ -154,31 +154,81 @@ Every traveller-of-the-pipeline table also carries `is_tracer` (INT NOT NULL DEF
 
 ---
 
-## Decision funnel (target — none live yet)
+## Decision funnel (live as of cycle 7, 2026-05-25)
 
-Once P1 ships, every headline runs the cascade:
+Every headline runs the cascade. Each gate emits a `gate_history` JSON entry; the `decisions` table records every outcome with `reason` so the funnel is queryable per cycle.
 
 ```
-ingest      → article row (always written)
-dedupe      → cluster_id (chroma freshness label: BREAKING / EVOLVING / REHASH / STALE_RETURN)
-markets     → candidate market IDs (cosine top-K above similarity floor)
-match       → signal rows (one per article × candidate)
-predict     → prediction rows (one per signal; LLM direction + confidence)
-trade gate  → trade row or decision='reject' row with explicit reason
+ingest      → article row (sources: rss / html / combined / social-future)
+              scraper-v2: combined mode = parallel RSS+HTML merge by canonical URL
+              article body fan-out enriches top-N HTML-only links
+dedupe      → cluster_id + freshness label (chroma cosine):
+              BREAKING (nearest_dist > breaking_distance)
+              EVOLVING (< 6h since cluster's first)
+              REHASH (6-24h)  STALE_RETURN (> 24h)
+markets     → gamma poll; markets table; CLOB token_yes/token_no
+match       → signals = (article × top-K markets above similarity floor)
+
+trade gate cascade (in order; first reject wins):
+  1. similarity_floor (min_similarity = 0.35)
+  2. freshness         (accept_freshness = {BREAKING, EVOLVING})
+  2.5 entity_overlap   (LLM-extracted entities must appear in market question)
+  3. direction         (LLM Y/N/P/U/R label + confidence digit ≥ min_confidence)
+  4. mid_degenerate    (mid > min_mid AND mid < max_mid; default 0.02/0.98)
+  4.b market_news_imbalance  ← cycle 7
+       (a) thin_market: volume_usdc < $10k        (defensive: skipped on 0/NULL)
+       (b) extreme_mid_no_breaking: mid in [0.15,0.85]ᶜ AND freshness != BREAKING
+       (c) far_future_no_breaking: days_to_expiry > 180 AND freshness != BREAKING
+       (d) near_expiry: days_to_expiry < 1
+       (e) singleton_on_extreme_mid: cluster_size = 1 AND mid in extreme zone
+  5. edge        (edge = |p_hat - mid| - fee_buffer ≥ min_edge=0.04)
+  6. size        (Kelly-fraction sized; ≥ min_position_usdc and ≤ max_position_fraction × balance)
+  7. cash        (clips to available cash; reject only if clipped < min_position_usdc)
+  → trade row + 'execute' decision
+
+closer (background poll every cfg.closer.poll_seconds):
+  edge_decay → take_profit (cfg.closer.take_profit_pct) → stop_loss → stagnation → timeout
+  exit_mid from CLOB get_mid; on None and skip_on_missing_mid=True: hold
+  PnL via _compute_gross_pnl - round-trip Polymarket fee  ← cycle 7
+
+markets-stage:
+  _deactivate_missing flags Gamma-dropped markets active=0
+  auto-closes orphaned trades on those markets with                     ← cycle 7
+    close_reason='market_resolved'  exit_mid=entry_mid  PnL = -(fee)
 ```
 
-Drop rates land here once we have data. Until then: nothing to report.
+### Polymarket fee model (cycle 7)
+
+Per-leg taker fee folded into `realized_pnl_usdc` at close:
+
+```
+fee_usdc = shares * fee_rate * p * (1 - p)
+```
+
+where `p` = share price, `shares = size_usdc / position_price`. Maker = 0, settlement = 0.
+
+| category | fee_rate | peak fee /100 shares at p=0.5 |
+|---|---|---|
+| crypto | 0.072 | $1.80 |
+| economics/culture/weather/general | 0.05 | $1.25 |
+| finance/politics/tech/mentions | 0.04 | $1.00 |
+| sports | 0.03 | $0.75 |
+| geopolitics | 0.00 | $0 (free) |
+
+`trade_closures` carries `entry_fee_usdc` + `exit_fee_usdc` as audit columns; they're already folded into the net `realized_pnl_usdc`.
 
 ---
 
-## Known limitations (today)
+## Known limitations (2026-05-25)
 
-- **Live CLOB pricing is wired but not exercised by the soak.** `trade.py` calls `deps.clob.get_mid()` for the bet-side token and falls back to `cfg.trade.default_mid_price=0.5` on None. `main.py` constructs a real `CLOBClient` against `https://clob.polymarket.com`. The soak harness uses a stub CLOB so the soak is hermetic; a real-CLOB soak is the first item in P2.
-- **No position closer beyond timeout.** P1 ships timeout-only. Target / stop / market_resolved rules slot into `closer._evaluate_rules` in later phases.
-- **No position closer.** `trades.closed_at` and `trades.realized_pnl` columns exist but nothing populates them yet.
-- **Dedupe degrades to all-BREAKING when chromadb is missing.** Documented and intentional — keeps tests fast (no chromadb required) and survives a container that lost the dep. Docker image installs chromadb; degradation is for dev/CI only.
-- **DKG layers (P2/P3)** are unspecified at the code level — the spec lives at `docs/dkg_spec.md` but the eventizer clustering thresholds and `directness_score`'s actual function are open research questions per the master-plan critique.
-- **`docs/decision_funnel.md`, `docs/pitfalls.md`, `docs/errors_and_fixes.md`** are TBD — they land alongside the modules they describe.
+- **`markets.volume_usdc` is 0 / NULL for every row.** Gamma returns it (e.g. Rihanna market: $750k) but the upsert path persists 0. Parser at `app/stages/markets.py:_parse_gamma_row:184` looks correct — needs a focused debug. Cycle 7's `thin_market` gate sub-rule is defensive and skipped when the field is empty, so it's a no-op until fixed.
+- **`markets.category` is NULL for every row.** Gamma's top-level response doesn't have a `category` key; it has `feeType` ("general_fees", "politics_fees", etc.) plus a `tags` array. We need to derive category from `feeType` so the Polymarket fee resolver hits the real tier. Until then, default fee_rate=0.05 applies to every market.
+- **Market-resolved auto-close settles at entry_mid, not the actual resolution.** Gross PnL = 0, net PnL = -(round-trip fee). The smaller hit. Real resolution requires a second Gamma call against `closed=true` for `outcomePrices`; ~20 lines, deferred.
+- **DKG path lacks the cycle-7 market_news_imbalance gate.** DKG already has the cycle-4 `mid_degenerate` gate via Fix 7 / cycle 5.1, but the new market-weight check is MVP-only for now. DKG fires rarely (final_score ≥ 0.8 condition); low priority but worth porting for parity.
+- **LLM R-rate stays around 70-80%.** Phase F (prompt fix) is queued but hasn't shipped — cycle-5/5.1 already dropped R from 87% via richer summaries. Re-evaluate if R climbs back.
+- **No real-CLOB soak yet.** `trade.py` calls `deps.clob.get_mid()` for live mid; `main.py` wires a real `CLOBClient` against `https://clob.polymarket.com`. Cycle 29 hit it for real. The closer also hits it. We've seen real responses + the "token goes dark on resolution" path (Trade #37 motivated the cycle-7 auto-close fix).
+- **Dedupe degrades to all-BREAKING when chromadb is missing.** Intentional dev fallback.
+- **DKG layers (P2/P3)** scaffolding is live (extract / resolve / eventize / link stages); the link's `directness_score / novelty_score / deadline_fit / resolution_fit` are equally weighted today. DKG path fires when `market_links.final_score >= 0.8` — rare under live data.
 
 ---
 
@@ -191,3 +241,7 @@ Drop rates land here once we have data. Until then: nothing to report.
 3. Single-decision-per-headline (no variant fan-out in v1).
 4. Tracers and live trades cannot mix (`is_tracer=1 AND paper=0` is a hard write rejection).
 5. Capture (`decision_inputs`, `llm_calls`) lives inside the live `db.batch()` — never lags.
+6. **(2026-05-24)** Implement-then-soak-long. Don't ship multiple changes mid-soak.
+7. **(2026-05-24)** Per-cycle data hygiene. `articles`/`markets`/`entities`/`facts`/`events`/`signals`/`market_links` are SHARED across cycles. `trades`/`decisions`/`predictions`/`trade_closures`/`llm_calls`/`llm_parse_failures` are PER-CYCLE.
+8. **(2026-05-25, cycle 7)** PnL is NET of fees. `realized_pnl_usdc` already includes the round-trip Polymarket taker fee; `entry_fee_usdc` + `exit_fee_usdc` on `trade_closures` are audit-only.
+9. **(2026-05-25, cycle 7)** Auto-close on market deactivation. `markets._deactivate_missing` writes `close_reason='market_resolved'` rows for orphaned trades — no trade should be held indefinitely on a resolved market.
