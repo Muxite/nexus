@@ -97,6 +97,16 @@ class _TradeCfg:
     default_mid_price: float = 0.5
     min_mid: float = 0.02
     max_mid: float = 0.98
+    # Cycle 7: market-news weight gate knobs. Match TradeSection defaults
+    # in app/config.py. Tests override only what's relevant per case.
+    min_market_volume_usdc: float = 10_000.0
+    far_future_days: int = 180
+    min_days_to_expiry: int = 1
+    extreme_mid_low: float = 0.15
+    extreme_mid_high: float = 0.85
+    require_breaking_for_extreme_mid: bool = True
+    require_breaking_for_far_future: bool = True
+    reject_singleton_on_extreme_mid: bool = True
     accept_freshness: list = field(default_factory=lambda: ["BREAKING", "EVOLVING"])
 
 
@@ -135,7 +145,7 @@ async def db_seeded():
                  embedding_dim, embedding_updated_at, active, closed_at,
                  first_seen_at, updated_at)
             VALUES ('m1', 'slug-1', 'Will X happen by end of year?',
-                    'Resolution details.', 'politics', '2026-12-31', 1000.0,
+                    'Resolution details.', 'politics', '2026-12-31', 50000.0,
                     'ty', 'tn', NULL, NULL, NULL, NULL, 1, NULL,
                     '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
             """,
@@ -361,7 +371,7 @@ async def test_target_mid_computed_correctly_for_yes_and_no(db_seeded):
                  embedding_dim, embedding_updated_at, active, closed_at,
                  first_seen_at, updated_at)
             VALUES ('m2', 'slug-2', 'Will Y happen?', 'd2', 'p', '2026-12-31',
-                    1000.0, 'tY2', 'tN2', NULL, NULL, NULL, NULL, 1, NULL,
+                    50000.0, 'tY2', 'tN2', NULL, NULL, NULL, NULL, 1, NULL,
                     '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
             """
         )
@@ -670,6 +680,99 @@ async def test_mid_degenerate_rejects_no_at_high_mid(db_seeded):
     cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM trades")
     assert (await cur.fetchone())[0] == 0
     await cur.close()
+
+
+async def test_market_news_imbalance_thin_market_rejects(db_seeded):
+    # Cycle 7: market with volume_usdc < min_market_volume_usdc rejects.
+    # Override m1's volume to $5k (under the $10k default floor).
+    async with db_seeded.batch() as cur:
+        await cur.execute("UPDATE markets SET volume_usdc=5000.0 WHERE condition_id='m1'")
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=51,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "market_news_imbalance"
+
+
+async def test_market_news_imbalance_far_future_evolving_rejects(db_seeded):
+    # Cycle 7: end_date > 180 days AND freshness != BREAKING rejects.
+    # Fixture has end_date='2026-12-31'; treat the test "now" as far enough
+    # back that 2026-12-31 is > 180 days away. Force end_date to 2030 so
+    # the test is robust to time-of-clock drift.
+    async with db_seeded.batch() as cur:
+        await cur.execute("UPDATE markets SET end_date='2030-12-31T00:00:00Z' WHERE condition_id='m1'")
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=52,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload(freshness="EVOLVING"))
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "market_news_imbalance"
+
+
+async def test_market_news_imbalance_far_future_breaking_allows(db_seeded):
+    # Same far-future market BUT freshness=BREAKING bypasses the rule.
+    async with db_seeded.batch() as cur:
+        await cur.execute("UPDATE markets SET end_date='2030-12-31T00:00:00Z' WHERE condition_id='m1'")
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=53,
+        cached=False, raw_response="{}",
+    ))
+    # Use a CLOB that returns a non-extreme mid so we make it past gate.
+    clob = _FakeCLOB({"ty": 0.5, "tn": 0.5})
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload(freshness="BREAKING"))
+    d = await _single_decision(db_seeded)
+    # Passes market_news_imbalance; should reach edge gate.
+    assert d["reason"] != "market_news_imbalance"
+
+
+async def test_market_news_imbalance_extreme_mid_evolving_rejects(db_seeded):
+    # Mid 0.95 + EVOLVING → reject. Bring end_date close so far_future doesn't fire.
+    async with db_seeded.batch() as cur:
+        await cur.execute("UPDATE markets SET end_date='2026-06-15T00:00:00Z' WHERE condition_id='m1'")
+    clob = _FakeCLOB({"ty": 0.95, "tn": 0.05})
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=54,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload(freshness="EVOLVING"))
+    d = await _single_decision(db_seeded)
+    # min_mid/max_mid = 0.02/0.98 so degenerate-mid doesn't fire at 0.95;
+    # market_news_imbalance:extreme_mid_no_breaking should fire instead.
+    assert d["reason"] == "market_news_imbalance"
+
+
+async def test_market_news_imbalance_near_expiry_rejects(db_seeded):
+    # end_date in the past (or < 1 day) → reject regardless of freshness.
+    async with db_seeded.batch() as cur:
+        await cur.execute("UPDATE markets SET end_date='2020-01-01T00:00:00Z' WHERE condition_id='m1'")
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=55,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload(freshness="BREAKING"))
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "market_news_imbalance"
 
 
 async def test_edge_below_min_rejects(db_seeded):

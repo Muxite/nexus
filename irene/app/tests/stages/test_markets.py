@@ -15,6 +15,12 @@ import pytest
 
 # Importing app.stages.markets registers the markets DDL with db.py.
 import app.stages.markets  # noqa: F401
+# Cycle 7: markets-stage auto-close calls write_trade_closure, which
+# inserts into trade_closures. Import the closer (DDL owner) and trade
+# (decisions/trades DDL) modules here so DB.ephemeral() has the full
+# schema set when the auto-close test runs.
+import app.stages.closer  # noqa: F401
+import app.stages.trade  # noqa: F401
 # main.py owns the cycles DDL; importing it keeps DB.connect() symmetrical with
 # the rest of the suite even though MarketsStage itself never reads cycle_id.
 import app.main  # noqa: F401
@@ -87,8 +93,24 @@ def _config(dim: int = 8) -> object:
         # Mirrors the EmbedderSection surface MarketsStage reads.
         dim = 8
 
+    class _TradeFeeCfg:
+        # Cycle 7: market-resolved auto-close path delegates to the
+        # shared `write_trade_closure` helper, which reads fee knobs off
+        # cfg.trade. Mirror app/config.py defaults so the tests don't
+        # blow up on missing attrs.
+        polymarket_fee_rates = {
+            "crypto": 0.072,
+            "culture": 0.05, "economics": 0.05, "weather": 0.05, "general": 0.05,
+            "finance": 0.04, "politics": 0.04, "tech": 0.04, "mentions": 0.04,
+            "sports": 0.03,
+            "geopolitics": 0.00,
+        }
+        default_fee_rate = 0.05
+        gas_cost_usdc = 0.0
+
     class _Cfg:
         embedder = _Emb()
+        trade = _TradeFeeCfg()
 
     _Emb.dim = dim
     return _Cfg()
@@ -277,6 +299,79 @@ async def test_disappearing_market_is_deactivated(db_ready, bus, embedder, monke
     assert by_id["0xA"]["closed_at"] is None
     assert by_id["0xB"]["active"] == 0
     assert by_id["0xB"]["closed_at"] is not None
+
+
+async def test_disappearing_market_auto_closes_open_trades(db_ready, bus, embedder, monkeypatch):
+    """Cycle 7: when a market disappears from Gamma's open list, any
+    irene paper trade still positioned on it gets auto-closed with
+    reason='market_resolved' and exit_mid=entry_mid (conservative —
+    no Gamma outcome lookup yet). Without this, the closer's
+    `skip_on_missing_mid` would hold the trade forever."""
+    stage = _make_stage(db_ready, bus, embedder)
+
+    # Seed via Gamma: two markets so we can drop one without triggering
+    # the empty-fetch safeguard in _deactivate_missing.
+    fetched = [_gamma_row("0xZ", "Will Z happen?"), _gamma_row("0xY", "Will Y happen?")]
+
+    async def fake_fetch(self):
+        return list(fetched)
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    # Seed an open paper trade on that market.
+    from app.cycle import cycle_scope
+    async with db_ready.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO cycles (id, name, opened_at)
+            VALUES (1, 'test', '2026-05-25T00:00:00+00:00')
+            """,
+        )
+        await cur.execute(
+            """
+            INSERT INTO decisions
+                (signal_id, outcome, reason, gate_history, prediction_id,
+                 cycle_id, is_tracer, tracer_id, created_at)
+            VALUES (NULL, 'execute', 'ok', '[]', 1, 1, 0, NULL,
+                    '2026-05-25T00:01:00+00:00')
+            """,
+        )
+        decision_id = cur.lastrowid
+        await cur.execute(
+            """
+            INSERT INTO trades
+                (id, signal_id, decision_id, prediction_id, market_id,
+                 direction, confidence, similarity, freshness, p_hat,
+                 mid_price, edge, kelly_fraction, size_usdc, decision_path,
+                 features_snapshot, cycle_id, is_tracer, tracer_id,
+                 decided_at, target_mid)
+            VALUES (100, NULL, ?, 1, '0xZ', 'YES', 0.7, 0.8, 'BREAKING',
+                    0.7, 0.5, 0.1, 0.1, 100.0, 'mvp', '{}', 1, 0, NULL,
+                    '2026-05-25T00:02:00+00:00', 0.7)
+            """,
+            (decision_id,),
+        )
+
+    # Now 0xZ disappears from Gamma's open list (but 0xY stays so the
+    # empty-fetch safeguard doesn't short-circuit).
+    fetched.pop(0)  # drop the first entry = 0xZ
+    with cycle_scope(1):
+        await stage.poll_once()
+
+    # Trade was auto-closed.
+    cur = await db_ready.conn.execute(
+        "SELECT trade_id, close_reason, exit_mid_price, realized_pnl_usdc "
+        "FROM trade_closures WHERE trade_id=100"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None, "auto-close should have written a closure row"
+    assert row["close_reason"] == "market_resolved"
+    assert row["exit_mid_price"] == pytest.approx(0.5)  # entry mid
+    # gross 0; net is -fee. Market category='Politics' → fee_rate=0.04.
+    # shares=100/0.5=200; per-leg fee = 200 * 0.04 * 0.5 * 0.5 = 2.0; rt=4.0.
+    assert row["realized_pnl_usdc"] == pytest.approx(-4.0, rel=1e-3)
 
 
 async def test_network_error_keeps_loop_alive(db_ready, bus, embedder, monkeypatch, caplog):

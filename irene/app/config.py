@@ -244,6 +244,47 @@ class TradeSection(BaseModel):
     # trades through (they can still profit) but blocks 0.01/0.99 extremes.
     min_mid: float = Field(default=0.02, ge=0.0, lt=0.5)
     max_mid: float = Field(default=0.98, gt=0.5, le=1.0)
+    # Cycle 7: market-news weight gate. Reject when the market is "too
+    # big" or "too thin" for the article evidence to plausibly move it.
+    # See app/stages/trade.py::_check_market_news_imbalance.
+    min_market_volume_usdc: float = Field(default=10_000.0, ge=0.0)
+    far_future_days: int = Field(default=180, ge=1)
+    min_days_to_expiry: int = Field(default=1, ge=0)
+    extreme_mid_low: float = Field(default=0.15, ge=0.0, lt=0.5)
+    extreme_mid_high: float = Field(default=0.85, gt=0.5, le=1.0)
+    require_breaking_for_extreme_mid: bool = True
+    require_breaking_for_far_future: bool = True
+    reject_singleton_on_extreme_mid: bool = True
+    # Cycle 7: Polymarket dynamic taker-fee model. Per-leg fee:
+    #     fee_usdc = shares * fee_rate * p * (1 - p)
+    # where p is the SHARE PRICE (=YES-side price for YES position,
+    # =(1-mid) for NO position) and shares = size_usdc / position_price.
+    # Both legs are taker fees (paper mode assumes we hit the book).
+    # Maker (limit) fees are 0; settlement fee is 0.
+    #
+    # Category → fee_rate map (per Polymarket's published schedule):
+    #   crypto                       — 0.072
+    #   economics/culture/weather    — 0.05 (default)
+    #   finance/politics/tech        — 0.04
+    #   sports                       — 0.03
+    #   geopolitics                  — 0.00 (free)
+    #
+    # NOT a config knob (locked to Polymarket's schedule) but the
+    # default_fee_rate fallback IS configurable.
+    polymarket_fee_rates: dict = Field(default_factory=lambda: {
+        "crypto": 0.072,
+        "culture": 0.05, "economics": 0.05, "weather": 0.05, "general": 0.05,
+        "finance": 0.04, "politics": 0.04, "tech": 0.04, "mentions": 0.04,
+        "sports": 0.03,
+        "geopolitics": 0.00,
+    })
+    default_fee_rate: float = Field(default=0.05, ge=0.0, lt=1.0)
+    # Per-leg gas (entry + exit). Default 0 since paper mode doesn't
+    # deduct gas; flip on if you want a more conservative wallet.
+    gas_cost_usdc: float = Field(default=0.0, ge=0.0, lt=10.0)
+    # Cycle 7: kept for backwards-compat / scripts/replay. NOT used
+    # in the new PnL math — the per-leg formula replaces flat bps.
+    spread_cost_bps: float = Field(default=0.0, ge=0.0, lt=1000.0)
     kelly_fraction: float = Field(default=0.25, gt=0.0, le=1.0)
     max_position_fraction: float = Field(default=0.20, gt=0.0, le=1.0)
     min_position_usdc: float = Field(default=1.0, gt=0)

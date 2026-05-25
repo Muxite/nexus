@@ -105,6 +105,11 @@ _CLOSER_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_trade_closures_close_reason ON trade_closures(close_reason)",
     "CREATE INDEX IF NOT EXISTS idx_trade_closures_closed_at ON trade_closures(closed_at)",
     "CREATE INDEX IF NOT EXISTS idx_trade_closures_cycle_id ON trade_closures(cycle_id)",
+    # Cycle 7: fee accounting columns (NULL = legacy pre-cycle-7 row).
+    # entry_fee_usdc + exit_fee_usdc are already baked into realized_pnl_usdc;
+    # they exist so audits can attribute total fees paid per cycle.
+    "ALTER TABLE trade_closures ADD COLUMN entry_fee_usdc REAL DEFAULT 0",
+    "ALTER TABLE trade_closures ADD COLUMN exit_fee_usdc  REAL DEFAULT 0",
 ]
 db_module.register_schema("app/stages/closer.py", _CLOSER_DDL)
 
@@ -127,10 +132,10 @@ def _parse_iso(value: str) -> Optional[datetime]:
         return None
 
 
-def _compute_pnl(direction: str, entry_mid: float, exit_mid: float, size_usdc: float) -> float:
-    """The two PnL formulas the spec block documents. Kept as a free
-    function so `scripts/replay/accuracy.py` can call it without
-    instantiating the stage."""
+def _compute_gross_pnl(direction: str, entry_mid: float, exit_mid: float, size_usdc: float) -> float:
+    """Pure mid-to-mid PnL. The two formulas the spec block documents.
+    Kept as a free function so `scripts/replay/accuracy.py` can call it
+    without instantiating the stage."""
     if direction == "YES":
         if entry_mid <= 0.0:
             return 0.0
@@ -142,6 +147,155 @@ def _compute_pnl(direction: str, entry_mid: float, exit_mid: float, size_usdc: f
     return size_usdc * (entry_mid - exit_mid) / denom
 
 
+def _resolve_fee_rate(category: Optional[str], rates: dict, default: float) -> float:
+    """Lookup Polymarket's category → fee_rate (case-insensitive,
+    substring-tolerant). Falls back to `default` when the category
+    is missing or unrecognized."""
+    if not category:
+        return default
+    key = category.strip().lower()
+    if key in rates:
+        return float(rates[key])
+    # Light substring match — Polymarket categories sometimes include
+    # qualifiers like "us-politics" or "world-politics"; collapse to the
+    # base tier.
+    for token, rate in rates.items():
+        if token in key:
+            return float(rate)
+    return default
+
+
+def _polymarket_taker_fee(price: float, shares: float, fee_rate: float) -> float:
+    """Per-leg Polymarket taker fee.
+      fee = shares * fee_rate * p * (1 - p)
+    The parabola peaks at p=0.5 and is symmetric — buying NO at YES_mid=0.45
+    (i.e. NO_price = 0.55) and buying YES at 0.55 pay the same per-share fee.
+    Returns 0 when fee_rate=0 (Polymarket's geopolitics tier).
+    """
+    if fee_rate <= 0.0 or shares <= 0.0:
+        return 0.0
+    p = max(0.0, min(1.0, float(price)))
+    return shares * fee_rate * p * (1.0 - p)
+
+
+def _compute_round_trip_fees(
+    direction: str,
+    entry_mid: float,
+    exit_mid: float,
+    size_usdc: float,
+    fee_rate: float,
+    gas_cost_usdc: float = 0.0,
+) -> tuple[float, float]:
+    """Cycle 7: faithful Polymarket fee model.
+
+    Returns (entry_fee_usdc, exit_fee_usdc). Each leg uses
+        fee = shares * fee_rate * p * (1 - p)
+    with `p` being the share-side price (=entry/exit mid for YES,
+    =(1-mid) for NO). `shares = size_usdc / position_price`.
+
+    Gas (if configured) is added per leg.
+    """
+    if size_usdc <= 0.0:
+        return 0.0, 0.0
+    if direction == "YES":
+        entry_price = entry_mid
+        exit_price = exit_mid
+    else:
+        entry_price = 1.0 - entry_mid
+        exit_price = 1.0 - exit_mid
+
+    if entry_price <= 0.0:
+        # Degenerate entry — no shares purchased. Zero fee model-wise.
+        return 0.0, 0.0
+    shares = size_usdc / entry_price
+    entry_fee = _polymarket_taker_fee(entry_price, shares, fee_rate) + gas_cost_usdc
+    exit_fee = _polymarket_taker_fee(exit_price, shares, fee_rate) + gas_cost_usdc
+    return entry_fee, exit_fee
+
+
+# Backwards-compat shim: scripts/replay/accuracy.py imports _compute_pnl.
+# Keep the old name as the gross-only path so existing callers see no
+# behaviour change. CloserStage._close_trade uses the gross helper plus
+# the fee deduction directly.
+_compute_pnl = _compute_gross_pnl
+
+
+async def write_trade_closure(
+    db,
+    *,
+    trade: dict,
+    exit_mid: float,
+    close_reason: str,
+    trade_cfg,
+    category: Optional[str] = None,
+    now_iso: Optional[str] = None,
+) -> bool:
+    """Cycle 7: free function that writes a trade_closures row with
+    Polymarket-fee-deducted PnL. Used by CloserStage._close_trade and
+    by MarketsStage when a market deactivates with an open trade.
+    Returns True iff a closure row was inserted (UNIQUE(trade_id)
+    prevents double-fires).
+
+    `trade_cfg` must expose `polymarket_fee_rates`, `default_fee_rate`,
+    and `gas_cost_usdc`. `category` comes from the market row when the
+    caller has it (CloserStage._close_trade fetches it; tests pass it
+    inline). Missing/unknown category falls back to default_fee_rate.
+
+    Fee model — per-leg parabolic:
+        fee = shares * fee_rate * p * (1 - p)
+    Both legs are taker fees. Maker fees and settlement fees are 0.
+    See app/config.py:TradeSection.polymarket_fee_rates.
+    """
+    exit_mid = max(0.0, min(1.0, float(exit_mid)))
+    gross_pnl = _compute_gross_pnl(
+        direction=trade["direction"],
+        entry_mid=float(trade["mid_price"]),
+        exit_mid=exit_mid,
+        size_usdc=float(trade["size_usdc"]),
+    )
+    fee_rate = _resolve_fee_rate(
+        category,
+        getattr(trade_cfg, "polymarket_fee_rates", {}),
+        float(getattr(trade_cfg, "default_fee_rate", 0.05)),
+    )
+    gas_usdc = float(getattr(trade_cfg, "gas_cost_usdc", 0.0))
+    entry_fee, exit_fee = _compute_round_trip_fees(
+        direction=trade["direction"],
+        entry_mid=float(trade["mid_price"]),
+        exit_mid=exit_mid,
+        size_usdc=float(trade["size_usdc"]),
+        fee_rate=fee_rate,
+        gas_cost_usdc=gas_usdc,
+    )
+    net_pnl = gross_pnl - entry_fee - exit_fee
+
+    cycle_id = current_cycle_id()
+    timestamp = now_iso or _now_iso()
+    async with db.batch() as cur:
+        await cur.execute(
+            """
+            INSERT OR IGNORE INTO trade_closures
+                (trade_id, closed_at, close_reason, exit_mid_price,
+                 realized_pnl_usdc, cycle_id, is_tracer, tracer_id,
+                 entry_fee_usdc, exit_fee_usdc)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trade["id"],
+                timestamp,
+                close_reason,
+                exit_mid,
+                net_pnl,
+                cycle_id,
+                1 if trade.get("is_tracer") else 0,
+                trade.get("tracer_id"),
+                entry_fee,
+                exit_fee,
+            ),
+        )
+        return cur.rowcount == 1
+
+
 class CloserStage:
     def __init__(self, deps: StageDeps) -> None:
         if deps.clob is None:
@@ -149,6 +303,9 @@ class CloserStage:
         self._db = deps.db
         self._clob = deps.clob
         self._cfg = deps.config.closer
+        # Cycle 7: stash cfg.trade so closure writes can read the fee
+        # knobs (spread_cost_bps, gas_cost_usdc).
+        self._trade_cfg = deps.config.trade
         self._task: Optional[asyncio.Task] = None
         self._stopped = False
 
@@ -310,14 +467,18 @@ class CloserStage:
 
     async def _fetch_tokens(self, market_id: str) -> Optional[dict]:
         cur = await self._db.conn.execute(
-            "SELECT token_yes, token_no FROM markets WHERE condition_id = ?",
+            "SELECT token_yes, token_no, category FROM markets WHERE condition_id = ?",
             (market_id,),
         )
         row = await cur.fetchone()
         await cur.close()
         if row is None:
             return None
-        return {"token_yes": row["token_yes"], "token_no": row["token_no"]}
+        return {
+            "token_yes": row["token_yes"],
+            "token_no": row["token_no"],
+            "category": row["category"],
+        }
 
     async def _close_trade(
         self,
@@ -338,15 +499,20 @@ class CloserStage:
         """
         direction = trade["direction"]
         exit_mid: Optional[float] = exit_mid_hint
+        # Cycle 7: fetch category alongside tokens so the closure write
+        # can resolve the Polymarket fee_rate. _fetch_tokens always runs
+        # — even when we have exit_mid_hint — because the hint comes
+        # from rule evaluation, not the markets row.
+        market_meta = await self._fetch_tokens(trade["market_id"])
+        category = market_meta.get("category") if market_meta else None
         if exit_mid is None:
-            tokens = await self._fetch_tokens(trade["market_id"])
-            if tokens is None:
+            if market_meta is None:
                 logger.warning(
                     "closer: trade_id=%d market %s missing from markets — skipping",
                     trade["id"], trade["market_id"],
                 )
                 return False
-            token_id = tokens["token_yes"] if direction == "YES" else tokens["token_no"]
+            token_id = market_meta["token_yes"] if direction == "YES" else market_meta["token_no"]
             if token_id:
                 exit_mid = await self._clob.get_mid(token_id)
 
@@ -370,34 +536,15 @@ class CloserStage:
         # the whole poll body.
         exit_mid = max(0.0, min(1.0, float(exit_mid)))
 
-        pnl = _compute_pnl(
-            direction=direction,
-            entry_mid=trade["mid_price"],
+        return await write_trade_closure(
+            self._db,
+            trade=trade,
             exit_mid=exit_mid,
-            size_usdc=trade["size_usdc"],
+            close_reason=close_reason,
+            trade_cfg=self._trade_cfg,
+            category=category,
+            now_iso=now_iso,
         )
-
-        cycle_id = current_cycle_id()
-        async with self._db.batch() as cur:
-            await cur.execute(
-                """
-                INSERT OR IGNORE INTO trade_closures
-                    (trade_id, closed_at, close_reason, exit_mid_price,
-                     realized_pnl_usdc, cycle_id, is_tracer, tracer_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    trade["id"],
-                    now_iso,
-                    close_reason,
-                    exit_mid,
-                    pnl,
-                    cycle_id,
-                    1 if trade["is_tracer"] else 0,
-                    trade["tracer_id"],
-                ),
-            )
-            return cur.rowcount == 1
 
 
 if __name__ == "__main__":

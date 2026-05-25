@@ -626,6 +626,12 @@ class MarketsStage:
         diff against the open set in Python, then issue chunked UPDATEs by
         positive id list. This avoids a `NOT IN (chunk)` that would
         wrongly flip rows present in some other chunk.
+
+        Cycle 7: after deactivating a market, close any open trades
+        positioned on it (`close_reason='market_resolved'`). Without
+        this step the closer's `skip_on_missing_mid=True` policy
+        leaves trades hanging forever — the CLOB orderbook for the
+        market is purged once Gamma drops the listing.
         """
         if not open_ids:
             # An empty fresh fetch should not blow away the whole table —
@@ -653,4 +659,76 @@ class MarketsStage:
                     """,
                     (now, now, *chunk),
                 )
+        # Cycle 7: settle any open paper trades on the deactivated markets.
+        await self._close_orphaned_trades_for(to_close)
         return len(to_close)
+
+    async def _close_orphaned_trades_for(self, condition_ids: list[str]) -> int:
+        """Find any non-closed `trades` rows on the deactivated markets
+        and write trade_closures entries with close_reason='market_resolved'.
+
+        Exit mid is set to the trade's entry mid — irene can't tell
+        whether the market resolved YES or NO from Gamma's drop alone,
+        so PnL is recorded as fees-only (gross_pnl=0, net_pnl=-fees).
+        This is the conservative seulgi-style "exit at entry" path.
+
+        Returns the number of closures written. Idempotent — re-running
+        is a no-op because trade_closures.trade_id is UNIQUE.
+        """
+        if not condition_ids:
+            return 0
+        # Import the free helper lazily so this module doesn't grab
+        # CloserStage's lifecycle (the closer module is imported anyway
+        # since both stages register schema).
+        from app.stages.closer import write_trade_closure  # noqa: WPS433
+
+        written = 0
+        for start in range(0, len(condition_ids), 800):
+            chunk = condition_ids[start:start + 800]
+            placeholders = ",".join("?" * len(chunk))
+            cur = await self._db.conn.execute(
+                f"""
+                SELECT t.id, t.signal_id, t.market_id, t.direction,
+                       t.mid_price, t.size_usdc, t.decided_at,
+                       t.is_tracer, t.tracer_id, t.target_mid,
+                       m.category
+                FROM trades t
+                LEFT JOIN trade_closures c ON c.trade_id = t.id
+                LEFT JOIN markets m ON m.condition_id = t.market_id
+                WHERE c.id IS NULL
+                  AND t.market_id IN ({placeholders})
+                """,
+                tuple(chunk),
+            )
+            rows = await cur.fetchall()
+            await cur.close()
+            for r in rows:
+                trade = {
+                    "id": r["id"],
+                    "signal_id": r["signal_id"],
+                    "market_id": r["market_id"],
+                    "direction": r["direction"],
+                    "mid_price": float(r["mid_price"]),
+                    "size_usdc": float(r["size_usdc"]),
+                    "decided_at": r["decided_at"],
+                    "is_tracer": int(r["is_tracer"] or 0),
+                    "tracer_id": r["tracer_id"],
+                    "target_mid": (
+                        float(r["target_mid"]) if r["target_mid"] is not None else None
+                    ),
+                }
+                ok = await write_trade_closure(
+                    self._db,
+                    trade=trade,
+                    exit_mid=trade["mid_price"],
+                    close_reason="market_resolved",
+                    trade_cfg=self._config.trade,
+                    category=r["category"],
+                )
+                if ok:
+                    written += 1
+                    logger.info(
+                        "markets: auto-closed trade_id=%d (market %s resolved)",
+                        trade["id"], trade["market_id"],
+                    )
+        return written

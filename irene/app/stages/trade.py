@@ -422,6 +422,30 @@ class TradeStage:
                 tracer_id=tracer_id,
             )
             return
+        # 4b. market-news weight imbalance — reject when the market is
+        # too big / too thin / too far / too soon for the news to
+        # plausibly move it. Cycle 7. See _check_market_news_imbalance.
+        imbalance = await self._check_market_news_imbalance(
+            market=market,
+            mid=mid,
+            freshness=freshness,
+            signal_id=int(signal_id),
+        )
+        if imbalance is not None:
+            sub_rule, detail = imbalance
+            gate_history.append(
+                _gate_entry("market_news_imbalance", "reject", sub_rule, detail)
+            )
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason="market_news_imbalance",
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
         if direction == "YES":
             edge = p_hat - mid - self._cfg.fee_buffer
         else:
@@ -581,7 +605,8 @@ class TradeStage:
 
     async def _fetch_market(self, market_id: str) -> Optional[dict]:
         cur = await self._db.conn.execute(
-            "SELECT question, description, token_yes, token_no "
+            "SELECT question, description, token_yes, token_no, "
+            "       category, end_date, volume_usdc "
             "FROM markets WHERE condition_id=?",
             (market_id,),
         )
@@ -594,7 +619,93 @@ class TradeStage:
             "description": row["description"],
             "token_yes": row["token_yes"],
             "token_no": row["token_no"],
+            "category": row["category"],
+            "end_date": row["end_date"],
+            "volume_usdc": row["volume_usdc"],
         }
+
+    async def _cluster_size_for_signal(self, signal_id: int) -> int:
+        """COUNT(*) on article_cluster_members for the signal's cluster.
+        Returns 1 (singleton) when the join produces no match (defensive
+        for tests that skip dedupe). Used by the market_news_imbalance
+        gate's singleton-on-extreme-mid sub-rule."""
+        cur = await self._db.conn.execute(
+            """
+            SELECT COUNT(*) AS n
+            FROM article_cluster_members
+            WHERE cluster_id = (SELECT cluster_id FROM signals WHERE id = ?)
+            """,
+            (signal_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None or row["n"] is None:
+            return 1
+        return max(1, int(row["n"]))
+
+    @staticmethod
+    def _days_to(end_date_iso: Optional[str]) -> Optional[int]:
+        """Days from now (UTC) to a Polymarket end_date string. Returns
+        None if the timestamp can't be parsed. Negative for past dates."""
+        if not end_date_iso:
+            return None
+        from datetime import datetime, timezone
+        s = end_date_iso.replace("Z", "+00:00")
+        try:
+            end = datetime.fromisoformat(s)
+        except (TypeError, ValueError):
+            return None
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return int((end - now).total_seconds() // 86400)
+
+    async def _check_market_news_imbalance(
+        self,
+        *,
+        market: dict,
+        mid: float,
+        freshness: Optional[str],
+        signal_id: int,
+    ) -> Optional[tuple[str, object]]:
+        """Cycle 7: reject when news weight is too small for the market's
+        narrative weight. Returns None (ok) or (sub_rule, detail). Five
+        sub-rules — see plan §"Market-weight vs news-weight gate".
+
+        Defensive: when a signal is missing (volume=None/0, end_date=None)
+        we skip that sub-rule rather than fail-open the whole gate. This
+        keeps the system trading while upstream parsers are improving."""
+        cfg = self._cfg
+        is_breaking = (freshness == "BREAKING")
+
+        # Sub-rule 1: thin market (skip when volume unknown / 0 — parser bug).
+        volume = market.get("volume_usdc")
+        if isinstance(volume, (int, float)) and volume > 0:
+            if volume < cfg.min_market_volume_usdc:
+                return ("thin_market", float(volume))
+
+        # Sub-rule 2: extreme mid without BREAKING news.
+        if cfg.require_breaking_for_extreme_mid and not is_breaking:
+            if mid <= cfg.extreme_mid_low or mid >= cfg.extreme_mid_high:
+                return ("extreme_mid_no_breaking", mid)
+
+        # Sub-rules 3 & 4: time-to-expiry.
+        days = self._days_to(market.get("end_date"))
+        if days is not None:
+            if days < cfg.min_days_to_expiry:
+                return ("near_expiry", days)
+            if cfg.require_breaking_for_far_future and not is_breaking:
+                if days > cfg.far_future_days:
+                    return ("far_future_no_breaking", days)
+
+        # Sub-rule 5: singleton cluster on extreme mid (slightly tighter
+        # threshold than the breaking check). Costs one COUNT(*) query.
+        if cfg.reject_singleton_on_extreme_mid:
+            if mid <= 0.15 or mid >= 0.85:
+                cluster_size = await self._cluster_size_for_signal(signal_id)
+                if cluster_size == 1:
+                    return ("singleton_on_extreme_mid", mid)
+        return None
 
     def _compose_prompt(self, article: dict, market: dict) -> str:
         # Per `docs/philosophy.md`: irene is not a forecaster. The LLM is
