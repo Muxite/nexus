@@ -231,3 +231,71 @@ async def test_get_market_fee_rate_out_of_range_returns_none():
     c = CLOBClient(base_url="http://x")
     _install(c, _Mock(body=_ok_market(taker_base_fee=20000)))
     assert await c.get_market_fee_rate("0xabc") is None
+
+
+# -------------------------------------------------------------------------
+# get_market_info — added 2026-05-25 (cycle 13). Returns both `fee_rate`
+# (cycle-10 backwards-compat) AND `min_order_size` (cycle-13, SHARES NOT
+# USDC) from one HTTP. `get_market_fee_rate` is now a thin shim over this.
+# -------------------------------------------------------------------------
+
+
+async def test_get_market_info_happy_path_returns_both_fields():
+    """Live 2026-05-25 cycle-13 verification: a single /markets call
+    yields BOTH `taker_base_fee` (bps) and `minimum_order_size` (shares).
+    `get_market_info` parses both and returns a dict — one HTTP, two
+    columns populated downstream."""
+    c = CLOBClient(base_url="http://x")
+    m = _Mock(body=_ok_market(taker_base_fee=200, minimum_order_size=5))
+    _install(c, m)
+    info = await c.get_market_info("0xabc")
+    assert info == {"fee_rate": pytest.approx(0.02), "min_order_size": 5.0}
+    assert m.calls == [("http://x/markets/0xabc", None)]
+
+
+async def test_get_market_info_missing_min_order_size_keeps_fee_rate():
+    """Older markets may not expose `minimum_order_size`. The fee_rate
+    path must keep working — only the missing field returns None inside
+    the dict. The shim `get_market_fee_rate` stays useful in that
+    regime (regression guard for cycle-10 callers)."""
+    c = CLOBClient(base_url="http://x")
+    body = _ok_market(taker_base_fee=200)  # no minimum_order_size field
+    _install(c, _Mock(body=body))
+    info = await c.get_market_info("0xabc")
+    assert info == {"fee_rate": pytest.approx(0.02), "min_order_size": None}
+
+
+async def test_get_market_info_negative_min_order_size_returns_none_for_that_field():
+    """Defensive: a negative minimum_order_size is nonsensical — parse
+    to None so the gate falls back to the global config floor instead
+    of inverting the comparison."""
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market(taker_base_fee=200, minimum_order_size=-1)))
+    info = await c.get_market_info("0xabc")
+    assert info is not None
+    assert info["min_order_size"] is None
+    assert info["fee_rate"] == pytest.approx(0.02)
+
+
+async def test_get_market_info_empty_condition_id_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market()))
+    assert await c.get_market_info("") is None
+
+
+async def test_get_market_info_non_2xx_returns_none():
+    """Whole-call failure (no usable data) → return None, NOT a dict
+    of two Nones. Distinguishes "Polymarket dropped the field" from
+    "we never got a response"."""
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(status=404, body={}))
+    assert await c.get_market_info("0xabc") is None
+
+
+async def test_get_market_fee_rate_still_works_after_cycle13_refactor():
+    """Backwards-compat guard: `get_market_fee_rate` is now a thin shim
+    over `get_market_info`. Cycle-10 callers (markets.py legacy path,
+    closer.py fallback) must keep getting the same float."""
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market(taker_base_fee=1000, minimum_order_size=5)))
+    assert await c.get_market_fee_rate("0xabc") == pytest.approx(0.10)

@@ -31,7 +31,23 @@ open positions).
   {0, 200, 1000} → fractional {0.00, 0.02, 0.10}. Returns `None` on
   any failure (network, non-2xx, missing field, parse error,
   out-of-range value). Authoritative source for `markets.fee_rate`
-  (see plans/markets-gamma.md + plans/closer-fees.md).
+  (see plans/markets-gamma.md + plans/closer-fees.md). Cycle 13:
+  this is now a thin shim over `get_market_info` so callers that
+  need BOTH fee_rate and min_order_size pay one HTTP, while existing
+  callers keep the single-purpose interface.
+- `await client.get_market_info(condition_id: str) -> dict | None`
+  — reads `GET /markets/<condition_id>` once and returns a small dict
+  `{"fee_rate": float | None, "min_order_size": float | None}` so the
+  markets stage can populate both columns in a single round-trip on
+  first-seen markets. Each value is independently `None` when the
+  source field is missing / unparseable / out-of-range; the whole
+  call returns `None` only on network / non-2xx / unparseable-JSON
+  failure (i.e. when we got NO usable data). `min_order_size` is
+  read from the `minimum_order_size` field of the CLOB payload —
+  units are SHARES, NOT USDC (cycle-13 live verification:
+  `minimum_order_size=5` for a market priced ~$0.006 ⇒ ~$0.03 USDC
+  floor). The trade-stage size gate handles the shares→USDC
+  conversion using the executable price for the bet's side.
 - `await client.close()` — closes the underlying `httpx.AsyncClient`.
 
 **Invariants.**
@@ -212,9 +228,64 @@ class CLOBClient:
             return None
         return (best_bid, best_ask)
 
+    async def get_market_info(self, condition_id: str) -> Optional[dict]:
+        """Read `GET /markets/<condition_id>` once and return a dict
+        `{"fee_rate": <float|None>, "min_order_size": <float|None>}`.
+
+        - `fee_rate` is the **taker** fee fraction in `[0.0, 1.0]`,
+          parsed from `taker_base_fee` (basis points → /10000). `None`
+          when the field is missing / unparseable / out-of-range.
+        - `min_order_size` is the **per-market platform floor in
+          SHARES** (cycle 13), parsed from `minimum_order_size`. `None`
+          when the field is missing / unparseable / negative. Units
+          are NOT USDC: callers must convert via
+          `min_shares × executable_price = min_usdc_on_this_market`.
+          Live verification 2026-05-25: a market priced ~$0.006 with
+          `minimum_order_size=5` ⇒ ~$0.03 USDC platform floor.
+
+        Returns `None` only when the HTTP call itself fails (empty
+        condition_id, network error, non-2xx, unparseable body) — i.e.
+        when we got NO usable data. A 200 response with one field
+        missing yields a dict with that field set to `None` and the
+        other populated; this is what lets cycle-10 callers keep
+        getting a fee_rate even if Polymarket later removes
+        `minimum_order_size` from the payload.
+        """
+        if not condition_id:
+            return None
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        url = f"{self._base_url}/markets/{condition_id}"
+        try:
+            resp = await self._client.get(url)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "clob: get_market_info(%s) network error: %s",
+                condition_id, exc.__class__.__name__,
+            )
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "clob: get_market_info(%s) status %d",
+                condition_id, resp.status_code,
+            )
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            logger.warning(
+                "clob: get_market_info(%s) unparseable JSON", condition_id,
+            )
+            return None
+        return {
+            "fee_rate": _parse_taker_fee_rate(body, condition_id),
+            "min_order_size": _parse_min_order_size(body, condition_id),
+        }
+
     async def get_market_fee_rate(self, condition_id: str) -> Optional[float]:
         """Return the **taker** fee rate for a market as a fractional
-        number in `[0.0, 1.0]`.
+        number in `[0.0, 1.0]`. Cycle-13 thin shim over `get_market_info`
+        so callers that only need the fee continue to work.
 
         Reads `GET /markets/<condition_id>`. The CLOB payload exposes
         `taker_base_fee` in basis points (1 bp = 1e-4); we divide by
@@ -231,43 +302,54 @@ class CLOBClient:
         is silent so the caller can fall back to the category lookup
         (`config.polymarket_fee_rates`).
         """
-        if not condition_id:
+        info = await self.get_market_info(condition_id)
+        if info is None:
             return None
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
-        url = f"{self._base_url}/markets/{condition_id}"
-        try:
-            resp = await self._client.get(url)
-        except httpx.HTTPError as exc:
-            logger.warning(
-                "clob: get_market_fee_rate(%s) network error: %s",
-                condition_id, exc.__class__.__name__,
-            )
-            return None
-        if resp.status_code != 200:
-            logger.warning(
-                "clob: get_market_fee_rate(%s) status %d",
-                condition_id, resp.status_code,
-            )
-            return None
-        try:
-            body = resp.json()
-        except ValueError:
-            logger.warning(
-                "clob: get_market_fee_rate(%s) unparseable JSON", condition_id,
-            )
-            return None
-        raw = body.get("taker_base_fee")
-        if raw is None:
-            logger.warning(
-                "clob: get_market_fee_rate(%s) missing taker_base_fee", condition_id,
-            )
-            return None
-        try:
-            fee_bps = float(raw)
-        except (TypeError, ValueError):
-            return None
-        fee_rate = fee_bps / 10000.0
-        if 0.0 <= fee_rate <= 1.0:
-            return fee_rate
+        return info["fee_rate"]
+
+
+def _parse_taker_fee_rate(body: dict, condition_id: str) -> Optional[float]:
+    """Pull `taker_base_fee` (basis points) out of a /markets response
+    body and return the fractional rate in `[0.0, 1.0]` or `None`.
+    Extracted as a free helper so `get_market_info` can compose with
+    `_parse_min_order_size` without duplicating the HTTP plumbing."""
+    raw = body.get("taker_base_fee")
+    if raw is None:
+        logger.warning(
+            "clob: get_market_info(%s) missing taker_base_fee", condition_id,
+        )
         return None
+    try:
+        fee_bps = float(raw)
+    except (TypeError, ValueError):
+        return None
+    fee_rate = fee_bps / 10000.0
+    if 0.0 <= fee_rate <= 1.0:
+        return fee_rate
+    return None
+
+
+def _parse_min_order_size(body: dict, condition_id: str) -> Optional[float]:
+    """Pull `minimum_order_size` out of a /markets response body. Units
+    are SHARES, not USDC — the trade-stage size gate is responsible
+    for the conversion using the executable price. Returns `None`
+    when the field is missing / unparseable / negative. Zero is a
+    legitimate value (the platform default for many markets) and is
+    preserved; the gate then becomes a no-op for that market."""
+    raw = body.get("minimum_order_size")
+    if raw is None:
+        # Missing field is common (older markets); don't WARN — log at
+        # DEBUG so the discovery loop stays quiet. Caller will leave the
+        # column NULL and the gate falls back to the global config floor.
+        return None
+    try:
+        mos = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "clob: get_market_info(%s) unparseable minimum_order_size=%r",
+            condition_id, raw,
+        )
+        return None
+    if mos < 0.0:
+        return None
+    return mos

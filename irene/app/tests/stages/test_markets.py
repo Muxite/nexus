@@ -177,21 +177,42 @@ def _make_stage(
 
 
 class _FakeCLOB:
-    """Minimal CLOB stub for cycle-10 per-market fee_rate fetch.
+    """Minimal CLOB stub for cycle-10 per-market fee_rate fetch and
+    cycle-13 per-market min_order_size fetch.
 
-    Records every `get_market_fee_rate` call so tests can assert
-    first-seen-only semantics."""
+    Records every `get_market_fee_rate` / `get_market_info` call so
+    tests can assert first-seen-only semantics. Cycle 13: prefers the
+    new unified `get_market_info` when present on the stub; legacy
+    tests pinned to `get_market_fee_rate` keep working via the shim."""
 
-    def __init__(self, fee_by_id: Optional[dict] = None, default: Optional[float] = 0.02) -> None:
+    def __init__(
+        self,
+        fee_by_id: Optional[dict] = None,
+        default: Optional[float] = 0.02,
+        min_order_size_by_id: Optional[dict] = None,
+    ) -> None:
         self._fee_by_id = fee_by_id or {}
         self._default = default
+        self._mos_by_id = min_order_size_by_id or {}
         self.fee_calls: list[str] = []
+        self.info_calls: list[str] = []
 
     async def get_market_fee_rate(self, condition_id: str) -> Optional[float]:
         self.fee_calls.append(condition_id)
         if condition_id in self._fee_by_id:
             return self._fee_by_id[condition_id]
         return self._default
+
+    async def get_market_info(self, condition_id: str) -> Optional[dict]:
+        self.info_calls.append(condition_id)
+        # Mirror clob.py contract: one HTTP, both fields. Each value is
+        # independently None when the stub wasn't pre-seeded with it.
+        if condition_id in self._fee_by_id:
+            fee = self._fee_by_id[condition_id]
+        else:
+            fee = self._default
+        mos = self._mos_by_id.get(condition_id)
+        return {"fee_rate": fee, "min_order_size": mos}
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +455,9 @@ async def _seed_open_trade_async(
 async def test_first_seen_market_populates_fee_rate_from_clob(
     db_ready, bus, embedder, monkeypatch,
 ):
-    """Cycle 10: on first-seen markets the stage calls
-    `clob.get_market_fee_rate(conditionId)` and persists the result
+    """Cycle 10/13: on first-seen markets the stage calls the CLOB
+    (cycle 13: `get_market_info`; falls back to cycle-10
+    `get_market_fee_rate` for legacy stubs) and persists `fee_rate`
     into `markets.fee_rate`. Already-populated rows are NOT re-fetched
     (refresh cadence is a separate decision per plans/markets-gamma.md).
     """
@@ -457,13 +479,59 @@ async def test_first_seen_market_populates_fee_rate_from_clob(
     by_id = {r["condition_id"]: r["fee_rate"] for r in rows}
     assert by_id["0xfee1"] == pytest.approx(0.02)
     assert by_id["0xfee2"] == pytest.approx(0.10)
-    assert sorted(clob.fee_calls) == ["0xfee1", "0xfee2"]
+    # Cycle 13: stage prefers `get_market_info` when the CLOB exposes
+    # it (our `_FakeCLOB` does). `fee_calls` from the legacy path
+    # stays empty; `info_calls` tracks the unified fetch.
+    assert sorted(clob.info_calls) == ["0xfee1", "0xfee2"]
+    assert clob.fee_calls == []
 
     # Second poll — both rows now have non-NULL fee_rate, so no extra
-    # fetches fire (first-seen-only semantics).
-    clob.fee_calls.clear()
+    # fetches fire (first-seen-only semantics, keyed off fee_rate).
+    clob.info_calls.clear()
     await stage.poll_once()
-    assert clob.fee_calls == []
+    assert clob.info_calls == []
+
+
+async def test_first_seen_market_populates_min_order_size_from_clob(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 13: on first-seen markets the stage calls
+    `clob.get_market_info(conditionId)` and persists BOTH `fee_rate`
+    AND `min_order_size` into the markets row in one HTTP. The new
+    column is in SHARES (not USDC) per the platform contract — the
+    trade-stage size gate handles the shares→USDC conversion.
+
+    Backwards-compat with cycle 10: a market whose response omits
+    `minimum_order_size` (older markets in the live 2026-05-25 survey)
+    leaves the column NULL; fee_rate still lands."""
+    clob = _FakeCLOB(
+        fee_by_id={"0xmos1": 0.02, "0xmos2": 0.10},
+        min_order_size_by_id={"0xmos1": 5.0, "0xmos2": 15.0},
+    )
+    stage = _make_stage(db_ready, bus, embedder, clob=clob)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xmos1", "Q1"), _gamma_row("0xmos2", "Q2")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    cur = await db_ready.conn.execute(
+        "SELECT condition_id, fee_rate, min_order_size "
+        "FROM markets ORDER BY condition_id"
+    )
+    rows = await cur.fetchall()
+    by_id = {r["condition_id"]: r for r in rows}
+    assert by_id["0xmos1"]["fee_rate"] == pytest.approx(0.02)
+    assert by_id["0xmos1"]["min_order_size"] == pytest.approx(5.0)
+    assert by_id["0xmos2"]["fee_rate"] == pytest.approx(0.10)
+    assert by_id["0xmos2"]["min_order_size"] == pytest.approx(15.0)
+    # One HTTP per market populated both columns.
+    assert sorted(clob.info_calls) == ["0xmos1", "0xmos2"]
+    # Second poll — first-seen-only contract holds; no refetch.
+    clob.info_calls.clear()
+    await stage.poll_once()
+    assert clob.info_calls == []
 
 
 async def test_fee_rate_column_stays_null_when_clob_absent(
@@ -503,6 +571,134 @@ async def test_network_error_keeps_loop_alive(db_ready, bus, embedder, monkeypat
     # No rows inserted.
     cur = await db_ready.conn.execute("SELECT COUNT(*) FROM markets")
     assert (await cur.fetchone())[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# Cycle 13: Gamma Retry-After backoff
+# ---------------------------------------------------------------------------
+
+
+class _ScriptedHttpx:
+    """Returns scripted responses in order, recording every call. Each
+    scripted entry is a tuple of (status_code, body_json, headers).
+    Raises IndexError if the test scripts fewer responses than the helper
+    actually makes — which is what we want for "expected exactly N retries".
+    """
+
+    def __init__(self, responses: list[tuple[int, object, dict]]) -> None:
+        self._responses = list(responses)
+        self.calls: list[tuple[str, dict]] = []
+
+    async def get(self, url: str, params=None):
+        import httpx
+        self.calls.append((url, dict(params or {})))
+        status, body, headers = self._responses.pop(0)
+        return httpx.Response(
+            status, json=body, headers=headers,
+            request=httpx.Request("GET", url),
+        )
+
+    async def aclose(self):
+        pass
+
+
+async def test_backoff_passes_200_through(db_ready, bus, embedder, monkeypatch):
+    stage = _make_stage(db_ready, bus, embedder)
+    stage._client = _ScriptedHttpx([(200, [{"ok": True}], {})])  # type: ignore[assignment]
+
+    resp = await stage._gamma_get_with_backoff({"x": "y"})
+    assert resp.status_code == 200
+    assert len(stage._client.calls) == 1  # type: ignore[attr-defined]
+
+
+async def test_backoff_retries_on_429_then_succeeds(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """One 429 with Retry-After=0.01 then a 200. Helper should sleep,
+    retry, return the 200 — caller never sees the 429."""
+    stage = _make_stage(db_ready, bus, embedder)
+    stage._client = _ScriptedHttpx([  # type: ignore[assignment]
+        (429, {"error": "rate"}, {"Retry-After": "0.01"}),
+        (200, [{"ok": True}], {}),
+    ])
+
+    slept: list[float] = []
+    async def fake_sleep(s):
+        slept.append(s)
+    monkeypatch.setattr("app.stages.markets.asyncio.sleep", fake_sleep)
+
+    resp = await stage._gamma_get_with_backoff({"x": "y"})
+    assert resp.status_code == 200
+    assert len(stage._client.calls) == 2  # type: ignore[attr-defined]
+    assert len(slept) == 1
+    # Sleep should be at LEAST the Retry-After value (jitter adds 0-0.5s).
+    assert 0.01 <= slept[0] <= 0.51
+
+
+async def test_backoff_uses_fallback_when_no_retry_after_header(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """429 without Retry-After header → exponential-backoff fallback fires."""
+    stage = _make_stage(db_ready, bus, embedder)
+    stage._client = _ScriptedHttpx([  # type: ignore[assignment]
+        (429, {"error": "rate"}, {}),  # no Retry-After
+        (200, [{"ok": True}], {}),
+    ])
+
+    slept: list[float] = []
+    async def fake_sleep(s):
+        slept.append(s)
+    monkeypatch.setattr("app.stages.markets.asyncio.sleep", fake_sleep)
+
+    resp = await stage._gamma_get_with_backoff({"x": "y"})
+    assert resp.status_code == 200
+    assert len(slept) == 1
+    # Fallback initial backoff is 1.0s; jitter brings it to [1.0, 1.5].
+    assert 1.0 <= slept[0] <= 1.5
+
+
+async def test_backoff_gives_up_after_max_retries(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Persistent 429s: after max_retries we return the 429 so the caller's
+    raise_for_status() still fires. Don't loop forever."""
+    stage = _make_stage(db_ready, bus, embedder)
+    stage._client = _ScriptedHttpx([  # type: ignore[assignment]
+        (429, {"error": "rate"}, {"Retry-After": "0.01"}),
+        (429, {"error": "rate"}, {"Retry-After": "0.01"}),
+        (429, {"error": "rate"}, {"Retry-After": "0.01"}),
+        (429, {"error": "rate"}, {"Retry-After": "0.01"}),
+    ])
+
+    async def fake_sleep(s):
+        pass
+    monkeypatch.setattr("app.stages.markets.asyncio.sleep", fake_sleep)
+
+    resp = await stage._gamma_get_with_backoff({"x": "y"}, max_retries=3)
+    assert resp.status_code == 429
+    # max_retries=3 → up to 4 attempts (initial + 3 retries).
+    assert len(stage._client.calls) == 4  # type: ignore[attr-defined]
+
+
+async def test_backoff_handles_non_numeric_retry_after_header(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """HTTP-date Retry-After (rare from Polymarket) → fall back to delay."""
+    stage = _make_stage(db_ready, bus, embedder)
+    stage._client = _ScriptedHttpx([  # type: ignore[assignment]
+        (429, {}, {"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"}),
+        (200, [{"ok": True}], {}),
+    ])
+
+    slept: list[float] = []
+    async def fake_sleep(s):
+        slept.append(s)
+    monkeypatch.setattr("app.stages.markets.asyncio.sleep", fake_sleep)
+
+    resp = await stage._gamma_get_with_backoff({"x": "y"})
+    assert resp.status_code == 200
+    # Fell back to 1.0s + jitter.
+    assert 1.0 <= slept[0] <= 1.5
 
 
 # ---------------------------------------------------------------------------

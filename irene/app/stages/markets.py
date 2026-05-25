@@ -70,6 +70,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -93,6 +94,13 @@ _GAMMA_URL = "https://gamma-api.polymarket.com/markets"
 _GAMMA_PAGE_SIZE = 100
 _GAMMA_MAX_PAGES = 1000  # ~100k markets hard ceiling; current universe ~50k
 _GAMMA_TIMEOUT_SECONDS = 15.0
+# Cycle 13: Cloudflare-fronted Gamma occasionally returns 429. Honor
+# `Retry-After` (seconds) when present; fall back to exponential backoff
+# with jitter when not. Cap retries to prevent a poll task from getting
+# stuck.
+_GAMMA_429_MAX_RETRIES = 3
+_GAMMA_429_INITIAL_BACKOFF_S = 1.0
+_GAMMA_429_MAX_BACKOFF_S = 60.0
 
 _DEFAULT_POLL_SECONDS = 120
 _DEFAULT_EMBED_REFRESH_SECONDS = 3600
@@ -145,6 +153,16 @@ _MARKETS_DDL = [
     # `config.polymarket_fee_rates`. Idempotent via the
     # `schema_migrations` table (db.py applies each statement once per sha).
     "ALTER TABLE markets ADD COLUMN fee_rate REAL",
+    # Cycle 13: per-market platform floor in **SHARES**, sourced from
+    # `GET /markets/<conditionId>:minimum_order_size` (see `app/clob.py:
+    # get_market_info`). Stored as REAL to match the `fee_rate` column
+    # convention, even though the source is an integer. NOT in USDC —
+    # the trade-stage size gate (`app/stages/trade.py`) is responsible
+    # for the shares→USDC conversion via the executable price for the
+    # bet's side. NULL = not-yet-fetched / fetch failed; the gate then
+    # falls back to `cfg.trade.min_position_usdc` only (no per-market
+    # floor enforced). See plans/order-execution-spreads.md proposal #4.
+    "ALTER TABLE markets ADD COLUMN min_order_size REAL",
     # Cycle 11: three-state UMA close machine state (plans/resolution-oracle.md
     # D1). The Gamma close flag (`closed=true`) is NOT finality —
     # Polymarket settles through UMA's Optimistic Oracle with a 2h
@@ -836,6 +854,49 @@ class MarketsStage:
 
     # ---- helpers --------------------------------------------------------
 
+    async def _gamma_get_with_backoff(
+        self, params: dict, *, max_retries: int = _GAMMA_429_MAX_RETRIES
+    ) -> httpx.Response:
+        """GET Gamma with Retry-After-aware backoff on 429s.
+
+        Cycle 13: previously every fetch path called `raise_for_status()`
+        directly, so a single Cloudflare 429 would crash the whole poll
+        cycle. Now we honor `Retry-After` (seconds-form is what
+        Polymarket sends) when present, fall back to exponential
+        backoff with jitter when not, and cap retries at `max_retries`.
+        On the final 429 we still raise so the caller's existing error
+        path fires. Non-429 responses (including 4xx other than 429 and
+        5xx) are returned unchanged for the caller to handle.
+        """
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=_GAMMA_TIMEOUT_SECONDS)
+        delay = _GAMMA_429_INITIAL_BACKOFF_S
+        resp = None
+        for attempt in range(max_retries + 1):
+            resp = await self._client.get(_GAMMA_URL, params=params)
+            if resp.status_code != 429:
+                return resp
+            retry_after = resp.headers.get("Retry-After")
+            try:
+                sleep_s = float(retry_after) if retry_after else delay
+            except ValueError:
+                # HTTP-date form — uncommon from Polymarket; use the fallback
+                sleep_s = delay
+            if attempt == max_retries:
+                # Out of retries — let the caller's raise_for_status fire.
+                return resp
+            sleep_s = sleep_s + random.uniform(0.0, 0.5)
+            logger.warning(
+                "markets: Gamma 429 attempt %d/%d, sleeping %.2fs "
+                "(Retry-After=%s)",
+                attempt + 1, max_retries + 1, sleep_s,
+                retry_after if retry_after else "<none>",
+            )
+            await asyncio.sleep(sleep_s)
+            delay = min(delay * 2, _GAMMA_429_MAX_BACKOFF_S)
+        # Unreachable in practice but keeps the typechecker happy.
+        return resp  # type: ignore[return-value]
+
     async def _fetch_all_gamma(self) -> list[dict]:
         """Paginate Gamma's `/markets` endpoint and return every open row.
 
@@ -844,9 +905,10 @@ class MarketsStage:
         condition is "page returned fewer than page_size rows", per the PR
         spec; the safety `max_pages` guards against an infinite loop if
         Gamma's pagination ever regresses.
+
+        Cycle 13: 429s now go through `_gamma_get_with_backoff` instead
+        of crashing the poll cycle.
         """
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=_GAMMA_TIMEOUT_SECONDS)
         markets: list[dict] = []
         offset = 0
         for _ in range(_GAMMA_MAX_PAGES):
@@ -856,7 +918,7 @@ class MarketsStage:
                 "limit": str(_GAMMA_PAGE_SIZE),
                 "offset": str(offset),
             }
-            resp = await self._client.get(_GAMMA_URL, params=params)
+            resp = await self._gamma_get_with_backoff(params)
             resp.raise_for_status()
             page = resp.json()
             if not isinstance(page, list) or not page:
@@ -885,11 +947,9 @@ class MarketsStage:
         fails. Caller is expected to feed the result back through
         `_parse_gamma_row` + `_upsert_market`.
         """
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=_GAMMA_TIMEOUT_SECONDS)
         params = {"condition_ids": condition_id}
         try:
-            resp = await self._client.get(_GAMMA_URL, params=params)
+            resp = await self._gamma_get_with_backoff(params)
             resp.raise_for_status()
             body = resp.json()
         except httpx.HTTPError as exc:
@@ -976,14 +1036,14 @@ class MarketsStage:
         await self._maybe_stamp_resolution_transition(
             row["condition_id"], row.get("uma_resolution_status"),
         )
-        # Cycle 10: per-market fee_rate fetch. **First-seen only** for
-        # this cycle — we read the current fee_rate after the upsert
-        # and only call the CLOB if the column is still NULL. This
-        # keeps the discovery loop cheap (one extra HTTP per net-new
-        # market) and avoids drift-vs-cache complexity for already-
-        # populated rows. Existing-row refresh cadence is a separate
-        # decision (see plans/markets-gamma.md).
-        await self._maybe_fetch_fee_rate(row["condition_id"])
+        # Cycle 10/13: per-market fee_rate + min_order_size fetch.
+        # **First-seen only** for this cycle — we read the current
+        # fee_rate after the upsert and only call the CLOB if EITHER
+        # column is still NULL. One HTTP per net-new market populates
+        # both via `clob.get_market_info` (cycle-13 helper that returns
+        # a dict). Existing-row refresh cadence is a separate decision
+        # (see plans/markets-gamma.md).
+        await self._maybe_fetch_market_info(row["condition_id"])
 
     async def _maybe_stamp_resolution_transition(
         self, condition_id: str, status: Optional[str],
@@ -1016,11 +1076,26 @@ class MarketsStage:
                 (now, now, condition_id),
             )
 
-    async def _maybe_fetch_fee_rate(self, condition_id: str) -> None:
-        """If the CLOB client is wired and this market's fee_rate is
-        still NULL, fetch it from `GET /markets/<conditionId>` and
-        persist. Silent no-op on any failure — closer.py falls back
-        to the category lookup in `config.polymarket_fee_rates`."""
+    async def _maybe_fetch_market_info(self, condition_id: str) -> None:
+        """If the CLOB client is wired and this market's `fee_rate` is
+        still NULL, fetch `GET /markets/<conditionId>` once and persist
+        whichever fields the response yielded (`fee_rate` and/or
+        `min_order_size`). Silent no-op on any failure: closer.py falls
+        back to the category lookup in `config.polymarket_fee_rates`
+        and the trade-stage size gate falls back to
+        `cfg.trade.min_position_usdc` only.
+
+        Cycle 13: extends the cycle-10 fee-rate-first-seen-only path
+        to ALSO populate `min_order_size`. **`fee_rate IS NULL` is the
+        first-seen marker for the whole call** — once we've tried (and
+        gotten a fee back), we don't refetch even if `min_order_size`
+        came back NULL. This keeps the HTTP budget at one-per-net-new-
+        market and matches the cycle-10 contract; refresh cadence for
+        already-populated rows remains deferred. If a parallel cycle-13
+        backfill later finds rows with `fee_rate` populated but
+        `min_order_size` NULL, a separate backfill task can handle
+        them — this hot path stays single-fetch.
+        """
         if self._clob is None:
             return
         cur = await self._db.conn.execute(
@@ -1030,15 +1105,44 @@ class MarketsStage:
         row = await cur.fetchone()
         await cur.close()
         if row is None or row["fee_rate"] is not None:
-            return  # not first-seen, skip per cycle-10 scope
-        fee_rate = await self._clob.get_market_fee_rate(condition_id)
-        if fee_rate is None:
-            return  # CLOB miss; leave NULL so a future cycle can retry
+            return  # not first-seen, skip per cycle-10/13 scope
+        # Cycle 13: prefer the unified `get_market_info` helper (returns
+        # both fields from one HTTP). Fall back to the cycle-10 single-
+        # purpose method if a CLOB stub doesn't expose the new method
+        # — keeps legacy test stubs and any custom wirings working.
+        fee_rate: Optional[float]
+        min_order_size: Optional[float] = None
+        if hasattr(self._clob, "get_market_info"):
+            info = await self._clob.get_market_info(condition_id)
+            if info is None:
+                return  # CLOB miss; leave NULL so a future cycle can retry
+            fee_rate = info.get("fee_rate")
+            min_order_size = info.get("min_order_size")
+        else:
+            fee_rate = await self._clob.get_market_fee_rate(condition_id)
+        if fee_rate is None and min_order_size is None:
+            return  # nothing usable came back
         now = _now_iso()
+        # Build a partial UPDATE that only touches the columns we
+        # actually have values for; preserves any already-populated
+        # column on the row (defensive — `fee_rate IS NULL` is checked
+        # above but min_order_size could have been backfilled).
+        set_clauses = []
+        params: list = []
+        if fee_rate is not None:
+            set_clauses.append("fee_rate = ?")
+            params.append(fee_rate)
+        if min_order_size is not None:
+            set_clauses.append("min_order_size = ?")
+            params.append(min_order_size)
+        set_clauses.append("updated_at = ?")
+        params.append(now)
+        params.append(condition_id)
         async with self._db.batch() as cur:
             await cur.execute(
-                "UPDATE markets SET fee_rate = ?, updated_at = ? WHERE condition_id = ?",
-                (fee_rate, now, condition_id),
+                f"UPDATE markets SET {', '.join(set_clauses)} "  # noqa: S608
+                f"WHERE condition_id = ?",
+                tuple(params),
             )
 
     async def _deactivate_missing(self, open_ids: set[str]) -> int:

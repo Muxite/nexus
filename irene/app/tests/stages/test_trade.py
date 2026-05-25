@@ -1006,6 +1006,92 @@ async def test_size_below_min_rejects(db_seeded):
     assert bus.published[0][1]["reason"] == "size_below_min"
 
 
+async def test_size_gate_rejects_below_market_min_when_floor_binds(db_seeded):
+    """Cycle 13 (plans/order-execution-spreads.md proposal #4).
+
+    Polymarket exposes a per-market `minimum_order_size` in SHARES.
+    The trade-stage size gate converts to USDC via the executable
+    price for the bet's side:
+        min_usdc_on_this_market = min_shares × executable_price
+    With defaults (balance=1000, kelly_fraction=0.25,
+    max_position_fraction=0.20) and YES@0.7 vs mid=0.5: size=100 USDC.
+
+    Seed the market row with `min_order_size=300` shares. At the
+    default mid 0.5 the per-market floor = 300×0.5 = 150 USDC,
+    which exceeds the computed size (100). Gate must reject with
+    `reason="below_market_min"` — NOT the legacy `size_below_min`
+    — so funnel monitoring distinguishes "platform rejected" from
+    "trader's own config bound"."""
+    # Stamp the per-market floor on the seeded market row.
+    async with db_seeded.batch() as cur:
+        await cur.execute(
+            "UPDATE markets SET min_order_size = 300 WHERE condition_id='m1'"
+        )
+    cfg = _Config(trade=_TradeCfg(
+        balance_usdc=1000.0,
+        kelly_fraction=0.25,
+        max_position_fraction=0.20,
+        min_position_usdc=1.0,  # tiny — the market floor binds
+    ))
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=11,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, cfg=cfg)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "below_market_min"
+    assert bus.published[0][1]["reason"] == "below_market_min"
+    # Sanity check the gate_history records the market-derived
+    # threshold (150.0 USDC at mid=0.5), not the global config floor.
+    size_entries = [g for g in d["gate_history"] if g["gate"] == "size"]
+    assert len(size_entries) == 1
+    assert size_entries[0]["outcome"] == "reject"
+    assert size_entries[0]["threshold"] == pytest.approx(150.0)
+
+
+async def test_size_gate_config_floor_still_binds_when_market_floor_lower(db_seeded):
+    """Cycle 13: when the per-market `min_order_size × price` is BELOW
+    the global `cfg.trade.min_position_usdc`, the global config floor
+    remains the binding threshold. Rejection reason stays `size_below_min`
+    (legacy) so the funnel-monitoring contract for the global gate is
+    preserved.
+
+    Seed the market with a tiny `min_order_size=1` share. At mid=0.5
+    that's 0.5 USDC — well below the (deliberately large) config
+    floor of 50 USDC. With balance=1.0 the computed size is 0.1 USDC,
+    so the config floor bites, not the market one."""
+    async with db_seeded.batch() as cur:
+        await cur.execute(
+            "UPDATE markets SET min_order_size = 1 WHERE condition_id='m1'"
+        )
+    cfg = _Config(trade=_TradeCfg(
+        balance_usdc=1.0,  # tiny so size < both floors
+        min_position_usdc=50.0,  # deliberately large
+    ))
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=12,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, cfg=cfg)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "size_below_min"
+    # gate_history threshold is the config floor (50.0), confirming
+    # the global config is what bound.
+    size_entries = [g for g in d["gate_history"] if g["gate"] == "size"]
+    assert len(size_entries) == 1
+    assert size_entries[0]["threshold"] == pytest.approx(50.0)
+
+
 async def test_idempotent_on_replay(db_seeded):
     bus = _FakeBus()
     ai = _FakeAI()

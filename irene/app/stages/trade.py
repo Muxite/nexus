@@ -189,6 +189,68 @@ def _gate_entry(name: str, outcome: str, value, threshold) -> dict:
     return {"gate": name, "outcome": outcome, "value": value, "threshold": threshold}
 
 
+def _market_min_usdc(
+    *,
+    min_shares,
+    executable_price: Optional[float],
+    mid: float,
+    direction: str,
+) -> tuple[Optional[float], Optional[str]]:
+    """Convert a per-market `minimum_order_size` (in SHARES) to a USDC
+    floor for the size gate.
+
+    The Polymarket platform `minimum_order_size` is a per-market floor
+    measured in SHARES. To compare against `size` (USDC) we use the
+    price-per-share we'd actually pay on this side:
+
+      - YES buy: `executable_price` is `best_ask` (the YES we'd pay).
+      - NO buy:  `executable_price` is `1 - best_ask_no` projected back
+                 into YES-price terms. The NO share's cost is
+                 `1 - executable_price` (i.e. `best_ask_no`).
+
+    When the book is unavailable (`executable_price is None`) we fall
+    back to `mid` for the YES side and `1 - mid` for the NO side — same
+    side-aware logic as the legacy edge fallback. This is intentionally
+    conservative: the platform fee is in USDC at fill time and we don't
+    want a missing-book event to silently bypass the gate.
+
+    Returns `(usdc_floor, source)` where `source` is one of:
+      - `None` if `min_shares` was NULL / negative / unparseable, OR
+        we couldn't derive a sane price scalar (mid degenerate).
+      - `"executable"` when we used the live book.
+      - `"mid_fallback"` when we used `mid` (book unavailable).
+    """
+    if min_shares is None:
+        return None, None
+    try:
+        ms = float(min_shares)
+    except (TypeError, ValueError):
+        return None, None
+    if ms <= 0.0:
+        # Zero (or negative) shares is a no-op floor — return 0 with a
+        # source so we get a sane `gate_history` audit but never reject.
+        return 0.0, "executable"
+    if executable_price is not None:
+        # Convert the YES-price executable to the per-share USDC cost
+        # for the bet's side. YES side pays `executable_price`; NO side
+        # pays `1 - executable_price` per share.
+        per_share = (
+            float(executable_price)
+            if direction == "YES"
+            else 1.0 - float(executable_price)
+        )
+        if per_share <= 0.0:
+            return None, None
+        return ms * per_share, "executable"
+    # Book-unavailable fallback: use mid (YES) or 1 - mid (NO). `mid` is
+    # the YES mid by convention (see `_resolve_mid`); guard against the
+    # degenerate edge so we don't multiply by 0.
+    per_share = mid if direction == "YES" else (1.0 - mid)
+    if per_share <= 0.0:
+        return None, None
+    return ms * per_share, "mid_fallback"
+
+
 def compose_direction_prompt(article: dict, market: dict) -> str:
     """Shared LLM-direction prompt builder for the MVP + DKG trade paths.
 
@@ -538,11 +600,44 @@ class TradeStage:
             kelly_capped * self._cfg.balance_usdc,
             self._cfg.balance_usdc * self._cfg.max_position_fraction,
         )
-        if size < self._cfg.min_position_usdc:
-            gate_history.append(_gate_entry("size", "reject", size, self._cfg.min_position_usdc))
+        # Cycle 13: per-market platform floor (plans/order-execution-spreads.md
+        # proposal #4). Polymarket exposes `minimum_order_size` in SHARES on
+        # `GET /markets/<cid>`. To compare against `size` (USDC) we must
+        # convert via the price we'd actually pay on this side:
+        #   min_usdc_on_this_market = min_shares × executable_price
+        # `executable_price` (best_ask for YES, 1 - best_ask_no for NO,
+        # both in YES-price units) is the right scalar — it's exactly what
+        # the exchange will fill at. Fall back to `mid` when the book read
+        # failed so we still get a sane USDC estimate. The gate floor is
+        # the MAX of the global config and the market-derived floor — the
+        # config is still in force as a baseline; the per-market value
+        # only ever ratchets the floor UP.
+        min_shares = market.get("min_order_size")
+        market_floor_usdc, _floor_source = _market_min_usdc(
+            min_shares=min_shares,
+            executable_price=executable_price,
+            mid=mid,
+            direction=direction,
+        )
+        effective_floor = max(self._cfg.min_position_usdc, market_floor_usdc or 0.0)
+        if size < effective_floor:
+            # Pick the rejection reason based on which floor bound:
+            # `below_market_min` if the per-market floor is what bit
+            # (cycle 13), otherwise the legacy `size_below_min` so the
+            # existing funnel-monitoring + tests stay intact.
+            if (
+                market_floor_usdc is not None
+                and market_floor_usdc > self._cfg.min_position_usdc
+            ):
+                reason = "below_market_min"
+                threshold = market_floor_usdc
+            else:
+                reason = "size_below_min"
+                threshold = self._cfg.min_position_usdc
+            gate_history.append(_gate_entry("size", "reject", size, threshold))
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="size_below_min",
+                reason=reason,
                 gate_history=gate_history,
                 prediction_id=result.prediction_id,
                 cycle_id=cycle_id,
@@ -550,7 +645,7 @@ class TradeStage:
                 tracer_id=tracer_id,
             )
             return
-        gate_history.append(_gate_entry("size", "ok", size, self._cfg.min_position_usdc))
+        gate_history.append(_gate_entry("size", "ok", size, effective_floor))
 
         # 6. cash (paper wallet) ---------------------------------------------
         # Cycle 3: CLIP size to fit available cash instead of rejecting
@@ -587,13 +682,27 @@ class TradeStage:
                 _gate_entry("cash", "clip", size, cash_available)
             )
             size = cash_available
-            if size < self._cfg.min_position_usdc:
+            # Cycle 13: re-check against the SAME effective floor we used
+            # on the pre-clip path. If the cash-clip pushes us under the
+            # per-market floor, the reason is still `below_market_min`;
+            # under just the config floor, keep the legacy
+            # `size_below_min` reason for funnel continuity.
+            if size < effective_floor:
+                if (
+                    market_floor_usdc is not None
+                    and market_floor_usdc > self._cfg.min_position_usdc
+                ):
+                    reason_clip = "below_market_min"
+                    threshold_clip = market_floor_usdc
+                else:
+                    reason_clip = "size_below_min"
+                    threshold_clip = self._cfg.min_position_usdc
                 gate_history.append(
-                    _gate_entry("size_after_clip", "reject", size, self._cfg.min_position_usdc)
+                    _gate_entry("size_after_clip", "reject", size, threshold_clip)
                 )
                 await self._record_reject(
                     signal_id=int(signal_id),
-                    reason="size_below_min",
+                    reason=reason_clip,
                     gate_history=gate_history,
                     prediction_id=result.prediction_id,
                     cycle_id=cycle_id,
@@ -667,7 +776,7 @@ class TradeStage:
     async def _fetch_market(self, market_id: str) -> Optional[dict]:
         cur = await self._db.conn.execute(
             "SELECT question, description, token_yes, token_no, "
-            "       category, end_date, volume_usdc "
+            "       category, end_date, volume_usdc, min_order_size "
             "FROM markets WHERE condition_id=?",
             (market_id,),
         )
@@ -683,6 +792,13 @@ class TradeStage:
             "category": row["category"],
             "end_date": row["end_date"],
             "volume_usdc": row["volume_usdc"],
+            # Cycle 13: per-market platform floor in SHARES (NOT USDC).
+            # The size gate converts to USDC via the executable price for
+            # the bet's side. NULL when the row was inserted before the
+            # column existed or the CLOB fetch failed — gate then falls
+            # back to `cfg.trade.min_position_usdc` only. See
+            # plans/order-execution-spreads.md proposal #4.
+            "min_order_size": row["min_order_size"],
         }
 
     async def _cluster_size_for_signal(self, signal_id: int) -> int:
