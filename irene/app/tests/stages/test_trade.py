@@ -1259,3 +1259,170 @@ async def test_executed_trade_records_latency_ms(db_seeded):
     for step, ms in breakdown.items():
         assert isinstance(ms, (int, float)), f"{step} value not numeric: {ms!r}"
         assert ms >= 0.0, f"{step} negative: {ms}"
+
+
+# ---------------------------------------------------------------------------
+# Cycle 16: reject-path latency instrumentation
+# ---------------------------------------------------------------------------
+
+
+async def test_rejected_decision_has_latency_columns(db_seeded):
+    """Schema check: the cycle-16 ALTER TABLEs added the two latency
+    columns to `decisions`. PRAGMA reflects them with the expected types
+    (REAL for ms, TEXT for the JSON blob), NULL-allowed (legacy +
+    execute rows stay NULL).
+    """
+    cur = await db_seeded.conn.execute("PRAGMA table_info(decisions)")
+    rows = await cur.fetchall()
+    await cur.close()
+    cols = {r["name"]: r["type"] for r in rows}
+    assert "decision_latency_ms" in cols, (
+        f"decision_latency_ms missing on decisions; columns are: {sorted(cols)}"
+    )
+    assert "decision_latency_breakdown" in cols, (
+        f"decision_latency_breakdown missing on decisions; columns are: "
+        f"{sorted(cols)}"
+    )
+    assert cols["decision_latency_ms"].upper() == "REAL"
+    assert cols["decision_latency_breakdown"].upper() == "TEXT"
+
+
+async def test_similarity_reject_records_latency_with_partial_breakdown(db_seeded):
+    """A `similarity_floor` reject is gate 1 — it fires BEFORE any
+    fetch_article / fetch_market / ai_direction step runs. The
+    breakdown JSON should therefore be present (not NULL) but empty
+    (or strictly a subset of the execute-path keys; in particular it
+    must NOT contain `ai_direction`).
+    """
+    bus = _FakeBus()
+    ai = _FakeAI()
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload(similarity=0.10))
+
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, reason, decision_latency_ms, decision_latency_breakdown "
+        "FROM decisions WHERE signal_id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row["outcome"] == "reject"
+    assert row["reason"] == "similarity_floor"
+
+    latency_ms = row["decision_latency_ms"]
+    assert latency_ms is not None, "decision_latency_ms not populated on reject"
+    assert isinstance(latency_ms, float)
+    assert latency_ms > 0.0, f"expected positive latency, got {latency_ms}"
+    assert latency_ms < 60_000.0, f"latency suspiciously large: {latency_ms}"
+
+    raw = row["decision_latency_breakdown"]
+    assert raw is not None, "decision_latency_breakdown not populated on reject"
+    breakdown = json.loads(raw)
+    assert isinstance(breakdown, dict)
+    # Gate 1 fires before any instrumented step runs.
+    assert "ai_direction" not in breakdown, (
+        f"ai_direction must NOT be in similarity_floor breakdown; got {breakdown}"
+    )
+    assert "fetch_article" not in breakdown, (
+        f"fetch_article must NOT be in similarity_floor breakdown; got {breakdown}"
+    )
+    assert "resolve_mid" not in breakdown
+    assert "resolve_book" not in breakdown
+
+
+async def test_edge_reject_records_latency_with_more_steps(db_seeded):
+    """An `edge_below_min` reject is gate 4 — fetch_article, fetch_market,
+    ai_direction, resolve_mid, resolve_book, imbalance_check all run
+    before it fires. The breakdown should contain those keys but NOT
+    `db_insert` (only execute paths reach the trade-row INSERT).
+    """
+    # Configure: high min_edge so the edge gate rejects.
+    cfg = _Config()
+    cfg.trade.min_edge = 0.99
+    bus = _FakeBus()
+    ai = _FakeAI()  # YES @ 0.7 → p_hat=0.7, mid=0.5 → edge=0.18 < 0.99
+    stage = _make_stage(db_seeded, bus, ai, cfg=cfg)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, reason, decision_latency_ms, decision_latency_breakdown "
+        "FROM decisions WHERE signal_id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row["outcome"] == "reject"
+    assert row["reason"] == "edge_below_min"
+
+    latency_ms = row["decision_latency_ms"]
+    assert latency_ms is not None and latency_ms > 0.0
+
+    raw = row["decision_latency_breakdown"]
+    assert raw is not None
+    breakdown = json.loads(raw)
+    assert isinstance(breakdown, dict)
+    # Gate 4 (edge) runs AFTER ai_direction + the two book/mid resolves.
+    assert "ai_direction" in breakdown, (
+        f"ai_direction expected in edge_below_min breakdown; got {breakdown}"
+    )
+    assert "resolve_mid" in breakdown
+    assert "resolve_book" in breakdown
+    # Reject paths NEVER reach the trade-row INSERT — so db_insert must
+    # NOT be in the dict. (db_insert is appended by _record_execute only.)
+    assert "db_insert" not in breakdown, (
+        f"db_insert must NOT be in reject breakdown; got {breakdown}"
+    )
+    # All recorded values are non-negative floats.
+    for step, ms in breakdown.items():
+        assert isinstance(ms, (int, float))
+        assert ms >= 0.0
+
+
+async def test_execute_path_still_records_latency(db_seeded):
+    """Regression guard for cycle 14: making `_record_reject` carry the
+    same instrumentation must not break the execute path's existing
+    latency columns on `trades`. We re-assert the canonical key set on a
+    happy-path trade — duplicating part of
+    `test_executed_trade_records_latency_ms` but isolating the
+    regression-guard intent.
+    """
+    bus = _FakeBus()
+    ai = _FakeAI()
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    cur = await db_seeded.conn.execute(
+        "SELECT decision_latency_ms, decision_latency_breakdown "
+        "FROM trades WHERE signal_id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+
+    latency_ms = row["decision_latency_ms"]
+    assert latency_ms is not None and latency_ms > 0.0
+
+    raw = row["decision_latency_breakdown"]
+    assert raw is not None
+    breakdown = json.loads(raw)
+    assert isinstance(breakdown, dict)
+    # Full execute-path keys present.
+    assert {"fetch_article", "fetch_market", "ai_direction",
+            "resolve_mid", "resolve_book", "imbalance_check",
+            "db_insert"} <= set(breakdown)
+    # And the matching `decisions` row for the same execute path
+    # leaves the latency columns NULL — the canonical numbers live on
+    # `trades` for executes; double-writing would be redundant.
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, decision_latency_ms, decision_latency_breakdown "
+        "FROM decisions WHERE signal_id=1"
+    )
+    drow = await cur.fetchone()
+    await cur.close()
+    assert drow is not None
+    assert drow["outcome"] == "execute"
+    assert drow["decision_latency_ms"] is None
+    assert drow["decision_latency_breakdown"] is None

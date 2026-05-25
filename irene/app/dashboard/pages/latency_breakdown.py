@@ -14,6 +14,15 @@ Stages instrumented in cycle 14 (canonical order):
     fetch_article, fetch_market, ai_direction,
     resolve_mid, resolve_book, imbalance_check, db_insert
 
+Cycle 16: extend the panel to ALSO read the same two columns on
+`decisions` (reject rows). Execute-path rows are still the primary
+source — the cycle-15 table renders first as before. Underneath, a
+new "Reject-path latencies" section buckets the reject rows by
+`reason` and shows the per-step p50 for the steps that ran before
+each gate fired. ~95%+ of signals fail the cascade, so this is where
+most of the latency-budget signal actually lives once we look beyond
+the execute path.
+
 The page reads ONLY (no writes back to the DB) and uses the same
 atomic `.tmp → rename` pattern as the rest of the dashboard via
 `core.tick`'s `_atomic_write`.
@@ -83,7 +92,16 @@ async def render(dash) -> str:
     await cur.close()
 
     if not rows:
-        return _empty_panel(cycle_id)
+        # No executes yet — show the empty-execute message, then
+        # render the cycle-16 reject section underneath if any reject
+        # rows carry latency data. (Production hits this state during
+        # the first cycle after a deploy: rejects accumulate fast,
+        # executes trickle in.)
+        empty = _empty_panel(cycle_id)
+        reject_section = await _render_reject_section(dash, cycle_sql)
+        if reject_section:
+            return empty + "\n" + "\n".join(reject_section) + "\n"
+        return empty
 
     # Accumulate per-step samples. Rows with malformed JSON are skipped
     # (logged via the dashboard's per-page exception handler in core.tick
@@ -155,4 +173,118 @@ async def render(dash) -> str:
             f"{p['p50']:>7.1f} {p['p95']:>7.1f} {p['p99']:>7.1f} "
             f"{_max(totals):>7.1f}"
         )
+
+    # ── Reject-path latencies (cycle 16) ─────────────────────────────
+    # ~95%+ of signals fail the cascade. Bucket those reject rows by
+    # `reason` (the column on decisions that names which gate fired)
+    # so an operator can see, per gate, how much time it consumed
+    # before tripping. The per-step samples are partial — a
+    # `similarity_floor` reject's breakdown is empty (gate 1, no
+    # fetches yet); an `edge_below_min` reject's breakdown carries
+    # everything up to (but not including) `db_insert`.
+    reject_section = await _render_reject_section(dash, cycle_sql)
+    if reject_section:
+        lines.append("")
+        lines.extend(reject_section)
+
     return "\n".join(lines) + "\n"
+
+
+async def _render_reject_section(dash, cycle_sql: str) -> list[str]:
+    """Render the per-reason reject-path sub-tables. Returns the lines
+    to append (empty list when no reject rows carry latency data).
+
+    Bucketing strategy: GROUP BY `reason` in Python (cheaper than two
+    round-trips + simpler to keep ordering deterministic). For each
+    bucket we render a one-line header (`reason (n=N)`) plus a
+    fixed-width per-step table showing only the steps that actually
+    ran inside that bucket. Steps follow the same canonical order as
+    the execute-path table.
+    """
+    cur = await dash.db.conn.execute(
+        f"""
+        SELECT reason, decision_latency_ms, decision_latency_breakdown
+        FROM decisions
+        WHERE outcome='reject'
+          AND decision_latency_ms IS NOT NULL
+          {cycle_sql}
+        ORDER BY id DESC
+        LIMIT {_SAMPLE_LIMIT}
+        """
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    if not rows:
+        return []
+
+    # Per-reason aggregation: { reason: { "total": [ms,...],
+    #                                     "by_stage": { step: [ms,...] } } }
+    buckets: dict[str, dict] = {}
+    for r in rows:
+        reason = str(r["reason"])
+        b = buckets.setdefault(reason, {"total": [], "by_stage": {}})
+        total = r["decision_latency_ms"]
+        if total is not None and total >= 0:
+            b["total"].append(float(total))
+        raw = r["decision_latency_breakdown"]
+        if not raw:
+            continue
+        try:
+            blob = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(blob, dict):
+            continue
+        for step, ms in blob.items():
+            if ms is None:
+                continue
+            try:
+                ms_f = float(ms)
+            except (TypeError, ValueError):
+                continue
+            if ms_f < 0:
+                continue
+            b["by_stage"].setdefault(str(step), []).append(ms_f)
+
+    if not buckets:
+        return []
+
+    n_total = sum(len(b["total"]) for b in buckets.values())
+    out: list[str] = [
+        f"  Reject-path latencies (last {n_total} rejects, by reason)",
+        "  " + "=" * 54,
+    ]
+    # Stable ordering: most-frequent reason first. Ties broken alphabetically.
+    ordered_reasons = sorted(
+        buckets.keys(),
+        key=lambda k: (-len(buckets[k]["total"]), k),
+    )
+    for reason in ordered_reasons:
+        b = buckets[reason]
+        n = len(b["total"])
+        total_p = _percentiles(b["total"])
+        out.append("")
+        out.append(
+            f"  {reason} (n={n}): total p50={total_p['p50']:.1f}ms "
+            f"p95={total_p['p95']:.1f}ms"
+        )
+        # Per-step lines — only steps that actually ran before this gate.
+        seen = set(b["by_stage"].keys())
+        if not seen:
+            # Gate-1 rejects (similarity_floor / freshness_stale) ran
+            # NO instrumented step. Make that visible rather than
+            # silently dropping the section.
+            out.append("    (no per-step samples — reject fired before any instrumented step)")
+            continue
+        ordered_stages = [s for s in _CANONICAL_STAGES if s in seen]
+        extras = sorted(seen - set(_CANONICAL_STAGES))
+        ordered_stages.extend(extras)
+        for stage in ordered_stages:
+            samples = b["by_stage"][stage]
+            p = _percentiles(samples)
+            out.append(
+                f"    {stage:<16} n={p['count']:<4d} "
+                f"p50={p['p50']:>6.1f}ms p95={p['p95']:>6.1f}ms "
+                f"p99={p['p99']:>6.1f}ms"
+            )
+    return out

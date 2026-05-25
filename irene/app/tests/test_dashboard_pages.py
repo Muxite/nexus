@@ -394,3 +394,97 @@ async def test_latency_panel_skips_trades_with_null_breakdown(db_ready, tmp_path
     assert cells[0] == "fetch_article"
     assert cells[1] == "5"
     assert cells[5] == "5.0"
+
+
+# ─── reject-path section (cycle 16) ──────────────────────────────────
+# The cycle-16 dashboard extension reads the same two latency columns
+# off `decisions` (reject rows) and appends a per-`reason` section
+# underneath the existing execute-path table. Seed a mix of rejects
+# with partial breakdowns and verify the section renders.
+
+
+async def _seed_reject_decision(
+    cur,
+    *,
+    decision_id: int,
+    reason: str,
+    decision_latency_ms,
+    decision_latency_breakdown,
+) -> None:
+    """Insert a reject decision with cycle-16 latency columns populated.
+
+    No `signal_id` is set on the decision (and no signal/article rows
+    are seeded) — the dashboard reader only joins on `decisions`
+    columns, so the reject-section render needs nothing else.
+    """
+    breakdown_json = (
+        json.dumps(decision_latency_breakdown)
+        if decision_latency_breakdown is not None
+        else None
+    )
+    await cur.execute(
+        """
+        INSERT INTO decisions (id, signal_id, outcome, reason, gate_history,
+                               prediction_id, cycle_id, is_tracer, tracer_id, created_at,
+                               decision_latency_ms, decision_latency_breakdown)
+        VALUES (?, NULL, 'reject', ?, '[]', NULL, 1, 0, NULL,
+                datetime('now','-5 seconds'), ?, ?)
+        """,
+        (decision_id, reason, decision_latency_ms, breakdown_json),
+    )
+
+
+async def test_latency_panel_renders_reject_section(db_ready, tmp_path):
+    """Mix of reject decisions with partial breakdowns:
+      - 3 `similarity_floor` rejects (gate 1 → empty breakdown).
+      - 2 `edge_below_min` rejects (gate 4 → fetch_article +
+        fetch_market + ai_direction + resolve_mid + resolve_book).
+    The rendered page must contain the reject-section header, both
+    per-reason headers with the right counts, and a per-step line for
+    ai_direction under edge_below_min.
+    """
+    async with db_ready.batch() as cur:
+        # similarity_floor — gate 1, no instrumented step ran.
+        for i in range(1, 4):
+            await _seed_reject_decision(
+                cur,
+                decision_id=i,
+                reason="similarity_floor",
+                decision_latency_ms=float(i),
+                decision_latency_breakdown={},
+            )
+        # edge_below_min — gate 4, fetched + ai_direction + resolves.
+        for i in range(4, 6):
+            await _seed_reject_decision(
+                cur,
+                decision_id=i,
+                reason="edge_below_min",
+                decision_latency_ms=float(i * 50),
+                decision_latency_breakdown={
+                    "fetch_article": 2.0,
+                    "fetch_market": 1.5,
+                    "ai_direction": 140.0 + i,
+                    "resolve_mid": 5.0,
+                    "resolve_book": 6.0,
+                },
+            )
+
+    dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)
+    body = await latency_breakdown_page.render(dash)
+
+    # Section header — the n is the count of reject rows we seeded.
+    assert "Reject-path latencies" in body
+    assert "last 5 rejects" in body
+    # Both per-reason headers appear with the right n.
+    assert "similarity_floor (n=3)" in body
+    assert "edge_below_min (n=2)" in body
+    # similarity_floor had no per-step samples — render explains why.
+    assert "no per-step samples" in body
+    # edge_below_min carries ai_direction.
+    edge_lines = [
+        line for line in body.splitlines()
+        if line.strip().startswith("ai_direction")
+    ]
+    assert edge_lines, "ai_direction per-step line not found in reject section"
+    # n=2 for the two edge_below_min rejects.
+    assert "n=2" in edge_lines[0]

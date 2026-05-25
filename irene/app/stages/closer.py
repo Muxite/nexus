@@ -293,7 +293,11 @@ async def write_trade_closure(
     fee_rate = _resolve_fee_rate(
         category,
         getattr(trade_cfg, "polymarket_fee_rates", {}),
-        float(getattr(trade_cfg, "default_fee_rate", 0.05)),
+        # Cycle 15 audit: top-500 markets by volume24hr are 82% at 10%
+        # taker; raised this defensive fallback from 0.05 to 0.10 to
+        # match the volume-tail modal value. See cfg.trade.default_fee_rate
+        # for the canonical config knob (per-market fetch is preferred).
+        float(getattr(trade_cfg, "default_fee_rate", 0.10)),
         market_fee_rate=market_fee_rate,
     )
     gas_usdc = float(getattr(trade_cfg, "gas_cost_usdc", 0.0))

@@ -54,20 +54,39 @@
 ```
 # Seed: $0.01-0.02 tight / $0.03-0.05 medium / $0.05+ wide
 # Source: unstructured answers.md 2026-05-25-unstructured-1 line 203
-# Measured (2026-05-25, top-30 markets by volume24hr, n=812 samples over 30 min):
+#
+# Measured #1 — high-volume (2026-05-25 cycle-10 soak, top-30 by
+# volume24hr, n=812 samples over 30 min):
 #   ≥$1M volume:      median 0.0010, p90 0.0100, max 0.0100
 #   $500k-$1M volume: median 0.0010, p90 0.0100, max 0.0200
 #   $100k-$500k:      median 0.0025, p90 0.0040, max 0.0040
 #   All samples:      p50 0.0010, p90 0.0100, p99 0.0200, max 0.0200
-#   spread > $0.10:   0 / 812 = 0.0% (wide_spread gate would never fire on this sample)
+#   spread > $0.10:   0 / 812 = 0.0% (wide_spread gate would never fire)
 # Producing: irene/reports/2026-05-25-cycle12-data-collection.md
-# Sample bias: top-30 by volume; thin / niche markets not in this dataset.
-# Action: high-volume markets are 5-50x tighter than the RAG "tight" prior.
-#         Consider tightening cfg.trade.wide_spread_threshold from 0.10
-#         after a second window of data, AND collect a separate
-#         thin-market sample to confirm the RAG "10¢+ on thin" prior
-#         (would inform whether thin_market gate is enough or we need a
-#         volume-conditional spread threshold).
+#
+# Measured #2 — low-volume (2026-05-25 cycle-14 soak v2, $10k-$50k band,
+# top-30 by volume24hr, n=790 samples / 37 unique markets over 28 min;
+# only sampled markets all landed in $30k-$50k subband, didn't reach
+# below $30k — TOP_N=30 was filled before walking that far):
+#   $30k-$50k:        n=37, median 0.0010, p75 0.0100, p90 0.0100, max 0.0450
+#   All samples:      p50 0.0010, p75 0.0100, p90 0.0100, p99 0.0300, max 0.0450
+#   spread > $0.05:   0 / 790 = 0.0%
+#   spread > $0.10:   0 / 790 = 0.0%
+# Producing: irene/reports/2026-05-25-cycle16-low-vol-spread-analysis.md
+#
+# Combined interpretation:
+# - Spreads at $30k-$50k volume look IDENTICAL to spreads at $500k+
+#   volume (same medians, slightly wider tail at $0.045 vs $0.020 max).
+# - The RAG "$0.05+ wide" claim is invalidated for markets above $30k.
+# - Markets below $30k still unsampled — TRUE niche markets (<$1k) may
+#   yet show the RAG-claimed wider spreads.
+# - cfg.trade.wide_spread_threshold = 0.10 is now even MORE conservative
+#   than cycle 12 thought: across 1602 samples spanning $30k - $5M+
+#   volume, ZERO would have tripped. Could tighten to 0.05 with high
+#   confidence (still leaves 0/1602 = 0% rejection rate on this dataset).
+# - Defer tightening: collect a <$30k sample first to confirm the
+#   thin_market + wide_spread pair is well-tuned even at the bottom of
+#   the active universe.
 ```
 
 ## C4 / E2 — CLOB round-trip latency from our host

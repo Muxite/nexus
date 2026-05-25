@@ -190,6 +190,20 @@ _TRADE_DDL = [
     # the module is idempotent.
     "ALTER TABLE trades ADD COLUMN decision_latency_ms        REAL",
     "ALTER TABLE trades ADD COLUMN decision_latency_breakdown TEXT",
+    # Cycle 16: extend latency-chain instrumentation to REJECT paths.
+    # ~95%+ of signals fail the gate cascade and never write a `trades`
+    # row, so the cycle-14 columns above only reveal half the latency
+    # story. Mirror the two columns onto `decisions`: total ms from
+    # handle()-entry up to the reject point, plus the partial breakdown
+    # dict of whichever steps ran before the gate fired. A `similarity_floor`
+    # reject (gate 1, no fetch) will hold an empty breakdown; an
+    # `edge_below_min` reject (gate 4) will have fetch_article +
+    # fetch_market + ai_direction + resolve_mid + resolve_book. Execute
+    # rows on `decisions` leave both NULL — the canonical chain numbers
+    # for those live on the `trades` row instead. ALTER TABLE rows
+    # are sha1-tracked so re-importing the module is idempotent.
+    "ALTER TABLE decisions ADD COLUMN decision_latency_ms        REAL",
+    "ALTER TABLE decisions ADD COLUMN decision_latency_breakdown TEXT",
 ]
 db_module.register_schema("app/stages/trade.py", _TRADE_DDL)
 
@@ -365,6 +379,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         gate_history.append(
@@ -384,6 +400,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         gate_history.append(
@@ -407,6 +425,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         if market is None:
@@ -418,6 +438,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
 
@@ -442,6 +464,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         gate_history.append(
@@ -476,6 +500,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         if result.confidence < self._cfg.min_confidence:
@@ -490,6 +516,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         gate_history.append(
@@ -516,6 +544,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         # 4a-bis. wide-spread guard — Polymarket's /midpoint returns the
@@ -541,6 +571,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         # 4b. market-news weight imbalance — reject when the market is
@@ -567,6 +599,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         # Cycle 10: explicit-spread-term refactor. When the live book is
@@ -618,6 +652,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         gate_history.append(_gate_entry("edge", "ok", edge, self._cfg.min_edge))
@@ -679,6 +715,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         gate_history.append(_gate_entry("size", "ok", size, effective_floor))
@@ -710,6 +748,8 @@ class TradeStage:
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
             )
             return
         if size > cash_available:
@@ -744,6 +784,8 @@ class TradeStage:
                     cycle_id=cycle_id,
                     is_tracer=is_tracer,
                     tracer_id=tracer_id,
+                    decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                    decision_latency_breakdown=dict(breakdown),
                 )
                 return
         else:
@@ -1191,6 +1233,8 @@ class TradeStage:
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
+        decision_latency_ms: Optional[float] = None,
+        decision_latency_breakdown: Optional[dict[str, float]] = None,
     ) -> None:
         decision_id = await self._insert_decision(
             signal_id=signal_id,
@@ -1201,6 +1245,8 @@ class TradeStage:
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
+            decision_latency_ms=decision_latency_ms,
+            decision_latency_breakdown=decision_latency_breakdown,
         )
         if decision_id is None:
             # A prior pass already wrote the decision; don't republish.
@@ -1322,14 +1368,29 @@ class TradeStage:
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
+        decision_latency_ms: Optional[float] = None,
+        decision_latency_breakdown: Optional[dict[str, float]] = None,
     ) -> Optional[int]:
+        # Cycle 16: serialise the partial breakdown for reject rows. The
+        # dict only contains the steps that ACTUALLY RAN before the
+        # rejecting gate fired (e.g. a `similarity_floor` reject yields
+        # an empty dict; an `edge_below_min` reject yields fetch_article,
+        # fetch_market, ai_direction, resolve_mid, resolve_book). Execute
+        # decisions pass None on both kwargs — the canonical chain numbers
+        # live on the `trades` row in that case.
+        breakdown_json = (
+            json.dumps(decision_latency_breakdown)
+            if decision_latency_breakdown is not None
+            else None
+        )
         async with self._db.batch() as cur:
             await cur.execute(
                 """
                 INSERT OR IGNORE INTO decisions
                     (signal_id, outcome, reason, gate_history, prediction_id,
-                     cycle_id, is_tracer, tracer_id, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     cycle_id, is_tracer, tracer_id, created_at,
+                     decision_latency_ms, decision_latency_breakdown)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal_id,
@@ -1341,6 +1402,8 @@ class TradeStage:
                     1 if is_tracer else 0,
                     tracer_id,
                     _now_iso(),
+                    decision_latency_ms,
+                    breakdown_json,
                 ),
             )
             if cur.rowcount != 1:

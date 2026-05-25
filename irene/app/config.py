@@ -302,15 +302,20 @@ class TradeSection(BaseModel):
     # Both legs are taker fees (paper mode assumes we hit the book).
     # Maker (limit) fees are 0; settlement fee is 0.
     #
-    # Category → fee_rate map (per Polymarket's published schedule):
+    # FALLBACK ONLY. Since cycle 10 the canonical fee_rate is fetched
+    # per-market via `app/clob.py:get_market_info` (writes to
+    # `markets.fee_rate`); cycle 15 added a weekly refresh cadence
+    # (`fee_rate_fetched_at`). `closer.py:_resolve_fee_rate` prefers the
+    # per-market value over this category table; the table only fires
+    # when the per-market fetch fails or the row predates cycle 10.
+    #
+    # Category → fee_rate map (per Polymarket's published schedule, as a
+    # fallback for unfetched markets):
     #   crypto                       — 0.072
-    #   economics/culture/weather    — 0.05 (default)
+    #   economics/culture/weather    — 0.05 (default category)
     #   finance/politics/tech        — 0.04
     #   sports                       — 0.03
     #   geopolitics                  — 0.00 (free)
-    #
-    # NOT a config knob (locked to Polymarket's schedule) but the
-    # default_fee_rate fallback IS configurable.
     polymarket_fee_rates: dict = Field(default_factory=lambda: {
         # 2026-05-25 unstructured RAG batch reports crypto at 0.07; we keep
         # 0.072 (conservative — over-estimates by ~2.8%) until a
@@ -322,7 +327,14 @@ class TradeSection(BaseModel):
         "sports": 0.03,
         "geopolitics": 0.00,
     })
-    default_fee_rate: float = Field(default=0.05, ge=0.0, lt=1.0)
+    # 2026-05-25 (cycle 15 audit): top-500 markets by volume24hr split
+    # 82.2% at 1000 bps (10%) / 17.8% at 0 bps. The cycle-7 default of
+    # 0.05 was a guess; the volume-weighted modal value is 10%. Raised
+    # to 0.10 to make the fallback conservative on the trading tail.
+    # Per-market fetch (cycle 10) is still the source of truth — this
+    # default only fires when fetch fails. Report:
+    # `irene/reports/2026-05-25-cycle15-market-floor-audit.md`.
+    default_fee_rate: float = Field(default=0.10, ge=0.0, lt=1.0)
     # Per-leg gas (entry + exit). Default 0 since paper mode doesn't
     # deduct gas; flip on if you want a more conservative wallet.
     gas_cost_usdc: float = Field(default=0.0, ge=0.0, lt=10.0)
