@@ -140,25 +140,42 @@ class IngestStage:
         self._html_poll_seconds = int(
             getattr(deps.config.ingest, "html_poll_seconds", 300)
         )
+        # Cycle 5: combined RSS+HTML source list — polled via /scrape mode=combined.
+        self._combined_sources = list(
+            getattr(deps.config.ingest, "combined_sources", []) or []
+        )
+        self._combined_poll_seconds = int(
+            getattr(deps.config.ingest, "combined_poll_seconds", 180)
+        )
+        self._combined_enrich_top_n = int(
+            getattr(deps.config.ingest, "combined_enrich_html_top_n", 0)
+        )
         self._client: Optional[httpx.AsyncClient] = None
         self._feed_task: Optional[asyncio.Task] = None
         self._html_task: Optional[asyncio.Task] = None
+        self._combined_task: Optional[asyncio.Task] = None
         self._stopped = False
 
     async def start(self) -> None:
-        if self._feed_task is not None or self._html_task is not None:
+        if (
+            self._feed_task is not None
+            or self._html_task is not None
+            or self._combined_task is not None
+        ):
             return
         self._client = httpx.AsyncClient(timeout=self._scraper_timeout)
         self._feed_task = asyncio.create_task(self._run_feed_loop())
         # Only start the HTML loop when sites are configured; idle is fine.
         if self._html_sites:
             self._html_task = asyncio.create_task(self._run_html_loop())
+        if self._combined_sources:
+            self._combined_task = asyncio.create_task(self._run_combined_loop())
 
     async def stop(self) -> None:
         if self._stopped:
             return
         self._stopped = True
-        for task in (self._feed_task, self._html_task):
+        for task in (self._feed_task, self._html_task, self._combined_task):
             if task is None:
                 continue
             task.cancel()
@@ -168,6 +185,7 @@ class IngestStage:
                 pass
         self._feed_task = None
         self._html_task = None
+        self._combined_task = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -326,6 +344,120 @@ class IngestStage:
             return None
         # Defensive: only `kind=="links"` carries headline link items.
         if data.get("kind") != "links":
+            return None
+        links = data.get("links")
+        if not isinstance(links, list):
+            return None
+        return links
+
+    # ---- Combined RSS+HTML loop (cycle 5) -----------------------------
+
+    async def _run_combined_loop(self) -> None:
+        """Per-source loop driving /scrape mode=combined. The scraper
+        fetches the host's pinned RSS feed (per_host.yaml) and the HTML
+        homepage in parallel and returns the merged link-set. Each
+        merged entry carries title (always), summary + published_at
+        (when RSS contributed) and a `seen_in` list.
+        """
+        if not self._combined_sources:
+            return
+        last_polled: dict[str, float] = {}
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        for source in self._combined_sources:
+            last_polled[source] = now - random.uniform(0, self._combined_poll_seconds)
+        while True:
+            for source in self._combined_sources:
+                if loop.time() - last_polled[source] < self._combined_poll_seconds:
+                    continue
+                last_polled[source] = loop.time()
+                try:
+                    await self._poll_combined_source(source)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    logger.exception("ingest: unexpected error polling combined %r", source)
+            await asyncio.sleep(1.0)
+
+    async def _poll_combined_source(self, source_url: str) -> None:
+        links = await self._fetch_combined_links(source_url)
+        if links is None:
+            return
+        for link in links:
+            url = link.get("url")
+            text = link.get("text") or ""
+            if not isinstance(url, str) or not url:
+                continue
+            title = text.strip()
+            # Boilerplate filter — same triple guard as the HTML loop:
+            # length + title blocklist + URL pattern blocklist. The
+            # scraper already drops most cruft, but defence in depth.
+            if len(title) < 30 or title.lower() in _BOILERPLATE_TITLE_BLOCKLIST:
+                continue
+            url_lower = url.lower()
+            if any(pat in url_lower for pat in _NON_ARTICLE_URL_PATTERNS):
+                continue
+            summary = link.get("summary") or None
+            published = link.get("published") or None
+            seen_in = link.get("seen_in") or []
+            # source_detail records which sub-strategies surfaced this
+            # so chunked decision audits can attribute back to RSS/HTML.
+            if isinstance(seen_in, list) and seen_in:
+                tag_suffix = "+" + "+".join(sorted(seen_in))
+            else:
+                tag_suffix = ""
+            await self._ingest_item(
+                source="combined",
+                source_detail=f"{source_url}{tag_suffix}",
+                item={
+                    "url": url,
+                    "title": title,
+                    "summary": summary if isinstance(summary, str) else None,
+                    "published_at": published if isinstance(published, str) else None,
+                },
+            )
+
+    async def _fetch_combined_links(
+        self, source_url: str
+    ) -> Optional[list[dict[str, Any]]]:
+        """POST /scrape with mode=combined. Returns the merged link list
+        (each item is `{url, text, summary, published, seen_in}`), or
+        None on any HTTP-layer error."""
+        assert self._client is not None
+        try:
+            resp = await self._client.post(
+                f"{self._scraper_url}/scrape",
+                json={
+                    "url": source_url,
+                    "mode": "combined",
+                    "enrich_html_top_n": self._combined_enrich_top_n,
+                },
+            )
+            if resp.status_code == 429:
+                logger.warning(
+                    "ingest: scraper /scrape mode=combined 429 for %r — skipping",
+                    source_url,
+                )
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "ingest: scraper /scrape combined failed for %r (%s) — skipping",
+                source_url,
+                exc.__class__.__name__,
+            )
+            return None
+        except ValueError as exc:
+            logger.warning(
+                "ingest: scraper /scrape combined non-JSON for %r (%s)",
+                source_url, exc,
+            )
+            return None
+        if not isinstance(data, dict):
+            return None
+        # `kind=='empty'` is fine — just no links this tick.
+        if data.get("kind") not in ("links", "empty"):
             return None
         links = data.get("links")
         if not isinstance(links, list):

@@ -51,6 +51,9 @@ def _make_config(
     poll_seconds: int = 60,
     html_sites: list[str] | None = None,
     html_poll_seconds: int = 300,
+    combined_sources: list[str] | None = None,
+    combined_poll_seconds: int = 180,
+    combined_enrich_html_top_n: int = 0,
 ) -> Config:
     return Config(
         irene=IreneSection(),
@@ -60,6 +63,9 @@ def _make_config(
             poll_seconds=poll_seconds,
             html_sites=html_sites or [],
             html_poll_seconds=html_poll_seconds,
+            combined_sources=combined_sources or [],
+            combined_poll_seconds=combined_poll_seconds,
+            combined_enrich_html_top_n=combined_enrich_html_top_n,
         ),
     )
 
@@ -94,10 +100,14 @@ def _make_stage(
     bus: _FakeBus,
     feeds: list[str] | None = None,
     html_sites: list[str] | None = None,
+    combined_sources: list[str] | None = None,
 ) -> IngestStage:
     deps = StageDeps(
         db=db, bus=bus,
-        config=_make_config(feeds=feeds, html_sites=html_sites),
+        config=_make_config(
+            feeds=feeds, html_sites=html_sites,
+            combined_sources=combined_sources,
+        ),
     )
     return IngestStage(deps)
 
@@ -353,6 +363,87 @@ async def test_html_path_skips_response_with_wrong_kind(db_ready, bus, monkeypat
     with cycle_scope(1):
         result = await stage._fetch_html_links("https://apnews.com")
     assert result is None
+
+
+async def test_combined_path_inserts_articles_with_source_combined(db_ready, bus, monkeypatch):
+    """Cycle 5: /scrape mode=combined returns LinkItem rows enriched with
+    summary + published + seen_in. The combined watcher converts each
+    into a source='combined' article row carrying RSS-side metadata
+    when present."""
+    stage = _make_stage(db_ready, bus, combined_sources=["https://apnews.com"])
+
+    async def stub_fetch(self, source_url: str):
+        assert source_url == "https://apnews.com"
+        return [
+            {
+                "url": "https://apnews.com/iran",
+                "text": "Trump announces breaking Iran deal in late-night session",
+                "summary": "The agreement was reached after a marathon negotiation between US and Iranian officials.",
+                "published": "2026-05-25T01:00:00+00:00",
+                "seen_in": ["rss", "html"],
+            },
+            {
+                "url": "https://apnews.com/breaking",
+                "text": "Pakistan elections result in surprise coalition government this morning",
+                "summary": "",
+                "published": "",
+                "seen_in": ["html"],
+            },
+        ]
+
+    monkeypatch.setattr(IngestStage, "_fetch_combined_links", stub_fetch)
+
+    with cycle_scope(1):
+        await stage._poll_combined_source("https://apnews.com")
+
+    cur = await db_ready.conn.execute(
+        "SELECT source, source_detail, title, summary, published_at FROM articles ORDER BY id"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    assert len(rows) == 2
+    assert all(r["source"] == "combined" for r in rows)
+    # Source-detail carries seen_in tag suffix so downstream audits can attribute.
+    details = {r["source_detail"] for r in rows}
+    assert "https://apnews.com+html+rss" in details
+    assert "https://apnews.com+html" in details
+    # The RSS-enriched row carries summary + published.
+    iran = next(r for r in rows if "Iran deal" in r["title"])
+    assert iran["summary"].startswith("The agreement was reached")
+    assert iran["published_at"] == "2026-05-25T01:00:00+00:00"
+    # The HTML-only row has no summary/published.
+    pak = next(r for r in rows if "Pakistan elections" in r["title"])
+    assert pak["summary"] is None
+    assert pak["published_at"] is None
+    # Bus publishes once per row.
+    assert len(bus.published) == 2
+
+
+async def test_combined_path_filters_boilerplate_and_non_articles(db_ready, bus, monkeypatch):
+    """Same triple guard the html path uses: length, blocklist, URL pattern."""
+    stage = _make_stage(db_ready, bus, combined_sources=["https://apnews.com"])
+
+    async def stub_fetch(self, source_url: str):
+        return [
+            {"url": "https://apnews.com/sub", "text": "Subscribe", "seen_in": ["html"]},
+            {"url": "https://apnews.com/short", "text": "Hi", "seen_in": ["html"]},
+            {"url": "https://www.nytimes.com/crosswords/abc",
+             "text": "The Crossword Get clued in with wordplay every day",
+             "seen_in": ["html"]},
+            {"url": "https://apnews.com/real",
+             "text": "Russia launches new attack on Kyiv overnight tonight",
+             "summary": "Air-raid sirens sounded across the capital after the strike began.",
+             "seen_in": ["rss", "html"]},
+        ]
+
+    monkeypatch.setattr(IngestStage, "_fetch_combined_links", stub_fetch)
+
+    with cycle_scope(1):
+        await stage._poll_combined_source("https://apnews.com")
+
+    cur = await db_ready.conn.execute("SELECT title FROM articles")
+    titles = [r["title"] for r in await cur.fetchall()]
+    assert titles == ["Russia launches new attack on Kyiv overnight tonight"]
 
 
 async def test_stop_is_idempotent(db_ready, bus):

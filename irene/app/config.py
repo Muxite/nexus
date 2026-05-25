@@ -120,6 +120,19 @@ class IngestSection(BaseModel):
     # HTML homepages polled via /scrape mode=links.
     html_sites: list[str] = Field(default_factory=list)
     html_poll_seconds: int = Field(default=300, ge=30)
+    # Cycle 5: combined RSS+HTML homepages polled via /scrape mode=combined.
+    # The scraper fetches the host's pinned RSS feed (from per_host.yaml)
+    # and the HTML homepage in parallel and returns the merged link-set,
+    # so a single source URL produces both RSS items (with summaries)
+    # and HTML breaking links not yet in the feed. Empty list → loop is
+    # a no-op; existing rss_feeds/html_sites loops keep working.
+    combined_sources: list[str] = Field(default_factory=list)
+    combined_poll_seconds: int = Field(default=180, ge=30)
+    # When > 0, /scrape mode=combined fans out mode=article fetches for
+    # the top-N HTML-only links to enrich them with body-derived summaries.
+    # Costs an extra HTTP/render per link, in exchange for far better
+    # LLM-side signal on bare-title HTML breaking news. Default off.
+    combined_enrich_html_top_n: int = Field(default=0, ge=0, le=20)
 
 
 class DedupeSection(BaseModel):

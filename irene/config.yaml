@@ -54,23 +54,41 @@ ingest:
   poll_seconds: 60
 
   # Cycle 4: HTML homepages — v2's /scrape mode=links returns the
-  # boilerplate-stripped headline link-set. Lit up Reuters/AP/WaPo and
-  # the rest of seulgi's watched_sites set since their RSS is dead or
-  # incomplete. Polled every 5 min (v2 caches by fingerprint so this
-  # is cheap when nothing changed).
-  html_sites:
+  # boilerplate-stripped headline link-set. Polled every 5 min (v2
+  # caches by fingerprint so this is cheap when nothing changed).
+  # Cycle 5: most of these are now in `combined_sources` below, which
+  # uses /scrape mode=combined to fetch RSS + HTML in parallel. The
+  # html_sites entries that remain are sites WITHOUT a pinned RSS in
+  # services/scraper-v2/config/per_host.yaml — there combined mode
+  # would degenerate to html-only anyway.
+  html_sites: []
+  html_poll_seconds: 300
+
+  # Cycle 5: combined RSS+HTML sources. Each entry is a homepage URL;
+  # the scraper looks up the host's pinned `rss_url` in per_host.yaml,
+  # fetches RSS + HTML in parallel, and returns the merged link set
+  # (HTML breaking news + RSS summaries). enrich_html_top_n=3 asks the
+  # scraper to fan out mode=article for up to 3 HTML-only links per
+  # poll, attaching body-derived summaries — meaningful for the LLM.
+  combined_sources:
     - https://apnews.com
     - https://www.reuters.com
     - https://www.bbc.com/news
-    - https://www.politico.com
-    - https://www.axios.com
-    - https://www.aljazeera.com
     - https://www.theguardian.com/world
-    - https://www.wsj.com
-    - https://www.ft.com
     - https://www.nytimes.com
     - https://www.washingtonpost.com
-  html_poll_seconds: 300
+    - https://www.cnn.com
+    - https://www.aljazeera.com
+    - https://www.ft.com
+    - https://www.wsj.com
+    - https://www.politico.com
+    - https://www.axios.com
+    - https://thehill.com
+    - https://www.bloomberg.com
+    - https://www.cnbc.com
+    - https://www.npr.org
+  combined_poll_seconds: 180
+  combined_enrich_html_top_n: 3
 
 trade:
   balance_usdc: 1000.0
