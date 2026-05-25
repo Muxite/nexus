@@ -238,6 +238,15 @@ class TradeSection(BaseModel):
     min_confidence: float = Field(default=0.55, gt=0.0, le=1.0)
     min_edge: float = Field(default=0.04, gt=0.0, lt=1.0)
     fee_buffer: float = Field(default=0.02, ge=0.0, lt=1.0)
+    # Cycle 10 (irene/plans/order-execution-spreads.md §2): explicit
+    # per-leg taker-fee budget used by the new edge formula
+    # `edge = executable_side - p_hat - taker_fee_buffer - half_spread`
+    # when a live book is available. Separate from `fee_buffer`, which
+    # is a single lumped fee+spread cushion still used by (a) the legacy
+    # book-unavailable fallback in the edge gate and (b) the closer's
+    # `target_mid` computation in `_insert_trade`. Default 0.01 ≈ the
+    # spread-free half of the historical 0.02 lump.
+    taker_fee_buffer: float = Field(default=0.01, ge=0.0, lt=1.0)
     # Cycle 4: reject entries when CLOB mid is in degenerate range — the
     # market is essentially resolved and any "edge" the model thinks it
     # sees is mostly fees + spread. Threshold 0.02/0.98 lets 0.946-type

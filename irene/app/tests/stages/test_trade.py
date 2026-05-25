@@ -91,6 +91,7 @@ class _TradeCfg:
     min_confidence: float = 0.55
     min_edge: float = 0.04
     fee_buffer: float = 0.02
+    taker_fee_buffer: float = 0.01
     kelly_fraction: float = 0.25
     max_position_fraction: float = 0.20
     min_position_usdc: float = 1.0
@@ -763,6 +764,117 @@ async def test_narrow_spread_passes_gate(db_seeded):
 
     d = await _single_decision(db_seeded)
     assert d["reason"] != "wide_spread"
+
+
+async def test_edge_uses_executable_side_when_book_available(db_seeded):
+    """Cycle 10: when the live book is available, the edge gate uses
+    `executable_side - p_hat - taker_fee_buffer - half_spread`, not the
+    legacy lumped `fee_buffer`. With p_hat=0.9 and a tight book of
+    (0.49, 0.51), the executable YES side is best_ask=0.51, half_spread
+    is 0.01, taker_fee_buffer is 0.01, so
+        edge = 0.9 - 0.51 - 0.01 - 0.01 = 0.37
+    — well above min_edge=0.04. Trade should execute and the
+    `edge_components` block should be plumbed into features_snapshot
+    with the new fields and `fallback=False`."""
+    clob = _FakeCLOB(
+        prices={"ty": 0.51, "tn": 0.49},
+        books={"ty": (0.49, 0.51)},
+    )
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.9, prediction_id=101,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "execute", d
+    cur = await db_seeded.conn.execute(
+        "SELECT edge, features_snapshot FROM trades WHERE prediction_id=101"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    assert row["edge"] == pytest.approx(0.9 - 0.51 - 0.01 - 0.01, abs=1e-9)
+    snap = json.loads(row["features_snapshot"])
+    ec = snap["edge_components"]
+    assert ec["fallback"] is False
+    assert ec["executable_price"] == pytest.approx(0.51, abs=1e-9)
+    assert ec["spread"] == pytest.approx(0.02, abs=1e-9)
+    assert ec["half_spread"] == pytest.approx(0.01, abs=1e-9)
+    assert ec["taker_fee_buffer"] == pytest.approx(0.01, abs=1e-9)
+
+
+async def test_edge_falls_back_to_mid_when_book_unavailable(db_seeded):
+    """Cycle 10: with no live book, the edge gate falls back to the
+    legacy `p_hat - mid - fee_buffer` formula. `features_snapshot.
+    edge_components.fallback` must be True so we can audit how often
+    the fallback path fires. With p_hat=0.7, mid=0.5, fee_buffer=0.02,
+    edge = 0.18 > min_edge."""
+    clob = _FakeCLOB(prices={"ty": 0.50, "tn": 0.50})  # no `books`
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=102,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "execute", d
+    cur = await db_seeded.conn.execute(
+        "SELECT edge, features_snapshot FROM trades WHERE prediction_id=102"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+    # Legacy formula: 0.7 - 0.5 - 0.02 = 0.18.
+    assert row["edge"] == pytest.approx(0.18, abs=1e-9)
+    snap = json.loads(row["features_snapshot"])
+    ec = snap["edge_components"]
+    assert ec["fallback"] is True
+    assert ec["fee_buffer"] == pytest.approx(0.02, abs=1e-9)
+    assert "executable_price" not in ec
+
+
+async def test_edge_rejects_when_executable_side_eats_budget(db_seeded):
+    """Cycle 10: a narrow-enough book to pass `wide_spread` (0.02 <
+    0.10) can still kill the edge once we account for the executable
+    side and explicit costs. Book (0.85, 0.87), confidence 0.86 → YES
+    edge = 0.86 - 0.87 - 0.01 - 0.01 = -0.03 < min_edge=0.04 → reject
+    with `edge_below_min`. The legacy formula would have given
+    0.86 - 0.86 - 0.02 = -0.02 (also reject, but only because mid==p_hat
+    coincidentally) — the new formula rejects cleanly on the executable
+    side eating the budget regardless of where mid sits."""
+    # Mid here is the YES mid surrogate — set to 0.86 so degenerate-mid
+    # (max_mid=0.98) and market-news extreme-mid (0.85 boundary) don't
+    # fire instead. We need a non-BREAKING-friendly setup: ensure
+    # freshness=BREAKING so extreme-mid sub-rule is bypassed.
+    clob = _FakeCLOB(
+        prices={"ty": 0.86, "tn": 0.14},
+        books={"ty": (0.85, 0.87)},
+    )
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.86, prediction_id=103,
+        cached=False, raw_response="{}",
+    ))
+    # Disable singleton-on-extreme-mid so we land on the edge gate, not
+    # on market_news_imbalance (mid=0.86 is past the 0.85 threshold).
+    cfg = _Config(trade=_TradeCfg(
+        reject_singleton_on_extreme_mid=False,
+        require_breaking_for_extreme_mid=False,
+    ))
+    stage = _make_stage(db_seeded, bus, ai, cfg=cfg, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload(freshness="BREAKING"))
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject", d
+    assert d["reason"] == "edge_below_min"
 
 
 async def test_market_news_imbalance_thin_market_rejects(db_seeded):

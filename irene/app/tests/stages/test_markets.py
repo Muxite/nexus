@@ -168,9 +168,30 @@ def _make_stage(
     bus: _FakeBus,
     embedder: _FakeEmbedder,
     dim: int = 8,
+    clob=None,
 ) -> MarketsStage:
-    deps = StageDeps(db=db, bus=bus, config=_config(dim=dim), embedder=embedder)
+    deps = StageDeps(
+        db=db, bus=bus, config=_config(dim=dim), embedder=embedder, clob=clob,
+    )
     return MarketsStage(deps)
+
+
+class _FakeCLOB:
+    """Minimal CLOB stub for cycle-10 per-market fee_rate fetch.
+
+    Records every `get_market_fee_rate` call so tests can assert
+    first-seen-only semantics."""
+
+    def __init__(self, fee_by_id: Optional[dict] = None, default: Optional[float] = 0.02) -> None:
+        self._fee_by_id = fee_by_id or {}
+        self._default = default
+        self.fee_calls: list[str] = []
+
+    async def get_market_fee_rate(self, condition_id: str) -> Optional[float]:
+        self.fee_calls.append(condition_id)
+        if condition_id in self._fee_by_id:
+            return self._fee_by_id[condition_id]
+        return self._default
 
 
 # ---------------------------------------------------------------------------
@@ -399,6 +420,62 @@ async def test_disappearing_market_auto_closes_open_trades(db_ready, bus, embedd
     # per the no-fee-at-resolution rule). Politics → fee_rate=0.04.
     # shares=100/0.5=200; entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0.
     assert row["realized_pnl_usdc"] == pytest.approx(-2.0, rel=1e-3)
+
+
+async def test_first_seen_market_populates_fee_rate_from_clob(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 10: on first-seen markets the stage calls
+    `clob.get_market_fee_rate(conditionId)` and persists the result
+    into `markets.fee_rate`. Already-populated rows are NOT re-fetched
+    (refresh cadence is a separate decision per plans/markets-gamma.md).
+    """
+    clob = _FakeCLOB(fee_by_id={"0xfee1": 0.02, "0xfee2": 0.10})
+    stage = _make_stage(db_ready, bus, embedder, clob=clob)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xfee1", "Q1"), _gamma_row("0xfee2", "Q2")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+
+    # First poll — both markets are first-seen so both get fetched.
+    await stage.poll_once()
+
+    cur = await db_ready.conn.execute(
+        "SELECT condition_id, fee_rate FROM markets ORDER BY condition_id"
+    )
+    rows = await cur.fetchall()
+    by_id = {r["condition_id"]: r["fee_rate"] for r in rows}
+    assert by_id["0xfee1"] == pytest.approx(0.02)
+    assert by_id["0xfee2"] == pytest.approx(0.10)
+    assert sorted(clob.fee_calls) == ["0xfee1", "0xfee2"]
+
+    # Second poll — both rows now have non-NULL fee_rate, so no extra
+    # fetches fire (first-seen-only semantics).
+    clob.fee_calls.clear()
+    await stage.poll_once()
+    assert clob.fee_calls == []
+
+
+async def test_fee_rate_column_stays_null_when_clob_absent(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """When the CLOB client isn't wired (e.g. minimal test deps), the
+    stage MUST NOT crash — fee_rate just stays NULL and closer.py
+    falls back to the category lookup."""
+    stage = _make_stage(db_ready, bus, embedder, clob=None)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xno-clob", "Q")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    cur = await db_ready.conn.execute(
+        "SELECT fee_rate FROM markets WHERE condition_id='0xno-clob'"
+    )
+    row = await cur.fetchone()
+    assert row["fee_rate"] is None
 
 
 async def test_network_error_keeps_loop_alive(db_ready, bus, embedder, monkeypatch, caplog):

@@ -430,7 +430,11 @@ class TradeStage:
         # and reject if spread exceeds the threshold. Graceful degrade:
         # if the book read fails (None), skip this check rather than
         # blocking the trade. See app/clob.py:get_top_of_book.
-        spread = await self._resolve_spread(direction=direction, market=market)
+        book = await self._resolve_executable_side(direction=direction, market=market)
+        if book is not None:
+            executable_price, spread = book
+        else:
+            executable_price, spread = None, None
         if spread is not None and spread > self._cfg.wide_spread_threshold:
             gate_history.append(_gate_entry("edge", "reject", spread, "wide_spread"))
             await self._record_reject(
@@ -467,10 +471,45 @@ class TradeStage:
                 tracer_id=tracer_id,
             )
             return
-        if direction == "YES":
-            edge = p_hat - mid - self._cfg.fee_buffer
+        # Cycle 10: explicit-spread-term refactor. When the live book is
+        # available, use the executable side + half-spread + an explicit
+        # taker-fee buffer instead of the single lumped `fee_buffer`
+        # constant. The fallback path (book-unavailable) preserves the
+        # legacy behaviour so paper/test environments without a book
+        # source keep reproducing prior cycle-7 trade counts.
+        # See irene/plans/order-execution-spreads.md §2.
+        if executable_price is not None and spread is not None:
+            half_spread = float(spread) / 2.0
+            if direction == "YES":
+                # Buying YES: pay YES-side best_ask.
+                # executable_price == best_ask_yes.
+                edge = p_hat - executable_price - self._cfg.taker_fee_buffer - half_spread
+            else:
+                # Buying NO: pay NO-side best_ask = 1 - best_bid_yes.
+                # Edge of NO buy = (1 - p_hat) - best_ask_no
+                #                = (1 - best_ask_no) - p_hat
+                # so the executable_price returned in YES-price terms is
+                # `1 - best_ask_no` (i.e. best_bid_yes) and the symmetric
+                # formula matches the YES branch's shape.
+                edge = executable_price - p_hat - self._cfg.taker_fee_buffer - half_spread
+            edge_components = {
+                "mid": mid,
+                "executable_price": float(executable_price),
+                "spread": float(spread),
+                "half_spread": half_spread,
+                "taker_fee_buffer": float(self._cfg.taker_fee_buffer),
+                "fallback": False,
+            }
         else:
-            edge = mid - p_hat - self._cfg.fee_buffer
+            if direction == "YES":
+                edge = p_hat - mid - self._cfg.fee_buffer
+            else:
+                edge = mid - p_hat - self._cfg.fee_buffer
+            edge_components = {
+                "mid": mid,
+                "fee_buffer": float(self._cfg.fee_buffer),
+                "fallback": True,
+            }
         if edge < self._cfg.min_edge:
             gate_history.append(_gate_entry("edge", "reject", edge, self._cfg.min_edge))
             await self._record_reject(
@@ -577,6 +616,7 @@ class TradeStage:
             "p_hat": p_hat,
             "mid": mid,
             "edge": edge,
+            "edge_components": edge_components,
             "kelly_full": kelly_full,
             "kelly_capped": kelly_capped,
             "size_usdc": size,
@@ -921,6 +961,65 @@ class TradeStage:
             return None
         best_bid, best_ask = book
         return float(best_ask) - float(best_bid)
+
+    async def _resolve_executable_side(
+        self, *, direction: str, market: Optional[dict]
+    ) -> Optional[tuple[float, float]]:
+        """Return ``(executable_price, spread)`` in YES-price units for the
+        side we're betting, or ``None`` when the book read fails.
+
+        Edge-math convention. The whole edge gate works in YES-price
+        space (mid is the YES mid, p_hat is P(YES)). The executable
+        price returned here is the YES-side scalar that slots into
+        that formula:
+
+          - YES buy: pay ``best_ask``. ``edge = p_hat - best_ask - costs``.
+          - NO buy: NO-side cost is ``1 - best_bid_yes``. The NO buy's
+            edge expressed in YES-price terms is
+            ``(1 - p_hat) - (1 - best_bid) = best_bid - p_hat``, so the
+            executable price to plug into the symmetric formula
+            ``edge = executable_price - p_hat - costs`` is ``best_bid``
+            (the YES bid). This matches the legacy fallback's "use the
+            YES mid for both sides" convention — we're just swapping mid
+            for the executable YES-side price.
+
+        Both branches read the YES token's book (``market['token_yes']``)
+        because the NO book is the mirror image; reading the YES side
+        once keeps the math in one price space and avoids a second
+        round-trip on every signal.
+        """
+        if self._clob is None or market is None:
+            return None
+        if not hasattr(self._clob, "get_top_of_book"):
+            return None
+        token_id: Optional[str] = (
+            market.get("token_yes") if direction == "YES" else market.get("token_no")
+        )
+        if not token_id:
+            return None
+        book = await self._clob.get_top_of_book(str(token_id))
+        if book is None:
+            return None
+        best_bid, best_ask = book
+        best_bid_f = float(best_bid)
+        best_ask_f = float(best_ask)
+        spread = best_ask_f - best_bid_f
+        if direction == "YES":
+            # For YES we read the YES token's book; executable = best_ask
+            # (price we pay to buy YES).
+            executable = best_ask_f
+        else:
+            # For NO we read the NO token's book. Buying NO costs
+            # `best_ask` on the NO book. We project that back into the
+            # YES-price convention used by the edge formula: NO-cost is
+            # `best_ask_no`, which corresponds to a YES-side scalar of
+            # `1 - best_ask_no`. Edge of NO buy =
+            #     (1 - p_hat) - best_ask_no
+            #   = (1 - best_ask_no) - p_hat
+            # so `executable = 1 - best_ask_no` fits the symmetric
+            # formula `edge = executable - p_hat - costs`.
+            executable = 1.0 - best_ask_f
+        return executable, spread
 
     async def _record_reject(
         self,

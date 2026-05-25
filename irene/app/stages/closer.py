@@ -147,10 +147,38 @@ def _compute_gross_pnl(direction: str, entry_mid: float, exit_mid: float, size_u
     return size_usdc * (entry_mid - exit_mid) / denom
 
 
-def _resolve_fee_rate(category: Optional[str], rates: dict, default: float) -> float:
-    """Lookup Polymarket's category → fee_rate (case-insensitive,
-    substring-tolerant). Falls back to `default` when the category
-    is missing or unrecognized."""
+def _resolve_fee_rate(
+    category: Optional[str],
+    rates: dict,
+    default: float,
+    *,
+    market_fee_rate: Optional[float] = None,
+) -> float:
+    """Resolve the Polymarket taker fee rate for a trade.
+
+    **Cycle 10 lookup priority** (markets-gamma.md + closer-fees.md):
+      1. `market_fee_rate` — the per-market rate fetched from
+         `GET /markets/<conditionId>:taker_base_fee` and stored in
+         `markets.fee_rate` (authoritative; varies per market — a
+         2026-05-25 live survey found {0.00, 0.02, 0.10} across the
+         universe). Used as-is when present and in `[0.0, 1.0]`.
+      2. `category` → `rates` lookup (case-insensitive, substring-
+         tolerant fallback for categories like "us-politics" /
+         "world-politics" → "politics" base tier).
+      3. `default` when both are missing / unrecognized.
+
+    The category table stays as the fallback — markets without a
+    fetched fee_rate (network miss at discovery, legacy rows from
+    before cycle 10, NULL after migration) still get a sensible
+    fee deduction.
+    """
+    if market_fee_rate is not None:
+        try:
+            mf = float(market_fee_rate)
+        except (TypeError, ValueError):
+            mf = -1.0
+        if 0.0 <= mf <= 1.0:
+            return mf
     if not category:
         return default
     key = category.strip().lower()
@@ -228,6 +256,7 @@ async def write_trade_closure(
     close_reason: str,
     trade_cfg,
     category: Optional[str] = None,
+    market_fee_rate: Optional[float] = None,
     now_iso: Optional[str] = None,
 ) -> bool:
     """Cycle 7: free function that writes a trade_closures row with
@@ -265,6 +294,7 @@ async def write_trade_closure(
         category,
         getattr(trade_cfg, "polymarket_fee_rates", {}),
         float(getattr(trade_cfg, "default_fee_rate", 0.05)),
+        market_fee_rate=market_fee_rate,
     )
     gas_usdc = float(getattr(trade_cfg, "gas_cost_usdc", 0.0))
     entry_fee, exit_fee = _compute_round_trip_fees(
@@ -479,8 +509,13 @@ class CloserStage:
         ]
 
     async def _fetch_tokens(self, market_id: str) -> Optional[dict]:
+        # Cycle 10: also pull `fee_rate` so the closure write can prefer
+        # the per-market Polymarket taker rate over the category lookup.
+        # NULL fee_rate (legacy rows / network miss at first-seen) falls
+        # back to `category` → `config.polymarket_fee_rates` in
+        # `_resolve_fee_rate`.
         cur = await self._db.conn.execute(
-            "SELECT token_yes, token_no, category FROM markets WHERE condition_id = ?",
+            "SELECT token_yes, token_no, category, fee_rate FROM markets WHERE condition_id = ?",
             (market_id,),
         )
         row = await cur.fetchone()
@@ -491,6 +526,7 @@ class CloserStage:
             "token_yes": row["token_yes"],
             "token_no": row["token_no"],
             "category": row["category"],
+            "fee_rate": row["fee_rate"],
         }
 
     async def _close_trade(
@@ -518,6 +554,7 @@ class CloserStage:
         # from rule evaluation, not the markets row.
         market_meta = await self._fetch_tokens(trade["market_id"])
         category = market_meta.get("category") if market_meta else None
+        market_fee_rate = market_meta.get("fee_rate") if market_meta else None
         if exit_mid is None:
             if market_meta is None:
                 logger.warning(
@@ -556,6 +593,7 @@ class CloserStage:
             close_reason=close_reason,
             trade_cfg=self._trade_cfg,
             category=category,
+            market_fee_rate=market_fee_rate,
             now_iso=now_iso,
         )
 

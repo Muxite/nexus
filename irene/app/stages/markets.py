@@ -129,6 +129,16 @@ _MARKETS_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_markets_active ON markets(active)",
     "CREATE INDEX IF NOT EXISTS idx_markets_closed_at ON markets(closed_at)",
+    # Cycle 10: per-market Polymarket taker fee_rate, sourced from
+    # `GET /markets/<conditionId>:taker_base_fee` (basis points → fractional
+    # in `app/clob.py:get_market_fee_rate`). Stored as a **fractional rate**
+    # in [0.0, 1.0] (e.g. 0.02 for a 2% taker fee), NOT bps — `closer.py`
+    # consumes a fraction directly. Column name is `fee_rate` (not
+    # `fee_rate_bps`) to match the stored unit and avoid a confused reader.
+    # NULL = not-yet-fetched; closer falls back to the category lookup in
+    # `config.polymarket_fee_rates`. Idempotent via the
+    # `schema_migrations` table (db.py applies each statement once per sha).
+    "ALTER TABLE markets ADD COLUMN fee_rate REAL",
 ]
 db_module.register_schema("app/stages/markets.py", _MARKETS_DDL)
 
@@ -388,6 +398,14 @@ class MarketsStage:
         self._bus = deps.bus
         self._config = deps.config
         self._embedder = deps.embedder
+        # Cycle 10: CLOB client is OPTIONAL on MarketsStage. When present,
+        # `_upsert_market` triggers a per-market fee_rate fetch for rows
+        # that have a NULL fee_rate (first-seen only — refresh cadence for
+        # already-populated rows is a separate decision documented in
+        # plans/markets-gamma.md). When absent (e.g. minimal test wirings
+        # that don't pass `clob=`), the fee_rate stays NULL and closer.py
+        # falls back to the category lookup in `config.polymarket_fee_rates`.
+        self._clob = deps.clob
 
         self._poll_seconds = _read_int_env(
             _ENV_POLL_SECONDS,
@@ -623,6 +641,39 @@ class MarketsStage:
                     now,
                 ),
             )
+        # Cycle 10: per-market fee_rate fetch. **First-seen only** for
+        # this cycle — we read the current fee_rate after the upsert
+        # and only call the CLOB if the column is still NULL. This
+        # keeps the discovery loop cheap (one extra HTTP per net-new
+        # market) and avoids drift-vs-cache complexity for already-
+        # populated rows. Existing-row refresh cadence is a separate
+        # decision (see plans/markets-gamma.md).
+        await self._maybe_fetch_fee_rate(row["condition_id"])
+
+    async def _maybe_fetch_fee_rate(self, condition_id: str) -> None:
+        """If the CLOB client is wired and this market's fee_rate is
+        still NULL, fetch it from `GET /markets/<conditionId>` and
+        persist. Silent no-op on any failure — closer.py falls back
+        to the category lookup in `config.polymarket_fee_rates`."""
+        if self._clob is None:
+            return
+        cur = await self._db.conn.execute(
+            "SELECT fee_rate FROM markets WHERE condition_id = ?",
+            (condition_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None or row["fee_rate"] is not None:
+            return  # not first-seen, skip per cycle-10 scope
+        fee_rate = await self._clob.get_market_fee_rate(condition_id)
+        if fee_rate is None:
+            return  # CLOB miss; leave NULL so a future cycle can retry
+        now = _now_iso()
+        async with self._db.batch() as cur:
+            await cur.execute(
+                "UPDATE markets SET fee_rate = ?, updated_at = ? WHERE condition_id = ?",
+                (fee_rate, now, condition_id),
+            )
 
     async def _deactivate_missing(self, open_ids: set[str]) -> int:
         """Mark every active row whose condition_id is NOT in the fresh
@@ -698,7 +749,7 @@ class MarketsStage:
                 SELECT t.id, t.signal_id, t.market_id, t.direction,
                        t.mid_price, t.size_usdc, t.decided_at,
                        t.is_tracer, t.tracer_id, t.target_mid,
-                       m.category
+                       m.category, m.fee_rate
                 FROM trades t
                 LEFT JOIN trade_closures c ON c.trade_id = t.id
                 LEFT JOIN markets m ON m.condition_id = t.market_id
@@ -731,6 +782,7 @@ class MarketsStage:
                     close_reason="market_resolved",
                     trade_cfg=self._config.trade,
                     category=r["category"],
+                    market_fee_rate=r["fee_rate"],
                 )
                 if ok:
                     written += 1

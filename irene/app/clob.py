@@ -21,6 +21,17 @@ open positions).
   failure (network, non-2xx, missing fields, crossed book, out-of-
   range prices). The path-param form `/book/<id>` 404s; the
   query-param form is the correct API (2026-05-25 live probe).
+- `await client.get_market_fee_rate(condition_id: str) -> float | None`
+  — reads `GET /markets/<condition_id>` and returns the **taker** fee
+  rate as a fractional number in `[0.0, 1.0]`. The CLOB payload
+  exposes `maker_base_fee` and `taker_base_fee` in **basis points**
+  (1 bp = 0.01% = 1e-4); we read `taker_base_fee` (the relevant
+  rate for paper-trade taker fills) and divide by 10000. A 2026-05-25
+  live survey of 1000 markets returned `taker_base_fee` in
+  {0, 200, 1000} → fractional {0.00, 0.02, 0.10}. Returns `None` on
+  any failure (network, non-2xx, missing field, parse error,
+  out-of-range value). Authoritative source for `markets.fee_rate`
+  (see plans/markets-gamma.md + plans/closer-fees.md).
 - `await client.close()` — closes the underlying `httpx.AsyncClient`.
 
 **Invariants.**
@@ -200,3 +211,63 @@ class CLOBClient:
         if best_bid > best_ask:
             return None
         return (best_bid, best_ask)
+
+    async def get_market_fee_rate(self, condition_id: str) -> Optional[float]:
+        """Return the **taker** fee rate for a market as a fractional
+        number in `[0.0, 1.0]`.
+
+        Reads `GET /markets/<condition_id>`. The CLOB payload exposes
+        `taker_base_fee` in basis points (1 bp = 1e-4); we divide by
+        10000 to return the fractional rate that the rest of the codebase
+        (`closer.py:_polymarket_taker_fee`) consumes directly. We use
+        `taker_base_fee` rather than `maker_base_fee` because the paper-
+        trade model in `closer.py:_compute_round_trip_fees` assumes
+        we always cross the spread (taker fills both legs).
+
+        Returns `None` on any failure: empty condition_id, network error,
+        non-2xx status, unparseable JSON, missing/invalid field, or a
+        fractional value outside [0.0, 1.0]. Same failure discipline as
+        `get_top_of_book` — a WARNING is logged per failure and recovery
+        is silent so the caller can fall back to the category lookup
+        (`config.polymarket_fee_rates`).
+        """
+        if not condition_id:
+            return None
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        url = f"{self._base_url}/markets/{condition_id}"
+        try:
+            resp = await self._client.get(url)
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "clob: get_market_fee_rate(%s) network error: %s",
+                condition_id, exc.__class__.__name__,
+            )
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "clob: get_market_fee_rate(%s) status %d",
+                condition_id, resp.status_code,
+            )
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            logger.warning(
+                "clob: get_market_fee_rate(%s) unparseable JSON", condition_id,
+            )
+            return None
+        raw = body.get("taker_base_fee")
+        if raw is None:
+            logger.warning(
+                "clob: get_market_fee_rate(%s) missing taker_base_fee", condition_id,
+            )
+            return None
+        try:
+            fee_bps = float(raw)
+        except (TypeError, ValueError):
+            return None
+        fee_rate = fee_bps / 10000.0
+        if 0.0 <= fee_rate <= 1.0:
+            return fee_rate
+        return None

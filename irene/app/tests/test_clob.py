@@ -157,3 +157,77 @@ async def test_get_top_of_book_unparseable_price_returns_none():
     _install(c, _Mock(body={"bids": [{"price": "n/a", "size": "1"}],
                              "asks": [{"price": "0.6", "size": "1"}]}))
     assert await c.get_top_of_book("tk1") is None
+
+
+# -------------------------------------------------------------------------
+# get_market_fee_rate — added 2026-05-25 (cycle 10) for per-market fees
+# -------------------------------------------------------------------------
+
+
+def _ok_market(taker_base_fee: int | str | None = 200, **extra) -> dict:
+    """Minimal `GET /markets/<conditionId>` response shape. Live 2026-05-25
+    probe of 1000 markets returned `taker_base_fee` in {0, 200, 1000} —
+    fractional rates {0.00, 0.02, 0.10}."""
+    body = {
+        "condition_id": "0xabc",
+        "question": "Will X happen?",
+        "active": True,
+        "maker_base_fee": 0,
+    }
+    if taker_base_fee is not None:
+        body["taker_base_fee"] = taker_base_fee
+    body.update(extra)
+    return body
+
+
+async def test_get_market_fee_rate_happy_path():
+    """200 bps → 0.02 fractional. Hits the path-param /markets/<id> form."""
+    c = CLOBClient(base_url="http://x")
+    m = _Mock(body=_ok_market(taker_base_fee=200))
+    _install(c, m)
+    assert await c.get_market_fee_rate("0xabc") == pytest.approx(0.02)
+    assert m.calls == [("http://x/markets/0xabc", None)]
+
+
+async def test_get_market_fee_rate_zero_fee_market():
+    """The dominant case (999/1000 markets in the live survey): no fee."""
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market(taker_base_fee=0)))
+    assert await c.get_market_fee_rate("0xabc") == 0.0
+
+
+async def test_get_market_fee_rate_empty_condition_id_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market()))
+    assert await c.get_market_fee_rate("") is None
+
+
+async def test_get_market_fee_rate_missing_field_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market(taker_base_fee=None)))
+    assert await c.get_market_fee_rate("0xabc") is None
+
+
+async def test_get_market_fee_rate_non_2xx_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(status=404, body={}))
+    assert await c.get_market_fee_rate("0xabc") is None
+
+
+async def test_get_market_fee_rate_network_error_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(raise_exc=httpx.ConnectError("nope")))
+    assert await c.get_market_fee_rate("0xabc") is None
+
+
+async def test_get_market_fee_rate_unparseable_value_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market(taker_base_fee="n/a")))
+    assert await c.get_market_fee_rate("0xabc") is None
+
+
+async def test_get_market_fee_rate_out_of_range_returns_none():
+    """A value > 10000 bps would map to > 1.0 fractional — refuse."""
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_market(taker_base_fee=20000)))
+    assert await c.get_market_fee_rate("0xabc") is None

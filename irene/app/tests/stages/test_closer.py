@@ -520,6 +520,56 @@ async def test_pnl_yes_with_crypto_higher_fee_rate(db):
     assert rows[0]["realized_pnl_usdc"] == pytest.approx(41.36, rel=1e-3)
 
 
+async def test_per_market_fee_rate_overrides_category_lookup(db):
+    """Cycle 10: when `markets.fee_rate` is populated (per-market fetch
+    from `clob.get_market_fee_rate(conditionId)`), the closure uses
+    that value instead of the category lookup in
+    `config.polymarket_fee_rates`. The category fallback only fires
+    when fee_rate is NULL.
+
+    This test puts a market in category='crypto' (which maps to 0.072
+    via category lookup) but stamps fee_rate=0.02 on the row. The
+    closure must use 0.02, not 0.072.
+    """
+    # Seed market with category=crypto BUT per-market fee_rate=0.02.
+    # If the closer wrongly used the category lookup, the per-leg fee
+    # would be ~3.6x larger and the test would fail.
+    async with db.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO markets
+                (condition_id, slug, question, description, category, end_date,
+                 volume_usdc, token_yes, token_no, embedding, embedder_id,
+                 embedding_dim, embedding_updated_at, active, closed_at,
+                 first_seen_at, updated_at, fee_rate)
+            VALUES ('m1', 'slug', 'Q?', 'desc', 'crypto', '2026-12-31',
+                    1000.0, 'tY', 'tN', NULL, NULL, NULL, NULL, 1, NULL,
+                    '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00',
+                    0.02)
+            """,
+        )
+    decided = datetime.now(timezone.utc) - timedelta(hours=48)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.4, size_usdc=100.0)
+    clob = _FakeCLOB(mids={"tY": 0.6})
+
+    stage = _make_stage(db, clob)
+    with cycle_scope(1):
+        await stage.run_close_cycle()
+
+    rows = await _closures(db)
+    # shares=100/0.4=250; per-leg fee at fee_rate=0.02:
+    #   entry: 250 * 0.02 * 0.4 * 0.6 = 1.20
+    #   exit:  250 * 0.02 * 0.6 * 0.4 = 1.20
+    # gross = 100 * (0.6 - 0.4) / 0.4 = 50.0
+    # net   = 50.0 - 2.40 = 47.60
+    # (If the category lookup at 0.072 had fired, net would be ~41.36 —
+    #  way outside the 1e-3 tolerance.)
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(1.20, rel=1e-3)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(1.20, rel=1e-3)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(47.60, rel=1e-3)
+
+
 async def test_market_resolved_charges_no_exit_fee(db):
     """Polymarket charges no fee at resolution — winning shares redeem at
     $1 / losing at $0. write_trade_closure must zero the exit leg when
