@@ -180,8 +180,15 @@ def _parse_gamma_row(raw: dict) -> Optional[dict]:
     token_yes = str(clob_ids[0]) if len(clob_ids) >= 1 and clob_ids[0] else None
     token_no = str(clob_ids[1]) if len(clob_ids) >= 2 and clob_ids[1] else None
 
+    # `volume24hr` is the rolling 24h USDC notional; `volume` / `volumeNum`
+    # are lifetime totals (often much larger). The thin_market gate in
+    # trade.py compares against a 24h threshold, so the parser must read
+    # the 24h field — falling back to lifetime would silently let
+    # low-activity markets through the gate.
+    # Source: unstructured answers batch 2026-05-25-unstructured-1, lines
+    # 27-36 (sample payload showing volume24hr ≠ volumeNum on same market).
     try:
-        volume = float(raw.get("volume") or 0.0)
+        volume = float(raw.get("volume24hr") or 0.0)
     except (TypeError, ValueError):
         volume = None
 

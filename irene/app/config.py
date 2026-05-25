@@ -244,6 +244,14 @@ class TradeSection(BaseModel):
     # trades through (they can still profit) but blocks 0.01/0.99 extremes.
     min_mid: float = Field(default=0.02, ge=0.0, lt=0.5)
     max_mid: float = Field(default=0.98, gt=0.5, le=1.0)
+    # 2026-05-25 (unstructured RAG batch): Polymarket's /midpoint returns
+    # the true bid-ask mid only when spread <= $0.10; on wider spreads it
+    # silently falls back to the last traded price (which can be hours
+    # stale). Reject entries when the book spread exceeds this threshold
+    # so we never enter on a stale-mid edge estimate. Graceful degrade:
+    # if the book read fails, the gate is skipped (mid_degenerate +
+    # market_news_imbalance still defend the entry).
+    wide_spread_threshold: float = Field(default=0.10, gt=0.0, le=1.0)
     # Cycle 7: market-news weight gate. Reject when the market is "too
     # big" or "too thin" for the article evidence to plausibly move it.
     # See app/stages/trade.py::_check_market_news_imbalance.
@@ -272,6 +280,10 @@ class TradeSection(BaseModel):
     # NOT a config knob (locked to Polymarket's schedule) but the
     # default_fee_rate fallback IS configurable.
     polymarket_fee_rates: dict = Field(default_factory=lambda: {
+        # 2026-05-25 unstructured RAG batch reports crypto at 0.07; we keep
+        # 0.072 (conservative — over-estimates by ~2.8%) until a
+        # `getClobMarketInfo(conditionID)` call settles it. See
+        # plans/markets-gamma.md for the per-market fee fetcher.
         "crypto": 0.072,
         "culture": 0.05, "economics": 0.05, "weather": 0.05, "general": 0.05,
         "finance": 0.04, "politics": 0.04, "tech": 0.04, "mentions": 0.04,

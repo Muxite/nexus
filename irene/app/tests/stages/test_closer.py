@@ -25,7 +25,7 @@ import app.stages.trade  # noqa: F401
 from app.cycle import cycle_scope
 from app.db import DB
 from app.deps import StageDeps
-from app.stages.closer import CloserStage, _compute_pnl
+from app.stages.closer import CloserStage, _compute_pnl, write_trade_closure
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +518,81 @@ async def test_pnl_yes_with_crypto_higher_fee_rate(db):
     # shares=250; per-leg fee = 250 * 0.072 * 0.4 * 0.6 = 4.32; round-trip 8.64
     # net = 50 - 8.64 = 41.36
     assert rows[0]["realized_pnl_usdc"] == pytest.approx(41.36, rel=1e-3)
+
+
+async def test_market_resolved_charges_no_exit_fee(db):
+    """Polymarket charges no fee at resolution — winning shares redeem at
+    $1 / losing at $0. write_trade_closure must zero the exit leg when
+    close_reason='market_resolved' but still charge the entry leg.
+    Mirrors the MarketsStage auto-close path (markets.py:_close_orphaned_trades_for).
+    """
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(hours=48)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.4, size_usdc=100.0)
+
+    trade = {
+        "id": 1,
+        "direction": "YES",
+        "mid_price": 0.4,
+        "size_usdc": 100.0,
+        "is_tracer": 0,
+        "tracer_id": None,
+    }
+    cfg = _Config()
+    with cycle_scope(1):
+        ok = await write_trade_closure(
+            db,
+            trade=trade,
+            exit_mid=1.0,  # YES resolved true → shares redeem at $1
+            close_reason="market_resolved",
+            trade_cfg=cfg.trade,
+            category="finance",  # fee_rate = 0.04
+        )
+    assert ok
+
+    rows = await _closures(db)
+    # shares = 100/0.4 = 250; entry_fee = 250 * 0.04 * 0.4 * 0.6 = 2.40
+    # exit_fee = 0.0 (resolution exception)
+    # gross  = 100 * (1.0 - 0.4) / 0.4 = 150.0
+    # net    = 150.0 - 2.40 = 147.60
+    assert rows[0]["close_reason"] == "market_resolved"
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(2.40, rel=1e-4)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(0.0)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(147.60, rel=1e-4)
+
+
+async def test_non_market_resolved_still_charges_exit_fee(db):
+    """Sanity check: every other close_reason still charges the exit-leg
+    taker fee (the resolution exception is narrow)."""
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(hours=48)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.4, size_usdc=100.0)
+
+    trade = {
+        "id": 1,
+        "direction": "YES",
+        "mid_price": 0.4,
+        "size_usdc": 100.0,
+        "is_tracer": 0,
+        "tracer_id": None,
+    }
+    cfg = _Config()
+    with cycle_scope(1):
+        await write_trade_closure(
+            db,
+            trade=trade,
+            exit_mid=0.6,
+            close_reason="timeout",
+            trade_cfg=cfg.trade,
+            category="finance",
+        )
+
+    rows = await _closures(db)
+    # entry_fee = exit_fee = 250 * 0.04 * 0.4 * 0.6 = 2.40
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(2.40, rel=1e-4)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(2.40, rel=1e-4)
 
 
 async def test_idempotent_double_run(db):

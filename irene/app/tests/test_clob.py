@@ -85,3 +85,75 @@ async def test_close_is_idempotent():
     c = CLOBClient(base_url="http://x")
     await c.close()
     await c.close()
+
+
+# -------------------------------------------------------------------------
+# get_top_of_book — added 2026-05-25 for the wide-spread gate
+# -------------------------------------------------------------------------
+
+
+def _ok_book(bids: list, asks: list) -> dict:
+    """Response shape from `GET /book?token_id=...`:
+        {"bids":[{"price":"0.40","size":"100"},...],
+         "asks":[{"price":"0.60","size":"50"},...]}
+    """
+    return {
+        "bids": [{"price": str(p), "size": str(s)} for p, s in bids],
+        "asks": [{"price": str(p), "size": str(s)} for p, s in asks],
+    }
+
+
+async def test_get_top_of_book_happy_path():
+    c = CLOBClient(base_url="http://x")
+    # Real Polymarket book has bids ascending; best bid = max, best ask = min.
+    m = _Mock(body=_ok_book(
+        bids=[(0.001, 1000), (0.002, 500), (0.40, 100)],
+        asks=[(0.60, 50), (0.61, 80), (0.999, 1)],
+    ))
+    _install(c, m)
+    assert await c.get_top_of_book("tk1") == (0.40, 0.60)
+    assert m.calls == [("http://x/book", {"token_id": "tk1"})]
+
+
+async def test_get_top_of_book_empty_token_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_book([(0.4, 1)], [(0.6, 1)])))
+    assert await c.get_top_of_book("") is None
+
+
+async def test_get_top_of_book_empty_side_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_book([(0.4, 1)], [])))  # no asks
+    assert await c.get_top_of_book("tk1") is None
+
+
+async def test_get_top_of_book_crossed_book_returns_none():
+    c = CLOBClient(base_url="http://x")
+    # Best bid > best ask shouldn't happen on a sane book; if it does, refuse.
+    _install(c, _Mock(body=_ok_book([(0.7, 1)], [(0.5, 1)])))
+    assert await c.get_top_of_book("tk1") is None
+
+
+async def test_get_top_of_book_out_of_range_price_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body=_ok_book([(0.4, 1)], [(1.5, 1)])))
+    assert await c.get_top_of_book("tk1") is None
+
+
+async def test_get_top_of_book_non_2xx_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(status=404, body={}))
+    assert await c.get_top_of_book("tk1") is None
+
+
+async def test_get_top_of_book_network_error_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(raise_exc=httpx.ConnectError("nope")))
+    assert await c.get_top_of_book("tk1") is None
+
+
+async def test_get_top_of_book_unparseable_price_returns_none():
+    c = CLOBClient(base_url="http://x")
+    _install(c, _Mock(body={"bids": [{"price": "n/a", "size": "1"}],
+                             "asks": [{"price": "0.6", "size": "1"}]}))
+    assert await c.get_top_of_book("tk1") is None

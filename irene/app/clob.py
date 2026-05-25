@@ -11,9 +11,16 @@ open positions).
 - `CLOBClient(base_url: str, timeout_seconds: float = 5.0)`
 - `await client.get_mid(token_id: str) -> float | None` — reads the
   midpoint from `GET /midpoint?token_id=<id>` which returns
-  `{"mid":"0.545"}`. The historical `/book/<id>` endpoint 404s for
-  every token we tested (2026-05-24 live probe), so this is the
-  correct API per Polymarket today. Returns `None` on any failure.
+  `{"mid":"0.545"}`. NOTE: per Polymarket's own docs, this scalar is
+  the bid-ask midpoint only when spread ≤ $0.10; on wider spreads it
+  falls back to the **last traded price** (which can be hours stale).
+  Use `get_top_of_book()` to detect this case before trusting `mid`.
+- `await client.get_top_of_book(token_id: str) -> (best_bid, best_ask) | None`
+  — reads `GET /book?token_id=<id>` and returns the best executable
+  prices. Spread = `best_ask - best_bid`. Returns `None` on any
+  failure (network, non-2xx, missing fields, crossed book, out-of-
+  range prices). The path-param form `/book/<id>` 404s; the
+  query-param form is the correct API (2026-05-25 live probe).
 - `await client.close()` — closes the underlying `httpx.AsyncClient`.
 
 **Invariants.**
@@ -137,3 +144,59 @@ class CLOBClient:
         if 0.0 <= mid <= 1.0:
             return mid
         return None
+
+    async def get_top_of_book(
+        self, token_id: str
+    ) -> Optional[tuple[float, float]]:
+        """Return `(best_bid, best_ask)` from `GET /book?token_id=<id>`.
+
+        `/book` returns the full depth as `{"bids":[{"price","size"},...],
+        "asks":[...]}`. We pick `max(bids[].price)` and `min(asks[].price)`
+        so order-of-entries doesn't matter. `None` on any failure or
+        degenerate response (empty side, crossed book, out-of-range
+        prices).
+
+        Consumers can derive `mid = (bid + ask) / 2` and
+        `spread = ask - bid` from the returned pair, which is the only
+        way to reliably detect Polymarket's "spread > $0.10 → display
+        last trade instead of mid" fallback documented for `/midpoint`.
+        """
+        if not token_id:
+            return None
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        url = f"{self._base_url}/book"
+        try:
+            resp = await self._client.get(url, params={"token_id": token_id})
+        except httpx.HTTPError as exc:
+            logger.warning(
+                "clob: get_top_of_book(%s) network error: %s",
+                token_id, exc.__class__.__name__,
+            )
+            return None
+        if resp.status_code != 200:
+            logger.warning(
+                "clob: get_top_of_book(%s) status %d", token_id, resp.status_code,
+            )
+            return None
+        try:
+            body = resp.json()
+        except ValueError:
+            logger.warning("clob: get_top_of_book(%s) unparseable JSON", token_id)
+            return None
+        bids = body.get("bids")
+        asks = body.get("asks")
+        if not isinstance(bids, list) or not isinstance(asks, list):
+            return None
+        if not bids or not asks:
+            return None
+        try:
+            best_bid = max(float(b["price"]) for b in bids if "price" in b)
+            best_ask = min(float(a["price"]) for a in asks if "price" in a)
+        except (TypeError, ValueError, KeyError):
+            return None
+        if not (0.0 <= best_bid <= 1.0 and 0.0 <= best_ask <= 1.0):
+            return None
+        if best_bid > best_ask:
+            return None
+        return (best_bid, best_ask)

@@ -244,7 +244,15 @@ async def write_trade_closure(
     Fee model — per-leg parabolic:
         fee = shares * fee_rate * p * (1 - p)
     Both legs are taker fees. Maker fees and settlement fees are 0.
-    See app/config.py:TradeSection.polymarket_fee_rates.
+    Exception: `close_reason='market_resolved'` zeros the exit-leg fee
+    (no taker fill at resolution — shares redeem at $1/$0). See
+    app/config.py:TradeSection.polymarket_fee_rates.
+
+    Paper-mode caveat: `p` in the formula is the *taker fill price*, but
+    we use `entry_mid` / `exit_mid` as the best proxy available in paper
+    mode. The error is bounded by half the spread per leg and is roughly
+    symmetric. The real-money executor (cycle 9+) must swap `mid` for
+    the executed `fill_price` on the trade row.
     """
     exit_mid = max(0.0, min(1.0, float(exit_mid)))
     gross_pnl = _compute_gross_pnl(
@@ -267,6 +275,11 @@ async def write_trade_closure(
         fee_rate=fee_rate,
         gas_cost_usdc=gas_usdc,
     )
+    if close_reason == "market_resolved":
+        # Polymarket charges no trading fee at resolution — winning shares
+        # redeem at $1, losing at $0, no taker fill on the exit leg.
+        # The entry-leg fee still stands (paid at entry).
+        exit_fee = 0.0
     net_pnl = gross_pnl - entry_fee - exit_fee
 
     cycle_id = current_cycle_id()

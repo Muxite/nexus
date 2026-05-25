@@ -97,6 +97,7 @@ class _TradeCfg:
     default_mid_price: float = 0.5
     min_mid: float = 0.02
     max_mid: float = 0.98
+    wide_spread_threshold: float = 0.10
     # Cycle 7: market-news weight gate knobs. Match TradeSection defaults
     # in app/config.py. Tests override only what's relevant per case.
     min_market_volume_usdc: float = 10_000.0
@@ -177,15 +178,30 @@ def _make_stage(db, bus, ai, cfg: Optional[_Config] = None, *, clob=None) -> Tra
 
 
 class _FakeCLOB:
-    """Async CLOB stand-in. Returns the price keyed by token_id, else None."""
+    """Async CLOB stand-in. Returns the price keyed by token_id, else None.
 
-    def __init__(self, prices: dict[str, float]) -> None:
+    Optionally also supports `get_top_of_book` for the wide-spread gate:
+    pass `books={token_id: (best_bid, best_ask)}`. A token missing from
+    `books` resolves to `None` (no book → gate is skipped).
+    """
+
+    def __init__(
+        self,
+        prices: dict[str, float],
+        books: Optional[dict[str, tuple[float, float]]] = None,
+    ) -> None:
         self.prices = dict(prices)
+        self.books = dict(books or {})
         self.calls: list[str] = []
+        self.book_calls: list[str] = []
 
     async def get_mid(self, token_id: str):
         self.calls.append(token_id)
         return self.prices.get(token_id)
+
+    async def get_top_of_book(self, token_id: str):
+        self.book_calls.append(token_id)
+        return self.books.get(token_id)
 
 
 def _payload(
@@ -680,6 +696,73 @@ async def test_mid_degenerate_rejects_no_at_high_mid(db_seeded):
     cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM trades")
     assert (await cur.fetchone())[0] == 0
     await cur.close()
+
+
+async def test_wide_spread_rejects_when_book_exceeds_threshold(db_seeded):
+    """Polymarket's /midpoint returns the last traded price (not the true
+    mid) when spread > $0.10. We don't trust mid-derived edge on wide
+    markets — reject at entry before the edge math fires."""
+    # Mid is fine (0.50), but book shows a 0.20 spread → reject.
+    clob = _FakeCLOB(
+        prices={"ty": 0.50, "tn": 0.50},
+        books={"ty": (0.40, 0.60)},  # spread = 0.20 > 0.10 default
+    )
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=22,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "wide_spread"
+    assert bus.published[0][1]["reason"] == "wide_spread"
+    cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM trades")
+    assert (await cur.fetchone())[0] == 0
+    await cur.close()
+
+
+async def test_wide_spread_gate_skipped_when_book_unavailable(db_seeded):
+    """If the book read fails (None), the wide-spread gate is skipped
+    rather than blocking the trade — graceful degrade. The
+    degenerate-mid + market-news gates still defend the entry."""
+    # No `books` arg → get_top_of_book returns None for every token.
+    clob = _FakeCLOB(prices={"ty": 0.50, "tn": 0.50})
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.9, prediction_id=23,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    # Whatever the downstream outcome, it must NOT be wide_spread.
+    assert d["reason"] != "wide_spread"
+
+
+async def test_narrow_spread_passes_gate(db_seeded):
+    """A book with spread <= threshold doesn't trigger the wide-spread
+    gate."""
+    clob = _FakeCLOB(
+        prices={"ty": 0.50, "tn": 0.50},
+        books={"ty": (0.49, 0.51)},  # spread = 0.02 << 0.10
+    )
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.9, prediction_id=24,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["reason"] != "wide_spread"
 
 
 async def test_market_news_imbalance_thin_market_rejects(db_seeded):

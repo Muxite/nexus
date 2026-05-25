@@ -422,6 +422,25 @@ class TradeStage:
                 tracer_id=tracer_id,
             )
             return
+        # 4a-bis. wide-spread guard — Polymarket's /midpoint returns the
+        # last traded price (not the true mid) when spread > $0.10. Any
+        # edge estimate built on that scalar is unreliable. Read the book
+        # and reject if spread exceeds the threshold. Graceful degrade:
+        # if the book read fails (None), skip this check rather than
+        # blocking the trade. See app/clob.py:get_top_of_book.
+        spread = await self._resolve_spread(direction=direction, market=market)
+        if spread is not None and spread > self._cfg.wide_spread_threshold:
+            gate_history.append(_gate_entry("edge", "reject", spread, "wide_spread"))
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason="wide_spread",
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
         # 4b. market-news weight imbalance — reject when the market is
         # too big / too thin / too far / too soon for the news to
         # plausibly move it. Cycle 7. See _check_market_news_imbalance.
@@ -740,6 +759,30 @@ class TradeStage:
         if mid is None:
             return self._cfg.default_mid_price
         return float(mid)
+
+    async def _resolve_spread(
+        self, *, direction: str, market: Optional[dict]
+    ) -> Optional[float]:
+        """Return `best_ask - best_bid` for the side we're betting on, or
+        `None` if the book read fails (no client, no token, network /
+        parse error, empty book). Callers use `None` to mean "can't
+        tell" and should NOT reject on that signal alone — the
+        degenerate-mid and market-news gates are still in force.
+        """
+        if self._clob is None or market is None:
+            return None
+        if not hasattr(self._clob, "get_top_of_book"):
+            return None
+        token_id: Optional[str] = (
+            market.get("token_yes") if direction == "YES" else market.get("token_no")
+        )
+        if not token_id:
+            return None
+        book = await self._clob.get_top_of_book(str(token_id))
+        if book is None:
+            return None
+        best_bid, best_ask = book
+        return float(best_ask) - float(best_bid)
 
     async def _record_reject(
         self,

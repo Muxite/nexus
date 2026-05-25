@@ -124,7 +124,13 @@ def _gamma_row(condition_id: str, question: str, **overrides) -> dict:
         "description": f"desc for {condition_id}",
         "category": "Politics",
         "endDate": "2026-12-31T23:59:59Z",
-        "volume": 1234.5,
+        # Production Gamma returns both `volume24hr` (rolling 24h) and
+        # `volume` / `volumeNum` (lifetime). The parser must read the 24h
+        # field. We include both with deliberately different values so a
+        # regression to reading lifetime would fail the assertion.
+        "volume24hr": 1234.5,
+        "volume": 999999.0,
+        "volumeNum": 999999.0,
         # Production Gamma returns clobTokenIds as a JSON-encoded *string*.
         "clobTokenIds": json.dumps([f"{condition_id}-yes", f"{condition_id}-no"]),
     }
@@ -194,6 +200,26 @@ def test_parse_gamma_row_handles_native_clob_list():
     row = _parse_gamma_row(raw)
     assert row["token_yes"] == "a"
     assert row["token_no"] == "b"
+
+
+def test_parse_gamma_row_reads_volume24hr_not_lifetime():
+    """Regression guard: thin_market gate compares against a 24h threshold,
+    so the parser must read Gamma's `volume24hr`, never fall back to the
+    `volume` / `volumeNum` lifetime totals."""
+    raw = _gamma_row("0xd", "Q")
+    # Lifetime is ~810x the 24h figure on this fixture — a fallback would
+    # blow the assertion well outside any approx tolerance.
+    row = _parse_gamma_row(raw)
+    assert row["volume_usdc"] == 1234.5
+
+
+def test_parse_gamma_row_missing_volume24hr_is_zero_not_lifetime():
+    """When `volume24hr` is absent, the parser returns 0 rather than
+    silently picking up the lifetime `volume` field."""
+    raw = _gamma_row("0xe", "Q")
+    del raw["volume24hr"]
+    row = _parse_gamma_row(raw)
+    assert row["volume_usdc"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -369,9 +395,10 @@ async def test_disappearing_market_auto_closes_open_trades(db_ready, bus, embedd
     assert row is not None, "auto-close should have written a closure row"
     assert row["close_reason"] == "market_resolved"
     assert row["exit_mid_price"] == pytest.approx(0.5)  # entry mid
-    # gross 0; net is -fee. Market category='Politics' → fee_rate=0.04.
-    # shares=100/0.5=200; per-leg fee = 200 * 0.04 * 0.5 * 0.5 = 2.0; rt=4.0.
-    assert row["realized_pnl_usdc"] == pytest.approx(-4.0, rel=1e-3)
+    # gross 0; net is -entry_fee only (exit_fee is zeroed on market_resolved
+    # per the no-fee-at-resolution rule). Politics → fee_rate=0.04.
+    # shares=100/0.5=200; entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0.
+    assert row["realized_pnl_usdc"] == pytest.approx(-2.0, rel=1e-3)
 
 
 async def test_network_error_keeps_loop_alive(db_ready, bus, embedder, monkeypatch, caplog):
