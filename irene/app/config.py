@@ -95,6 +95,28 @@ class OpenRouterSection(BaseModel):
     timeout_seconds: float = Field(default=20.0, gt=0)
 
 
+class ProbeSection(BaseModel):
+    """Cycle 14: A/B latency + label-agreement probe lane for
+    `app/ai.py::AIClient.direction()`. See `irene/plans/llm-prompt-cache.md`
+    §1. Fire-and-forget shadow calls to alternative providers; results land
+    in `llm_probe_calls` and are NEVER consulted by trade decisions. The
+    production model (`OpenRouterSection.direction_model`) is unaffected.
+
+    HARD DEFAULT: `probe_enabled=False`. Flip on per-deploy via
+    `IRENE__PROBE__PROBE_ENABLED=true` or config.yaml; the master switch is
+    intentionally explicit so a stray YAML edit cannot start burning provider
+    quota.
+    """
+
+    probe_enabled: bool = False
+    probe_sample_rate: float = Field(default=0.10, ge=0.0, le=1.0)
+    probe_providers: list[str] = Field(default_factory=list)
+    # Per-provider hard cap. Kept tighter than `OpenRouterSection.timeout_seconds`
+    # so a slow challenger cannot delay the (already-returned) production call's
+    # follow-on work — and so probe tasks finish before the process exits.
+    probe_timeout_seconds: float = Field(default=10.0, gt=0)
+
+
 class BudgetSection(BaseModel):
     """Wired in P1 — see master-plan §"Phase 1 — Detailed scope"."""
 
@@ -329,6 +351,7 @@ class Config(BaseModel):
     scraper: ScraperSection = Field(default_factory=ScraperSection)
     embedder: EmbedderSection = Field(default_factory=EmbedderSection)
     openrouter: OpenRouterSection = Field(default_factory=OpenRouterSection)
+    probe: ProbeSection = Field(default_factory=ProbeSection)
     budget: BudgetSection = Field(default_factory=BudgetSection)
     ingest: IngestSection = Field(default_factory=IngestSection)
     dedupe: DedupeSection = Field(default_factory=DedupeSection)

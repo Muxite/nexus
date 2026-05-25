@@ -65,9 +65,11 @@ SQLite writes to the three owned tables. Bumps `budget` streak counters.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -194,6 +196,47 @@ _AI_DDL = [
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_llm_parse_failures_reason ON llm_parse_failures(reason)",
+    # Cycle 14: A/B probe lane. One row per (production call, challenger
+    # provider) when the sampled-shadow probe fires. NEVER consulted by
+    # trade decisions — pure observability. See
+    # `irene/plans/llm-prompt-cache.md` §1.
+    #
+    # `prediction_id` is the production prediction this row is shadowing
+    # (nullable on failure to record per-prediction context, e.g. probes
+    # that fire on a NEUTRAL/parse-error production result). `signal_id`
+    # mirrors the production call (nullable for DKG path). `prompt_hash`
+    # is SHA-256 of the exact prompt text — independent of the
+    # `llm_calls.prompt_sha` (SHA-1 over a different envelope) so the
+    # two cache spaces stay distinct and a future re-probe can dedupe
+    # cleanly.
+    #
+    # On failure: `ttft_ms`, `total_ms`, `direction`, `confidence`, and
+    # `raw_response` are NULL and `error` is populated ("timeout",
+    # "http_error: …", "rate_limit", "parse_error", etc.). Successful
+    # rows have `error IS NULL`.
+    """
+    CREATE TABLE IF NOT EXISTS llm_probe_calls (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        signal_id       INTEGER,
+        prediction_id   INTEGER REFERENCES predictions(id),
+        prompt_hash     TEXT NOT NULL,
+        provider        TEXT NOT NULL,
+        model           TEXT NOT NULL,
+        ttft_ms         REAL,
+        total_ms        REAL,
+        direction       TEXT,
+        confidence      REAL,
+        raw_response    TEXT,
+        error           TEXT,
+        created_at      TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_llm_probe_calls_prediction "
+    "ON llm_probe_calls(prediction_id)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_probe_calls_provider "
+    "ON llm_probe_calls(provider)",
+    "CREATE INDEX IF NOT EXISTS idx_llm_probe_calls_prompt_hash "
+    "ON llm_probe_calls(prompt_hash)",
 ]
 db_module.register_schema("app/ai.py", _AI_DDL)
 
@@ -212,6 +255,10 @@ class DirectionResult:
 
 def _sha1(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8")).hexdigest()
+
+
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
 def _now_iso() -> str:
@@ -358,8 +405,33 @@ class AIClient:
         # The client is created lazily so tests can patch httpx without
         # paying connection costs during construction.
         self._client: Optional[httpx.AsyncClient] = None
+        # Cycle 14: A/B probe lane. Optional section; absent in test fakes
+        # that only set `config.openrouter`. Read defensively so legacy
+        # call-sites don't break.
+        probe = getattr(config, "probe", None)
+        self._probe_enabled: bool = bool(getattr(probe, "probe_enabled", False))
+        self._probe_sample_rate: float = float(
+            getattr(probe, "probe_sample_rate", 0.0)
+        )
+        self._probe_providers: list[str] = list(
+            getattr(probe, "probe_providers", []) or []
+        )
+        self._probe_timeout: float = float(
+            getattr(probe, "probe_timeout_seconds", 10.0)
+        )
+        # Background probe tasks (fire-and-forget). We keep references so
+        # `close()` can drain them and they aren't GC'd mid-flight; per
+        # PEP 458 / asyncio docs, dropping a `Task` reference can cancel it.
+        self._probe_tasks: set[asyncio.Task[None]] = set()
 
     async def close(self) -> None:
+        # Drain any outstanding fire-and-forget probe tasks before closing
+        # the HTTP client. Probes are wrapped to never raise, so this is
+        # bounded by the per-provider timeout.
+        if self._probe_tasks:
+            pending = list(self._probe_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+            self._probe_tasks.clear()
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -388,7 +460,7 @@ class AIClient:
         )
 
         if self._budget.is_paused():
-            return await self._neutral_with_failure(
+            result = await self._neutral_with_failure(
                 signal_id=signal_id,
                 prompt_sha=prompt_sha,
                 reason="budget_paused",
@@ -397,19 +469,29 @@ class AIClient:
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
             )
+            self._maybe_fire_probe(
+                signal_id=signal_id, prediction_id=result.prediction_id,
+                full_prompt=full_prompt,
+            )
+            return result
 
         cached_row = await self._lookup_cache(prompt_sha)
         if cached_row is not None:
-            return await self._record_from_cache(
+            result = await self._record_from_cache(
                 signal_id=signal_id,
                 cached_row=cached_row,
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
             )
+            self._maybe_fire_probe(
+                signal_id=signal_id, prediction_id=result.prediction_id,
+                full_prompt=full_prompt,
+            )
+            return result
 
         response = await self._call_openrouter(full_prompt)
-        return await self._record_fresh_call(
+        result = await self._record_fresh_call(
             signal_id=signal_id,
             prompt_sha=prompt_sha,
             full_prompt=full_prompt,
@@ -418,6 +500,11 @@ class AIClient:
             is_tracer=is_tracer,
             tracer_id=tracer_id,
         )
+        self._maybe_fire_probe(
+            signal_id=signal_id, prediction_id=result.prediction_id,
+            full_prompt=full_prompt,
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Internals
@@ -821,6 +908,235 @@ class AIClient:
             raw_response=raw_response,
             label="?",
         )
+
+    # ------------------------------------------------------------------
+    # A/B probe lane (cycle 14)
+    # ------------------------------------------------------------------
+
+    def _maybe_fire_probe(
+        self,
+        *,
+        signal_id: Optional[int],
+        prediction_id: int,
+        full_prompt: str,
+    ) -> None:
+        """Sampled fire-and-forget shadow probes. NEVER blocks the caller.
+
+        Gate cascade:
+        1. Master switch (`probe_enabled`) — default False.
+        2. Non-empty `probe_providers`.
+        3. `random() < probe_sample_rate`.
+
+        On pass, schedules ONE probe task per provider via
+        `asyncio.create_task` and returns immediately. The production
+        `direction()` return value and timing are unchanged.
+        """
+        if not self._probe_enabled:
+            return
+        if not self._probe_providers:
+            return
+        if random.random() >= self._probe_sample_rate:
+            return
+        prompt_hash = _sha256(full_prompt)
+        for provider in self._probe_providers:
+            task = asyncio.create_task(
+                self._run_probe(
+                    signal_id=signal_id,
+                    prediction_id=prediction_id,
+                    provider=provider,
+                    full_prompt=full_prompt,
+                    prompt_hash=prompt_hash,
+                )
+            )
+            self._probe_tasks.add(task)
+            task.add_done_callback(self._probe_tasks.discard)
+
+    async def _run_probe(
+        self,
+        *,
+        signal_id: Optional[int],
+        prediction_id: int,
+        provider: str,
+        full_prompt: str,
+        prompt_hash: str,
+    ) -> None:
+        """Run one shadow call. NEVER raises out — failures land in the
+        `error` column. TTFT measured via streaming when supported."""
+        try:
+            probe = await self._call_probe_provider(provider, full_prompt)
+        except Exception as exc:  # noqa: BLE001 — defence-in-depth; the
+            # inner call already catches everything we know about, but a
+            # task that raises would only log to the asyncio default
+            # handler and we'd lose the row.
+            probe = {
+                "ttft_ms": None,
+                "total_ms": None,
+                "direction": None,
+                "confidence": None,
+                "raw_response": None,
+                "error": f"probe_unexpected: {exc.__class__.__name__}",
+            }
+        try:
+            await self._insert_probe_row(
+                signal_id=signal_id,
+                prediction_id=prediction_id,
+                prompt_hash=prompt_hash,
+                provider=provider,
+                model=provider,
+                probe=probe,
+            )
+        except Exception as exc:  # noqa: BLE001 — DB write failure on the
+            # probe path is non-fatal; log and move on.
+            logger.warning(
+                "probe insert failed for provider=%s: %s", provider, exc
+            )
+
+    async def _call_probe_provider(
+        self, provider: str, full_prompt: str
+    ) -> dict:
+        """Single streaming call to an OpenRouter-hosted challenger.
+
+        Returns a dict with `ttft_ms`, `total_ms`, `direction`,
+        `confidence`, `raw_response`, `error`. NEVER raises — all errors
+        (timeout, HTTP, parse) are converted into populated `error` field.
+        """
+        if self._client is None:
+            # Reuse the main httpx client; its timeout is set to the
+            # main-call timeout, but we ALSO apply a per-request override
+            # via the probe timeout below.
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        t0 = time.monotonic()
+        ttft_ms: Optional[float] = None
+        chunks: list[str] = []
+        payload = {
+            "model": provider,
+            "messages": [
+                {"role": "system", "content": _SYSTEM_MESSAGE},
+                {"role": "user", "content": full_prompt},
+            ],
+            "max_tokens": 32,
+            "temperature": 0,
+            "logit_bias": _LOGIT_BIAS_YNU,
+            "stream": True,
+        }
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        try:
+            async with self._client.stream(
+                "POST",
+                _OPENROUTER_URL,
+                headers=headers,
+                json=payload,
+                timeout=self._probe_timeout,
+            ) as resp:
+                if resp.status_code == 429:
+                    return _probe_error("rate_limit", t0)
+                if resp.status_code < 200 or resp.status_code >= 300:
+                    return _probe_error(
+                        f"http_status_{resp.status_code}", t0
+                    )
+                async for line in resp.aiter_lines():
+                    if not line:
+                        continue
+                    # OpenRouter SSE — lines prefixed with "data: " carry
+                    # JSON deltas; "data: [DONE]" terminates the stream.
+                    if not line.startswith("data:"):
+                        continue
+                    payload_str = line[len("data:"):].strip()
+                    if not payload_str or payload_str == "[DONE]":
+                        continue
+                    if ttft_ms is None:
+                        ttft_ms = (time.monotonic() - t0) * 1000.0
+                    try:
+                        chunk = json.loads(payload_str)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = (
+                        (chunk.get("choices") or [{}])[0]
+                        .get("delta", {})
+                        .get("content")
+                    )
+                    if delta:
+                        chunks.append(delta)
+        except httpx.TimeoutException:
+            return _probe_error("timeout", t0)
+        except httpx.HTTPError as exc:
+            return _probe_error(f"http_error: {exc.__class__.__name__}", t0)
+        total_ms = (time.monotonic() - t0) * 1000.0
+        content = "".join(chunks)
+        parsed = _parse_response(content) if content else None
+        if parsed is None:
+            return {
+                "ttft_ms": ttft_ms,
+                "total_ms": total_ms,
+                "direction": None,
+                "confidence": None,
+                # Truncate to keep the column lean — 500 chars per the
+                # plan spec.
+                "raw_response": content[:500] if content else None,
+                "error": "parse_error",
+            }
+        direction, confidence, _label = parsed
+        # Confidence: probe uses the simple v2-fast 1.0 / 0.0 convention
+        # (per task brief), not the v6-strict digit mapping. Raw response
+        # is preserved verbatim (first 500 chars) for downstream analysis.
+        return {
+            "ttft_ms": ttft_ms,
+            "total_ms": total_ms,
+            "direction": direction,
+            "confidence": 1.0 if direction in ("YES", "NO") else 0.0,
+            "raw_response": content[:500] if content else None,
+            "error": None,
+        }
+
+    async def _insert_probe_row(
+        self,
+        *,
+        signal_id: Optional[int],
+        prediction_id: int,
+        prompt_hash: str,
+        provider: str,
+        model: str,
+        probe: dict,
+    ) -> None:
+        async with self._db.batch() as cur:
+            await cur.execute(
+                """
+                INSERT INTO llm_probe_calls
+                    (signal_id, prediction_id, prompt_hash, provider, model,
+                     ttft_ms, total_ms, direction, confidence, raw_response,
+                     error, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    signal_id,
+                    prediction_id,
+                    prompt_hash,
+                    provider,
+                    model,
+                    probe.get("ttft_ms"),
+                    probe.get("total_ms"),
+                    probe.get("direction"),
+                    probe.get("confidence"),
+                    probe.get("raw_response"),
+                    probe.get("error"),
+                    _now_iso(),
+                ),
+            )
+
+
+def _probe_error(reason: str, t0: float) -> dict:
+    """Synthesise a failure dict for `_call_probe_provider`. All metric
+    fields NULL; `error` populated and `total_ms` records how long we
+    waited before giving up (handy for timeout vs early-fail distinction).
+    """
+    return {
+        "ttft_ms": None,
+        "total_ms": (time.monotonic() - t0) * 1000.0,
+        "direction": None,
+        "confidence": None,
+        "raw_response": None,
+        "error": reason,
+    }
 
 
 def _extract_content(response_body: str) -> str:

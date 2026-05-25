@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
-"""Spread soak — low-volume band ($10k-$50k 24h volume), top-30 by volume.
+"""Spread soak — low-volume band ($10k-$50k 24h volume).
 
-Validates the cycle-12 finding (high-volume markets at $0.001-0.02 spread)
-against the RAG claim "$0.05+ wide on thin markets". Pairs with the
-`thin_market` gate (`cfg.trade.min_market_volume_usdc = 10_000`) — if this
-band shows $0.05+ medians, the `thin_market + wide_spread($0.10)` pair is
-well-tuned; if it's still tight, we can lower `wide_spread_threshold` from
-0.10.
+Cycle 13 v1 used `ascending=true` and got drowned in $0-volume markets that
+never traded today. v2 walks the descending list (most active first), keeps
+walking until we have TOP_N markets that fall inside the band, then samples
+those every CADENCE_S.
 
-Output: CSV at `/tmp/spread_soak_low_vol.csv`. Same row schema as
-soak_spread_sampler.py. Runs 30 min.
+Output: CSV at `/tmp/spread_soak_low_vol.csv`. Same schema as the cycle-10
+high-vol sampler. Runs 30 min.
 """
 from __future__ import annotations
 
@@ -30,18 +28,24 @@ MIN_VOL = 10_000.0
 MAX_VOL = 50_000.0
 CADENCE_S = 60
 DURATION_S = 1800  # 30 min
+GAMMA_MAX_PAGES = 50  # walk up to 5000 markets before giving up
 
 
 async def fetch_low_volume_markets(http: httpx.AsyncClient) -> list[dict]:
-    """Walk pages from least-volume of the active set, filter into the band."""
+    """Walk DESCENDING by volume24hr; filter into the band; stop when full.
+
+    Most high-volume markets sit above the band, so we walk past them
+    until we hit the band and collect TOP_N entries. Once volume drops
+    below MIN_VOL we stop walking (everything below that is out of band).
+    """
     out: list[dict] = []
     offset = 0
-    while len(out) < TOP_N and offset < 500:
+    for _ in range(GAMMA_MAX_PAGES):
         r = await http.get(
             GAMMA,
             params={
                 "limit": 100, "active": "true", "closed": "false",
-                "order": "volume24hr", "ascending": "true",
+                "order": "volume24hr", "ascending": "false",
                 "offset": offset,
             },
         )
@@ -51,11 +55,16 @@ async def fetch_low_volume_markets(http: httpx.AsyncClient) -> list[dict]:
             break
         for m in page:
             v = float(m.get("volume24hr") or 0.0)
-            if MIN_VOL <= v <= MAX_VOL:
+            if v < MIN_VOL:
+                # Walked past the band; nothing useful further down.
+                return out
+            if v <= MAX_VOL:
                 out.append(m)
                 if len(out) >= TOP_N:
-                    break
-        offset += 100
+                    return out
+        offset += len(page)
+        if len(page) < 100:
+            break
     return out
 
 
@@ -94,7 +103,7 @@ async def main():
             try:
                 ms = await fetch_low_volume_markets(http)
             except Exception as exc:
-                print(f"[low-vol soak] gamma error: {exc}", file=sys.stderr, flush=True)
+                print(f"[low-vol v2] gamma error: {exc}", file=sys.stderr, flush=True)
                 await asyncio.sleep(CADENCE_S)
                 continue
             ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -122,13 +131,13 @@ async def main():
                 sampled += 1
             f.flush()
             cycles += 1
-            print(f"[low-vol soak] cycle {cycles}: {sampled}/{len(ms)} markets @ {ts}",
+            print(f"[low-vol v2] cycle {cycles}: {sampled}/{len(ms)} markets @ {ts}",
                   file=sys.stderr, flush=True)
             await asyncio.sleep(CADENCE_S)
     finally:
         await http.aclose()
         f.close()
-        print(f"[low-vol soak] done. {cycles} cycles, output {OUT}",
+        print(f"[low-vol v2] done. {cycles} cycles, output {OUT}",
               file=sys.stderr, flush=True)
 
 

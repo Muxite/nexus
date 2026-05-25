@@ -344,3 +344,273 @@ async def test_direction_unset_cycle_raises(ai, db_ready):
     # No cycle_scope — should LookupError out.
     with pytest.raises(LookupError):
         await client.direction(signal_id=80, prompt="P")
+
+
+# ---------------------------------------------------------------------------
+# Cycle 14: A/B probe lane
+# ---------------------------------------------------------------------------
+
+
+def _fake_config_with_probe(
+    *,
+    probe_enabled: bool,
+    probe_sample_rate: float = 1.0,
+    probe_providers: list[str] | None = None,
+    probe_timeout_seconds: float = 10.0,
+    model: str = "google/gemini-2.5-flash",
+) -> object:
+    """Variant of _fake_config that includes the cycle-14 ProbeSection
+    fields. AIClient reads these via getattr on `config.probe.*`."""
+
+    class _OR:
+        api_key = "test-key"
+        direction_model = model
+        timeout_seconds = 5.0
+
+    class _Probe:
+        pass
+
+    pr = _Probe()
+    pr.probe_enabled = probe_enabled
+    pr.probe_sample_rate = probe_sample_rate
+    pr.probe_providers = list(probe_providers or [])
+    pr.probe_timeout_seconds = probe_timeout_seconds
+
+    class _Cfg:
+        openrouter = _OR()
+        probe = pr
+
+    return _Cfg()
+
+
+async def _drain_probe_tasks(client: AIClient) -> None:
+    """Await all outstanding fire-and-forget probe tasks so assertions
+    on the `llm_probe_calls` table observe the writes."""
+    if client._probe_tasks:
+        await asyncio.gather(*list(client._probe_tasks), return_exceptions=True)
+
+
+async def test_probe_disabled_by_default(db_ready, monkeypatch):
+    """Default config has probe_enabled=False → no probe rows are written
+    even when probe_providers is non-empty."""
+    budget = _FakeBudget()
+    config = _fake_config_with_probe(
+        probe_enabled=False,
+        probe_sample_rate=1.0,
+        probe_providers=["anthropic/claude-haiku-4.5"],
+    )
+    client = AIClient(db=db_ready, budget=budget, config=config)
+    client._mock_response = _ok_response("YES")
+
+    async def stub_call(full_prompt: str) -> dict:
+        return client._mock_response
+
+    monkeypatch.setattr(client, "_call_openrouter", stub_call)
+
+    # Probe path should never execute; assert by patching to raise.
+    async def boom(*_a, **_kw):
+        raise AssertionError("probe should not run when probe_enabled=False")
+
+    monkeypatch.setattr(client, "_call_probe_provider", boom)
+
+    try:
+        with cycle_scope(1):
+            await client.direction(signal_id=100, prompt="news A market B")
+        await _drain_probe_tasks(client)
+    finally:
+        await client.close()
+
+    cur = await db_ready.conn.execute("SELECT COUNT(*) FROM llm_probe_calls")
+    assert (await cur.fetchone())[0] == 0
+
+
+async def test_probe_writes_one_row_per_provider(db_ready, monkeypatch):
+    """probe_enabled=True, sample_rate=1.0, 2 providers → 2 probe rows
+    per production call. Mock the probe HTTP layer so no real provider
+    is hit."""
+    budget = _FakeBudget()
+    providers = [
+        "anthropic/claude-haiku-4.5",
+        "deepseek/deepseek-chat-v3",
+    ]
+    config = _fake_config_with_probe(
+        probe_enabled=True,
+        probe_sample_rate=1.0,
+        probe_providers=providers,
+    )
+    client = AIClient(db=db_ready, budget=budget, config=config)
+    client._mock_response = _ok_response("YES")
+
+    async def stub_call(full_prompt: str) -> dict:
+        return client._mock_response
+
+    monkeypatch.setattr(client, "_call_openrouter", stub_call)
+
+    calls: list[str] = []
+
+    async def fake_probe(provider: str, full_prompt: str) -> dict:
+        calls.append(provider)
+        return {
+            "ttft_ms": 42.0,
+            "total_ms": 100.0,
+            "direction": "YES",
+            "confidence": 1.0,
+            "raw_response": "Y",
+            "error": None,
+        }
+
+    monkeypatch.setattr(client, "_call_probe_provider", fake_probe)
+
+    try:
+        with cycle_scope(1):
+            await client.direction(signal_id=110, prompt="news X market Y")
+        await _drain_probe_tasks(client)
+    finally:
+        await client.close()
+
+    assert sorted(calls) == sorted(providers)
+    cur = await db_ready.conn.execute(
+        "SELECT provider, ttft_ms, total_ms, direction, confidence, error "
+        "FROM llm_probe_calls ORDER BY provider"
+    )
+    rows = await cur.fetchall()
+    assert len(rows) == 2
+    assert {r["provider"] for r in rows} == set(providers)
+    for r in rows:
+        assert r["ttft_ms"] == 42.0
+        assert r["total_ms"] == 100.0
+        assert r["direction"] == "YES"
+        assert r["confidence"] == 1.0
+        assert r["error"] is None
+
+
+async def test_probe_failure_records_error_row(db_ready, monkeypatch):
+    """One probe provider times out → row written with error='timeout'
+    and metric fields NULL. The other provider succeeds normally."""
+    budget = _FakeBudget()
+    providers = [
+        "anthropic/claude-haiku-4.5",  # will time out
+        "deepseek/deepseek-chat-v3",   # will succeed
+    ]
+    config = _fake_config_with_probe(
+        probe_enabled=True,
+        probe_sample_rate=1.0,
+        probe_providers=providers,
+    )
+    client = AIClient(db=db_ready, budget=budget, config=config)
+    client._mock_response = _ok_response("YES")
+
+    async def stub_call(full_prompt: str) -> dict:
+        return client._mock_response
+
+    monkeypatch.setattr(client, "_call_openrouter", stub_call)
+
+    async def selective_probe(provider: str, full_prompt: str) -> dict:
+        if provider == "anthropic/claude-haiku-4.5":
+            return {
+                "ttft_ms": None,
+                "total_ms": 10_000.0,
+                "direction": None,
+                "confidence": None,
+                "raw_response": None,
+                "error": "timeout",
+            }
+        return {
+            "ttft_ms": 55.0,
+            "total_ms": 120.0,
+            "direction": "YES",
+            "confidence": 1.0,
+            "raw_response": "Y",
+            "error": None,
+        }
+
+    monkeypatch.setattr(client, "_call_probe_provider", selective_probe)
+
+    try:
+        with cycle_scope(1):
+            await client.direction(signal_id=120, prompt="news P market Q")
+        await _drain_probe_tasks(client)
+    finally:
+        await client.close()
+
+    cur = await db_ready.conn.execute(
+        "SELECT provider, ttft_ms, total_ms, direction, confidence, error "
+        "FROM llm_probe_calls ORDER BY provider"
+    )
+    rows = await cur.fetchall()
+    assert len(rows) == 2
+    by_provider = {r["provider"]: r for r in rows}
+    haiku = by_provider["anthropic/claude-haiku-4.5"]
+    assert haiku["error"] == "timeout"
+    assert haiku["ttft_ms"] is None
+    assert haiku["direction"] is None
+    assert haiku["confidence"] is None
+    deepseek = by_provider["deepseek/deepseek-chat-v3"]
+    assert deepseek["error"] is None
+    assert deepseek["direction"] == "YES"
+    assert deepseek["confidence"] == 1.0
+
+
+async def test_probe_does_not_change_production_call(db_ready, monkeypatch):
+    """The DirectionResult returned by direction() is identical whether
+    probe_enabled is True or False (for the same inputs and same mocked
+    production response). The probe is a pure side-effect lane."""
+    budget_off = _FakeBudget()
+    budget_on = _FakeBudget()
+    mock_resp = _ok_response("YES")
+
+    async def stub(full_prompt: str) -> dict:
+        return mock_resp
+
+    cfg_off = _fake_config_with_probe(probe_enabled=False)
+    cfg_on = _fake_config_with_probe(
+        probe_enabled=True,
+        probe_sample_rate=1.0,
+        probe_providers=["anthropic/claude-haiku-4.5"],
+    )
+
+    client_off = AIClient(db=db_ready, budget=budget_off, config=cfg_off)
+    client_on = AIClient(db=db_ready, budget=budget_on, config=cfg_on)
+    monkeypatch.setattr(client_off, "_call_openrouter", stub)
+    monkeypatch.setattr(client_on, "_call_openrouter", stub)
+
+    async def fake_probe(provider, full_prompt):
+        return {
+            "ttft_ms": 1.0,
+            "total_ms": 2.0,
+            "direction": "NO",  # deliberately disagree — must NOT leak
+            "confidence": 1.0,
+            "raw_response": "N",
+            "error": None,
+        }
+
+    monkeypatch.setattr(client_on, "_call_probe_provider", fake_probe)
+
+    try:
+        with cycle_scope(1):
+            # Different signal_ids so the per-signal predictions UNIQUE
+            # doesn't dedupe; same prompt so the llm_calls cache fires
+            # on the second call (which is fine — the comparison is on
+            # the DirectionResult shape, not on cached vs fresh).
+            off_result = await client_off.direction(signal_id=130, prompt="P")
+            on_result = await client_on.direction(signal_id=131, prompt="P")
+        await _drain_probe_tasks(client_on)
+    finally:
+        await client_off.close()
+        await client_on.close()
+
+    # Identical user-visible direction + confidence + raw_response + label.
+    assert off_result.direction == on_result.direction == "YES"
+    assert off_result.confidence == on_result.confidence
+    assert off_result.label == on_result.label
+    assert off_result.raw_response == on_result.raw_response
+    # Probe row exists for the on-client only.
+    cur = await db_ready.conn.execute("SELECT COUNT(*) FROM llm_probe_calls")
+    assert (await cur.fetchone())[0] == 1
+    cur = await db_ready.conn.execute(
+        "SELECT direction FROM llm_probe_calls LIMIT 1"
+    )
+    row = await cur.fetchone()
+    # Probe's disagreeing label sits in the probe row, not in any
+    # production-visible field.
+    assert row["direction"] == "NO"

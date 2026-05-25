@@ -1186,3 +1186,76 @@ async def test_clob_missing_token_falls_back_to_default(db_seeded):
     # (under default config which has min_edge=0.04).
     assert row is not None
     assert row["mid_price"] == pytest.approx(0.5)
+
+
+# ---------------------------------------------------------------------------
+# Cycle 14: per-signal latency-chain instrumentation
+# ---------------------------------------------------------------------------
+
+
+async def test_trade_row_has_decision_latency_columns(db_seeded):
+    """Schema check: the cycle-14 ALTER TABLEs added the two latency
+    columns to `trades`. PRAGMA table_info reflects them with the
+    expected types and NULL-allowed (legacy rows stay NULL).
+    """
+    cur = await db_seeded.conn.execute("PRAGMA table_info(trades)")
+    rows = await cur.fetchall()
+    await cur.close()
+    cols = {r["name"]: r["type"] for r in rows}
+    assert "decision_latency_ms" in cols, (
+        f"decision_latency_ms missing; columns are: {sorted(cols)}"
+    )
+    assert "decision_latency_breakdown" in cols, (
+        f"decision_latency_breakdown missing; columns are: {sorted(cols)}"
+    )
+    # Types per the DDL — REAL for ms, TEXT for the JSON blob.
+    assert cols["decision_latency_ms"].upper() == "REAL"
+    assert cols["decision_latency_breakdown"].upper() == "TEXT"
+
+
+async def test_executed_trade_records_latency_ms(db_seeded):
+    """Drive a successful trade and confirm the cycle-14 instrumentation
+    populates both columns. Range/shape checks only — never assert exact
+    ms values because CI clocks vary.
+    """
+    bus = _FakeBus()
+    ai = _FakeAI()  # default happy path
+    stage = _make_stage(db_seeded, bus, ai)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    cur = await db_seeded.conn.execute(
+        "SELECT decision_latency_ms, decision_latency_breakdown "
+        "FROM trades WHERE signal_id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row is not None
+
+    # decision_latency_ms — positive, sane upper bound (sanity, not strict).
+    latency_ms = row["decision_latency_ms"]
+    assert latency_ms is not None, "decision_latency_ms not populated"
+    assert isinstance(latency_ms, float)
+    assert latency_ms > 0.0, f"expected positive latency, got {latency_ms}"
+    assert latency_ms < 60_000.0, f"latency suspiciously large: {latency_ms}"
+
+    # decision_latency_breakdown — JSON-encoded dict keyed by step name.
+    raw = row["decision_latency_breakdown"]
+    assert raw is not None, "decision_latency_breakdown not populated"
+    breakdown = json.loads(raw)
+    assert isinstance(breakdown, dict)
+    expected_keys = {
+        "fetch_article",
+        "fetch_market",
+        "ai_direction",
+        "resolve_mid",
+        "resolve_book",
+        "imbalance_check",
+        "db_insert",
+    }
+    missing = expected_keys - set(breakdown)
+    assert not missing, f"breakdown missing keys: {missing}; got {breakdown}"
+    # Every per-step ms is a non-negative float.
+    for step, ms in breakdown.items():
+        assert isinstance(ms, (int, float)), f"{step} value not numeric: {ms!r}"
+        assert ms >= 0.0, f"{step} negative: {ms}"

@@ -80,6 +80,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from datetime import datetime, time as dt_time, timezone
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -177,6 +178,18 @@ _TRADE_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_trade_features_trade_id ON trade_features(trade_id)",
     "CREATE INDEX IF NOT EXISTS idx_trade_features_feature_name ON trade_features(feature_name)",
+    # Cycle 14: per-signal latency-chain instrumentation. Total wall-clock
+    # ms from `handle()` entry to the `trades` row insert (`decision_latency_ms`),
+    # plus a per-step breakdown JSON keyed by step name (`fetch_article`,
+    # `fetch_market`, `ai_direction`, `resolve_mid`, `resolve_book`,
+    # `imbalance_check`, `db_insert`). NULL on legacy + reject rows;
+    # populated only on execute paths. See calibration_seeds.md C4/E2 and
+    # philosophy.md's 200ms budget — the breakdown is what lets us
+    # actually replan that number once chains widen past a single
+    # CLOB call. ALTER TABLE rows are sha1-tracked so re-importing
+    # the module is idempotent.
+    "ALTER TABLE trades ADD COLUMN decision_latency_ms        REAL",
+    "ALTER TABLE trades ADD COLUMN decision_latency_breakdown TEXT",
 ]
 db_module.register_schema("app/stages/trade.py", _TRADE_DDL)
 
@@ -311,6 +324,17 @@ class TradeStage:
         return
 
     async def handle(self, payload: dict) -> None:
+        # Cycle 14: per-signal latency-chain timer. `t_start` brackets the
+        # whole gate cascade up to (and including) the trade-row insert on
+        # execute paths. `breakdown` accumulates `{step_name: ms}` for the
+        # major async steps so we can see which call dominates a chain.
+        # See calibration_seeds.md C4/E2 + plans/instrumentation. Reject
+        # paths leave both columns NULL on `decisions` rows in this cycle
+        # (reject-path latency is a follow-up); we still record the timer
+        # data inline but it just isn't persisted.
+        t_start = time.perf_counter()
+        breakdown: dict[str, float] = {}
+
         signal_id = payload.get("signal_id")
         article_id = payload.get("article_id")
         market_id = payload.get("market_id")
@@ -368,8 +392,12 @@ class TradeStage:
 
         # Compose prompt from article + market. Done after the cheap gates so
         # we don't pay a DB round-trip for signals that fail upstream.
+        _t = time.perf_counter()
         article = await self._fetch_article(int(article_id))
+        breakdown["fetch_article"] = (time.perf_counter() - _t) * 1000.0
+        _t = time.perf_counter()
         market = await self._fetch_market(str(market_id))
+        breakdown["fetch_market"] = (time.perf_counter() - _t) * 1000.0
         if article is None:
             await self._record_reject(
                 signal_id=int(signal_id),
@@ -428,12 +456,14 @@ class TradeStage:
         prompt = self._compose_prompt(article, market)
 
         # 3. direction --------------------------------------------------------
+        _t = time.perf_counter()
         result = await self._ai.direction(
             signal_id=int(signal_id),
             prompt=prompt,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
         )
+        breakdown["ai_direction"] = (time.perf_counter() - _t) * 1000.0
         if result.direction == "NEUTRAL":
             gate_history.append(
                 _gate_entry("direction", "reject", "NEUTRAL", "YES|NO")
@@ -470,7 +500,9 @@ class TradeStage:
         direction = result.direction
         confidence = result.confidence
         p_hat = confidence if direction == "YES" else (1.0 - confidence)
+        _t = time.perf_counter()
         mid = await self._resolve_mid(direction=direction, market=market)
+        breakdown["resolve_mid"] = (time.perf_counter() - _t) * 1000.0
         # 4a. degenerate-mid guard — markets at mid <= min_mid or >= max_mid
         # are essentially resolved. Cycle 3 surfaced PnL=0 trades on these
         # because the closer would force-close at entry_mid. Block at entry.
@@ -492,7 +524,9 @@ class TradeStage:
         # and reject if spread exceeds the threshold. Graceful degrade:
         # if the book read fails (None), skip this check rather than
         # blocking the trade. See app/clob.py:get_top_of_book.
+        _t = time.perf_counter()
         book = await self._resolve_executable_side(direction=direction, market=market)
+        breakdown["resolve_book"] = (time.perf_counter() - _t) * 1000.0
         if book is not None:
             executable_price, spread = book
         else:
@@ -512,12 +546,14 @@ class TradeStage:
         # 4b. market-news weight imbalance — reject when the market is
         # too big / too thin / too far / too soon for the news to
         # plausibly move it. Cycle 7. See _check_market_news_imbalance.
+        _t = time.perf_counter()
         imbalance = await self._check_market_news_imbalance(
             market=market,
             mid=mid,
             freshness=freshness,
             signal_id=int(signal_id),
         )
+        breakdown["imbalance_check"] = (time.perf_counter() - _t) * 1000.0
         if imbalance is not None:
             sub_rule, detail = imbalance
             gate_history.append(
@@ -731,6 +767,11 @@ class TradeStage:
             "size_usdc": size,
             "balance_usdc": self._cfg.balance_usdc,
         }
+        # Cycle 14: time the DB write (decision + trade + features inserts
+        # are all under `_record_execute`). Total chain latency snapshots
+        # *after* the write so what lands on the trade row matches the
+        # actual end-to-end time including the insert it's annotating.
+        _t = time.perf_counter()
         await self._record_execute(
             signal_id=int(signal_id),
             market_id=str(market_id),
@@ -749,6 +790,9 @@ class TradeStage:
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
+            breakdown=breakdown,
+            t_start=t_start,
+            db_insert_t_start=_t,
         )
 
     # ------------------------------------------------------------------
@@ -1193,6 +1237,9 @@ class TradeStage:
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
+        breakdown: Optional[dict[str, float]] = None,
+        t_start: Optional[float] = None,
+        db_insert_t_start: Optional[float] = None,
     ) -> None:
         decision_id = await self._insert_decision(
             signal_id=signal_id,
@@ -1206,6 +1253,16 @@ class TradeStage:
         )
         if decision_id is None:
             return
+        # Cycle 14: finalise the per-signal latency-chain numbers right
+        # before the trade-row INSERT so the values that land on the row
+        # genuinely cover handle()-entry → trades-write. `db_insert` here
+        # is the cost of `_insert_decision` (and is replaced by the full
+        # _insert_trade cost on subsequent passes — see _insert_trade).
+        if breakdown is not None and db_insert_t_start is not None:
+            breakdown["db_insert"] = (time.perf_counter() - db_insert_t_start) * 1000.0
+        decision_latency_ms = (
+            (time.perf_counter() - t_start) * 1000.0 if t_start is not None else None
+        )
         trade_id = await self._insert_trade(
             signal_id=signal_id,
             decision_id=decision_id,
@@ -1224,6 +1281,8 @@ class TradeStage:
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
+            decision_latency_ms=decision_latency_ms,
+            decision_latency_breakdown=breakdown,
         )
         if trade_id is None:
             return
@@ -1308,6 +1367,8 @@ class TradeStage:
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
+        decision_latency_ms: Optional[float] = None,
+        decision_latency_breakdown: Optional[dict[str, float]] = None,
     ) -> Optional[int]:
         # v6: derive the target_mid where the model's edge collapses.
         # `p_hat` is the model's implied P(YES). The target is always
@@ -1323,6 +1384,15 @@ class TradeStage:
             target_mid = max(0.0, min(1.0, float(p_hat) - fee_buffer))
         else:  # NO
             target_mid = max(0.0, min(1.0, float(p_hat) + fee_buffer))
+        # Cycle 14: serialise the per-step breakdown to JSON. NULL when
+        # the caller didn't pass one (defensive — non-handle() callers
+        # of _insert_trade simply omit the kwarg and legacy rows stay
+        # NULL on both new columns).
+        breakdown_json = (
+            json.dumps(decision_latency_breakdown)
+            if decision_latency_breakdown is not None
+            else None
+        )
         async with self._db.batch() as cur:
             await cur.execute(
                 """
@@ -1330,8 +1400,9 @@ class TradeStage:
                     (signal_id, decision_id, prediction_id, market_id, direction,
                      confidence, similarity, freshness, p_hat, mid_price, edge,
                      kelly_fraction, size_usdc, decision_path, features_snapshot,
-                     cycle_id, is_tracer, tracer_id, decided_at, target_mid)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?, ?)
+                     cycle_id, is_tracer, tracer_id, decided_at, target_mid,
+                     decision_latency_ms, decision_latency_breakdown)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal_id,
@@ -1353,6 +1424,8 @@ class TradeStage:
                     tracer_id,
                     _now_iso(),
                     target_mid,
+                    decision_latency_ms,
+                    breakdown_json,
                 ),
             )
             if cur.rowcount != 1:
