@@ -139,6 +139,24 @@ _MARKETS_DDL = [
     # `config.polymarket_fee_rates`. Idempotent via the
     # `schema_migrations` table (db.py applies each statement once per sha).
     "ALTER TABLE markets ADD COLUMN fee_rate REAL",
+    # Cycle 11: three-state UMA close machine state (plans/resolution-oracle.md
+    # D1). The Gamma close flag (`closed=true`) is NOT finality —
+    # Polymarket settles through UMA's Optimistic Oracle with a 2h
+    # uncontested window or ~4-6d disputed path. Stamp `uma_proposed_at`
+    # on the *transition* into `umaResolutionStatus='proposed'` and
+    # `uma_finalized_at` on the transition into `'resolved'` (idempotent;
+    # only set when the existing column is NULL). `last_resolution_status`
+    # is the last-seen string from Gamma for restart-safe wait logic.
+    # All three columns nullable — NULL means "never observed".
+    "ALTER TABLE markets ADD COLUMN uma_proposed_at TEXT",
+    "ALTER TABLE markets ADD COLUMN uma_finalized_at TEXT",
+    "ALTER TABLE markets ADD COLUMN last_resolution_status TEXT",
+    # Cycle 11 (supporting column): JSON-encoded `outcomePrices` list as
+    # last observed from Gamma. Needed so the State-3 close path can
+    # recover the final YES/NO payout after a process restart — the three
+    # status columns above record WHEN we transitioned, this records WHAT
+    # the final payout is. NULL = never observed.
+    "ALTER TABLE markets ADD COLUMN last_outcome_prices TEXT",
 ]
 db_module.register_schema("app/stages/markets.py", _MARKETS_DDL)
 
@@ -160,6 +178,80 @@ class MarketIndexEmbedderMismatch(RuntimeError):
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _state3_exit_mid(
+    *,
+    direction: str,  # noqa: ARG001 — present for caller symmetry; see note
+    last_outcome_prices,
+) -> Optional[float]:
+    """Translate a stored `last_outcome_prices` payload into the
+    State-3 exit mid passed to `write_trade_closure`, or return None
+    if the payload is malformed / unusable.
+
+    Polymarket Gamma convention (unstructured-1 answers, lines 36-44):
+    `outcomePrices` is a 2-element list where index 0 = YES payout and
+    index 1 = NO payout; both stringified. The pair sums to ~1 for a
+    binary market.
+
+    **Direction is ignored on purpose.** `write_trade_closure` /
+    `_compute_gross_pnl` expect `exit_mid` to be the YES-side mid for
+    BOTH directions — the NO sign-flip is applied inside the PnL helper
+    (`(entry - exit) / (1 - entry)`). So a NO trade that won on
+    `outcomePrices=["0","1"]` correctly receives `exit_mid=0.0` here
+    and computes `(0.5 - 0) / (1 - 0.5) = 1.0` shares-worth-redemption
+    inside the closer. We keep `direction` in the signature so a future
+    multi-outcome market (Q5 in resolution-oracle.md) can wire it back in
+    without a signature churn.
+
+    Accepts either a Python list (in-memory) or a JSON-encoded string
+    (as stored in `markets.last_outcome_prices`).
+    """
+    if last_outcome_prices is None:
+        return None
+    if isinstance(last_outcome_prices, str):
+        s = last_outcome_prices.strip()
+        if not s.startswith("["):
+            return None
+        try:
+            parsed = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    else:
+        parsed = last_outcome_prices
+    if not isinstance(parsed, list) or len(parsed) < 2:
+        return None
+    try:
+        yes_payout = float(parsed[0])
+        no_payout = float(parsed[1])
+    except (TypeError, ValueError):
+        return None
+    # Binary YES/NO markets only — reject any payload that doesn't sum
+    # cleanly to a $1 redemption. This catches N>2 outcome markets
+    # (resolution-oracle.md Q5) and any garbled string we shouldn't act on.
+    if not (0.0 <= yes_payout <= 1.0 and 0.0 <= no_payout <= 1.0):
+        return None
+    if abs((yes_payout + no_payout) - 1.0) > 1e-6:
+        return None
+    # Always return the YES-side payout — closer.write_trade_closure
+    # handles the NO sign flip internally.
+    return yes_payout
+
+
+def _hours_since(iso_ts: Optional[str], now_dt: datetime) -> Optional[float]:
+    """Hours between an ISO timestamp and `now_dt`, or None if the
+    timestamp is missing / unparseable. Used by the State-1 human-review
+    fallback so we never silently auto-close a never-resolved market."""
+    if not iso_ts:
+        return None
+    try:
+        ts = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    delta = now_dt - ts
+    return delta.total_seconds() / 3600.0
 
 
 def _parse_gamma_row(raw: dict) -> Optional[dict]:
@@ -202,6 +294,38 @@ def _parse_gamma_row(raw: dict) -> Optional[dict]:
     except (TypeError, ValueError):
         volume = None
 
+    # Cycle 11: three-state UMA close machine inputs
+    # (plans/resolution-oracle.md). `umaResolutionStatus` advances through
+    # `proposed` (2h challenge window) → `resolved` (finalized). `resolvedBy`
+    # is the authority address. `acceptingOrders` flips to false once trading
+    # halts. `outcomePrices` carries the final $1/$0 payout as a 2-element
+    # array — Gamma emits it sometimes as a native list, sometimes as a
+    # JSON-encoded string (mirrors the `clobTokenIds` quirk above).
+    uma_status_raw = raw.get("umaResolutionStatus")
+    uma_status = str(uma_status_raw) if uma_status_raw else None
+    resolved_by_raw = raw.get("resolvedBy")
+    resolved_by = str(resolved_by_raw) if resolved_by_raw else None
+    accepting_orders_raw = raw.get("acceptingOrders")
+    accepting_orders: Optional[bool]
+    if isinstance(accepting_orders_raw, bool):
+        accepting_orders = accepting_orders_raw
+    elif accepting_orders_raw is None:
+        accepting_orders = None
+    else:
+        accepting_orders = bool(accepting_orders_raw)
+
+    outcome_raw = raw.get("outcomePrices")
+    outcome_prices: list[str] = []
+    if isinstance(outcome_raw, list):
+        outcome_prices = [str(x) for x in outcome_raw]
+    elif isinstance(outcome_raw, str) and outcome_raw.strip().startswith("["):
+        try:
+            parsed_outcomes = json.loads(outcome_raw)
+            if isinstance(parsed_outcomes, list):
+                outcome_prices = [str(x) for x in parsed_outcomes]
+        except (json.JSONDecodeError, ValueError):
+            outcome_prices = []
+
     return {
         "condition_id": str(condition_id),
         "slug": raw.get("slug") or None,
@@ -212,6 +336,10 @@ def _parse_gamma_row(raw: dict) -> Optional[dict]:
         "volume_usdc": volume,
         "token_yes": token_yes,
         "token_no": token_no,
+        "uma_resolution_status": uma_status,
+        "resolved_by": resolved_by,
+        "accepting_orders": accepting_orders,
+        "outcome_prices": outcome_prices,
     }
 
 
@@ -606,14 +734,20 @@ class MarketsStage:
 
     async def _upsert_market(self, row: dict) -> None:
         now = _now_iso()
+        # Serialise observed outcomePrices for persistence. Empty list →
+        # NULL so we never clobber a prior non-empty observation (Gamma can
+        # transiently drop the field between polls).
+        outcome_prices = row.get("outcome_prices") or []
+        outcome_json = json.dumps(outcome_prices) if outcome_prices else None
         async with self._db.batch() as cur:
             await cur.execute(
                 """
                 INSERT INTO markets (
                     condition_id, slug, question, description, category,
                     end_date, volume_usdc, token_yes, token_no,
-                    active, closed_at, first_seen_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?)
+                    active, closed_at, first_seen_at, updated_at,
+                    last_resolution_status, last_outcome_prices
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, NULL, ?, ?, ?, ?)
                 ON CONFLICT(condition_id) DO UPDATE SET
                     slug = excluded.slug,
                     question = excluded.question,
@@ -625,7 +759,15 @@ class MarketsStage:
                     token_no = excluded.token_no,
                     active = 1,
                     closed_at = NULL,
-                    updated_at = excluded.updated_at
+                    updated_at = excluded.updated_at,
+                    last_resolution_status = excluded.last_resolution_status,
+                    -- Only overwrite when the new observation is non-NULL:
+                    -- Gamma can drop the field transiently mid-resolution,
+                    -- and we don't want to lose the final $1/$0 payout we
+                    -- already captured.
+                    last_outcome_prices = COALESCE(
+                        excluded.last_outcome_prices, markets.last_outcome_prices
+                    )
                 """,
                 (
                     row["condition_id"],
@@ -639,8 +781,21 @@ class MarketsStage:
                     row["token_no"],
                     now,
                     now,
+                    row.get("uma_resolution_status"),
+                    outcome_json,
                 ),
             )
+        # Cycle 11: stamp UMA resolution state transitions. Only set the
+        # `*_at` timestamps when (a) we just observed the matching status
+        # and (b) the column is still NULL — strictly forward-only, never
+        # overwrites. Use a single SELECT-then-UPDATE rather than a
+        # condition-in-SQL because we want each transition's wall-time
+        # recorded on FIRST observation (subsequent re-reads must not
+        # bump the timestamp). This matches the "post-close wait survives
+        # restarts" requirement in plans/resolution-oracle.md (line 101).
+        await self._maybe_stamp_resolution_transition(
+            row["condition_id"], row.get("uma_resolution_status"),
+        )
         # Cycle 10: per-market fee_rate fetch. **First-seen only** for
         # this cycle — we read the current fee_rate after the upsert
         # and only call the CLOB if the column is still NULL. This
@@ -649,6 +804,37 @@ class MarketsStage:
         # populated rows. Existing-row refresh cadence is a separate
         # decision (see plans/markets-gamma.md).
         await self._maybe_fetch_fee_rate(row["condition_id"])
+
+    async def _maybe_stamp_resolution_transition(
+        self, condition_id: str, status: Optional[str],
+    ) -> None:
+        """If we just observed `status='proposed'` or `'resolved'` and the
+        corresponding `*_at` column is still NULL, stamp it with `now`.
+        Idempotent — re-running on an already-stamped row is a no-op.
+        Called from `_upsert_market` after every upsert so we capture the
+        transition on whichever poll cycle first sees it.
+        """
+        if not status:
+            return
+        status_lower = status.lower()
+        if status_lower not in ("proposed", "resolved"):
+            return
+        column = "uma_proposed_at" if status_lower == "proposed" else "uma_finalized_at"
+        cur = await self._db.conn.execute(
+            f"SELECT {column} FROM markets WHERE condition_id = ?",  # noqa: S608
+            (condition_id,),
+        )
+        existing = await cur.fetchone()
+        await cur.close()
+        if existing is None or existing[column] is not None:
+            return
+        now = _now_iso()
+        async with self._db.batch() as cur:
+            await cur.execute(
+                f"UPDATE markets SET {column} = ?, updated_at = ? "  # noqa: S608
+                f"WHERE condition_id = ? AND {column} IS NULL",
+                (now, now, condition_id),
+            )
 
     async def _maybe_fetch_fee_rate(self, condition_id: str) -> None:
         """If the CLOB client is wired and this market's fee_rate is
@@ -722,16 +908,35 @@ class MarketsStage:
         return len(to_close)
 
     async def _close_orphaned_trades_for(self, condition_ids: list[str]) -> int:
-        """Find any non-closed `trades` rows on the deactivated markets
-        and write trade_closures entries with close_reason='market_resolved'.
+        """Cycle 11: three-state UMA close machine
+        (plans/resolution-oracle.md D1). Find open trades on the given
+        markets and decide per-market whether to auto-close, based on the
+        market's UMA resolution state:
 
-        Exit mid is set to the trade's entry mid — irene can't tell
-        whether the market resolved YES or NO from Gamma's drop alone,
-        so PnL is recorded as fees-only (gross_pnl=0, net_pnl=-fees).
-        This is the conservative seulgi-style "exit at entry" path.
+        - **State 1** — closed but `last_resolution_status` is not
+          `'resolved'`. Wait. Don't auto-close. The Gamma `closed=true`
+          flag is NOT finality: UMA's Optimistic Oracle has a 2h
+          uncontested challenge window (or ~4-6d disputed). Closing at
+          `entry_mid` here costs us the actual $1/$0 redemption value.
+        - **State 2** — `last_resolution_status='proposed'`. Inside the
+          challenge window. The `uma_proposed_at` transition is already
+          stamped by `_maybe_stamp_resolution_transition` during the
+          poll cycle; just log and wait.
+        - **State 3** — `last_resolution_status='resolved'` AND
+          `last_outcome_prices` is a sensible 2-element `["1","0"]` /
+          `["0","1"]` payload. Close at the proper YES/NO payout
+          (NOT entry_mid). Index 0 = YES payout per the Gamma payload
+          convention (`unstructured answers.md` lines 36-44).
+        - **Human-review fallback** — if a market has sat in State 1
+          past `cfg.markets.resolution_timeout_hours` (default 168h = 7d),
+          emit a `RESOLUTION_TIMEOUT` WARNING and STILL leave the trade
+          open. Better to require a human eyeball than auto-close at a
+          guess; we kept the seulgi-era conservative path off the table
+          here to avoid silent PnL contamination from never-resolved
+          markets.
 
-        Returns the number of closures written. Idempotent — re-running
-        is a no-op because trade_closures.trade_id is UNIQUE.
+        Returns the count of trades transitioned (State 3 closures only).
+        Idempotent: trade_closures.trade_id UNIQUE prevents double-fires.
         """
         if not condition_ids:
             return 0
@@ -739,6 +944,9 @@ class MarketsStage:
         # CloserStage's lifecycle (the closer module is imported anyway
         # since both stages register schema).
         from app.stages.closer import write_trade_closure  # noqa: WPS433
+
+        timeout_hours = float(_config_get(self._config, "resolution_timeout_hours", 168.0))
+        now_dt = datetime.now(timezone.utc)
 
         written = 0
         for start in range(0, len(condition_ids), 800):
@@ -749,7 +957,9 @@ class MarketsStage:
                 SELECT t.id, t.signal_id, t.market_id, t.direction,
                        t.mid_price, t.size_usdc, t.decided_at,
                        t.is_tracer, t.tracer_id, t.target_mid,
-                       m.category, m.fee_rate
+                       m.category, m.fee_rate,
+                       m.last_resolution_status, m.last_outcome_prices,
+                       m.uma_proposed_at, m.uma_finalized_at, m.closed_at
                 FROM trades t
                 LEFT JOIN trade_closures c ON c.trade_id = t.id
                 LEFT JOIN markets m ON m.condition_id = t.market_id
@@ -775,19 +985,73 @@ class MarketsStage:
                         float(r["target_mid"]) if r["target_mid"] is not None else None
                     ),
                 }
-                ok = await write_trade_closure(
-                    self._db,
-                    trade=trade,
-                    exit_mid=trade["mid_price"],
-                    close_reason="market_resolved",
-                    trade_cfg=self._config.trade,
-                    category=r["category"],
-                    market_fee_rate=r["fee_rate"],
+                status_raw = r["last_resolution_status"]
+                status = status_raw.lower() if status_raw else None
+                exit_mid = _state3_exit_mid(
+                    direction=trade["direction"],
+                    last_outcome_prices=r["last_outcome_prices"],
                 )
-                if ok:
-                    written += 1
-                    logger.info(
-                        "markets: auto-closed trade_id=%d (market %s resolved)",
-                        trade["id"], trade["market_id"],
+
+                # State 3: finalized AND we have a usable payout. Close at
+                # the real $1/$0 redemption value.
+                if status == "resolved" and exit_mid is not None:
+                    ok = await write_trade_closure(
+                        self._db,
+                        trade=trade,
+                        exit_mid=exit_mid,
+                        close_reason="market_resolved",
+                        trade_cfg=self._config.trade,
+                        category=r["category"],
+                        market_fee_rate=r["fee_rate"],
                     )
+                    if ok:
+                        written += 1
+                        logger.info(
+                            "markets: auto-closed trade_id=%d (market %s "
+                            "resolved at exit_mid=%.2f, direction=%s)",
+                            trade["id"], trade["market_id"], exit_mid,
+                            trade["direction"],
+                        )
+                    continue
+
+                # State 3 sentinel: resolved but outcome data is malformed.
+                # Per the hard constraint, do NOT fall back to entry_mid —
+                # log a WARNING and skip. A subsequent poll cycle may
+                # re-fetch a sane outcomePrices payload.
+                if status == "resolved":
+                    logger.warning(
+                        "markets: trade_id=%d market %s resolved but "
+                        "last_outcome_prices=%r is unusable; skipping close",
+                        trade["id"], trade["market_id"], r["last_outcome_prices"],
+                    )
+                    continue
+
+                # State 2: inside the 2h UMA challenge window.
+                if status == "proposed":
+                    logger.info(
+                        "markets: trade_id=%d market %s in proposed state; "
+                        "waiting for UMA finalization (proposed_at=%s)",
+                        trade["id"], trade["market_id"], r["uma_proposed_at"],
+                    )
+                    continue
+
+                # State 1: closed but no UMA status yet. Check the
+                # human-review timeout against the market's closed_at
+                # (when the row went inactive). Fall back to the trade's
+                # decided_at if closed_at is somehow NULL.
+                anchor_iso = r["closed_at"] or trade["decided_at"]
+                age_h = _hours_since(anchor_iso, now_dt)
+                if age_h is not None and age_h > timeout_hours:
+                    logger.warning(
+                        "RESOLUTION_TIMEOUT trade_id=%d market=%s waited=%.1fh "
+                        "(timeout=%.1fh); leaving trade open for human review",
+                        trade["id"], trade["market_id"], age_h, timeout_hours,
+                    )
+                    continue
+                logger.info(
+                    "markets: trade_id=%d market %s closed but UMA not yet "
+                    "finalized; waiting (status=%r, age=%.1fh)",
+                    trade["id"], trade["market_id"],
+                    status_raw, age_h if age_h is not None else -1.0,
+                )
         return written

@@ -348,12 +348,15 @@ async def test_disappearing_market_is_deactivated(db_ready, bus, embedder, monke
     assert by_id["0xB"]["closed_at"] is not None
 
 
-async def test_disappearing_market_auto_closes_open_trades(db_ready, bus, embedder, monkeypatch):
-    """Cycle 7: when a market disappears from Gamma's open list, any
-    irene paper trade still positioned on it gets auto-closed with
-    reason='market_resolved' and exit_mid=entry_mid (conservative —
-    no Gamma outcome lookup yet). Without this, the closer's
-    `skip_on_missing_mid` would hold the trade forever."""
+async def test_disappearing_market_without_uma_status_does_not_auto_close(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 11 (replaces cycle-7 conservative-close behavior): when a
+    market drops from Gamma's open list with NO UMA resolution status on
+    record, the three-state machine is in State 1 — closed but oracle has
+    not spoken. Do NOT auto-close at entry_mid. Wait for `umaResolutionStatus`
+    to advance to `'resolved'` (which surfaces via `outcomePrices`) before
+    realising PnL. Plans/resolution-oracle.md §"State 1"."""
     stage = _make_stage(db_ready, bus, embedder)
 
     # Seed via Gamma: two markets so we can drop one without triggering
@@ -365,24 +368,51 @@ async def test_disappearing_market_auto_closes_open_trades(db_ready, bus, embedd
 
     monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
     await stage.poll_once()
+    await _seed_open_trade_async(
+        db_ready, trade_id=100, market_id="0xZ", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
 
-    # Seed an open paper trade on that market.
+    # Now 0xZ disappears from Gamma's open list (but 0xY stays so the
+    # empty-fetch safeguard doesn't short-circuit). No UMA status was ever
+    # observed for 0xZ — State 1, must NOT auto-close.
     from app.cycle import cycle_scope
-    async with db_ready.batch() as cur:
+    fetched.pop(0)  # drop the first entry = 0xZ
+    with cycle_scope(1):
+        await stage.poll_once()
+
+    # Trade is still open: no closure written.
+    cur = await db_ready.conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=100"
+    )
+    assert (await cur.fetchone())["n"] == 0
+
+
+async def _seed_open_trade_async(
+    db,
+    *,
+    trade_id: int,
+    market_id: str,
+    direction: str,
+    decided_at: str,
+    cycle_id: int,
+):
+    async with db.batch() as cur:
+        # Cycle row may already exist across multiple seed calls in one test.
         await cur.execute(
-            """
-            INSERT INTO cycles (id, name, opened_at)
-            VALUES (1, 'test', '2026-05-25T00:00:00+00:00')
-            """,
+            "INSERT OR IGNORE INTO cycles (id, name, opened_at) "
+            "VALUES (?, 'test', '2026-05-25T00:00:00+00:00')",
+            (cycle_id,),
         )
         await cur.execute(
             """
             INSERT INTO decisions
                 (signal_id, outcome, reason, gate_history, prediction_id,
                  cycle_id, is_tracer, tracer_id, created_at)
-            VALUES (NULL, 'execute', 'ok', '[]', 1, 1, 0, NULL,
+            VALUES (NULL, 'execute', 'ok', '[]', 1, ?, 0, NULL,
                     '2026-05-25T00:01:00+00:00')
             """,
+            (cycle_id,),
         )
         decision_id = cur.lastrowid
         await cur.execute(
@@ -393,33 +423,12 @@ async def test_disappearing_market_auto_closes_open_trades(db_ready, bus, embedd
                  mid_price, edge, kelly_fraction, size_usdc, decision_path,
                  features_snapshot, cycle_id, is_tracer, tracer_id,
                  decided_at, target_mid)
-            VALUES (100, NULL, ?, 1, '0xZ', 'YES', 0.7, 0.8, 'BREAKING',
-                    0.7, 0.5, 0.1, 0.1, 100.0, 'mvp', '{}', 1, 0, NULL,
-                    '2026-05-25T00:02:00+00:00', 0.7)
+            VALUES (?, NULL, ?, 1, ?, ?, 0.7, 0.8, 'BREAKING',
+                    0.7, 0.5, 0.1, 0.1, 100.0, 'mvp', '{}', ?, 0, NULL,
+                    ?, 0.7)
             """,
-            (decision_id,),
+            (trade_id, decision_id, market_id, direction, cycle_id, decided_at),
         )
-
-    # Now 0xZ disappears from Gamma's open list (but 0xY stays so the
-    # empty-fetch safeguard doesn't short-circuit).
-    fetched.pop(0)  # drop the first entry = 0xZ
-    with cycle_scope(1):
-        await stage.poll_once()
-
-    # Trade was auto-closed.
-    cur = await db_ready.conn.execute(
-        "SELECT trade_id, close_reason, exit_mid_price, realized_pnl_usdc "
-        "FROM trade_closures WHERE trade_id=100"
-    )
-    row = await cur.fetchone()
-    await cur.close()
-    assert row is not None, "auto-close should have written a closure row"
-    assert row["close_reason"] == "market_resolved"
-    assert row["exit_mid_price"] == pytest.approx(0.5)  # entry mid
-    # gross 0; net is -entry_fee only (exit_fee is zeroed on market_resolved
-    # per the no-fee-at-resolution rule). Politics → fee_rate=0.04.
-    # shares=100/0.5=200; entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0.
-    assert row["realized_pnl_usdc"] == pytest.approx(-2.0, rel=1e-3)
 
 
 async def test_first_seen_market_populates_fee_rate_from_clob(
@@ -667,3 +676,326 @@ async def test_market_index_skips_inactive_rows(db_ready, embedder):
     assert n == 1
     results = idx.topk(v1, k=10, floor=0.0)
     assert [cid for cid, _ in results] == ["c0"]
+
+
+# ---------------------------------------------------------------------------
+# Cycle 11: three-state UMA close machine
+# (plans/resolution-oracle.md D1)
+# ---------------------------------------------------------------------------
+
+
+async def _seed_market_row(
+    db,
+    *,
+    condition_id: str,
+    category: str = "Politics",
+    fee_rate: float = 0.04,
+    last_resolution_status=None,
+    last_outcome_prices=None,
+    uma_proposed_at=None,
+    uma_finalized_at=None,
+    closed_at=None,
+    active: int = 0,
+):
+    """Seed a markets row directly with the UMA fields the close machine
+    keys off. Bypasses the Gamma poll so each test controls exactly one
+    market's resolution state. `last_outcome_prices` may be a Python list
+    (auto-JSON'd) or a pre-formatted string."""
+    now = "2026-05-25T00:00:00+00:00"
+    if isinstance(last_outcome_prices, list):
+        outcome_json = json.dumps(last_outcome_prices)
+    else:
+        outcome_json = last_outcome_prices  # None or already a string
+    async with db.batch() as cur:
+        await cur.execute(
+            """
+            INSERT INTO markets (
+                condition_id, question, active, closed_at,
+                first_seen_at, updated_at, category, fee_rate,
+                last_resolution_status, last_outcome_prices,
+                uma_proposed_at, uma_finalized_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                condition_id, f"Q-{condition_id}", active, closed_at,
+                now, now, category, fee_rate,
+                last_resolution_status, outcome_json,
+                uma_proposed_at, uma_finalized_at,
+            ),
+        )
+
+
+async def test_close_machine_state1_does_not_close(db_ready, bus, embedder):
+    """State 1: market is closed (active=0) but no UMA status recorded yet.
+    The 2h UMA challenge window has not even started — auto-closing now
+    would book PnL at a stale mid instead of the actual $1/$0 redemption.
+    Must NOT write a closure."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xS1",
+        last_resolution_status=None,
+        last_outcome_prices=None,
+        closed_at="2026-05-25T00:00:00+00:00",
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=201, market_id="0xS1", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+    with cycle_scope(1):
+        n = await stage._close_orphaned_trades_for(["0xS1"])
+    assert n == 0
+    cur = await db_ready.conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=201"
+    )
+    assert (await cur.fetchone())["n"] == 0
+
+
+async def test_close_machine_state2_records_proposed_at_no_close(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """State 2: `umaResolutionStatus='proposed'`. The Gamma poll has
+    already stamped `uma_proposed_at` via the upsert path; the close
+    machine sees the row in State 2 and waits (we're inside the 2h
+    challenge window). Closure must NOT be written."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+
+    async def fake_fetch(self):
+        # Gamma returns the market still in the open list, but with
+        # umaResolutionStatus already 'proposed'.
+        row = _gamma_row("0xS2", "Q proposed")
+        row["umaResolutionStatus"] = "proposed"
+        row["resolvedBy"] = "0xORACLE"
+        row["acceptingOrders"] = False
+        return [row]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    # Confirm the upsert path stamped uma_proposed_at on the transition.
+    cur = await db_ready.conn.execute(
+        "SELECT uma_proposed_at, last_resolution_status "
+        "FROM markets WHERE condition_id='0xS2'"
+    )
+    row = await cur.fetchone()
+    assert row["last_resolution_status"] == "proposed"
+    assert row["uma_proposed_at"] is not None
+
+    # Seed an open trade and run the close machine — must NOT close.
+    await _seed_open_trade_async(
+        db_ready, trade_id=202, market_id="0xS2", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+    with cycle_scope(1):
+        n = await stage._close_orphaned_trades_for(["0xS2"])
+    assert n == 0
+    cur = await db_ready.conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=202"
+    )
+    assert (await cur.fetchone())["n"] == 0
+
+
+async def test_close_machine_state3_resolved_yes_closes_at_one(
+    db_ready, bus, embedder,
+):
+    """State 3 + YES winner: outcomePrices=["1","0"] (Polymarket convention
+    — index 0 = YES payout). A YES position must close at exit_mid=1.0,
+    realizing full $1 redemption. exit_fee zeroed per market_resolved
+    contract (closer.write_trade_closure)."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xS3Y",
+        last_resolution_status="resolved",
+        last_outcome_prices=["1", "0"],
+        uma_finalized_at="2026-05-25T01:00:00+00:00",
+        closed_at="2026-05-25T00:00:00+00:00",
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=203, market_id="0xS3Y", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+    with cycle_scope(1):
+        n = await stage._close_orphaned_trades_for(["0xS3Y"])
+    assert n == 1
+    cur = await db_ready.conn.execute(
+        "SELECT close_reason, exit_mid_price, realized_pnl_usdc, "
+        "       entry_fee_usdc, exit_fee_usdc "
+        "FROM trade_closures WHERE trade_id=203"
+    )
+    row = await cur.fetchone()
+    assert row["close_reason"] == "market_resolved"
+    assert row["exit_mid_price"] == pytest.approx(1.0)
+    assert row["exit_fee_usdc"] == pytest.approx(0.0)
+    # entry_mid=0.5, size=100 → shares=200. YES wins at 1.0:
+    #   gross = 200 * (1.0 - 0.5) = 100
+    #   entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0
+    #   net = 100 - 2.0 - 0 = 98.0
+    assert row["entry_fee_usdc"] == pytest.approx(2.0, rel=1e-3)
+    assert row["realized_pnl_usdc"] == pytest.approx(98.0, rel=1e-3)
+
+
+async def test_close_machine_state3_resolved_no_closes_at_zero(
+    db_ready, bus, embedder,
+):
+    """State 3 + NO winner: outcomePrices=["0","1"] (YES payout=0, NO
+    payout=1). `exit_mid_price` stored in the closure is always the YES
+    side (closer.write_trade_closure convention — the NO sign flip is
+    applied inside _compute_gross_pnl, not by the caller). On this
+    market: YES position loses, NO position wins."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xS3N",
+        last_resolution_status="resolved",
+        last_outcome_prices=["0", "1"],
+        uma_finalized_at="2026-05-25T01:00:00+00:00",
+        closed_at="2026-05-25T00:00:00+00:00",
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=204, market_id="0xS3N", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+    # Also seed a NO position on the same market — should also close.
+    await _seed_open_trade_async(
+        db_ready, trade_id=205, market_id="0xS3N", direction="NO",
+        decided_at="2026-05-25T00:03:00+00:00", cycle_id=1,
+    )
+    with cycle_scope(1):
+        n = await stage._close_orphaned_trades_for(["0xS3N"])
+    assert n == 2
+
+    cur = await db_ready.conn.execute(
+        "SELECT trade_id, close_reason, exit_mid_price, realized_pnl_usdc, "
+        "       entry_fee_usdc, exit_fee_usdc "
+        "FROM trade_closures WHERE trade_id IN (204, 205) ORDER BY trade_id"
+    )
+    rows = await cur.fetchall()
+    by_id = {r["trade_id"]: r for r in rows}
+
+    # YES position on a NO-winning market — exit_mid (YES side) = 0.
+    # _compute_gross_pnl(YES) = size * (exit - entry) / entry
+    #   = 100 * (0.0 - 0.5) / 0.5 = -100
+    # entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0; exit_fee = 0 (market_resolved)
+    # net = -100 - 2 = -102
+    assert by_id[204]["close_reason"] == "market_resolved"
+    assert by_id[204]["exit_mid_price"] == pytest.approx(0.0)
+    assert by_id[204]["exit_fee_usdc"] == pytest.approx(0.0)
+    assert by_id[204]["realized_pnl_usdc"] == pytest.approx(-102.0, rel=1e-3)
+
+    # NO position on a NO-winning market — exit_mid (YES side) = 0 too,
+    # but _compute_gross_pnl flips the sign for NO:
+    #   gross = size * (entry - exit) / (1 - entry)
+    #         = 100 * (0.5 - 0.0) / 0.5 = +100   (full $1 NO redemption)
+    # entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0; exit_fee = 0
+    # net = 100 - 2 = 98
+    assert by_id[205]["close_reason"] == "market_resolved"
+    assert by_id[205]["exit_mid_price"] == pytest.approx(0.0)
+    assert by_id[205]["exit_fee_usdc"] == pytest.approx(0.0)
+    assert by_id[205]["realized_pnl_usdc"] == pytest.approx(98.0, rel=1e-3)
+
+
+async def test_close_machine_human_review_timeout_logs_warning(
+    db_ready, bus, embedder, caplog,
+):
+    """State 1 with age > resolution_timeout_hours: emit RESOLUTION_TIMEOUT
+    WARNING and STILL do NOT auto-close (the trade is left open for human
+    review — better than guessing at a $1/$0 outcome we can't verify)."""
+    import logging
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    # Patch the timeout to a tiny value so we don't have to fake "now".
+    stage._config.markets = type("MarketsCfg", (), {"resolution_timeout_hours": 0.001})()
+    # closed_at well in the past so we breach the timeout.
+    await _seed_market_row(
+        db_ready, condition_id="0xST",
+        last_resolution_status=None,
+        closed_at="2020-01-01T00:00:00+00:00",
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=206, market_id="0xST", direction="YES",
+        decided_at="2020-01-01T00:02:00+00:00", cycle_id=1,
+    )
+    with caplog.at_level(logging.WARNING, logger="app.stages.markets"):
+        with cycle_scope(1):
+            n = await stage._close_orphaned_trades_for(["0xST"])
+    assert n == 0
+    # Trade still open.
+    cur = await db_ready.conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=206"
+    )
+    assert (await cur.fetchone())["n"] == 0
+    # And a tagged warning was logged.
+    assert any(
+        "RESOLUTION_TIMEOUT" in rec.getMessage() and "trade_id=206" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+async def test_close_machine_idempotent_on_finalized_row(db_ready, bus, embedder):
+    """Re-running the close machine on an already-finalized market must
+    NOT double-write. trade_closures.trade_id UNIQUE enforces this at the
+    DB level; the second call should report 0 new closures."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xSI",
+        last_resolution_status="resolved",
+        last_outcome_prices=["1", "0"],
+        uma_finalized_at="2026-05-25T01:00:00+00:00",
+        closed_at="2026-05-25T00:00:00+00:00",
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=207, market_id="0xSI", direction="YES",
+        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+    )
+    with cycle_scope(1):
+        n_first = await stage._close_orphaned_trades_for(["0xSI"])
+        n_second = await stage._close_orphaned_trades_for(["0xSI"])
+    assert n_first == 1
+    assert n_second == 0
+    cur = await db_ready.conn.execute(
+        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=207"
+    )
+    assert (await cur.fetchone())["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Parser additions for cycle 11
+# ---------------------------------------------------------------------------
+
+
+def test_parse_gamma_row_extracts_uma_fields_native_list():
+    """outcomePrices as a native list (some Gamma responses)."""
+    raw = _gamma_row("0xUMA1", "Q")
+    raw["umaResolutionStatus"] = "resolved"
+    raw["resolvedBy"] = "0xORACLE"
+    raw["acceptingOrders"] = False
+    raw["outcomePrices"] = ["1", "0"]
+    row = _parse_gamma_row(raw)
+    assert row["uma_resolution_status"] == "resolved"
+    assert row["resolved_by"] == "0xORACLE"
+    assert row["accepting_orders"] is False
+    assert row["outcome_prices"] == ["1", "0"]
+
+
+def test_parse_gamma_row_extracts_uma_fields_json_string():
+    """outcomePrices as a JSON-encoded string (matches the clobTokenIds
+    quirk — Polymarket stringifies some array fields)."""
+    raw = _gamma_row("0xUMA2", "Q")
+    raw["umaResolutionStatus"] = "proposed"
+    raw["outcomePrices"] = json.dumps(["0", "1"])
+    row = _parse_gamma_row(raw)
+    assert row["uma_resolution_status"] == "proposed"
+    assert row["outcome_prices"] == ["0", "1"]
+
+
+def test_parse_gamma_row_handles_missing_uma_fields():
+    """Open markets typically have no UMA fields at all — parser must
+    return Nones / empty list, not blow up."""
+    row = _parse_gamma_row(_gamma_row("0xUMA3", "Q"))
+    assert row["uma_resolution_status"] is None
+    assert row["resolved_by"] is None
+    assert row["accepting_orders"] is None
+    assert row["outcome_prices"] == []

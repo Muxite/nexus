@@ -209,9 +209,10 @@ class ImpactSection(BaseModel):
 
     poll_seconds: int = Field(default=15, ge=5)
     # Maximum age (hours) we keep polling a price_impacts row. After this
-    # we stop polling even if some buckets are NULL — the t=3600s bucket
-    # is the last interesting one anyway.
-    max_age_hours: float = Field(default=2.0, gt=0)
+    # we stop polling even if some buckets are NULL. Raised to 24.0 in
+    # cycle 11 so the new +24h long-tail bucket has time to fire
+    # (impact_tracker.py BUCKETS_SECONDS now ends at 86400s).
+    max_age_hours: float = Field(default=24.0, gt=0)
 
 
 class DKGTradeSection(BaseModel):

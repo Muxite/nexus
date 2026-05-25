@@ -202,4 +202,6 @@ closer:
 
 impact:
   poll_seconds: 30
-  max_age_hours: 2.0
+  # Cycle 11: raised to 24h so the +24h long-tail bucket
+  # (BUCKETS_SECONDS=86400 in impact_tracker.py) has time to fire.
+  max_age_hours: 24.0
