@@ -22,6 +22,7 @@ import app.stages.resolve  # noqa: F401, E402
 import app.stages.trade  # noqa: F401, E402
 from app.dashboard import Dashboard  # noqa: E402
 from app.dashboard.pages import latency_breakdown as latency_breakdown_page  # noqa: E402
+from app.dashboard.pages import main as main_page  # noqa: E402
 from app.dashboard.pages import pnl as pnl_page  # noqa: E402
 from app.dashboard.pages import recent_trades as recent_trades_page  # noqa: E402
 from app.db import DB  # noqa: E402
@@ -488,3 +489,55 @@ async def test_latency_panel_renders_reject_section(db_ready, tmp_path):
     assert edge_lines, "ai_direction per-step line not found in reject section"
     # n=2 for the two edge_below_min rejects.
     assert "n=2" in edge_lines[0]
+
+
+# ─── wallet honesty on dead-market positions (cycle 24, handoff E) ───
+#
+# When a market closes while we still hold a position, Polymarket's
+# /midpoint returns the frozen last-traded price and the wallet panel
+# used to render "invested $X → current $X" as if that were live PnL.
+# main._current_mid_for_trade now short-circuits to None on closed/
+# inactive markets, and the per-position display annotates the row as
+# "unpriceable (frozen, market closed YYYY-MM-DD)". The accounting
+# identity must still hold (current_mid=None ⇒ value=entry_mid ⇒
+# unrealized=0), so the EQUITY check is still "OK".
+
+
+async def test_wallet_marks_closed_market_position_as_unpriceable(db_ready, tmp_path):
+    """Position on a closed market renders as unpriceable, not as a
+    healthy mark-to-market. EQUITY identity still holds because the
+    wallet helpers fall back to entry_mid (unrealized PnL = 0)."""
+    async with db_ready.batch() as cur:
+        # Seed the market as CLOSED 3 days ago (mirrors trade 40 in the
+        # cycle-19 retro). active=0, closed_at='2026-05-23'.
+        await cur.execute(
+            """
+            INSERT INTO markets
+              (condition_id, slug, question, description, category, end_date,
+               volume_usdc, token_yes, token_no, embedding, embedder_id,
+               embedding_dim, embedding_updated_at, active, closed_at,
+               first_seen_at, updated_at)
+            VALUES ('m1','s','Will the dead market resolve?','d','c','2026-05-23',
+                    100.0,'ty','tn',NULL,NULL,NULL,NULL,0,'2026-05-23T00:00:00+00:00',
+                    datetime('now'), datetime('now'))
+            """
+        )
+        # One open trade on the dead market.
+        await _seed_trade(cur, trade_id=1, decision_path="mvp", closed=False)
+
+    dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)
+    # cfg=None is the safe default — _current_mid_for_trade returns None
+    # before reaching the closed-market check, so we explicitly want a
+    # cfg so the closed-market short-circuit is exercised.
+    from app.config import Config
+    dash.cfg = Config()
+    body = await main_page.render(dash)
+
+    # Per-position annotation — date is the truncated closed_at.
+    assert "unpriceable (frozen, market closed 2026-05-23)" in body
+    # Summary line surfaces the unpriceable count: 1 open, 0 priced, 1 unpriceable.
+    assert "open positions (1, 0 priced (1 unpriceable))" in body
+    # current == invested (no fake PnL): both are $25.00 from the seed.
+    assert "invested $   25.00 → current $   25.00" in body
+    # And the accounting identity still passes (current=entry_mid → unrealized=0).
+    assert "identity OK" in body

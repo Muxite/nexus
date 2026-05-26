@@ -25,7 +25,8 @@ async def _fetch_open_trades(dash) -> list[dict]:
         f"""
         SELECT t.id, t.market_id, t.direction, t.mid_price AS entry_mid,
                t.size_usdc, t.decided_at, t.decision_path, t.target_mid,
-               m.token_yes, m.token_no, m.question
+               m.token_yes, m.token_no, m.question,
+               m.active AS market_active, m.closed_at AS market_closed_at
         FROM trades t
         LEFT JOIN trade_closures c ON c.trade_id = t.id
         LEFT JOIN markets m ON m.condition_id = t.market_id
@@ -64,6 +65,14 @@ async def _current_mid_for_trade(dash, t: dict) -> float | None:
     if dash.cfg is None:
         # No CLOB threaded → can't price open positions.
         return None
+    # Cycle 24 (handoff E): refuse to mark dead markets as live. Polymarket's
+    # /midpoint returns the frozen last-trade price for closed markets — accepting
+    # that as 'current value' makes invested == current == fake-flat, hiding the
+    # ~$15–17 of fees the stuck position will book at timeout.
+    if t.get("market_closed_at") is not None or (
+        t.get("market_active") is not None and int(t["market_active"]) != 1
+    ):
+        return None  # signals "unpriceable" to wallet helpers + display
     token_id = t.get("token_yes") if t["direction"] == "YES" else t.get("token_no")
     if not token_id:
         return None
@@ -260,6 +269,10 @@ async def render(dash) -> str:
             "decided_at": t["decided_at"],
             "question": t.get("question"),
             "id": t["id"],
+            # Cycle 24 (handoff E): propagate market liveness for the
+            # "unpriceable / frozen, market closed YYYY-MM-DD" annotation.
+            "market_active": t.get("market_active"),
+            "market_closed_at": t.get("market_closed_at"),
         })
 
     open_size = wallet.sum_open_size_invested(open_trades_raw)
@@ -277,13 +290,25 @@ async def render(dash) -> str:
     n_open = len(open_with_mid)
     n_closed = len(closed_trades)
     n_pricable = sum(1 for t in open_with_mid if t["current_mid"] is not None)
+    # Cycle 24 (handoff E): positions on dead markets (closed_at set OR
+    # active != 1) get current_mid=None upstream. Surface that count so
+    # operators don't read "invested == current" as healthy when it just
+    # means "the market is dead and we can't price it."
+    n_unpriceable = sum(
+        1 for t in open_with_mid
+        if t["current_mid"] is None and (
+            t.get("market_closed_at") is not None
+            or (t.get("market_active") is not None and int(t["market_active"]) != 1)
+        )
+    )
+    unpriceable_tail = f" ({n_unpriceable} unpriceable)" if n_unpriceable else ""
 
     lines += [
         "",
         "WALLET (paper):",
         f"  initial:   ${initial_balance:>9.2f}",
         f"  cash:      ${cash:>9.2f}    "
-        f"open positions ({n_open}, {n_pricable} priced): "
+        f"open positions ({n_open}, {n_pricable} priced{unpriceable_tail}): "
         f"invested ${open_size:>8.2f} → current ${open_value:>8.2f}",
         f"  realized:  {realized:>+9.2f}    unrealized: {unreal:>+9.2f}    "
         f"closed: {n_closed}",
@@ -328,8 +353,20 @@ async def render(dash) -> str:
         for t in open_with_mid[:5]:
             q = (t.get("question") or "(?)")[:50]
             cur_mid = t["current_mid"]
+            # Cycle 24 (handoff E): if current_mid is None because the
+            # market is closed/inactive, say so loudly. Anything else with
+            # None is a transient CLOB miss → the old "no mid" placeholder.
+            market_closed_at = t.get("market_closed_at")
+            market_active = t.get("market_active")
+            is_dead_market = market_closed_at is not None or (
+                market_active is not None and int(market_active) != 1
+            )
             if cur_mid is None:
-                priced = "  no mid "
+                if is_dead_market:
+                    closed_date = (market_closed_at or "")[:10] or "?"
+                    priced = f"unpriceable (frozen, market closed {closed_date})"
+                else:
+                    priced = "  no mid "
                 upnl_str = "    -   "
             else:
                 upnl_t = wallet.unrealized_pnl(
