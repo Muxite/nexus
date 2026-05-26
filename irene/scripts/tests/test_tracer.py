@@ -133,7 +133,10 @@ def test_check_empty_db_reports_zero_and_ok(tmp_path):
 
 def test_all_templates_parse_and_have_required_keys():
     paths = sorted(TEMPLATES_DIR.glob("*.yaml"))
-    assert len(paths) == 3, f"expected 3 templates, found {len(paths)}: {paths}"
+    # Cycle 24 added the tracer-stress scenario set on top of the
+    # original P1 three. Either bar (legacy ≥ 3) is fine — the assertion
+    # is just that every template on disk parses + renders.
+    assert len(paths) >= 3, f"expected >=3 templates, found {len(paths)}: {paths}"
     for path in paths:
         raw = yaml.safe_load(path.read_text())
         assert isinstance(raw, dict), f"{path} did not parse as a mapping"

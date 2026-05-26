@@ -1,0 +1,46 @@
+title: "Hezbollah disarms {percent}% of medium-range arsenal under Saudi-brokered deal"
+summary: "Tracer #{i} ({source_detail}): Per a {broker}-brokered framework, Hezbollah agrees to surrender {percent}% of its medium-range arsenal within {days} days. Lebanese army to take custody. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "hezbollah_disarm"
+url_pattern: "https://tracer.local/hezbollah_disarm/{i}"
+
+title_variants:
+  - "Hezbollah disarms {percent}% of medium-range arsenal under {broker}-brokered deal"
+  - "Lebanese parliament passes Hezbollah weapons-handover bill {vote}"
+  - "{broker} confirms Hezbollah weapons depot transferred to Lebanese army"
+  - "Nasrallah successor accepts {percent}% drawdown of long-range missile stocks"
+  - "UN verifies {percent}% of Hezbollah arsenal decommissioned in {city}"
+
+variables:
+  percent:
+    - "10"
+    - "25"
+    - "40"
+    - "60"
+    - "75"
+    - "90"
+  broker:
+    - Saudi
+    - Qatari
+    - Omani
+    - French
+    - U.S.
+    - Egyptian
+  days:
+    - "30"
+    - "60"
+    - "90"
+    - "120"
+    - "180"
+  vote:
+    - "64-58"
+    - "72-46"
+    - "85-33"
+    - "91-27"
+    - "103-15"
+  city:
+    - Beirut
+    - Sidon
+    - Baalbek
+    - Tyre
+    - Nabatieh

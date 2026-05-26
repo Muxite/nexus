@@ -1,0 +1,61 @@
+# Tracer template: Iran/Israel kinetic strikes
+#
+# Schema (back-compat):
+#   - title / summary / url_pattern: format strings with `{i}` and any var name
+#   - source / source_detail: literal strings
+#   - title_variants (optional): list of alternative title format strings;
+#     fire.py round-robins through them so a single template can produce
+#     wildly different headlines for the same scenario class.
+#   - variables (optional): mapping of {name: [list of choices]}.
+#     fire.py expands a deterministic combination per `i` so 50+ unique
+#     articles are produced without YAML bloat.
+#
+# Total distinct articles >= len(title_variants) x prod(len(var_list)).
+# For this file: 4 variants x 6 targets x 6 locations x 5 counts x 6 cities x 4 straits
+# = thousands — caps naturally at `count` parameter.
+
+title: "U.S. strikes Iranian missile site near {target}"
+summary: "Tracer #{i} ({source_detail}): U.S. forces conducted a precision strike on Iranian-linked infrastructure near {target}. Per officials, {count} casualties reported; Tehran has not commented. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "iran_strike"
+url_pattern: "https://tracer.local/iran_strike/{i}"
+
+title_variants:
+  - "U.S. strikes Iranian missile site near {target}"
+  - "Israel hits Hezbollah convoy in {location}; {count} reported dead"
+  - "Iran launches {count} missiles toward {israeli_city}"
+  - "U.S. Navy intercepts Iranian boat laying mines in {strait}"
+
+variables:
+  target:
+    - Bandar Abbas
+    - Natanz
+    - Fordow
+    - Isfahan
+    - Bushehr
+    - Tabriz
+  location:
+    - Bekaa Valley
+    - southern Lebanon
+    - Damascus suburbs
+    - the Golan Heights
+    - Beirut
+    - Tyre
+  count:
+    - "3"
+    - "12"
+    - "27"
+    - "44"
+    - "61"
+  israeli_city:
+    - Tel Aviv
+    - Haifa
+    - Eilat
+    - Be'er Sheva
+    - Ashkelon
+    - Jerusalem
+  strait:
+    - Strait of Hormuz
+    - Bab el-Mandeb
+    - Suez approaches
+    - Gulf of Oman

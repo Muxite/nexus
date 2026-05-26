@@ -1,0 +1,75 @@
+title: "{candidate} concedes {state} primary to {winner}"
+summary: "Tracer #{i} ({source_detail}): With {percent}% of precincts reporting in {state}, {candidate} conceded the {race} to {winner}. Margin: {margin} points. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "election_upset"
+url_pattern: "https://tracer.local/election_upset/{i}"
+
+title_variants:
+  - "{candidate} concedes {state} primary to {winner}, margin {margin} points"
+  - "{party} wins {n_seats}-seat majority in surprise upset"
+  - "Supreme Court rules {precedent} unconstitutional {vote}"
+  - "Recount confirms {winner} flip in {state}; {candidate} files challenge"
+  - "{winner} sweeps {state} delegation as {party} loses three governorships"
+
+variables:
+  candidate:
+    - Newsom
+    - DeSantis
+    - Haley
+    - Buttigieg
+    - Vance
+    - Whitmer
+    - Pritzker
+  state:
+    - Iowa
+    - New Hampshire
+    - South Carolina
+    - Michigan
+    - Pennsylvania
+    - Arizona
+    - Georgia
+  winner:
+    - an independent insurgent
+    - the incumbent
+    - a write-in candidate
+    - the dark-horse challenger
+    - a celebrity entrant
+  percent:
+    - "62"
+    - "78"
+    - "89"
+    - "94"
+    - "99"
+  race:
+    - governor's race
+    - senate primary
+    - presidential caucus
+    - special election
+  margin:
+    - "0.4"
+    - "1.7"
+    - "3.5"
+    - "6.2"
+    - "11"
+  party:
+    - GOP
+    - Democrats
+    - Greens
+    - Libertarians
+    - a new third party
+  n_seats:
+    - "4"
+    - "7"
+    - "12"
+    - "19"
+  precedent:
+    - the 1965 Voting Rights Act sec. 5
+    - Chevron deference
+    - the individual mandate
+    - state gerrymandering remedies
+    - federal student-loan forgiveness
+  vote:
+    - "6-3"
+    - "5-4"
+    - "7-2"
+    - "8-1"

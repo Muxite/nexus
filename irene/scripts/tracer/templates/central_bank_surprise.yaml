@@ -1,0 +1,61 @@
+title: "Fed hikes by {bps} bps in emergency meeting"
+summary: "Tracer #{i} ({source_detail}): {bank} announced an unscheduled {action} of {bps} basis points citing {reason}. Markets reacted sharply; dollar {dxy_dir}. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "central_bank_surprise"
+url_pattern: "https://tracer.local/central_bank_surprise/{i}"
+
+title_variants:
+  - "Fed hikes by {bps} bps in emergency meeting, cites {reason}"
+  - "ECB cuts rates {bps} bps, citing {reason}"
+  - "BoJ ends yield-curve control after {years} years"
+  - "Powell signals {hike_count} more hikes in 2026, dot-plot revised"
+  - "{bank} delivers shock {action} of {bps} bps, {dxy_dir}"
+  - "Bank of England {action} {bps} bps in {month} surprise"
+
+variables:
+  bps:
+    - "25"
+    - "50"
+    - "75"
+    - "100"
+    - "150"
+  bank:
+    - The Federal Reserve
+    - The ECB
+    - The Bank of Japan
+    - The Bank of England
+    - The PBoC
+    - The Swiss National Bank
+  action:
+    - hike
+    - cut
+    - hold-with-guidance
+    - reverse-repo expansion
+  reason:
+    - persistent core inflation
+    - currency defense pressure
+    - banking-sector stress
+    - oil-shock pass-through
+    - labor-market overheating
+    - financial-stability risk
+  dxy_dir:
+    - dollar surged
+    - dollar collapsed
+    - dollar whipsawed
+    - DXY broke 110
+  years:
+    - "5"
+    - "8"
+    - "11"
+    - "15"
+  hike_count:
+    - "two"
+    - "three"
+    - "four"
+    - "no"
+  month:
+    - January
+    - March
+    - June
+    - September
+    - November

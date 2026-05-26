@@ -1,0 +1,68 @@
+title: "{celeb} dies at {age} after long battle with {cause}"
+summary: "Tracer #{i} ({source_detail}): Family confirms {celeb}, {age}, passed at {location} after {cause}. Tributes pour in from {peer_group}. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "celebrity_event"
+url_pattern: "https://tracer.local/celebrity_event/{i}"
+
+title_variants:
+  - "{celeb} dies at {age} after long battle with {cause}"
+  - "{celeb} arrested in {location} on {charge} charges"
+  - "{celeb} announces retirement effective {month} {year}"
+  - "{celeb} hospitalized in {location} following {cause}"
+  - "{celeb} confirms divorce after {duration}-year marriage"
+
+variables:
+  celeb:
+    - A pop-superstar
+    - A tech-billionaire founder
+    - A former Hollywood A-lister
+    - A retired NBA legend
+    - A Nobel laureate
+    - A reality-TV mogul
+    - A reclusive author
+  age:
+    - "47"
+    - "58"
+    - "63"
+    - "71"
+    - "82"
+    - "89"
+  cause:
+    - cancer
+    - cardiac arrest
+    - undisclosed long illness
+    - complications from surgery
+    - a private health condition
+  location:
+    - Los Angeles
+    - New York
+    - Miami
+    - London
+    - Aspen
+    - Lake Como
+  peer_group:
+    - the music industry
+    - Silicon Valley
+    - the film community
+    - the literary world
+    - the sports world
+  charge:
+    - fraud
+    - DUI
+    - assault
+    - tax-evasion
+    - money-laundering
+  month:
+    - January
+    - May
+    - August
+    - December
+  year:
+    - "2026"
+    - "2027"
+    - "2028"
+  duration:
+    - "7"
+    - "14"
+    - "22"
+    - "31"

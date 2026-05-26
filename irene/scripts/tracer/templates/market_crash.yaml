@@ -1,0 +1,66 @@
+title: "S&P 500 plunges {percent}% on {trigger}"
+summary: "Tracer #{i} ({source_detail}): U.S. equities sold off sharply after {trigger}, with the S&P 500 down {percent}% intraday. VIX spiked above {vix}. Treasury yields {direction}. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "market_crash"
+url_pattern: "https://tracer.local/market_crash/{i}"
+
+title_variants:
+  - "S&P 500 plunges {percent}% on {trigger}"
+  - "Bitcoin crashes below ${price}k after {trigger}"
+  - "Nasdaq circuit breaker triggered at -{percent}% as {trigger} hits sentiment"
+  - "Treasury yields spike to {rate}% on {trigger}; bond rout deepens"
+  - "Gold hits all-time high ${gold_price}/oz on {trigger}, safe-haven flight intensifies"
+  - "Dow drops {dow_points} points in worst session since {past_year}"
+
+variables:
+  percent:
+    - "3.2"
+    - "5.7"
+    - "7.1"
+    - "9.8"
+    - "12.4"
+  trigger:
+    - escalation in the Strait of Hormuz
+    - surprise Fed emergency hike
+    - China property-sector collapse
+    - sovereign default rumors out of Europe
+    - mass tech layoff cascade
+    - AI capex pullback
+  vix:
+    - "38"
+    - "52"
+    - "67"
+    - "81"
+    - "95"
+  direction:
+    - collapsed to multi-year lows
+    - spiked to decade highs
+    - whipsawed in record volume
+    - inverted further
+  price:
+    - "42"
+    - "55"
+    - "68"
+    - "80"
+    - "95"
+  rate:
+    - "4.8"
+    - "5.3"
+    - "6.1"
+    - "7.0"
+    - "8.2"
+  gold_price:
+    - "2,850"
+    - "3,100"
+    - "3,475"
+    - "3,900"
+  dow_points:
+    - "1,200"
+    - "1,850"
+    - "2,400"
+    - "3,100"
+  past_year:
+    - "2008"
+    - "2020"
+    - "1987"
+    - "2001"

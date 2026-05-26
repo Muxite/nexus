@@ -1,0 +1,83 @@
+title: "{underdog} beats {favorite} {score} in {tournament} stunner"
+summary: "Tracer #{i} ({source_detail}): In a result few predicted, {underdog} defeated {favorite} by {score} at the {tournament}. Star player {star} {star_action}. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "sports_upset"
+url_pattern: "https://tracer.local/sports_upset/{i}"
+
+title_variants:
+  - "{underdog} beats {favorite} {score} in {tournament} stunner"
+  - "{star} ruled out for season with {injury}"
+  - "{team} fires manager {manager_name} after {streak}-game losing streak"
+  - "{underdog} clinches {tournament} title with {score} upset over {favorite}"
+  - "{star} suspended {games} games for {violation}"
+
+variables:
+  underdog:
+    - Wales
+    - Morocco
+    - the Phoenix Suns
+    - Bournemouth
+    - the Sacramento Kings
+    - Brighton
+    - Atalanta
+  favorite:
+    - Brazil
+    - Manchester City
+    - the Lakers
+    - Real Madrid
+    - the Celtics
+    - Bayern Munich
+  score:
+    - "2-1"
+    - "3-0"
+    - "4-3 (AET)"
+    - "118-104"
+    - "5-2"
+  tournament:
+    - World Cup quarter-final
+    - Champions League final
+    - NBA Finals
+    - FA Cup
+    - Super Bowl
+    - Cricket World Cup
+  star:
+    - the league MVP
+    - the captain
+    - the top scorer
+    - the rookie of the year
+  star_action:
+    - went off after 14 minutes
+    - dropped 42 points in defeat
+    - missed a late penalty
+    - delivered a hat-trick
+  injury:
+    - torn ACL
+    - Achilles rupture
+    - hamstring tear
+    - concussion protocol
+  team:
+    - Chelsea
+    - the Dallas Cowboys
+    - the New York Yankees
+    - Inter Milan
+    - the Toronto Maple Leafs
+  manager_name:
+    - Pochettino
+    - Pep Guardiola
+    - a long-tenured veteran
+    - the interim caretaker
+  streak:
+    - "6"
+    - "9"
+    - "12"
+    - "15"
+  games:
+    - "3"
+    - "8"
+    - "15"
+    - "25"
+  violation:
+    - PED test
+    - betting policy
+    - off-field conduct
+    - on-court altercation
