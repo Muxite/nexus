@@ -359,6 +359,54 @@ async def test_upsert_preserves_earlier_closedtime_via_coalesce(
     assert row["closed_at"] == "2026-05-25T08:00:00+00:00"
 
 
+async def test_upsert_does_not_reactivate_closed_market(
+    db_ready, bus, embedder,
+):
+    """Cycle 24 (handoff D): once a market has a `closed_at` stamp,
+    a subsequent Gamma observation that reports `closed=false` (the
+    cycle-12 active-flicker shape) MUST NOT flip `active` back to 1.
+    The SQL CASE in `_upsert_market`'s ON CONFLICT clause forces
+    `active=0` whenever `markets.closed_at IS NOT NULL`, completing
+    the fix that cycle-18 left half-done (COALESCE preserved
+    closed_at but `active = excluded.active` still let it flicker).
+
+    Worst-case witness: trade 40 in handoff A — DKG bought NO on a
+    market with `active=1, closed_at='2026-05-23'` because the upsert
+    let the two columns drift out of sync."""
+    stage = _make_stage(db_ready, bus, embedder)
+
+    # First upsert: market closed with a platform `closedTime`.
+    raw1 = _gamma_row("0xFLK1", "Will the flicker test pass?")
+    raw1["closed"] = True
+    raw1["closedTime"] = "2026-05-23T05:51:21+00:00"
+    await stage._upsert_market(_parse_gamma_row(raw1))
+
+    cur = await db_ready.conn.execute(
+        "SELECT active, closed_at FROM markets WHERE condition_id='0xFLK1'"
+    )
+    r = await cur.fetchone()
+    await cur.close()
+    assert r["active"] == 0
+    assert r["closed_at"] == "2026-05-23T05:51:21+00:00"
+
+    # Second upsert: Gamma re-emits the same market with closed=false
+    # (the active-flicker shape). Pre-cycle-24 this would have set
+    # active=1 while COALESCE kept closed_at populated, leaving the
+    # row in the contradictory "open + closed" state.
+    raw2 = _gamma_row("0xFLK1", "Will the flicker test pass?")
+    raw2["closed"] = False
+    await stage._upsert_market(_parse_gamma_row(raw2))
+
+    cur = await db_ready.conn.execute(
+        "SELECT active, closed_at FROM markets WHERE condition_id='0xFLK1'"
+    )
+    r = await cur.fetchone()
+    await cur.close()
+    # Cycle-24 fix: active stays 0 because closed_at is preserved.
+    assert r["active"] == 0, "active should NOT flip back to 1"
+    assert r["closed_at"] == "2026-05-23T05:51:21+00:00"
+
+
 # ---------------------------------------------------------------------------
 # DDL registration
 # ---------------------------------------------------------------------------

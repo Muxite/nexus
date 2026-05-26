@@ -1059,7 +1059,20 @@ class MarketsStage:
                     volume_usdc = excluded.volume_usdc,
                     token_yes = excluded.token_yes,
                     token_no = excluded.token_no,
-                    active = excluded.active,
+                    -- Cycle 24: markets do not re-open after closing on
+                    -- Polymarket. If we already have a historical
+                    -- `closed_at`, force `active=0` regardless of what
+                    -- Gamma reports — this completes the active-flicker
+                    -- fix that cycle-18 left half-done (cycle-18 only
+                    -- preserved closed_at via COALESCE but still let
+                    -- `active` flip back to 1 when Gamma transiently
+                    -- re-emits the market with closed=false). Trade 40
+                    -- (handoff A) is the worst-case witness: DKG bought
+                    -- NO on a market with active=1 + closed_at past.
+                    active = CASE
+                        WHEN markets.closed_at IS NOT NULL THEN 0
+                        ELSE excluded.active
+                    END,
                     -- Cycle 18: COALESCE preserves an earlier authoritative
                     -- closedTime if Gamma later transiently drops it. Only
                     -- overwrite NULL → non-NULL; never non-NULL → different.
