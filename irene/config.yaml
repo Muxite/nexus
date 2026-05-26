@@ -195,6 +195,23 @@ ingest:
 
 trade:
   balance_usdc: 1000.0
+  # Cycle 24 (2026-05-26) — RELAX FOR BACKTEST DATA YIELD.
+  # The post-cycle-24 funnel is direction-gate dominated (78% NEUTRAL) with
+  # market_news_imbalance (10%), mid_degenerate (4%), and edge_below_min (1%)
+  # killing decisive YES/NO predictions downstream. F's near-miss panel shows
+  # the LLM is making 0.75-0.95 confidence calls that get rejected on
+  # microstructure floors. To populate scripts/replay/sweep.py with a rich
+  # enough trade set to discriminate signal from noise, we deliberately let
+  # marginal trades through here, then sweep thresholds upward in replay to
+  # see which gates ACTUALLY filter losing trades vs which just cost yield.
+  # If a metric (PnL, win-rate, sharpe) IMPROVES when a knob is raised in
+  # backtest, that knob earns its keep; if not, it was just noise filtering.
+  # Re-tighten the survivors after the sweep finishes.
+  min_confidence: 0.45              # was 0.55 (Pydantic default)
+  min_edge: 0.02                    # was 0.04
+  min_market_volume_usdc: 2000.0    # was 10000 (unblocks "thin_market" floor)
+  extreme_mid_low: 0.05             # was 0.15 (widens mid_degenerate band)
+  extreme_mid_high: 0.95            # was 0.85
 
 dkg_trade:
   # Chunk-3 dual-path trader. final_score >= 0.8 gives ~69% precision
