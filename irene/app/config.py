@@ -374,6 +374,13 @@ class TradeSection(BaseModel):
     # for 24-72h" — that's not stale, it's developing slower; still worth
     # a trade-gate look. Only STALE_RETURN (≥72h quiet) stays rejected.
     accept_freshness: list[str] = Field(default_factory=lambda: ["BREAKING", "EVOLVING", "REHASH"])
+    # Cycle 24+ (handoff F): any prediction with confidence >= this floor
+    # is "leaning" enough to surface in the near-miss audit panel. Below
+    # this, the model itself is admitting it has no signal. Above this AND
+    # below `min_confidence` is the band we want to inspect manually before
+    # relaxing the trade gate. Strictly an audit knob — never consulted by
+    # the trade gate cascade.
+    audit_confidence_floor: float = Field(default=0.35, ge=0.0, le=1.0)
 
 
 # ---------------------------------------------------------------------------
