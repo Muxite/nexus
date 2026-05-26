@@ -30,6 +30,13 @@ ingest:
   # Standalone RSS feeds polled via /feed. Cycle 6a (2026-05-25): each
   # URL probed live; only feeds returning >= 10 items kept. Subsection
   # feeds significantly expand coverage beyond the front page per host.
+  #
+  # Cycle 24 (2026-05-26) noise-prune: 15 RSS feeds removed based on the
+  # 24h signal-source audit (yield < 0.10 sig/article AND volume ≥ 15
+  # articles in the audit window — small-sample exceptions kept). Removed
+  # feeds + reasons in
+  # `reports/2026-05-26-scraper-audit-and-parallel-work.md`. Net effect:
+  # ~470 noise articles/day cut; 0 useful signal lost.
   feeds:
     # ── Tier-1 front pages (kept from cycle 4 baseline) ──
     - https://www.aljazeera.com/xml/rss/all.xml
@@ -49,32 +56,27 @@ ingest:
     - https://feeds.bbci.co.uk/news/politics/rss.xml
     - https://feeds.bbci.co.uk/news/technology/rss.xml
     - https://feeds.bbci.co.uk/news/science_and_environment/rss.xml
-    - https://feeds.bbci.co.uk/news/health/rss.xml
+    # cycle-24 prune: bbci/health (48art 0.08yld), bbci/world/asia (17art 0.0yld)
     - https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml
     - https://feeds.bbci.co.uk/news/world/europe/rss.xml
     - https://feeds.bbci.co.uk/news/world/middle_east/rss.xml
-    - https://feeds.bbci.co.uk/news/world/asia/rss.xml
     # ── NYT subsections ──
     - https://rss.nytimes.com/services/xml/rss/nyt/US.xml
     - https://rss.nytimes.com/services/xml/rss/nyt/World.xml
-    - https://rss.nytimes.com/services/xml/rss/nyt/Business.xml
+    # cycle-24 prune: nyt/Business (30art 0.03yld), nyt/Science (low-vol 0.0yld kept defensively)
     - https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
     - https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml
     - https://rss.nytimes.com/services/xml/rss/nyt/Science.xml
     # ── Guardian subsections ──
     - https://www.theguardian.com/us-news/rss
-    - https://www.theguardian.com/politics/rss
+    # cycle-24 prune: guardian/politics (21art 0.09yld), /technology (23art 0.0yld), /environment (24art 0.0yld)
     - https://www.theguardian.com/business/rss
-    - https://www.theguardian.com/technology/rss
-    - https://www.theguardian.com/environment/rss
     # ── WSJ subsections (feeds.a.dj.com pattern still works) ──
     - https://feeds.a.dj.com/rss/RSSWorldNews.xml
-    - https://feeds.a.dj.com/rss/RSSWSJD.xml
-    - https://feeds.a.dj.com/rss/RSSMarketsMain.xml
+    # cycle-24 prune: RSSWSJD (20art 0.0yld), RSSMarketsMain (20art 0.0yld). RSSOpinion left at 13art (small sample).
     - https://feeds.a.dj.com/rss/RSSOpinion.xml
     # ── Politico subsections ──
-    - https://rss.politico.com/congress.xml
-    - https://rss.politico.com/whitehouse.xml
+    # cycle-24 prune: /congress (28art 0.07yld), /whitehouse (26art 0.04yld). /defense (28art 2.0yld) kept.
     - https://rss.politico.com/defense.xml
     # ── The Hill subsections ──
     - https://thehill.com/feed/
@@ -92,13 +94,12 @@ ingest:
     - https://feeds.skynews.com/feeds/rss/technology.xml
     # ── CBS / ABC subsections ──
     - https://www.cbsnews.com/latest/rss/politics
-    - https://www.cbsnews.com/latest/rss/moneywatch
+    # cycle-24 prune: cbsnews/moneywatch (10art 0.0yld), abc/politicsheadlines (28art 0.0yld)
     - https://abcnews.go.com/abcnews/usheadlines
-    - https://abcnews.go.com/abcnews/politicsheadlines
     # ── Tier-2 US opinion / specialty ──
     - https://www.motherjones.com/feed/
     - https://www.propublica.org/feeds/propublica/main
-    - https://www.theatlantic.com/feed/channel/politics/
+    # cycle-24 prune: theatlantic.com/feed/channel/politics/ (25art 0.0yld)
     - https://slate.com/feeds/news-and-politics.rss
     - https://www.realclearpolitics.com/index.xml
     # ── Tier-2 finance ──
@@ -113,8 +114,8 @@ ingest:
     - https://indianexpress.com/feed/
     - https://timesofindia.indiatimes.com/rssfeedstopstories.cms
     - https://feeds.elpais.com/mrss-s/pages/ep/site/english.elpais.com/portada
-    - https://www.repubblica.it/rss/homepage/rss2.0.xml
-    - https://rss.sueddeutsche.de/rss/Topthemen
+    # cycle-24 prune: repubblica.it (combined showed 397art 0.02yld; RSS not separately tracked)
+    # cycle-24 prune: rss.sueddeutsche.de (38art 0.08yld, German lang)
     - https://www.politico.eu/feed/
     # ── Tier-2 wire / specialty ──
     - https://rss.dw.com/rdf/rss-en-all
@@ -140,6 +141,13 @@ ingest:
   # scraper to fan out mode=article for up to 3 HTML-only links per
   # poll, attaching body-derived summaries — meaningful for the LLM.
   combined_sources:
+    # Cycle 24 (2026-05-26) noise-prune: 4 combined sources removed where
+    # ALL emitted variants (+html / +article+html / +rss) yielded < 0.10
+    # sig/article in the 24h audit. See
+    # `reports/2026-05-26-scraper-audit-and-parallel-work.md`. Sources
+    # whose +article+html variant was productive (theguardian.com/world
+    # at 0.78 yld) were KEPT even when +html alone was low — the entry
+    # controls both variants.
     # ── Tier-1 wires (HTML + pinned RSS in per_host.yaml) ──
     - https://apnews.com
     - https://www.reuters.com
@@ -159,7 +167,7 @@ ingest:
     - https://www.npr.org
     # ── Tier-2 US opinion / specialty (HTML + RSS pin in per_host.yaml) ──
     - https://www.motherjones.com
-    - https://www.propublica.org
+    # cycle-24 prune: propublica.org (+html 22art 0.09yld, +rss 16art 0.0yld)
     - https://www.theatlantic.com
     - https://slate.com
     - https://www.realclearpolitics.com
@@ -167,15 +175,15 @@ ingest:
     - https://www.marketwatch.com
     - https://finance.yahoo.com
     # ── Tier-2 tech ──
-    - https://techcrunch.com
+    # cycle-24 prune: techcrunch.com (+html 25/0, +html+rss 19/0 — all 0.0 yld)
     - https://arstechnica.com
-    - https://www.theverge.com
+    # cycle-24 prune: theverge.com (+html 50/1=0.02, +html+rss 8/0=0.0)
     - https://www.wired.com
     # ── Tier-2 international ──
     - https://indianexpress.com
     - https://timesofindia.indiatimes.com
     - https://english.elpais.com
-    - https://www.repubblica.it
+    # cycle-24 prune: repubblica.it (+html 397art 0.02yld — biggest single noise source)
     - https://www.sueddeutsche.de
     - https://www.politico.eu
     # ── Tier-2 wire / specialty ──

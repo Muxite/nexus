@@ -51,6 +51,56 @@ PER_CYCLE_TABLES = (
 )
 
 
+# Replay-required tables added in PR-B (post-cycle-21). These do NOT have
+# a `cycle_id` column of their own (price_impacts is global diagnostic
+# data — see `app/stages/impact_tracker.py`; llm_probe_calls predates the
+# convention; signals is shared cross-cycle). For replay we need the
+# cycle-relevant subset, so each is dumped via a JOIN through a table
+# that *does* carry cycle_id. Snapshots are read-only — these are NEVER
+# pruned.
+#
+# Keyed by output filename → SELECT statement template. Each query takes
+# exactly one parameter (the cycle_id). The SELECT must include every
+# column the replay needs.
+_JOIN_DUMPS: dict[str, str] = {
+    # Every signal that has a decision in this cycle. Signals predate the
+    # cycle are still emitted (since their `decisions` row IS in-cycle).
+    "signals": (
+        "SELECT DISTINCT s.* "
+        "FROM signals s "
+        "JOIN decisions d ON d.signal_id = s.id "
+        "WHERE d.cycle_id = ?"
+    ),
+    # Every price_impacts row whose anchoring trade fired in this cycle.
+    # `price_impacts.cycle_id` does not exist (see impact_tracker spec).
+    "price_impacts": (
+        "SELECT pi.* "
+        "FROM price_impacts pi "
+        "JOIN trades t ON t.id = pi.trade_id "
+        "WHERE t.cycle_id = ?"
+    ),
+    # Every probe call whose linked production prediction was made in
+    # this cycle. Probes may have NULL prediction_id on failure — those
+    # are not snapshotted (no cycle context to attribute them to).
+    "llm_probe_calls": (
+        "SELECT pc.* "
+        "FROM llm_probe_calls pc "
+        "JOIN predictions p ON p.id = pc.prediction_id "
+        "WHERE p.cycle_id = ?"
+    ),
+    # Articles referenced by any signal that produced a decision in this
+    # cycle. PR-F needs `articles.source` for per-source PnL attribution.
+    # Articles is a SHARED table; we dump only the cycle-relevant subset.
+    "articles": (
+        "SELECT DISTINCT a.* "
+        "FROM articles a "
+        "JOIN signals s ON s.article_id = a.id "
+        "JOIN decisions d ON d.signal_id = s.id "
+        "WHERE d.cycle_id = ?"
+    ),
+}
+
+
 def _resolve_cycle(db: sqlite3.Connection, cycle_id: int | None) -> tuple[int, str, str]:
     if cycle_id is None:
         row = db.execute("SELECT id, name, opened_at FROM cycles ORDER BY id DESC LIMIT 1").fetchone()
@@ -78,6 +128,35 @@ def _dump_table(
     n = 0
     with out_path.open("w") as f:
         cur = db.execute(f"SELECT * FROM {table} WHERE cycle_id = ?", (cycle_id,))
+        cols = [c[0] for c in cur.description]
+        for row in cur:
+            f.write(json.dumps(dict(zip(cols, row)), default=str) + "\n")
+            n += 1
+    return n
+
+
+def _dump_via_query(
+    db: sqlite3.Connection,
+    name: str,
+    sql: str,
+    cycle_id: int,
+    out_dir: Path,
+) -> int:
+    """Dump rows from a parametrised SELECT to `<name>.jsonl`. Used for
+    tables that don't carry `cycle_id` themselves (price_impacts,
+    llm_probe_calls) or that are shared cross-cycle (signals) — the SQL
+    JOIN narrows to the relevant subset for this cycle."""
+    out_path = out_dir / f"{name}.jsonl"
+    n = 0
+    with out_path.open("w") as f:
+        try:
+            cur = db.execute(sql, (cycle_id,))
+        except sqlite3.OperationalError as exc:
+            # Pre-cycle-14 DB may not have llm_probe_calls; pre-cycle-11
+            # may not have price_impacts. Write an empty file rather than
+            # crashing the snapshot.
+            print(f"  warn: {name}: {exc}", file=sys.stderr)
+            return 0
         cols = [c[0] for c in cur.description]
         for row in cur:
             f.write(json.dumps(dict(zip(cols, row)), default=str) + "\n")
@@ -183,6 +262,12 @@ def snapshot(
         except sqlite3.OperationalError as exc:
             table_counts[table] = -1
             print(f"  warn: {table}: {exc}", file=sys.stderr)
+
+    # PR-B: replay-required join dumps. These never get pruned (the
+    # underlying tables are shared cross-cycle or are global diagnostic
+    # data).
+    for name, sql in _JOIN_DUMPS.items():
+        table_counts[name] = _dump_via_query(db, name, sql, cid, out_dir)
 
     summary = _compute_wallet_summary(db, cid, initial_balance)
 

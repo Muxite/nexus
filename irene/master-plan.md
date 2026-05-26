@@ -2,8 +2,8 @@
 
 > The canonical roadmap. For current state, see [`architecture.md`](architecture.md). For the design north star, see [`docs/dkg_spec.md`](docs/dkg_spec.md). The full plan that authorised this build lives at `~/.claude/plans/based-on-the-new-lovely-coral.md` — this file is the in-repo working copy.
 
-- **Last updated:** 2026-05-24 (**P3 chunk 3 + 4 complete** — dual-path trader is live, scraper-v2 with HTML ingestion wired, accounting + per-cycle isolation shipped; long soak in progress)
-- **Current phase:** post-P3-ch4 long soak under `cycle3-fresh`. Next session picks a cycle from `handoffs/2026-05-24.md` §"Open follow-ups", implements it in full, then runs a 4h+ soak before re-planning. The user's directive this session was **implement-then-soak-long, gather the most data possible** — not many small mid-soak iterations.
+- **Last updated:** 2026-05-26 (**cycle 23 shipped** — pre-trade safety gates + Gamma 422 pagination fix deployed; bot back in production with kill-switch infra and `mid_unavailable` / `market_state` rejects replacing the silent `mid=0.5` fallback that produced 21/39 stub trades).
+- **Current phase:** post-P3 iterative long-soak under `cycle-23`. Next session picks an item from `## Current open work` below, implements it, runs a 4h+ soak, then re-plans from data. Cadence is **implement-then-soak-long** — small batches mid-soak are explicitly avoided.
 
 ---
 
@@ -135,7 +135,7 @@ Each phase ends with: (a) code merged, (b) a dated `reports/YYYY-MM-DD-phase-N.m
 | **P3 ch2** | Eventize + linker | `stages/eventize.py` + `stages/link.py`. Clustering algorithm locked in [`docs/papers/eventization/notes.md`](docs/papers/eventization/notes.md). Live in `wire_pipeline()`. | **✓ complete 2026-05-24** ([linker report](reports/2026-05-24-irene-link-backfill.md)) |
 | **P3 ch3** | Dual-path trader + wallet + closer | `decision_path='dkg'` wired alongside `'mvp'`. Paper-trade wallet with cash + equity + identity check. Closer rules: edge_decay → take_profit → stop_loss → stagnation → timeout. Real Kelly via v6 confidence digit. Per-cycle dashboard isolation. | **✓ complete 2026-05-24** ([handoff](handoffs/2026-05-24.md)) |
 | **P3 ch4** | scraper-v2 migration + HTML ingestion | Switched to `jennie-scraper-v2:9001`. `/feed` is shape-compatible; new `_run_html_loop` polls `/scrape mode=links` for 11 HTML homepages (apnews, reuters, bbc, etc.). Three-guard boilerplate filter. | **✓ complete 2026-05-24** ([handoff](handoffs/2026-05-24.md)) |
-| **P3 ch5+** | Iterative cycle loop | Next session picks one of: DKG path firing, reranker on matcher top-K, /scrape mode=article body extraction, graph-driven invalidation, missed-edge review. **Implement then long-soak (4h+).** | open — see `handoffs/2026-05-24.md` §"Open follow-ups" |
+| **P3 ch5+** | Iterative cycle loop (cycles 8–23 chronicle) | Polymarket fee math, three-state UMA close machine, per-market fee_rate fetcher, soak-monitoring harness, durable systemd timer, backtest preflight, pre-trade safety gates, Gamma pagination fix. | **in progress — cycles 8–23 shipped** ([cycle history](#cycle-history-chunk-3-onwards--iterative-loop), [open work](#current-open-work--issue-list)) |
 | **P4** | Dual-write comparison + Postgres draft | Reports quantify mvp vs dkg per-trade-path. Postgres DDL drafted (not run). Schema-reviewer agent owns this. | sketch |
 | **P5** | Cutover candidates | One non-critical read (market context) routed through DKG. Then candidate filtering. Final trade decision only after ≥5 consecutive 24h windows of DKG ≥ MVP. | TBD |
 
@@ -143,48 +143,9 @@ Phases are sized so each can be its own conversation. We don't pre-commit to P4+
 
 ---
 
-## Phase 1 — Detailed scope (next session entry point)
+## Phase 1 — shipped 2026-05-23
 
-**Goal:** irene is making paper trades in parallel with seulgi by end of phase.
-
-### Modules to implement (in order)
-
-1. ~~`app/config.py` — pydantic config, hot-reload pattern stolen from old-irene `irene_shared/config.py` (git history at commit `122720a`).~~ **Done 2026-05-23.**
-2. ~~`app/db.py` — schema creation, connection pool, `db.batch()` context manager, the seulgi-path assertion.~~ **Done 2026-05-23** as the *mechanism* — domain DDL is registered per-stage from each owner module (per modularization rule 4). Only `schema_migrations` (housekeeping) and `cycles` (owned by `main.py`) exist today.
-3. ~~`app/bus.py` — `publish/subscribe`; v1 uses `asyncio.Queue` under the hood, v2 swaps to redis.~~ **Done 2026-05-23.** Strict JSON roundtrip; trade-path back-pressure; telemetry drop-first; per-subscriber task isolation. Also shipped: `app/topics.py` (topic name constants), `app/deps.py` (StageDeps dataclass), `app/cycle.py` (cycle ContextVar). Full payload schema list in `docs/p1_contracts.md` §2.
-4. ~~`app/timing.py` — `Timer` + `ProfileStore`.~~ **Done 2026-05-23.**
-5. ~~`app/budget.py` — OpenRouter budget tracking.~~ **Done 2026-05-23.** Two pause sources (monthly cap + 402 streak), pause-flag file for IPC-less status sharing.
-6. ~~`app/embed.py` — sentence-transformers wrapper + embedding cache + `embedder_id` stamping.~~ **Done 2026-05-23.** Lazy model load; LRU cache; `EmbedderDimMismatch` on dim drift.
-7. ~~`app/ai.py` — OpenRouter client; direction classifier; logs every call to `llm_calls`; cache lookup via `prompt_sha`.~~ **Done 2026-05-23.** JSON-suffix prompt contract; budget-paused short-circuit; 402 → `note_402` + NEUTRAL; cache via `sha1(prompt+model+version)`.
-8. ~~`app/stages/markets.py` — Gamma API poller, market embeddings, in-memory `MarketIndex`.~~ **Done 2026-05-23.** `MarketIndex` is the documented rule-5 exception; asyncio.Lock guards mutation; mixed-embedder_id raises.
-9. ~~`app/stages/ingest.py` — scraper poller (HTML + RSS + Twitter); writes `articles`.~~ **Done 2026-05-23** — RSS only via scraper:9000 `/feed`; Twitter + HTML deferred. Jittered per-feed polls; `INSERT OR IGNORE` + `rowcount` gate on publish.
-10. ~~`app/stages/dedupe.py` — chroma-backed near-dup detection; writes `article_clusters`.~~ **Done 2026-05-23.** Freshness labels at deterministic distance + age boundaries; chromadb-missing degrades to all-BREAKING.
-11. ~~`app/stages/match.py` — cosine match article → market candidates; writes `signals` (immutable; no NULL direction).~~ **Done 2026-05-23.** `MarketIndex` consumed via `StageDeps.market_index`; `embedder_id` stamped per row; `INSERT OR IGNORE` + `cur.rowcount` gate on publish.
-12. ~~`app/stages/trade.py` — gate cascade (similarity floor → freshness → direction → edge → size); paper only; writes `trades` + `decisions`.~~ **Done 2026-05-23.** Five gates in sequence; one `decisions` row per signal regardless of outcome; `trades` only for execute; `trade_features` long-format fan-out per execute. `mid_price=0.5` stub for P1.
-13. ~~`app/main.py` — boot, wire stages via bus, shutdown.~~ **Done 2026-05-23.** `wire_pipeline()` helper constructs every stage, registers subscriptions before `bus.start()`, starts in topological order, stops in reverse. Budget poll only fires when `openrouter.api_key` is set.
-14. ~~`Dockerfile`, `requirements.txt`, `docker-compose.yml`~~ — done in the first P1 PR.
-12. `app/stages/trade.py` — gate cascade (similarity floor → freshness → direction → edge → size); paper only; writes `trades` + `decisions`.
-13. `app/main.py` — boot, wire stages via bus, shutdown.
-14. `Dockerfile`, `requirements.txt`, `docker-compose.yml` — container infra.
-
-### Cross-cutting (all of these ship in P1, not later)
-
-- Every gate writes a `decisions` row with `outcome` + `reason`.
-- Every trade writes a full `trader_trace` JSON + a fan-out of `trade_features` rows.
-- `cycles` writer: `main.py` calls `db.ensure_current_cycle(name)` on boot; every decision/prediction/trade carries `cycle_id`.
-- `budget.py` is wired in P1, not deferred — OpenRouter 402 / monthly cap must be respected from the first paid call.
-- Runtime assertion in `db.py`: refuses to connect if path matches a known seulgi path.
-- **Tracers** (`scripts/tracer/fire.py` + `scripts/tracer/check.py`) — synthetic articles travel the real pipeline; nightly liveness probe; CI stress test (1000 bullets / concurrency 50, 0 drops).
-- **Capture** — `decision_inputs` and `llm_calls` writes share `db.batch()` with the live write. Capture cannot lag.
-- **Replay accuracy harness** — `scripts/replay/accuracy.py` reconstructs `pnl_usdc` from `market_price_snaps` to ±1¢. This is the P1 ship gate.
-
-### P1 verification (ship gate)
-
-- `docker compose -f irene/docker-compose.yml up` boots and runs cleanly for 1+ hour.
-- `irene.db` accumulates rows in `articles`, `markets`, `signals`, `predictions`, `trades`, `decisions`, `decision_inputs`, `llm_calls`.
-- **Tracer gate:** `scripts/tracer/fire.py --count 1000 --concurrency 50` shows 0 dropped non-telemetry bullets.
-- **Accuracy gate:** `scripts/replay/accuracy.py` reconstructs every closed paper trade's `pnl_usdc` within ±1¢.
-- **Soak report:** `reports/YYYY-MM-DD-irene-p1-soak.md` compares first-hour numbers vs seulgi's first-hour: # articles ingested, # signals matched, # trades attempted, neutral-rate, # tracer drops (0), # capture rows vs # live rows (1:1).
+P1 modules (config, db, bus, ai, embed, budget, stages/{markets,ingest,dedupe,match,trade}, main, Dockerfile + compose) all landed in the first P1 PR. Tracer + replay-accuracy ship gates were verified. Full chronicle: [`reports/2026-05-23-irene-p1-soak.md`](reports/2026-05-23-irene-p1-soak.md).
 
 ---
 
@@ -265,5 +226,60 @@ Each row = one implementation cycle the user explicitly scoped. Detail in commit
 | 2026-05-25 | cycle 6a (`e81fa22`) | Site expansion: 40 subsection RSS (BBC/NYT/Guardian/WSJ/Politico/Hill/NPR/Sky/CBS/ABC) + sitemap_news for AP (761 entries) + Reuters (50 entries) + 18 tier-2 sources. Total ~33 → ~120 effective sources. | First 2 min: 1,112 articles ingested vs cycle 6's 45 (25× rate). 3 trades opened within 1 min. |
 | 2026-05-25 | throughput (`d04cad4`) | Dashboard: `throughput.txt` gains TIMINGS table (p1/p50/mean/p95/p99) + CLT STATS (n, σ, SE, 95% CI, required-n for ±10%/±1% accuracy). New plots: `throughput_overlay.png` (5 stages, hourly, log-y), `speed_overlay.png` (per-stage p50/p95/p99 grouped bars, log-y). | Catches `match→trade` gate cascade at n=990 already-converged (need only 145 for ±10% of mean); ingest→trade variance dominated by poll-wait. |
 | 2026-05-25 | cycle 7 (`11f8819`) | Polymarket parabolic taker-fee model folded into closure PnL (per-leg `shares * fee_rate * p * (1-p)`; category table); `trade_closures` gains `entry_fee_usdc` + `exit_fee_usdc` audit columns; markets-stage `_deactivate_missing` auto-closes orphaned trades with `close_reason='market_resolved'`; new `market_news_imbalance` trade gate with 5 sub-rules (thin market, extreme-mid w/o BREAKING, far-future w/o BREAKING, near-expiry, singleton-on-extreme). | 390 tests pass. Cycle 31 booting; gate verified via unit tests against cycle 29's 5 trades (rejects NATO + Rajasthan, allows Epstein/Steyer/Delhi). |
+| 2026-05-25 | cycle 8 (`583242c`) | Research-distill scaffolding + 3 cycle-7 bug fixes (no-fee-at-resolution; volume24hr; wide-spread gate). | |
+| 2026-05-25 | cycle 9 (`98677e6`) | ET-deadline parsing + similarity-floor docs + scraper audit + Axios pin. | |
+| 2026-05-25 | cycle 10 (`07a18e8`) | Per-market `fee_rate` fetcher (CLOB `/markets/<cid>`) + explicit spread term in edge gate + 30-min spread soak. | |
+| 2026-05-25 | cycle 11 (`7b608ac`) | D1 three-state UMA close machine + W6 `pre_news_drift_15m/60m` + impact-tracker long-tail buckets (out to 24h) + CLOB latency probe. | |
+| 2026-05-25 | cycle 12 (`13d3ea5`) | Closed-but-not-finalized resolution re-poll path + first measured `calibration_seeds.md` (C1 spread, C4/E2 latency). | |
+| 2026-05-25 | cycle 13 (`2498bba`) | Gamma `Retry-After` backoff helper + per-market `min_order_size` gate at arm-time + (failed) low-vol soak v1. | |
+| 2026-05-25 | cycle 14 (`63389d8`) | Per-signal latency-chain instrumentation on `trades` + LLM A/B probe lane (default-off shadow table) + low-vol soak v2 (working). | |
+| 2026-05-25 | cycle 15 (`9344e2a`) | Per-market `fee_rate` refresh cadence (168h) + latency dashboard panel + 500-market floor audit. | 82/18% bimodal fee distribution observed on the trading tail. |
+| 2026-05-25 | cycle 16 (`eff6349`) | `default_fee_rate` 0.05 → 0.10 + reject-path latency instrumentation on `decisions` + low-vol spread analysis. | |
+| 2026-05-25 | cycle 17 (`93613eb`) | Resolved-market schema verification against 100 live closed markets + sub-$30k spread sampler launch. | |
+| 2026-05-25 | cycle 18 (`1047864`) | `closedTime` authoritative timestamp + cycle-12 active-flicker fix + impact_tracker schema audit. | |
+| 2026-05-25 | cycle 19 (`9793f3c`) | Session retrospective (cycles 8–18) + `config.yaml` sanity-check. No code changes. | 492 tests pass (+97 across cycles 8–18). |
+| 2026-05-25 | cycle 20 (`f08588f`) | Production rebuild on cycle-18 code; launched `scripts/soak_check.py` (10-dimension health script) + session-local 2h cron `b4b3e445` for 24h soak. | Container Up; 3 baseline alerts (state 1/2, RESOLUTION_TIMEOUT, fee_rate coverage). |
+| 2026-05-25 | cycle 21 (`23e051c`) | 12h soak audit (3 parallel Explore agents) + 5-fix queue handoff. No code. | Confirmed `0 calls to /markets/<cid>` in 24h vs 25,846 `/midpoint` — but cycle-22 disproved the "clob=None" diagnosis. |
+| 2026-05-26 | cycle 22 (this branch) | Durable systemd-user timer for `soak_check.py` + `scripts/replay/preflight.py` (P1 gate as `ExecStartPre`) + Fix B (state 1/2 alert split into actionable vs `legacy_uma_backlog`) + Fix D (`IRENE_CYCLE` → `cycle-22`). Preflight against live DB surfaced gross-vs-net drift on trade 19 ($-1.67 stored vs $+15.65 reconstructed). | Alerts dropped 3 → 2; soaks now survive Claude session boundaries. |
+| 2026-05-26 | cycle 23 (this branch) | **Halt blind trading.** Pre-trade hard gates (`_gate_mid_unavailable`, `_gate_market_state`, `_insert_trade` post-condition assert) replace silent `mid=0.5` fallback. Kill switch `IRENE__TRADE__EXECUTION_ENABLED`. **Real root cause found:** Gamma caps pagination at `offset=10000`; `_fetch_all_gamma` dropped accumulated markets on 422 — frozen markets table since 2026-05-23. Fix preserves partial pages. Startup-time resolution rescan. RESOLUTION_TIMEOUT audit (13 markets, all no-position). | 655 tests pass. Deployed; `volume_usdc` + `fee_rate` repopulating live (~225 markets/min); kill-switch confirmed firing then re-enabled. |
 
-**390 tests pass** (was 380 pre-session, +8 new). See `handoffs/2026-05-25.md` for the cycle 4-7 chronology, the 7 open follow-ups (volume parser, Gamma outcome lookup, category derivation, queued prompt fix, DKG gate parity, etc.) and the unchanged implement-then-soak-long cadence.
+**655 tests pass** as of cycle 23 (+265 across cycles 8–23). See `## Current open work — issue list` below for the consolidated post-cycle-23 issue ledger.
+
+---
+
+## Current open work — issue list
+
+Single source of truth for next-cycle picks. **Cycle-24 work is now split into 8 self-contained handoff docs under `irene/handoffs/2026-05-26-{A..H}-*.md`.** Each is independently executable by a subagent; the reference doc is handoff A (the empirical funnel audit). Don't tackle the dependent work without reading A first.
+
+### Cycle-24 handoffs (active, post-cycle-23)
+
+| ID | Title | Status | Why |
+|---|---|---|---|
+| A | iran-funnel-audit | **reference doc, complete** | The empirical case for B–H. 556 Iran articles → 1656 signals → 1 LLM call → 0 trades on Iran markets. |
+| **B** | dedupe-freshness | **OPEN, CRITICAL** | 87% of signals labeled STALE_RETURN/REHASH; cluster age-based labeling starves sustained-news regimes. **Drastically reduce STALE aggression.** |
+| **C** | dkg-safety-gates | **OPEN, CRITICAL** | DKG path lacks the cycle-23 mid_unavailable / market_state / kill-switch gates; trade 40 proved it fires blind. |
+| D | active-flicker | open | 1,022 markets in `active=1 AND closed_at NOT NULL` state. SQL CASE fix + cleanup migration. |
+| E | wallet-honesty | open | Dashboard shows `current $200.00` on dead-market positions. `_current_mid_for_trade` should return None on closed markets. |
+| F | near-miss-audit | open | Original user ask. Dashboard panel + CLI to surface "decisive LLM verdict killed downstream." Most valuable post-B. |
+| G | tracer-stress-harness | open | Repurpose P1 tracer as interactive stress rig. Iran/peace-deal/market-crash templates + live-externals fire mode + wallet-exercise + cleanup. |
+| H | llm-context-richness | open | Reduce LLM-input truncation — give the model fuller article + market context. Cheap, possibly the difference between NEUTRAL and decisive YES/NO. |
+
+### Long-cycle-history items (deferred or done)
+
+| Area | Issue | Status | Next step |
+|---|---|---|---|
+| Safety | Pre-trade `mid_unavailable` + `market_state` + post-condition gates (MVP only) | **done (cycle 23)** | DKG parity → handoff C |
+| Markets | `volume_usdc` NULL on all active markets (cycle-21 Fix A symptom) | **done (cycle 23)** | Root cause: Gamma 422 pagination, fix in `_fetch_all_gamma` |
+| Markets | Gamma `category` field NULL | **wontfix — Polymarket-side** | Gamma returns `category: null` natively |
+| Resolution | RESOLUTION_TIMEOUT 11/13 markets (cycle-21 Fix E) | **done (cycle 23)** | All `no-position`; see `reports/2026-05-26-resolution-timeout-audit.md` |
+| Soak | State 1/2 alert over-counts (cycle-21 Fix B) | **done (cycle 22)** | Split into actionable vs `legacy_uma_backlog` |
+| Soak | `IRENE_CYCLE` stale env (cycle-21 Fix D) | **done (cycle 22 → cycle-23)** | Functional, not cosmetic |
+| Soak | Cron `b4b3e445` session-local | **done (cycle 22)** | Replaced by `scripts/systemd/irene-soak.{service,timer}` |
+| Replay | Preflight gross-vs-net drift (~$17 on trade 19) | **open, no handoff yet** | `plans/preflight-pnl-reconciliation.md` |
+| Resolution | Zero `close_reason='market_resolved'` rows ever | **open, no handoff yet** | Investigate alternate Polymarket endpoint for `umaResolutionStatus` |
+| LLM | DKG path missing `market_news_imbalance` gate | **open, low priority** | Naturally addressed when extracting `_gates.py` per handoff C |
+| Diagnostics | Throughput overlay process-time instrumentation | **partially done (cycle 14)** | Per-signal latency-chain landed |
+| Trading | Source-quality weighting | **deferred — needs ≥1 week pre_news_drift data** | Plan stub: `plans/source-quality-weighting.md` |
+| Trading | Asymmetric stop-loss | **deferred — needs ≥100 closed trades (~13 today)** | Plan stub: `plans/asymmetric-stop-loss.md` |
+| Infra | CLOB hosting region experiment (eu-west-2 VPS) | **deferred — infra, not code** | Plan: `plans/legal-ops-hosting.md` |
+| LLM | A/B probe lane (cycle 14) — default-off | **intentional** | Needs deliberate provider list + budget extension |

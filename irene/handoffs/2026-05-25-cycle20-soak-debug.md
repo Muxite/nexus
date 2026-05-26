@@ -185,3 +185,42 @@ The 24h cron `b4b3e445` is still session-local (despite the `durable: true` requ
 1. `CronDelete b4b3e445` to stop the noisy stuck-alert reports.
 2. Restart the container with the fixes.
 3. Re-arm a fresh cycle-21 cron once `fee_rate coverage` and `state 1/2` alerts are clean at baseline.
+
+---
+
+## 2026-05-26 correction (cycle 22)
+
+Two diagnoses above are wrong; correcting them so cycle 23 doesn't burn time on the wrong fix.
+
+### Fix A is misdiagnosed — `MarketsStage` IS wired with `clob`
+
+The handoff claims "`MarketsStage` is getting `deps.clob = None` … one-line fix in `app/main.py`." Verified in cycle 22: this is false.
+
+- `app/main.py:228` constructs `base_deps = StageDeps(db=db, bus=bus, config=cfg, embedder=embedder, ai=ai, budget=budget, clob=clob)`.
+- `app/main.py:237` constructs `markets = MarketsStage(base_deps)` — same path every other clob-using stage takes.
+- `app/tests/stages/test_markets.py:829` is a regression test (`test_fee_rate_column_stays_null_when_clob_absent`) that asserts the silent-NULL behavior is **intentional**, not a bug.
+- `CloserStage` and `ImpactTrackerStage` differ only in that they raise on `clob=None` (loud-fail). `MarketsStage` and `TradeStage` accept `None` and degrade.
+
+The real bug surface is "`deps.clob` resolves to `None` at runtime in production for some non-wiring reason." Cycle-23 reproducer:
+
+```bash
+docker exec irene python3 -c \
+  "from app.main import build_deps; import asyncio; print(asyncio.run(build_deps()).clob)"
+```
+
+Likely candidates: missing `POLY_PRIVATE_KEY` env in container, exception in `build_clob()` swallowed during startup, env mismatch between local and container. Investigate before patching.
+
+### Fix D is not cosmetic — `IRENE_CYCLE` is functional
+
+The handoff lists Fix D as "cosmetic." It is not:
+- `config.py:412–414` reads `IRENE_CYCLE` and overrides the config-file value.
+- `main.py:334–335` passes it to `db.ensure_current_cycle()` and `cycle.set_cycle_id()`, which stamps every decision/trade/closure row's `cycle_id` column.
+- Stale value means cycle-history analytics conflate cycles together.
+
+Cycle 22 bumped `.env` to `IRENE_CYCLE=cycle-22`. Cycle 23 should bump again on restart.
+
+### Other cycle-22 deltas
+
+- The session-local cron `b4b3e445` is replaced by a durable systemd-user timer (`irene/scripts/systemd/irene-soak.{service,timer}`, installed via `install.sh`). Soaks now survive Claude session boundaries — required to accumulate `market_price_snaps` for the seulgi backtest.
+- Fix B (state 1/2 alert split) landed: actionable count is the new alert metric; passive count is reframed as `legacy_uma_backlog` (info). Total alerts dropped from 3 → 2 on the live DB.
+- A backtest preflight gate (`scripts/replay/preflight.py`) runs before each soak tick. On first run against the live DB it flagged a real drift: trade 19's stored pnl ($-1.67) vs `accuracy.py`'s reconstruction ($+15.65), diff $17.32 ≈ entry+exit fees the closer applies but the P1 gate formula does not. The gate and the closer formulas have diverged — cycle-23 task: reconcile `scripts/replay/accuracy.py:reconstruct_pnl()` with `app/stages/closer.py`, or split into gross vs net reconstruction.

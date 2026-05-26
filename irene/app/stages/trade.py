@@ -81,14 +81,31 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, time as dt_time, timezone
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from app import db as db_module
 from app.cycle import current_cycle_id
 from app.deps import StageDeps
 from app.stages._entity_overlap import article_entities_overlap_market
+from app.stages._gates import (
+    _eval_market_news_imbalance_subrules,
+    _gate_cash,
+    _gate_direction,
+    _gate_edge,
+    _gate_entity_overlap,
+    _gate_entry,
+    _gate_freshness,
+    _gate_market_news_imbalance,
+    _gate_market_state,
+    _gate_mid_degenerate,
+    _gate_mid_unavailable,
+    _gate_similarity_floor,
+    _gate_size,
+    _gate_wide_spread,
+)
 from app.topics import TOPIC_TRADE_DECIDED
 
 logger = logging.getLogger(__name__)
@@ -212,10 +229,6 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _gate_entry(name: str, outcome: str, value, threshold) -> dict:
-    return {"gate": name, "outcome": outcome, "value": value, "threshold": threshold}
-
-
 def _market_min_usdc(
     *,
     min_shares,
@@ -278,6 +291,14 @@ def _market_min_usdc(
     return ms * per_share, "mid_fallback"
 
 
+#: Cycle 24 (handoff H): hard cap on the article-body slice fed to the
+#: LLM. ~3000 chars ≈ 750 tokens — leaves comfortable room for the
+#: market block + instructions + system message inside the ~4000-token
+#: `cfg.openrouter.max_input_tokens` budget without unbounded LLM cost
+#: on a 12 KB long-form article.
+MAX_ARTICLE_CHARS_IN_PROMPT = 3000
+
+
 def compose_direction_prompt(article: dict, market: dict) -> str:
     """Shared LLM-direction prompt builder for the MVP + DKG trade paths.
 
@@ -285,18 +306,65 @@ def compose_direction_prompt(article: dict, market: dict) -> str:
     decisively resolves the market — see `docs/philosophy.md`. The
     function is module-level so `app/stages/dkg_trade.py` can call it
     without inheriting any state from `TradeStage`.
+
+    Cycle 24 (handoff H — LLM context richness):
+    - Prefer `body` (full trafilatura-cleaned article text) over
+      `summary` (often 1-sentence RSS lede) when the body is meaningfully
+      longer — gives the LLM the supporting context the cycle-22 Iran
+      "decisively resolve" audit flagged as missing.
+    - Hard-cap the article slice at `MAX_ARTICLE_CHARS_IN_PROMPT` so a
+      runaway long-form article cannot blow the input budget.
+    - Surface `end_date`, `volume_usdc`, `category` so the LLM can reason
+      about resolution timing and market depth, not just the question
+      text.
+    - Soften the NEUTRAL guidance (the bot was over-abstaining per the
+      cycle-22 audit) — the gate cascade still filters on confidence, so
+      letting the model express a low-confidence directional lean is
+      preferable to a hard NEUTRAL whenever there is any visible cue.
     """
     title = article.get("title") or ""
-    summary = article.get("summary") or "(none)"
+    summary = article.get("summary") or ""
+    body = article.get("body") or ""
+    # Prefer body when it adds meaningful context vs the (often very
+    # short) RSS summary. The 1.5× floor avoids swapping a clean
+    # 1-sentence lede for a 1-sentence trafilatura excerpt that happens
+    # to be a few characters longer.
+    if body and len(body) > max(len(summary) * 1.5, 200):
+        article_text = body
+    elif summary:
+        article_text = summary
+    else:
+        article_text = "(no body or summary available)"
+    if len(article_text) > MAX_ARTICLE_CHARS_IN_PROMPT:
+        article_text = (
+            article_text[:MAX_ARTICLE_CHARS_IN_PROMPT] + " […truncated]"
+        )
+
     question = market.get("question") or ""
     description = market.get("description") or "(none)"
+    end_date = market.get("end_date") or "(unknown)"
+    volume = market.get("volume_usdc")
+    if isinstance(volume, (int, float)):
+        volume_str = f"{float(volume):,.0f} USDC"
+    else:
+        volume_str = "?"
+    category = market.get("category") or "(uncategorized)"
+
     return (
-        f"NEWS HEADLINE: {title}\n"
-        f"NEWS SUMMARY:  {summary}\n"
+        f"=== NEWS ARTICLE ===\n"
+        f"Headline: {title}\n"
         f"\n"
-        f"MARKET QUESTION: {question}\n"
-        f"MARKET DETAILS:  {description}\n"
+        f"{article_text}\n"
         f"\n"
+        f"=== MARKET ===\n"
+        f"Question: {question}\n"
+        f"Resolution deadline: {end_date}\n"
+        f"Volume (24h): {volume_str}\n"
+        f"Category: {category}\n"
+        f"\n"
+        f"Details: {description}\n"
+        f"\n"
+        f"=== INSTRUCTIONS ===\n"
         f"Read the news as plain language. Does the news DECISIVELY\n"
         f"resolve this market?\n"
         f"\n"
@@ -304,9 +372,13 @@ def compose_direction_prompt(article: dict, market: dict) -> str:
         f"            will happen or has just happened.\n"
         f"  NO      — the news plainly says the market's NO outcome\n"
         f"            will happen or has just happened.\n"
-        f"  NEUTRAL — the news is unrelated, ambiguous, or doesn't\n"
-        f"            clearly push the market either way. Default to\n"
-        f"            this whenever you're unsure.\n"
+        f"  NEUTRAL — the news is unrelated, ambiguous, or genuinely\n"
+        f"            doesn't push the market either way. Prefer YES or\n"
+        f"            NO with a low confidence (e.g. 0.4) when you can\n"
+        f"            see a directional lean even if the resolution\n"
+        f"            isn't certain — the gate handles confidence\n"
+        f"            filtering downstream. Reserve NEUTRAL for the\n"
+        f"            truly orthogonal cases.\n"
         f"\n"
         f"`confidence` is how CLEARLY the news resolves the market\n"
         f"(not a probability of YES). 0.9 = the article spells out\n"
@@ -314,6 +386,321 @@ def compose_direction_prompt(article: dict, market: dict) -> str:
         f"falls through to NEUTRAL anyway.\n"
         f"\n"
         f"Output JSON ONLY."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pure gate predicates — extracted for the replay harness so the replay
+# runs *exactly* the same cascade logic the live bot runs. Each helper is
+# pure (no I/O, no DB, no async). Returns
+# `(status, gate_entry_or_None, reject_reason_or_None)`:
+#   - status     : "ok" | "reject"
+#   - gate_entry : a dict suitable to append to gate_history, or None when
+#                  the live cascade traditionally omits a pass-entry (the
+#                  mid_degenerate / wide_spread / market_news_imbalance
+#                  family).
+#   - reason     : the canonical `decisions.reason` string when rejecting,
+#                  None on pass.
+#
+# The same helpers are called by `TradeStage.handle()` and by the
+# `evaluate_gates()` orchestrator below; that is the contract that keeps
+# replay from drifting away from production.
+# ---------------------------------------------------------------------------
+
+
+def _compute_edge(
+    *, direction: str, p_hat: float, mid: float,
+    executable_price: Optional[float], spread: Optional[float], cfg,
+) -> tuple[float, dict]:
+    """Cycle 10 explicit-spread formula when book is available, else legacy
+    lumped-fee fallback. Returns `(edge, edge_components_dict)`."""
+    if executable_price is not None and spread is not None:
+        half_spread = float(spread) / 2.0
+        if direction == "YES":
+            edge = p_hat - executable_price - cfg.taker_fee_buffer - half_spread
+        else:
+            edge = executable_price - p_hat - cfg.taker_fee_buffer - half_spread
+        edge_components = {
+            "mid": mid,
+            "executable_price": float(executable_price),
+            "spread": float(spread),
+            "half_spread": half_spread,
+            "taker_fee_buffer": float(cfg.taker_fee_buffer),
+            "fallback": False,
+        }
+    else:
+        if direction == "YES":
+            edge = p_hat - mid - cfg.fee_buffer
+        else:
+            edge = mid - p_hat - cfg.fee_buffer
+        edge_components = {
+            "mid": mid,
+            "fee_buffer": float(cfg.fee_buffer),
+            "fallback": True,
+        }
+    return edge, edge_components
+
+
+def _compute_kelly_and_size(
+    *, direction: str, p_hat: float, mid: float, cfg,
+) -> tuple[float, float, float]:
+    """Cycle 3 Kelly math + balance × max_position_fraction cap. Returns
+    `(kelly_full, kelly_capped, size_usdc)`."""
+    if direction == "YES":
+        b = (1.0 - mid) / mid
+        kelly_full = (p_hat * b - (1.0 - p_hat)) / b
+    else:
+        p_no = 1.0 - p_hat
+        mid_no = 1.0 - mid
+        b = (1.0 - mid_no) / mid_no
+        kelly_full = (p_no * b - (1.0 - p_no)) / b
+    kelly_capped = max(0.0, kelly_full) * cfg.kelly_fraction
+    size = min(
+        kelly_capped * cfg.balance_usdc,
+        cfg.balance_usdc * cfg.max_position_fraction,
+    )
+    return kelly_full, kelly_capped, size
+
+
+# ---------------------------------------------------------------------------
+# Replay surface: GateFeatures / GateResult / evaluate_gates.
+#
+# The replay harness (`scripts/replay/predict.py`) constructs a
+# GateFeatures from snapshot data and calls evaluate_gates() to obtain a
+# GateResult. The live `TradeStage.handle()` does the same gate decisions
+# via the per-gate helpers above; both paths share one implementation.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class GateFeatures:
+    """Inputs to `evaluate_gates`. Fields without values default to a
+    permissive sentinel (None for optional gates, True for presence checks).
+    The replay harness should populate every field it has; gates whose
+    required inputs are None will raise (a wiring bug) — except where the
+    field is genuinely optional (executable_price/spread, entity_overlap)."""
+
+    similarity: float
+    freshness: Optional[str]
+    article_present: bool = True
+    market_present: bool = True
+    # (overlaps, n_entities). None = skip the gate (older signals predate
+    # the cycle-7 entity_overlap check).
+    entity_overlap_result: Optional[tuple[bool, int]] = None
+    # LLM result — must be populated before the direction gate runs.
+    direction: Optional[str] = None  # 'YES' | 'NO' | 'NEUTRAL'
+    confidence: Optional[float] = None
+    prediction_id: Optional[int] = None
+    # Price scalars resolved from the CLOB (or stub).
+    mid: Optional[float] = None
+    executable_price: Optional[float] = None
+    spread: Optional[float] = None
+    # Market dict — fed verbatim to imbalance sub-rules. Must carry
+    # `volume_usdc`, `_days_to_expiry`, `min_order_size`.
+    market: Optional[dict] = None
+    cluster_size: int = 1
+    # Paper-wallet cash at decision time.
+    cash_available: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class GateResult:
+    """Output of `evaluate_gates`. Either `outcome='execute'` (every gate
+    passed) or `outcome='reject'` with `reason` naming the failing gate."""
+
+    outcome: str  # 'execute' | 'reject'
+    reason: str
+    gate_history: list[dict]
+    # Execute-only fields (None on reject).
+    direction: Optional[str] = None
+    confidence: Optional[float] = None
+    p_hat: Optional[float] = None
+    mid: Optional[float] = None
+    edge: Optional[float] = None
+    edge_components: Optional[dict] = None
+    kelly_full: Optional[float] = None
+    kelly_capped: Optional[float] = None
+    size_usdc: Optional[float] = None
+    market_floor_usdc: Optional[float] = None
+    effective_floor: Optional[float] = None
+    prediction_id: Optional[int] = None
+
+
+def evaluate_gates(features: GateFeatures, cfg) -> GateResult:
+    """Pure (sync) cascade runner. Same gates, same order, same helpers as
+    `TradeStage.handle()`. The function does no I/O — all features must be
+    pre-populated. Replay use only; live trades go through `handle()` which
+    interleaves I/O between gates for short-circuit savings.
+    """
+    history: list[dict] = []
+
+    # Gate 1 — similarity_floor.
+    status, entry, reason = _gate_similarity_floor(features.similarity, cfg)
+    history.append(entry)
+    if status == "reject":
+        return GateResult("reject", reason, history)
+
+    # Gate 2 — freshness.
+    status, entry, reason = _gate_freshness(features.freshness, cfg)
+    history.append(entry)
+    if status == "reject":
+        return GateResult("reject", reason, history)
+
+    # Presence checks (not gates, but they reject pre-LLM).
+    if not features.article_present:
+        history.append(_gate_entry("lookup", "reject", "article_missing", None))
+        return GateResult("reject", "article_missing", history)
+    if not features.market_present:
+        history.append(_gate_entry("lookup", "reject", "market_missing", None))
+        return GateResult("reject", "market_missing", history)
+
+    # Gate 2.25 — market_state (cycle 23). Permissive when the relevant
+    # columns are missing from the snapshot (historical replays predate the
+    # active/closed_at/end_date fields landing in features_snapshot).
+    if features.market is not None:
+        status, entry, reason = _gate_market_state(features.market, cfg)
+        if status == "reject":
+            history.append(entry)
+            return GateResult("reject", reason, history)
+
+    # Gate 2.5 — entity_overlap. Skipped if caller didn't compute it.
+    if features.entity_overlap_result is not None:
+        overlaps, n_entities = features.entity_overlap_result
+        status, entry, reason = _gate_entity_overlap(overlaps, n_entities)
+        history.append(entry)
+        if status == "reject":
+            return GateResult("reject", reason, history)
+
+    # Gate 3 — direction.
+    if features.direction is None or features.confidence is None:
+        raise ValueError(
+            "evaluate_gates: features.direction / features.confidence required "
+            "before the direction gate can run"
+        )
+    status, entry, reason = _gate_direction(
+        features.direction, features.confidence, cfg,
+    )
+    history.append(entry)
+    if status == "reject":
+        return GateResult(
+            "reject", reason, history, prediction_id=features.prediction_id,
+        )
+
+    direction = features.direction
+    confidence = features.confidence
+    p_hat = confidence if direction == "YES" else (1.0 - confidence)
+
+    # Gate 4-pre — mid_unavailable (cycle 23). Replaces the
+    # pre-cycle-23 `raise ValueError` so replay sees the same rejection a
+    # live trade would see when CLOB returns no price.
+    status, entry, reason = _gate_mid_unavailable(features.mid)
+    if status == "reject":
+        history.append(entry)
+        return GateResult(
+            "reject", reason, history, prediction_id=features.prediction_id,
+        )
+    mid = features.mid
+
+    # Gate 4 — mid_degenerate (no append on pass).
+    status, entry, reason = _gate_mid_degenerate(mid, cfg)
+    if status == "reject":
+        history.append(entry)
+        return GateResult(
+            "reject", reason, history, prediction_id=features.prediction_id,
+        )
+
+    # Gate 4a-bis — wide_spread (skipped silently when spread is None).
+    status, entry, reason = _gate_wide_spread(features.spread, cfg)
+    if status == "reject":
+        history.append(entry)
+        return GateResult(
+            "reject", reason, history, prediction_id=features.prediction_id,
+        )
+
+    # Gate 4b — market_news_imbalance.
+    if features.market is None:
+        raise ValueError("evaluate_gates: features.market required before imbalance gate")
+    status, entry, reason = _gate_market_news_imbalance(
+        market=features.market, mid=mid, freshness=features.freshness,
+        cluster_size=features.cluster_size, cfg=cfg,
+    )
+    if status == "reject":
+        history.append(entry)
+        return GateResult(
+            "reject", reason, history, prediction_id=features.prediction_id,
+        )
+
+    # Compute edge.
+    edge, edge_components = _compute_edge(
+        direction=direction, p_hat=p_hat, mid=mid,
+        executable_price=features.executable_price, spread=features.spread, cfg=cfg,
+    )
+
+    # Gate 5 — edge.
+    status, entry, reason = _gate_edge(edge, cfg)
+    history.append(entry)
+    if status == "reject":
+        return GateResult(
+            "reject", reason, history, prediction_id=features.prediction_id,
+        )
+
+    # Compute Kelly + size.
+    kelly_full, kelly_capped, size = _compute_kelly_and_size(
+        direction=direction, p_hat=p_hat, mid=mid, cfg=cfg,
+    )
+
+    # Gate 6 — size (with per-market floor conversion).
+    min_shares = features.market.get("min_order_size") if features.market else None
+    market_floor_usdc, _floor_source = _market_min_usdc(
+        min_shares=min_shares,
+        executable_price=features.executable_price,
+        mid=mid,
+        direction=direction,
+    )
+    status, entry, reason, effective_floor = _gate_size(
+        size=size, market_floor_usdc=market_floor_usdc, cfg=cfg,
+    )
+    history.append(entry)
+    if status == "reject":
+        return GateResult(
+            "reject", reason, history,
+            market_floor_usdc=market_floor_usdc,
+            effective_floor=effective_floor,
+            prediction_id=features.prediction_id,
+        )
+
+    # Gate 7 — cash (clip + post-clip floor check).
+    if features.cash_available is None:
+        raise ValueError("evaluate_gates: features.cash_available required before cash gate")
+    status, entries, reason, final_size = _gate_cash(
+        size=size, cash_available=features.cash_available,
+        effective_floor=effective_floor, market_floor_usdc=market_floor_usdc, cfg=cfg,
+    )
+    history.extend(entries)
+    if status == "reject":
+        return GateResult(
+            "reject", reason, history,
+            market_floor_usdc=market_floor_usdc,
+            effective_floor=effective_floor,
+            prediction_id=features.prediction_id,
+        )
+
+    return GateResult(
+        outcome="execute",
+        reason="ok",
+        gate_history=history,
+        direction=direction,
+        confidence=confidence,
+        p_hat=p_hat,
+        mid=mid,
+        edge=edge,
+        edge_components=edge_components,
+        kelly_full=kelly_full,
+        kelly_capped=kelly_capped,
+        size_usdc=final_size,
+        market_floor_usdc=market_floor_usdc,
+        effective_floor=effective_floor,
+        prediction_id=features.prediction_id,
     )
 
 
@@ -366,14 +753,18 @@ class TradeStage:
         cycle_id = current_cycle_id()
         gate_history: list[dict] = []
 
-        # 1. similarity_floor -------------------------------------------------
-        if float(similarity) < self._cfg.min_similarity:
+        # 0. execution kill switch (cycle 23) --------------------------------
+        # Lands BEFORE any LLM/CLOB-cost work so a halted bot doesn't burn
+        # tokens or hit Polymarket. Still writes a decisions row so the
+        # soak funnel shows the rejection — operationally distinguishable
+        # from a silent stall.
+        if not self._cfg.execution_enabled:
             gate_history.append(
-                _gate_entry("similarity_floor", "reject", float(similarity), self._cfg.min_similarity)
+                _gate_entry("execution_enabled", "reject", False, True)
             )
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="similarity_floor",
+                reason="execution_disabled",
                 gate_history=gate_history,
                 prediction_id=None,
                 cycle_id=cycle_id,
@@ -383,18 +774,31 @@ class TradeStage:
                 decision_latency_breakdown=dict(breakdown),
             )
             return
-        gate_history.append(
-            _gate_entry("similarity_floor", "ok", float(similarity), self._cfg.min_similarity)
-        )
+
+        # 1. similarity_floor -------------------------------------------------
+        status, entry, reason = _gate_similarity_floor(similarity, self._cfg)
+        gate_history.append(entry)
+        if status == "reject":
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=None,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
 
         # 2. freshness --------------------------------------------------------
-        if freshness not in self._cfg.accept_freshness:
-            gate_history.append(
-                _gate_entry("freshness", "reject", freshness, list(self._cfg.accept_freshness))
-            )
+        status, entry, reason = _gate_freshness(freshness, self._cfg)
+        gate_history.append(entry)
+        if status == "reject":
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="freshness_stale",
+                reason=reason,
                 gate_history=gate_history,
                 prediction_id=None,
                 cycle_id=cycle_id,
@@ -404,9 +808,6 @@ class TradeStage:
                 decision_latency_breakdown=dict(breakdown),
             )
             return
-        gate_history.append(
-            _gate_entry("freshness", "ok", freshness, list(self._cfg.accept_freshness))
-        )
 
         # Compose prompt from article + market. Done after the cheap gates so
         # we don't pay a DB round-trip for signals that fail upstream.
@@ -443,22 +844,18 @@ class TradeStage:
             )
             return
 
-        # 2.5 entity_overlap (stage-0 hard filter) ---------------------------
-        # Reject (article, market) pairs where the article's resolved
-        # entities don't appear in the market question. Saves an LLM
-        # call on obvious noise matches. Permissive when the extractor
-        # hasn't completed for this article yet — `n_entities == 0`
-        # means "no signal", not "no match".
-        overlaps, n_entities = await article_entities_overlap_market(
-            self._db, int(article_id), market["question"] or ""
-        )
-        if n_entities > 0 and not overlaps:
-            gate_history.append(
-                _gate_entry("entity_overlap", "reject", 0, n_entities)
-            )
+        # 2.25 market_state (cycle 23) ---------------------------------------
+        # Refuses entries on closed / inactive / near-expiry markets. Lands
+        # before the entity-overlap DB read and the LLM direction call so a
+        # bad market never burns tokens. Permissive when the relevant
+        # columns are NULL (don't reject on missing data — the upstream
+        # market_news_imbalance gate covers expiry distance separately).
+        status, entry, reason = _gate_market_state(market, self._cfg)
+        if status == "reject":
+            gate_history.append(entry)
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="entity_mismatch",
+                reason=reason,
                 gate_history=gate_history,
                 prediction_id=None,
                 cycle_id=cycle_id,
@@ -468,14 +865,31 @@ class TradeStage:
                 decision_latency_breakdown=dict(breakdown),
             )
             return
-        gate_history.append(
-            _gate_entry(
-                "entity_overlap",
-                "ok",
-                "match" if overlaps else "no_entities_yet",
-                n_entities,
-            )
+
+        # 2.5 entity_overlap (stage-0 hard filter) ---------------------------
+        # Reject (article, market) pairs where the article's resolved
+        # entities don't appear in the market question. Saves an LLM
+        # call on obvious noise matches. Permissive when the extractor
+        # hasn't completed for this article yet — `n_entities == 0`
+        # means "no signal", not "no match".
+        overlaps, n_entities = await article_entities_overlap_market(
+            self._db, int(article_id), market["question"] or ""
         )
+        status, entry, reason = _gate_entity_overlap(overlaps, n_entities)
+        gate_history.append(entry)
+        if status == "reject":
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=None,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
 
         prompt = self._compose_prompt(article, market)
 
@@ -488,41 +902,23 @@ class TradeStage:
             tracer_id=tracer_id,
         )
         breakdown["ai_direction"] = (time.perf_counter() - _t) * 1000.0
-        if result.direction == "NEUTRAL":
-            gate_history.append(
-                _gate_entry("direction", "reject", "NEUTRAL", "YES|NO")
-            )
-            await self._record_reject(
-                signal_id=int(signal_id),
-                reason="direction_neutral",
-                gate_history=gate_history,
-                prediction_id=result.prediction_id,
-                cycle_id=cycle_id,
-                is_tracer=is_tracer,
-                tracer_id=tracer_id,
-                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
-                decision_latency_breakdown=dict(breakdown),
-            )
-            return
-        if result.confidence < self._cfg.min_confidence:
-            gate_history.append(
-                _gate_entry("direction", "reject", result.confidence, self._cfg.min_confidence)
-            )
-            await self._record_reject(
-                signal_id=int(signal_id),
-                reason="direction_lowconf",
-                gate_history=gate_history,
-                prediction_id=result.prediction_id,
-                cycle_id=cycle_id,
-                is_tracer=is_tracer,
-                tracer_id=tracer_id,
-                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
-                decision_latency_breakdown=dict(breakdown),
-            )
-            return
-        gate_history.append(
-            _gate_entry("direction", "ok", result.direction, result.confidence)
+        status, entry, reason = _gate_direction(
+            result.direction, result.confidence, self._cfg,
         )
+        gate_history.append(entry)
+        if status == "reject":
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
 
         # 4. edge -------------------------------------------------------------
         direction = result.direction
@@ -531,14 +927,34 @@ class TradeStage:
         _t = time.perf_counter()
         mid = await self._resolve_mid(direction=direction, market=market)
         breakdown["resolve_mid"] = (time.perf_counter() - _t) * 1000.0
+        # 4-pre. mid_unavailable (cycle 23) ----------------------------------
+        # Replaces the pre-cycle-23 silent fallback to default_mid_price=0.5
+        # which produced 21/39 trades at stub mid. `_resolve_mid` now returns
+        # None on any non-real-mid path; we reject loudly.
+        status, entry, reason = _gate_mid_unavailable(mid)
+        if status == "reject":
+            gate_history.append(entry)
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
         # 4a. degenerate-mid guard — markets at mid <= min_mid or >= max_mid
         # are essentially resolved. Cycle 3 surfaced PnL=0 trades on these
         # because the closer would force-close at entry_mid. Block at entry.
-        if mid <= self._cfg.min_mid or mid >= self._cfg.max_mid:
-            gate_history.append(_gate_entry("edge", "reject", mid, "mid_degenerate"))
+        status, entry, reason = _gate_mid_degenerate(mid, self._cfg)
+        if status == "reject":
+            gate_history.append(entry)
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="mid_degenerate",
+                reason=reason,
                 gate_history=gate_history,
                 prediction_id=result.prediction_id,
                 cycle_id=cycle_id,
@@ -561,11 +977,12 @@ class TradeStage:
             executable_price, spread = book
         else:
             executable_price, spread = None, None
-        if spread is not None and spread > self._cfg.wide_spread_threshold:
-            gate_history.append(_gate_entry("edge", "reject", spread, "wide_spread"))
+        status, entry, reason = _gate_wide_spread(spread, self._cfg)
+        if status == "reject":
+            gate_history.append(entry)
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="wide_spread",
+                reason=reason,
                 gate_history=gate_history,
                 prediction_id=result.prediction_id,
                 cycle_id=cycle_id,
@@ -610,43 +1027,16 @@ class TradeStage:
         # legacy behaviour so paper/test environments without a book
         # source keep reproducing prior cycle-7 trade counts.
         # See irene/plans/order-execution-spreads.md §2.
-        if executable_price is not None and spread is not None:
-            half_spread = float(spread) / 2.0
-            if direction == "YES":
-                # Buying YES: pay YES-side best_ask.
-                # executable_price == best_ask_yes.
-                edge = p_hat - executable_price - self._cfg.taker_fee_buffer - half_spread
-            else:
-                # Buying NO: pay NO-side best_ask = 1 - best_bid_yes.
-                # Edge of NO buy = (1 - p_hat) - best_ask_no
-                #                = (1 - best_ask_no) - p_hat
-                # so the executable_price returned in YES-price terms is
-                # `1 - best_ask_no` (i.e. best_bid_yes) and the symmetric
-                # formula matches the YES branch's shape.
-                edge = executable_price - p_hat - self._cfg.taker_fee_buffer - half_spread
-            edge_components = {
-                "mid": mid,
-                "executable_price": float(executable_price),
-                "spread": float(spread),
-                "half_spread": half_spread,
-                "taker_fee_buffer": float(self._cfg.taker_fee_buffer),
-                "fallback": False,
-            }
-        else:
-            if direction == "YES":
-                edge = p_hat - mid - self._cfg.fee_buffer
-            else:
-                edge = mid - p_hat - self._cfg.fee_buffer
-            edge_components = {
-                "mid": mid,
-                "fee_buffer": float(self._cfg.fee_buffer),
-                "fallback": True,
-            }
-        if edge < self._cfg.min_edge:
-            gate_history.append(_gate_entry("edge", "reject", edge, self._cfg.min_edge))
+        edge, edge_components = _compute_edge(
+            direction=direction, p_hat=p_hat, mid=mid,
+            executable_price=executable_price, spread=spread, cfg=self._cfg,
+        )
+        status, entry, reason = _gate_edge(edge, self._cfg)
+        gate_history.append(entry)
+        if status == "reject":
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="edge_below_min",
+                reason=reason,
                 gate_history=gate_history,
                 prediction_id=result.prediction_id,
                 cycle_id=cycle_id,
@@ -656,21 +1046,10 @@ class TradeStage:
                 decision_latency_breakdown=dict(breakdown),
             )
             return
-        gate_history.append(_gate_entry("edge", "ok", edge, self._cfg.min_edge))
 
         # 5. size -------------------------------------------------------------
-        if direction == "YES":
-            b = (1.0 - mid) / mid
-            kelly_full = (p_hat * b - (1.0 - p_hat)) / b
-        else:
-            p_no = 1.0 - p_hat
-            mid_no = 1.0 - mid
-            b = (1.0 - mid_no) / mid_no
-            kelly_full = (p_no * b - (1.0 - p_no)) / b
-        kelly_capped = max(0.0, kelly_full) * self._cfg.kelly_fraction
-        size = min(
-            kelly_capped * self._cfg.balance_usdc,
-            self._cfg.balance_usdc * self._cfg.max_position_fraction,
+        kelly_full, kelly_capped, size = _compute_kelly_and_size(
+            direction=direction, p_hat=p_hat, mid=mid, cfg=self._cfg,
         )
         # Cycle 13: per-market platform floor (plans/order-execution-spreads.md
         # proposal #4). Polymarket exposes `minimum_order_size` in SHARES on
@@ -691,22 +1070,11 @@ class TradeStage:
             mid=mid,
             direction=direction,
         )
-        effective_floor = max(self._cfg.min_position_usdc, market_floor_usdc or 0.0)
-        if size < effective_floor:
-            # Pick the rejection reason based on which floor bound:
-            # `below_market_min` if the per-market floor is what bit
-            # (cycle 13), otherwise the legacy `size_below_min` so the
-            # existing funnel-monitoring + tests stay intact.
-            if (
-                market_floor_usdc is not None
-                and market_floor_usdc > self._cfg.min_position_usdc
-            ):
-                reason = "below_market_min"
-                threshold = market_floor_usdc
-            else:
-                reason = "size_below_min"
-                threshold = self._cfg.min_position_usdc
-            gate_history.append(_gate_entry("size", "reject", size, threshold))
+        status, entry, reason, effective_floor = _gate_size(
+            size=size, market_floor_usdc=market_floor_usdc, cfg=self._cfg,
+        )
+        gate_history.append(entry)
+        if status == "reject":
             await self._record_reject(
                 signal_id=int(signal_id),
                 reason=reason,
@@ -719,7 +1087,6 @@ class TradeStage:
                 decision_latency_breakdown=dict(breakdown),
             )
             return
-        gate_history.append(_gate_entry("size", "ok", size, effective_floor))
 
         # 6. cash (paper wallet) ---------------------------------------------
         # Cycle 3: CLIP size to fit available cash instead of rejecting
@@ -736,13 +1103,16 @@ class TradeStage:
         await cur.close()
         open_invested = float(row[0] or 0.0)
         cash_available = self._cfg.balance_usdc - open_invested
-        if cash_available <= 0.0:
-            gate_history.append(
-                _gate_entry("cash", "reject", size, cash_available)
-            )
+        status, entries, reason, final_size = _gate_cash(
+            size=size, cash_available=cash_available,
+            effective_floor=effective_floor, market_floor_usdc=market_floor_usdc,
+            cfg=self._cfg,
+        )
+        gate_history.extend(entries)
+        if status == "reject":
             await self._record_reject(
                 signal_id=int(signal_id),
-                reason="insufficient_cash",
+                reason=reason,
                 gate_history=gate_history,
                 prediction_id=result.prediction_id,
                 cycle_id=cycle_id,
@@ -752,46 +1122,16 @@ class TradeStage:
                 decision_latency_breakdown=dict(breakdown),
             )
             return
-        if size > cash_available:
-            # Clip — note the original requested size in gate_history.
-            gate_history.append(
-                _gate_entry("cash", "clip", size, cash_available)
-            )
-            size = cash_available
-            # Cycle 13: re-check against the SAME effective floor we used
-            # on the pre-clip path. If the cash-clip pushes us under the
-            # per-market floor, the reason is still `below_market_min`;
-            # under just the config floor, keep the legacy
-            # `size_below_min` reason for funnel continuity.
-            if size < effective_floor:
-                if (
-                    market_floor_usdc is not None
-                    and market_floor_usdc > self._cfg.min_position_usdc
-                ):
-                    reason_clip = "below_market_min"
-                    threshold_clip = market_floor_usdc
-                else:
-                    reason_clip = "size_below_min"
-                    threshold_clip = self._cfg.min_position_usdc
-                gate_history.append(
-                    _gate_entry("size_after_clip", "reject", size, threshold_clip)
-                )
-                await self._record_reject(
-                    signal_id=int(signal_id),
-                    reason=reason_clip,
-                    gate_history=gate_history,
-                    prediction_id=result.prediction_id,
-                    cycle_id=cycle_id,
-                    is_tracer=is_tracer,
-                    tracer_id=tracer_id,
-                    decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
-                    decision_latency_breakdown=dict(breakdown),
-                )
-                return
-        else:
-            gate_history.append(_gate_entry("cash", "ok", size, cash_available))
+        # Adopt the (possibly clipped) size for downstream feature/PnL math.
+        size = final_size
 
         # Execute path --------------------------------------------------------
+        # PR-B: `market_at_trade` pins the subset of the market dict that
+        # influenced this decision — `markets` is mutable across cycles, so
+        # the replay can't trust the current row. Captures: per-market
+        # fee_rate, volume_usdc, category, min_order_size, end_date. spread
+        # is already preserved inside `edge_components` for the book-aware
+        # path.
         features_snapshot = {
             "gate_history": gate_history,
             "prompt": prompt,
@@ -808,6 +1148,13 @@ class TradeStage:
             "kelly_capped": kelly_capped,
             "size_usdc": size,
             "balance_usdc": self._cfg.balance_usdc,
+            "market_at_trade": {
+                "fee_rate": market.get("fee_rate"),
+                "volume_usdc": market.get("volume_usdc"),
+                "category": market.get("category"),
+                "min_order_size": market.get("min_order_size"),
+                "end_date": market.get("end_date"),
+            },
         }
         # Cycle 14: time the DB write (decision + trade + features inserts
         # are all under `_record_execute`). Total chain latency snapshots
@@ -850,19 +1197,38 @@ class TradeStage:
         return row is not None
 
     async def _fetch_article(self, article_id: int) -> Optional[dict]:
+        # Cycle 24 (handoff H): `body` joins the fetch so the prompt
+        # builder can prefer the full trafilatura-cleaned article over
+        # the (often 1-sentence) RSS summary. NULL on legacy rows + on
+        # any path where the upstream scraper-v2 payload didn't supply
+        # a body field — the prompt builder falls back to `summary` in
+        # that case.
         cur = await self._db.conn.execute(
-            "SELECT title, summary FROM articles WHERE id=?", (article_id,)
+            "SELECT title, summary, body FROM articles WHERE id=?",
+            (article_id,),
         )
         row = await cur.fetchone()
         await cur.close()
         if row is None:
             return None
-        return {"title": row["title"], "summary": row["summary"]}
+        return {
+            "title": row["title"],
+            "summary": row["summary"],
+            "body": row["body"],
+        }
 
     async def _fetch_market(self, market_id: str) -> Optional[dict]:
+        # Cycle 21 / PR-B: `fee_rate` (cycle 10) is also fetched so the
+        # snapshot the trade row pins under `features_snapshot.market_at_trade`
+        # captures the per-market Polymarket taker rate as-of trade time.
+        # `markets` is a SHARED mutable table — its rows get refreshed by the
+        # markets-stage poller — so the replay harness cannot trust the
+        # current row to represent the value at decision time. Pinning the
+        # subset on the trade row is the durable record.
         cur = await self._db.conn.execute(
             "SELECT question, description, token_yes, token_no, "
-            "       category, end_date, volume_usdc, min_order_size "
+            "       category, end_date, volume_usdc, min_order_size, "
+            "       fee_rate, active, closed_at "
             "FROM markets WHERE condition_id=?",
             (market_id,),
         )
@@ -885,6 +1251,15 @@ class TradeStage:
             # back to `cfg.trade.min_position_usdc` only. See
             # plans/order-execution-spreads.md proposal #4.
             "min_order_size": row["min_order_size"],
+            # Cycle 10 / pinned by PR-B: per-market Polymarket taker
+            # fee_rate. NULL = not-yet-fetched; closer.py + replay both
+            # fall back to `cfg.trade.default_fee_rate` (cycle 16). See
+            # `markets.py:_maybe_fetch_market_info`.
+            "fee_rate": row["fee_rate"],
+            # Cycle 23: read by `_gate_market_state` so the trade path can
+            # refuse entries on closed / inactive / near-expiry markets.
+            "active": row["active"],
+            "closed_at": row["closed_at"],
         }
 
     async def _cluster_size_for_signal(self, signal_id: int) -> int:
@@ -1069,42 +1444,31 @@ class TradeStage:
         narrative weight. Returns None (ok) or (sub_rule, detail). Five
         sub-rules — see plan §"Market-weight vs news-weight gate".
 
+        Delegates to the pure helper `_eval_market_news_imbalance_subrules`
+        so the replay harness can re-run the same rules without a DB. The
+        two pieces of I/O the rules need — the parsed deadline-days and
+        sub-rule-5's cluster_size — are resolved here and passed in via
+        the market dict + `cluster_size` arg.
+
         Defensive: when a signal is missing (volume=None/0, end_date=None)
-        we skip that sub-rule rather than fail-open the whole gate. This
-        keeps the system trading while upstream parsers are improving."""
+        the helper skips that sub-rule rather than fail-open the whole gate."""
         cfg = self._cfg
-        is_breaking = (freshness == "BREAKING")
-
-        # Sub-rule 1: thin market (skip when volume unknown / 0 — parser bug).
-        volume = market.get("volume_usdc")
-        if isinstance(volume, (int, float)) and volume > 0:
-            if volume < cfg.min_market_volume_usdc:
-                return ("thin_market", float(volume))
-
-        # Sub-rule 2: extreme mid without BREAKING news.
-        if cfg.require_breaking_for_extreme_mid and not is_breaking:
-            if mid <= cfg.extreme_mid_low or mid >= cfg.extreme_mid_high:
-                return ("extreme_mid_no_breaking", mid)
-
-        # Sub-rules 3 & 4: time-to-expiry. Pass the whole market dict so
-        # the deadline parser can fall back to the title-string when
-        # Gamma's `end_date` is missing (per resolution-oracle plan D2).
-        days = self._days_to(market)
-        if days is not None:
-            if days < cfg.min_days_to_expiry:
-                return ("near_expiry", days)
-            if cfg.require_breaking_for_far_future and not is_breaking:
-                if days > cfg.far_future_days:
-                    return ("far_future_no_breaking", days)
-
-        # Sub-rule 5: singleton cluster on extreme mid (slightly tighter
-        # threshold than the breaking check). Costs one COUNT(*) query.
-        if cfg.reject_singleton_on_extreme_mid:
-            if mid <= 0.15 or mid >= 0.85:
-                cluster_size = await self._cluster_size_for_signal(signal_id)
-                if cluster_size == 1:
-                    return ("singleton_on_extreme_mid", mid)
-        return None
+        # Pre-compute the deadline-days and stuff it onto a copy of the
+        # market dict — the pure helper is sync and can't call the
+        # `_parse_market_deadline` chain itself (it depends on ET/UTC
+        # handling and lives as a TradeStage classmethod).
+        market_with_days = dict(market)
+        market_with_days["_days_to_expiry"] = self._days_to(market)
+        # Sub-rule 5's cluster_size query only matters when the
+        # singleton-on-extreme-mid rule could fire. Query lazily, mirroring
+        # the pre-refactor behaviour (only one extra COUNT(*) at most).
+        cluster_size = 1
+        if cfg.reject_singleton_on_extreme_mid and (mid <= 0.15 or mid >= 0.85):
+            cluster_size = await self._cluster_size_for_signal(signal_id)
+        return _eval_market_news_imbalance_subrules(
+            market=market_with_days, mid=mid, freshness=freshness,
+            cluster_size=cluster_size, cfg=cfg,
+        )
 
     def _compose_prompt(self, article: dict, market: dict) -> str:
         # Per `docs/philosophy.md`: irene is not a forecaster. The LLM is
@@ -1119,26 +1483,49 @@ class TradeStage:
         # (article, market) pair.
         return compose_direction_prompt(article, market)
 
-    async def _resolve_mid(self, *, direction: str, market: Optional[dict]) -> float:
-        """Return the mid-price for the side we're betting on.
+    async def _resolve_mid(
+        self, *, direction: str, market: Optional[dict]
+    ) -> Optional[float]:
+        """Return the mid-price for the side we're betting on, or `None`
+        when no real CLOB price is available.
 
-        Order of preference:
-          1. CLOB lookup for the side's token, when `deps.clob` is set
-             and the market row has a non-NULL token_id for that side.
-          2. `cfg.trade.default_mid_price` fallback (P1 stub).
-
-        Errors from CLOB are absorbed (the client itself returns None on
-        any recoverable failure); we just hit the fallback in that case.
+        Cycle 23: removed the silent fallback to `cfg.default_mid_price`.
+        Pre-cycle-23 this returned 0.5 on (a) `self._clob is None`,
+        (b) missing token, (c) `clob.get_mid()` returning None — the bot
+        then placed real BUYs at the stub price (21/39 trades in the audit
+        window). `_gate_mid_unavailable` now rejects on `None`. The clob
+        WARN-once defense is in `_warn_once_*` below.
         """
-        if self._clob is None or market is None:
-            return self._cfg.default_mid_price
-        token_id: Optional[str] = market.get("token_yes") if direction == "YES" else market.get("token_no")
+        if self._clob is None:
+            self._warn_once_clob_missing("_resolve_mid")
+            return None
+        if market is None:
+            return None
+        token_id: Optional[str] = (
+            market.get("token_yes") if direction == "YES" else market.get("token_no")
+        )
         if not token_id:
-            return self._cfg.default_mid_price
+            return None
         mid = await self._clob.get_mid(str(token_id))
         if mid is None:
-            return self._cfg.default_mid_price
+            return None
         return float(mid)
+
+    # Cycle 23: per-process one-shot WARN log so silent-fallback regressions
+    # are impossible to overlook. Keyed by call-site so each surface logs
+    # exactly once per process lifetime.
+    _CLOB_WARN_SEEN: set[str] = set()
+
+    def _warn_once_clob_missing(self, site: str) -> None:
+        if site in self._CLOB_WARN_SEEN:
+            return
+        self._CLOB_WARN_SEEN.add(site)
+        logger.warning(
+            "trade: %s observed self._clob is None — pre-trade gate "
+            "will reject with mid_unavailable. This is a SILENT-FALLBACK "
+            "regression: investigate build_deps() / build_clob() wiring.",
+            site,
+        )
 
     async def _resolve_spread(
         self, *, direction: str, market: Optional[dict]
@@ -1455,6 +1842,13 @@ class TradeStage:
             json.dumps(decision_latency_breakdown)
             if decision_latency_breakdown is not None
             else None
+        )
+        # Cycle 23: post-condition. After Phase 1 the mid_unavailable and
+        # mid_degenerate gates should make a degenerate mid unreachable
+        # here; assert so any regression is loud, never a silent bad row.
+        assert mid is not None and 0.0 < float(mid) < 1.0, (
+            f"_insert_trade refusing degenerate mid: market={market_id} "
+            f"direction={direction} mid={mid!r}"
         )
         async with self._db.batch() as cur:
             await cur.execute(

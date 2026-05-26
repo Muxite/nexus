@@ -110,6 +110,9 @@ class _TradeCfg:
     require_breaking_for_far_future: bool = True
     reject_singleton_on_extreme_mid: bool = True
     accept_freshness: list = field(default_factory=lambda: ["BREAKING", "EVOLVING"])
+    # Cycle 23: kill switch + market-state buffer. Defaults mirror config.py.
+    execution_enabled: bool = True
+    min_hours_to_expiry: float = 6.0
 
 
 @dataclass
@@ -168,6 +171,14 @@ async def db_seeded():
 
 
 def _make_stage(db, bus, ai, cfg: Optional[_Config] = None, *, clob=None) -> TradeStage:
+    # Cycle 23: pre-cycle-23 a missing clob produced mid=0.5 via the silent
+    # fallback in _resolve_mid. After cycle 23 that path returns None and
+    # rejects on mid_unavailable. Most existing tests exercise downstream
+    # gate logic and assume a workable mid; provide a sane default CLOB so
+    # they keep passing. Tests that specifically exercise the
+    # mid_unavailable path pass `clob=_FakeCLOB(prices={})` explicitly.
+    if clob is None:
+        clob = _FakeCLOB(prices={}, default_mid=0.5)
     deps = StageDeps(
         db=db,
         bus=bus,
@@ -179,7 +190,17 @@ def _make_stage(db, bus, ai, cfg: Optional[_Config] = None, *, clob=None) -> Tra
 
 
 class _FakeCLOB:
-    """Async CLOB stand-in. Returns the price keyed by token_id, else None.
+    """Async CLOB stand-in. Returns the price keyed by token_id, else
+    `default_mid` (None by default).
+
+    Cycle 23: pre-cycle-23 a missing token resolved to None and silently
+    fell back to `cfg.trade.default_mid_price=0.5` inside `_resolve_mid`.
+    After cycle 23 that path rejects with `mid_unavailable`. To preserve
+    the test-layer ergonomics, the default `_make_stage` clob passes
+    `default_mid=0.5` so tests that exercise downstream gate logic don't
+    have to enumerate every token. Tests that exercise the
+    `mid_unavailable` path pass `default_mid=None` (the constructor
+    default) and an empty `prices` dict.
 
     Optionally also supports `get_top_of_book` for the wide-spread gate:
     pass `books={token_id: (best_bid, best_ask)}`. A token missing from
@@ -190,15 +211,19 @@ class _FakeCLOB:
         self,
         prices: dict[str, float],
         books: Optional[dict[str, tuple[float, float]]] = None,
+        default_mid: Optional[float] = None,
     ) -> None:
         self.prices = dict(prices)
         self.books = dict(books or {})
+        self.default_mid = default_mid
         self.calls: list[str] = []
         self.book_calls: list[str] = []
 
     async def get_mid(self, token_id: str):
         self.calls.append(token_id)
-        return self.prices.get(token_id)
+        if token_id in self.prices:
+            return self.prices[token_id]
+        return self.default_mid
 
     async def get_top_of_book(self, token_id: str):
         self.book_calls.append(token_id)
@@ -954,7 +979,12 @@ async def test_market_news_imbalance_extreme_mid_evolving_rejects(db_seeded):
 
 
 async def test_market_news_imbalance_near_expiry_rejects(db_seeded):
-    # end_date in the past (or < 1 day) → reject regardless of freshness.
+    # Cycle 23: end_date in the past now trips the new `market_near_expiry`
+    # gate (which lives EARLIER in the cascade than market_news_imbalance,
+    # before the LLM direction call). Same intent — refuse to trade markets
+    # with no exit-room — but a more specific reject reason. The original
+    # market_news_imbalance near-expiry sub-rule still fires for markets
+    # between cfg.trade.min_hours_to_expiry (6h) and the old 1-day cutoff.
     async with db_seeded.batch() as cur:
         await cur.execute("UPDATE markets SET end_date='2020-01-01T00:00:00Z' WHERE condition_id='m1'")
     bus = _FakeBus()
@@ -967,7 +997,7 @@ async def test_market_news_imbalance_near_expiry_rejects(db_seeded):
         await stage.handle(_payload(freshness="BREAKING"))
     d = await _single_decision(db_seeded)
     assert d["outcome"] == "reject"
-    assert d["reason"] == "market_news_imbalance"
+    assert d["reason"] == "market_near_expiry"
 
 
 async def test_edge_below_min_rejects(db_seeded):
@@ -1169,23 +1199,34 @@ async def test_clob_supplies_real_mid_when_set(db_seeded):
     assert clob.calls == ["ty"], "YES direction should query the token_yes side"
 
 
-async def test_clob_missing_token_falls_back_to_default(db_seeded):
+async def test_clob_returning_none_rejects_with_mid_unavailable(db_seeded):
+    """Cycle 23: pre-cycle-23 this returned mid_price=0.5 (the silent
+    fallback bug that produced 21/39 stub trades). Now: a None mid from
+    CLOB rejects the decision with reason='mid_unavailable' and no trade
+    row is written. The bot is no longer allowed to buy blind."""
     bus = _FakeBus()
     ai = _FakeAI()
-    # Empty CLOB → get_mid returns None → fall back to default_mid_price (0.5).
+    # Empty CLOB → get_mid returns None for every token.
     clob = _FakeCLOB(prices={})
     stage = _make_stage(db_seeded, bus, ai, clob=clob)
     with cycle_scope(1):
         await stage.handle(_payload())
+    # No trade row.
     cur = await db_seeded.conn.execute(
-        "SELECT mid_price FROM trades WHERE signal_id=1"
+        "SELECT COUNT(*) AS n FROM trades WHERE signal_id=1"
     )
     row = await cur.fetchone()
     await cur.close()
-    # Default mid 0.5 + YES@0.7 → edge 0.2 - 0.02 = 0.18 → executes
-    # (under default config which has min_edge=0.04).
-    assert row is not None
-    assert row["mid_price"] == pytest.approx(0.5)
+    assert row["n"] == 0
+    # Decision row exists with the mid_unavailable reason.
+    cur = await db_seeded.conn.execute(
+        "SELECT outcome, reason FROM decisions WHERE signal_id=1"
+    )
+    drow = await cur.fetchone()
+    await cur.close()
+    assert drow is not None
+    assert drow["outcome"] == "reject"
+    assert drow["reason"] == "mid_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -1426,3 +1467,145 @@ async def test_execute_path_still_records_latency(db_seeded):
     assert drow["outcome"] == "execute"
     assert drow["decision_latency_ms"] is None
     assert drow["decision_latency_breakdown"] is None
+
+
+# ---------------------------------------------------------------------------
+# Cycle 24 (handoff H): compose_direction_prompt — fuller article body,
+# expanded market context, softer NEUTRAL guidance. The downstream parser
+# (`ai._parse_response`) still expects a JSON-only reply, so the "Output
+# JSON ONLY." tail must stay intact.
+# ---------------------------------------------------------------------------
+
+
+from app.stages.trade import (  # noqa: E402 — module-level import OK; collated with H tests
+    MAX_ARTICLE_CHARS_IN_PROMPT,
+    compose_direction_prompt,
+)
+
+
+def _h_article(*, title="T", summary="", body=""):
+    """Minimal article dict for prompt-builder unit tests. Empty strings
+    collapse to "" (the builder's own empty-default handling kicks in)."""
+    return {"title": title, "summary": summary, "body": body}
+
+
+def _h_market(**overrides):
+    """Minimal market dict. Defaults populate every field the cycle-24
+    prompt surfaces so tests can override one knob at a time."""
+    base = {
+        "question": "Will X happen?",
+        "description": "Resolution details.",
+        "end_date": "2026-12-31T23:59:59Z",
+        "volume_usdc": 12345.0,
+        "category": "politics",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_h_prompt_prefers_body_over_summary_when_body_longer():
+    """body must win over summary when meaningfully longer (>=1.5×, >=200 chars)."""
+    body = "Full article body. " * 30  # ~570 chars
+    summary = "Short lede sentence."     # ~20 chars
+    prompt = compose_direction_prompt(
+        _h_article(title="Headline", summary=summary, body=body),
+        _h_market(),
+    )
+    assert body[:100] in prompt
+    # The short summary should NOT appear verbatim — body replaced it.
+    assert summary not in prompt
+
+
+def test_h_prompt_falls_back_to_summary_when_body_absent():
+    """Empty body → summary wins (the cycle-23 behaviour for legacy rows)."""
+    summary = "The Senate passed the bill with 67 votes."
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary=summary, body=""),
+        _h_market(),
+    )
+    assert summary in prompt
+
+
+def test_h_prompt_falls_back_to_summary_when_body_too_short():
+    """A body that's <1.5× the summary length is NOT preferred — protects
+    against trafilatura returning a 1-sentence excerpt that happens to be
+    a few characters longer than the RSS lede."""
+    summary = "A clean one-sentence RSS lede that gives real context here."
+    body = "A slightly longer one-sentence excerpt that gives real context."
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary=summary, body=body),
+        _h_market(),
+    )
+    assert summary in prompt
+    assert body not in prompt
+
+
+def test_h_prompt_truncates_long_article_at_cap():
+    """A 12 KB body must be capped at MAX_ARTICLE_CHARS_IN_PROMPT chars
+    with a truncation marker so the LLM knows the input is incomplete."""
+    body = "x" * 12_000
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="", body=body),
+        _h_market(),
+    )
+    # The "x" run must not exceed the cap inside the prompt.
+    longest_x_run = max((len(s) for s in prompt.split("\n")), default=0)
+    assert longest_x_run <= MAX_ARTICLE_CHARS_IN_PROMPT + 100, (
+        f"prompt has a {longest_x_run}-char x-run; cap is "
+        f"{MAX_ARTICLE_CHARS_IN_PROMPT}"
+    )
+    assert "truncated" in prompt
+
+
+def test_h_prompt_surfaces_market_end_date_volume_category():
+    """end_date, volume (formatted), and category must all appear in the
+    prompt body so the LLM can reason about timing + depth + topic."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        _h_market(
+            end_date="2026-06-15T00:00:00Z",
+            volume_usdc=987_654.0,
+            category="geopolitics",
+        ),
+    )
+    assert "2026-06-15T00:00:00Z" in prompt
+    # Comma-grouped formatting per the builder.
+    assert "987,654" in prompt
+    assert "geopolitics" in prompt
+
+
+def test_h_prompt_handles_missing_market_fields_gracefully():
+    """Missing optional market fields must NOT raise — placeholders only."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        {"question": "Q?", "description": "D"},
+    )
+    assert "(unknown)" in prompt          # end_date placeholder
+    assert "(uncategorized)" in prompt    # category placeholder
+    assert "?" in prompt                  # volume placeholder
+
+
+def test_h_prompt_softens_neutral_guidance():
+    """The cycle-24 wording must drop the hard "Default to … whenever
+    you're unsure" line and explicitly invite a low-confidence
+    directional lean. The downstream gate cascade still filters on
+    `min_confidence`, so a more permissive prompt is safe."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        _h_market(),
+    )
+    assert "Default to" not in prompt
+    # Anchor on the new permissive phrasing.
+    assert "low confidence" in prompt
+    assert "directional lean" in prompt
+
+
+def test_h_prompt_preserves_json_only_tail():
+    """The downstream parser (`ai._parse_response`) keys on a JSON-only
+    response; if the tail line ever drifts, the parser regresses to
+    NEUTRAL on every call."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        _h_market(),
+    )
+    assert prompt.rstrip().endswith("Output JSON ONLY.")

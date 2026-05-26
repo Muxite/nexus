@@ -119,16 +119,44 @@ def main():
         ))
 
     # 7. Markets stuck at State 1/2 (cycle 11/12)
+    # Split per cycle-22: the cycle-12 _resolution_poll_loop only acts on
+    # markets where we still hold an open trade. Counting every closed-not-
+    # finalized market over-reports because the legacy backlog (no-open-trade
+    # rows) sits in this bucket indefinitely by design.
     rows = query(cur, """
-        SELECT COUNT(*) FROM markets
-        WHERE closed_at IS NOT NULL
-          AND uma_finalized_at IS NULL
-          AND (julianday('now') - julianday(closed_at)) * 24 < 168
+        SELECT COUNT(*) FROM markets m
+        WHERE m.closed_at IS NOT NULL
+          AND m.uma_finalized_at IS NULL
+          AND (julianday('now') - julianday(m.closed_at)) * 24 < 168
+          AND EXISTS (
+            SELECT 1 FROM trades t
+            LEFT JOIN trade_closures c ON c.trade_id = t.id
+            WHERE t.market_id = m.condition_id AND c.id IS NULL
+          )
     """)
-    stuck_n = rows[0][0]
-    # Healthy if < 20; if growing each check the resolution poll is failing.
-    stuck_ok = stuck_n < 50
-    out.append(alert_or_ok("markets state 1/2", stuck_ok, f"{stuck_n} closed-not-finalized"))
+    actionable_n = rows[0][0]
+    # Actionable = markets the resolution poll should be draining. Any
+    # non-zero count means the poll is failing to advance positions we hold.
+    actionable_ok = actionable_n == 0
+    out.append(alert_or_ok(
+        "state 1/2 actionable", actionable_ok,
+        f"{actionable_n} markets with open trades awaiting finalization",
+    ))
+
+    rows = query(cur, """
+        SELECT COUNT(*) FROM markets m
+        WHERE m.closed_at IS NOT NULL
+          AND m.uma_finalized_at IS NULL
+          AND (julianday('now') - julianday(m.closed_at)) * 24 < 168
+          AND NOT EXISTS (
+            SELECT 1 FROM trades t
+            LEFT JOIN trade_closures c ON c.trade_id = t.id
+            WHERE t.market_id = m.condition_id AND c.id IS NULL
+          )
+    """)
+    passive_n = rows[0][0]
+    # Passive = legacy backlog with no open positions; informational only.
+    out.append(f"[info]  {'legacy_uma_backlog':32s} {passive_n} closed-not-finalized (no open trades)")
 
     # 8. Markets in RESOLUTION_TIMEOUT (> 7d closed unresolved)
     rows = query(cur, """

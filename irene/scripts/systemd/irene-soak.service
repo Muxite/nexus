@@ -1,0 +1,18 @@
+[Unit]
+Description=Irene soak health check + backtest preflight
+# Don't block on docker — soak_check.py handles container-down gracefully.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/jennie/irene
+# Preflight first: replay-accuracy gate. Non-blocking ('-' prefix) so
+# stored-pnl drift gets logged without suppressing the soak summary.
+ExecStartPre=-/usr/bin/python3 -m scripts.replay.preflight
+ExecStart=/usr/bin/python3 -m scripts.soak_check
+StandardOutput=journal
+StandardError=journal
+# Soak check should finish in under a minute; cap at 5.
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=default.target

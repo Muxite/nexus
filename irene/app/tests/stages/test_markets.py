@@ -1754,3 +1754,86 @@ async def test_resolved_poll_handles_gamma_failure_gracefully(
         "SELECT uma_proposed_at FROM markets WHERE condition_id='0xRPF2'"
     )
     assert (await cur.fetchone())["uma_proposed_at"] is not None
+
+
+# ---------------------------------------------------------------------------
+# Cycle 23: Gamma 422 pagination handling.
+# ---------------------------------------------------------------------------
+
+
+async def test_fetch_all_gamma_preserves_partial_on_422_at_end_of_pagination(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 23 regression: Gamma caps pagination at offset=10000. The
+    101st page fetch (offset=10000 succeeds returning 100 rows; offset
+    advances to 10100; offset=10100 returns 422). Pre-cycle-23 the 422
+    propagated up out of `_fetch_all_gamma`; `poll_once` then dropped ALL
+    accumulated markets. This test verifies the cycle-23 behaviour: 422
+    after we have markets in hand is treated as end-of-pagination."""
+    import httpx
+    stage = _make_stage(db_ready, bus, embedder)
+
+    class _FakeResp:
+        def __init__(self, status: int, body):
+            self.status_code = status
+            self._body = body
+
+        def raise_for_status(self):
+            if 400 <= self.status_code < 600:
+                req = httpx.Request("GET", "https://gamma-api.polymarket.com/markets")
+                raise httpx.HTTPStatusError(
+                    f"status {self.status_code}", request=req,
+                    response=httpx.Response(self.status_code, request=req),
+                )
+
+        def json(self):
+            return self._body
+
+    page = [_gamma_row(f"0xPAG{i:04d}", f"Q {i}") for i in range(100)]
+
+    async def fake_get(self, params):
+        # Mimic Gamma: full page for offsets 0..9900; 422 at 10100.
+        off = int(params["offset"])
+        if off <= 9900:
+            return _FakeResp(200, page)
+        if off == 10000:
+            return _FakeResp(200, page)  # final full page
+        return _FakeResp(422, {"error": "offset out of bounds"})
+
+    monkeypatch.setattr(MarketsStage, "_gamma_get_with_backoff", fake_get)
+
+    result = await stage._fetch_all_gamma()
+
+    # 101 successful pages * 100 rows = 10100. The 422 at offset=10100
+    # is caught and the accumulated rows are returned, not dropped.
+    assert len(result) == 10100, (
+        f"expected 10100 markets preserved across the 422 boundary; got {len(result)}"
+    )
+
+
+async def test_fetch_all_gamma_re_raises_422_when_no_markets_accumulated(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """A 422 on the FIRST page is NOT end-of-pagination — it's a real
+    misconfiguration (bad params, Gamma outage). Don't swallow it."""
+    import httpx
+    stage = _make_stage(db_ready, bus, embedder)
+
+    async def fake_get(self, params):
+        req = httpx.Request("GET", "https://gamma-api.polymarket.com/markets")
+
+        class _R:
+            status_code = 422
+            def raise_for_status(self):
+                raise httpx.HTTPStatusError(
+                    "status 422", request=req,
+                    response=httpx.Response(422, request=req),
+                )
+            def json(self):
+                return {"error": "bad request"}
+        return _R()
+
+    monkeypatch.setattr(MarketsStage, "_gamma_get_with_backoff", fake_get)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await stage._fetch_all_gamma()

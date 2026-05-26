@@ -116,6 +116,10 @@ class RawHeadline:
     detected_at: datetime
     headline_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     source:      str = "news"   # "news" | "twitter" | "truth_social"
+    # Scraper-emitted classification (Phase C). Default values keep
+    # construction at existing call sites unchanged.
+    tier:           str = "mainstream"
+    breaking_score: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -523,11 +527,19 @@ class SiteWatcher:
             if url in self._seen:
                 continue
             self._seen.add(url)
+            tier = link.get("tier") if isinstance(link.get("tier"), str) else "mainstream"
+            score = link.get("breaking_score")
+            try:
+                score_f = float(score) if score is not None else 0.0
+            except (TypeError, ValueError):
+                score_f = 0.0
             results.append(RawHeadline(
                 site_url    = self._url,
                 headline    = title,
                 article_url = url,
                 detected_at = now,
+                tier        = tier,
+                breaking_score = score_f,
             ))
         return results, content_hash
 

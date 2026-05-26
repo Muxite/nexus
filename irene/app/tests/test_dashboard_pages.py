@@ -23,6 +23,7 @@ import app.stages.trade  # noqa: F401, E402
 from app.dashboard import Dashboard  # noqa: E402
 from app.dashboard.pages import latency_breakdown as latency_breakdown_page  # noqa: E402
 from app.dashboard.pages import main as main_page  # noqa: E402
+from app.dashboard.pages import near_miss_audit as near_miss_audit_page  # noqa: E402
 from app.dashboard.pages import pnl as pnl_page  # noqa: E402
 from app.dashboard.pages import recent_trades as recent_trades_page  # noqa: E402
 from app.db import DB  # noqa: E402
@@ -541,3 +542,158 @@ async def test_wallet_marks_closed_market_position_as_unpriceable(db_ready, tmp_
     assert "invested $   25.00 → current $   25.00" in body
     # And the accounting identity still passes (current=entry_mid → unrealized=0).
     assert "identity OK" in body
+
+
+# ─── near-miss audit (cycle 24, handoff F) ────────────────────────────
+#
+# Two sections, both populated from `decisions ← predictions`:
+#   A. direction_lowconf rejects with confidence in
+#      [audit_confidence_floor, min_confidence).
+#   B. decisive YES/NO rejects (confidence >= min_confidence) killed by
+#      a downstream gate (cash, mid, spread, etc.).
+# The page must render an empty-state block when either section is
+# empty so the operator knows the pipeline is starved upstream.
+
+
+async def _seed_near_miss_decision(
+    cur,
+    *,
+    decision_id: int,
+    reason: str,
+    direction: str,
+    confidence: float,
+) -> None:
+    """Seed an article + signal + prediction + reject decision pair.
+
+    Mirrors `_seed_trade` (with closed=False) up to the trades insert,
+    but writes a `reject` decision instead of `execute` and writes a
+    prediction row with the supplied direction/confidence so the
+    near-miss page's JOINs land.
+    """
+    await cur.execute(
+        """
+        INSERT INTO articles (id, source, source_detail, url, title, summary,
+                              published_at, ingested_at, cycle_id, is_tracer, tracer_id)
+        VALUES (?, 'rss','x', ?, ?, ?,
+                datetime('now','-60 seconds'),
+                datetime('now','-30 seconds'), 1, 0, NULL)
+        """,
+        (decision_id, f"u{decision_id}", f"t{decision_id}", f"s{decision_id}"),
+    )
+    await cur.execute(
+        """
+        INSERT INTO signals (id, article_id, market_id, similarity, cluster_id,
+                             freshness, embedder_id, cycle_id, is_tracer, tracer_id, created_at)
+        VALUES (?, ?, 'm1', 0.8, NULL, 'BREAKING', 'fake@4', 1, 0, NULL,
+                datetime('now','-15 seconds'))
+        """,
+        (decision_id, decision_id),
+    )
+    await cur.execute(
+        """
+        INSERT INTO predictions
+            (id, signal_id, llm_call_id, model, prompt_version,
+             direction, confidence, cached, raw_response, label,
+             cycle_id, is_tracer, tracer_id, created_at)
+        VALUES (?, ?, NULL, 'fake-model', 'v1', ?, ?, 0, ?, ?, 1, 0, NULL,
+                datetime('now','-12 seconds'))
+        """,
+        (
+            decision_id,
+            decision_id,
+            direction,
+            confidence,
+            direction[0],
+            direction[0],
+        ),
+    )
+    # gate_history contains the rejecting gate so the CLI's snippet
+    # extractor has something to chew on, but the dashboard page does
+    # not use it.
+    gate_history = json.dumps([
+        {"gate": "freshness", "outcome": "ok",
+         "value": "BREAKING", "threshold": ["BREAKING", "EVOLVING"]},
+        {"gate": reason, "outcome": "reject",
+         "value": confidence, "threshold": 0.55},
+    ])
+    await cur.execute(
+        """
+        INSERT INTO decisions (id, signal_id, outcome, reason, gate_history,
+                               prediction_id, cycle_id, is_tracer, tracer_id, created_at)
+        VALUES (?, ?, 'reject', ?, ?, ?, 1, 0, NULL,
+                datetime('now','-5 seconds'))
+        """,
+        (decision_id, decision_id, reason, gate_history, decision_id),
+    )
+
+
+async def test_near_miss_audit_empty_db(db_ready, tmp_path):
+    """Empty DB → both sections render the empty-state message and the
+    page does not crash. Header advertises the configured floors."""
+    dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)
+    body = await near_miss_audit_page.render(dash)
+
+    # Header carries the default floors (cfg=None on the test Dashboard
+    # → page falls back to 0.35 / 0.55).
+    assert body.startswith("# irene near-miss audit")
+    assert "audit_floor=0.35" in body
+    assert "trade_floor=0.55" in body
+    # Both section headers are present.
+    assert "Section A: leaning YES/NO rejected at the direction gate" in body
+    assert "Section B: decisive YES/NO killed by a downstream gate" in body
+    # Empty-state message renders TWICE (one per section).
+    empty_marker = "no near-miss rows in window"
+    assert body.count(empty_marker) == 2
+
+
+async def test_near_miss_audit_populated_sections(db_ready, tmp_path):
+    """Seed one near-miss per section and verify each lands in the
+    right block with the right metadata.
+
+    - Section A: a `direction_lowconf` reject with confidence 0.45
+      (above the 0.35 audit floor, below the 0.55 trade floor).
+    - Section B: an `insufficient_cash` reject with confidence 0.70
+      (above the 0.55 trade floor — the LLM was decisive but a
+      downstream gate killed the trade).
+    """
+    async with db_ready.batch() as cur:
+        await _seed_market(cur)
+        # Section A row — leaning YES, killed at direction gate.
+        await _seed_near_miss_decision(
+            cur,
+            decision_id=1,
+            reason="direction_lowconf",
+            direction="YES",
+            confidence=0.45,
+        )
+        # Section B row — decisive NO, killed by insufficient cash.
+        await _seed_near_miss_decision(
+            cur,
+            decision_id=2,
+            reason="insufficient_cash",
+            direction="NO",
+            confidence=0.70,
+        )
+
+    dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)
+    body = await near_miss_audit_page.render(dash)
+
+    # Carve into the two sections so we can assert per-section content.
+    section_a, section_b = body.split("=== Section B:", 1)
+
+    # Section A — direction_lowconf row visible with its confidence,
+    # direction, and the article/market titles from the seed.
+    assert "conf=0.45" in section_a
+    assert "YES" in section_a
+    assert "t1" in section_a  # article title from the seed helper
+    assert "q" in section_a   # market question from _seed_market
+    # The empty-state marker must NOT fire on Section A.
+    assert "no near-miss rows in window" not in section_a
+
+    # Section B — insufficient_cash row visible with its confidence,
+    # direction, and an explicit `reason=` annotation (only Section B
+    # surfaces the reject reason on the header).
+    assert "conf=0.70" in section_b
+    assert "NO" in section_b
+    assert "reason=insufficient_cash" in section_b
+    assert "no near-miss rows in window" not in section_b

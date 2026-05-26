@@ -338,6 +338,19 @@ async def main() -> int:
     budget = _build_budget(cfg)
     ai = AIClient(db=db, budget=budget, config=cfg)
     clob = CLOBClient(base_url=cfg.clob.base_url, timeout_seconds=cfg.clob.timeout_seconds)
+    # Cycle 23: refuse to start if the CLOB client is somehow None while
+    # execution_enabled is True. Belt-and-braces — the unconditional
+    # construction above means this should be unreachable, but the assert
+    # catches any future regression that re-introduces an optional path
+    # (e.g. "skip clob in tests / paper mode"). The kill-switch escape
+    # hatch (`IRENE_TRADE__EXECUTION_ENABLED=false`) lets you boot without
+    # clob if you genuinely need to.
+    if cfg.trade.execution_enabled and clob is None:
+        raise RuntimeError(
+            "CLOBClient construction returned None but trade.execution_enabled "
+            "is True. Refusing to start — fix the clob wiring or set "
+            "IRENE_TRADE__EXECUTION_ENABLED=false to boot without trading."
+        )
     bus = InProcBus()
 
     pipeline = wire_pipeline(

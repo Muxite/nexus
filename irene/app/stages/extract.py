@@ -78,6 +78,21 @@ skip dead articles).
   written; the run row records that the LLM found nothing).
 - `ok` — at least one fact survived validation.
 
+**DKG signal gate.** Before any LLM work, the article is checked against
+the scraper-emitted `breaking_score` and the dedupe-emitted `freshness`
+label. An article that is REHASH/STALE_RETURN AND scores below
+`config.extract.gate_threshold` (default 0.25, matching the scraper's
+`developing_threshold`) is recorded in `extract_skips` and the stage
+publishes `TOPIC_EXTRACTION_COMPLETED` with `status='skipped_low_signal'`.
+The downstream resolve/eventize/link stages already short-circuit on any
+non-`ok` status, so the skip cascades through the DKG pipeline with no
+extra plumbing.
+
+The gate exists to keep the DKG corpus on-topic. Without it, every
+re-published lifestyle/celebrity/sports headline pulled by the wires
+would consume LLM tokens and pollute the entity/fact graph. Tracers
+bypass the gate by design — end-to-end tracer firing must still work.
+
 **Non-goals.**
 - Cross-article entity clustering / linkage — P3 territory.
 - Free-form NER — the ontology is closed; out-of-vocab types/relations
@@ -243,6 +258,20 @@ _EXTRACT_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_extraction_runs_article ON extraction_runs(article_id)",
     "CREATE INDEX IF NOT EXISTS idx_extraction_runs_status ON extraction_runs(status)",
     "CREATE INDEX IF NOT EXISTS idx_extraction_runs_cycle_id ON extraction_runs(cycle_id)",
+    """
+    CREATE TABLE IF NOT EXISTS extract_skips (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        article_id      INTEGER NOT NULL UNIQUE,
+        reason          TEXT NOT NULL,
+        tier            TEXT,
+        breaking_score  REAL,
+        freshness       TEXT,
+        cycle_id        INTEGER NOT NULL,
+        created_at      TEXT NOT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_extract_skips_reason ON extract_skips(reason)",
+    "CREATE INDEX IF NOT EXISTS idx_extract_skips_cycle ON extract_skips(cycle_id)",
     """
     CREATE TABLE IF NOT EXISTS facts (
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -521,6 +550,13 @@ class ExtractStage:
         self._timeout = self._cfg.timeout_seconds
         self._max_tokens = self._cfg.max_tokens
         self._max_chars = self._cfg.max_article_chars
+        # DKG signal gate threshold. Articles tagged REHASH/STALE_RETURN
+        # by dedupe AND scoring below this floor are skipped — they
+        # never reach the LLM. Default 0.25 matches the scraper-side
+        # `developing_threshold`. Override in config.extract.gate_threshold.
+        self._gate_threshold: float = float(
+            getattr(self._cfg, "gate_threshold", 0.25) or 0.25
+        )
         # Lazy — tests patch the HTTP method, never need a real client.
         self._client: Optional[httpx.AsyncClient] = None
         self._stopped = False
@@ -550,6 +586,7 @@ class ExtractStage:
         article_id = int(article_id_raw)
         is_tracer = bool(payload.get("is_tracer", False))
         tracer_id = payload.get("tracer_id")
+        freshness = payload.get("freshness")
         cycle_id = current_cycle_id()
 
         if await self._already_extracted(article_id):
@@ -559,6 +596,45 @@ class ExtractStage:
         if article is None:
             logger.warning("extract: article %d not found in articles table", article_id)
             return
+
+        # ── DKG signal gate ────────────────────────────────────────────────
+        # Only `important` articles enter the DKG corpus. We define
+        # importance as:
+        #   (a) it's a tracer (always processed, end-to-end verification);
+        #   (b) freshness is BREAKING or EVOLVING (new or developing story);
+        #   AND/OR
+        #   (c) breaking_score >= self._gate_threshold.
+        # An article that is REHASH / STALE_RETURN AND scores below the
+        # threshold is recorded in `extract_skips` and never reaches the
+        # LLM — saving tokens and stopping garbage from polluting the
+        # entity/fact tables.
+        if not is_tracer:
+            score = float(article.get("breaking_score") or 0.0)
+            label = (freshness or "").upper()
+            stale = label in ("REHASH", "STALE_RETURN")
+            below_floor = score < self._gate_threshold
+            if stale and below_floor:
+                await self._record_skip(
+                    article_id=article_id,
+                    reason="rehash_low_signal",
+                    tier=article.get("tier"),
+                    breaking_score=score,
+                    freshness=label or None,
+                    cycle_id=cycle_id,
+                )
+                # Still publish so downstream stages (eventize/link) know
+                # the article has been processed — they get to make their
+                # own skip decision rather than waiting forever.
+                await self._bus.publish(
+                    TOPIC_EXTRACTION_COMPLETED,
+                    {
+                        "article_id": article_id,
+                        "status": "skipped_low_signal",
+                        "is_tracer": is_tracer,
+                        "tracer_id": tracer_id,
+                    },
+                )
+                return
 
         if self._budget.is_paused():
             await self._persist_run_only(
@@ -682,6 +758,42 @@ class ExtractStage:
 
     # ---- internals: DB lookups ----------------------------------------
 
+    async def _record_skip(
+        self,
+        *,
+        article_id: int,
+        reason: str,
+        tier: Optional[str],
+        breaking_score: float,
+        freshness: Optional[str],
+        cycle_id: int,
+    ) -> None:
+        try:
+            async with self._db.batch() as cur:
+                await cur.execute(
+                    """
+                    INSERT OR IGNORE INTO extract_skips
+                        (article_id, reason, tier, breaking_score, freshness,
+                         cycle_id, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        article_id,
+                        reason,
+                        tier,
+                        breaking_score,
+                        freshness,
+                        cycle_id,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("extract: skip row insert failed for %d: %s", article_id, exc)
+        logger.info(
+            "extract: gate skip article=%d reason=%s tier=%s score=%.2f freshness=%s",
+            article_id, reason, tier, breaking_score, freshness,
+        )
+
     async def _already_extracted(self, article_id: int) -> bool:
         cur = await self._db.conn.execute(
             "SELECT 1 FROM extraction_runs WHERE article_id=? AND model=? "
@@ -693,15 +805,25 @@ class ExtractStage:
         return row is not None
 
     async def _fetch_article(self, article_id: int) -> Optional[dict]:
+        # tier / breaking_score may be missing on a freshly-migrated old DB —
+        # COALESCE keeps the query tolerant.
         cur = await self._db.conn.execute(
-            "SELECT title, summary FROM articles WHERE id=?",
+            "SELECT title, summary, "
+            "COALESCE(tier, 'mainstream') AS tier, "
+            "COALESCE(breaking_score, 0.0) AS breaking_score "
+            "FROM articles WHERE id=?",
             (article_id,),
         )
         row = await cur.fetchone()
         await cur.close()
         if row is None:
             return None
-        return {"title": row["title"], "summary": row["summary"]}
+        return {
+            "title": row["title"],
+            "summary": row["summary"],
+            "tier": row["tier"],
+            "breaking_score": float(row["breaking_score"] or 0.0),
+        }
 
     # ---- internals: prompt + HTTP --------------------------------------
 

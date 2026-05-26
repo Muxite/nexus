@@ -577,6 +577,11 @@ def _config_get_embedder_dim(cfg) -> int:
 
 
 class MarketsStage:
+    # Cycle 23: per-process one-shot WARN flag for
+    # `_maybe_fetch_market_info`'s clob-None silent-skip path. Class-level
+    # so the flag survives across stage instances (tests construct many).
+    _fee_warn_seen: bool = False
+
     def __init__(self, deps: StageDeps) -> None:
         if deps.embedder is None:
             raise RuntimeError("MarketsStage requires deps.embedder")
@@ -658,6 +663,21 @@ class MarketsStage:
         # in `refresh_embeddings_once`.
         loaded = await self.index.load(self._db)  # type: ignore[attr-defined]
         logger.info("markets: index warmed (%d rows)", loaded)
+        # Cycle 23: synchronous resolution-rescan on boot. Closes the gap
+        # where a graceful restart during a market's post-close window
+        # misses the UMA finalization stamp until the periodic loop
+        # (every `_resolution_poll_seconds`, default 600s) next fires.
+        # Pure additive — `poll_resolved_markets_once` is the same code
+        # the periodic loop runs, just one early invocation. Wrapped so
+        # a transient failure here never blocks boot.
+        try:
+            n = await self.poll_resolved_markets_once()
+            logger.info("markets: startup resolution-rescan covered %d markets", n)
+        except Exception:  # noqa: BLE001 — boot must succeed
+            logger.exception(
+                "markets: startup resolution-rescan failed; "
+                "periodic loop will retry"
+            )
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._embed_task = asyncio.create_task(self._embed_loop())
         # Cycle 12: closed-but-not-finalized re-poll task.
@@ -953,6 +973,16 @@ class MarketsStage:
 
         Cycle 13: 429s now go through `_gamma_get_with_backoff` instead
         of crashing the poll cycle.
+
+        Cycle 23: Gamma caps pagination at `offset=10000`; any larger
+        offset returns 422 Unprocessable Entity. Pre-cycle-23 the 422
+        propagated out of this method, `poll_once` caught the HTTPError
+        and dropped EVERY market already fetched (typically 10,000+).
+        Net effect: the markets table stopped updating on 2026-05-23,
+        which masked itself as "fee_rate fetcher silently broken" in the
+        cycle-22 audit. New behavior: treat a 422 with non-empty
+        accumulated `markets` as "end-of-pagination" — preserve what we
+        have, log INFO, return.
         """
         markets: list[dict] = []
         offset = 0
@@ -963,8 +993,19 @@ class MarketsStage:
                 "limit": str(_GAMMA_PAGE_SIZE),
                 "offset": str(offset),
             }
-            resp = await self._gamma_get_with_backoff(params)
-            resp.raise_for_status()
+            try:
+                resp = await self._gamma_get_with_backoff(params)
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 422 and markets:
+                    logger.info(
+                        "markets: Gamma 422 at offset=%d — treating as "
+                        "end-of-pagination, preserving %d already-fetched "
+                        "markets (cycle-23 fix; Gamma caps at offset=10000)",
+                        offset, len(markets),
+                    )
+                    break
+                raise
             page = resp.json()
             if not isinstance(page, list) or not page:
                 break
@@ -1182,6 +1223,20 @@ class MarketsStage:
         wirings working.
         """
         if self._clob is None:
+            # Cycle 23: WARN-once per process. Pre-cycle-23 this path
+            # silently no-op'd, contributing to the cycle-22 audit's
+            # mis-diagnosis ("clob must be None at runtime"). Real cycle-22
+            # bug was elsewhere (Gamma 422 pagination breaking _upsert_market
+            # before it could reach this fetcher), but the defense remains:
+            # any future regression that re-introduces self._clob is None
+            # produces a single visible WARN log.
+            if not type(self)._fee_warn_seen:
+                type(self)._fee_warn_seen = True
+                logger.warning(
+                    "markets: _maybe_fetch_market_info observed self._clob is "
+                    "None — fee_rate fetcher will silently skip. Investigate "
+                    "wire_pipeline() / StageDeps.clob wiring.",
+                )
             return
         cur = await self._db.conn.execute(
             "SELECT fee_rate, fee_rate_fetched_at "

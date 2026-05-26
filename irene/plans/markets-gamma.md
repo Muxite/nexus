@@ -12,6 +12,53 @@ specifically the row parser (`_parse_gamma_row`), the pagination loop
 (`_fetch_all_gamma`), the upsert path (`_upsert_market`), and the
 resolved-market handoff into `_close_orphaned_trades_for`.
 
+## 2026-05-26 (cycle 23) update — real root cause found
+
+The cycle-22 audit framed "every active market has `volume_usdc = NULL`"
+as a parser bug. Cycle 23 docker-exec'd Gamma directly and found the
+real root cause:
+
+- **Gamma caps `/markets` pagination at `offset=10000`.** Live verified:
+  `offset=10000` returns 200 with 100 rows; `offset=10001` returns
+  **422 Unprocessable Entity**.
+- Pre-cycle-23 `_fetch_all_gamma` issued `resp.raise_for_status()` per page
+  without catching the 422. The `httpx.HTTPStatusError` propagated up
+  into `poll_once`, which caught the broad `httpx.HTTPError` and
+  **dropped every market already accumulated in the in-progress poll cycle**.
+- Net effect: on the day active markets crossed 10k (2026-05-23), the bot
+  stopped writing to the `markets` table entirely. `markets.updated_at`
+  was frozen at `2026-05-23T23:32` through cycle 23's deploy.
+- Downstream: `_upsert_market` never fired → `_maybe_fetch_market_info`
+  never fired → 9024/9024 active markets stuck with `fee_rate IS NULL`.
+  The cycle-21/22 "clob silent fallback" framing was wrong.
+
+**Cycle-23 fix** lives at `app/stages/markets.py:_fetch_all_gamma`:
+- Per-page fetch wrapped in `try / except httpx.HTTPStatusError`.
+- 422 AFTER accumulating markets → log INFO "end-of-pagination" + break,
+  returning the partial result. 422 on the FIRST page still raises
+  (real misconfiguration).
+- Regression tests at `app/tests/stages/test_markets.py`
+  (`test_fetch_all_gamma_preserves_partial_on_422_at_end_of_pagination`
+  + `test_fetch_all_gamma_re_raises_422_when_no_markets_accumulated`).
+- Defense in depth: a WARN-once log in
+  `markets.py:_maybe_fetch_market_info` fires the first time
+  `self._clob is None`, so any genuine wiring regression becomes loud.
+
+Live verification post-deploy: `volume_usdc` and `fee_rate` repopulating
+at ~225 markets/min (full coverage in ~36 min from boot). The
+`category` field stays NULL because Gamma genuinely returns `null` —
+that is Polymarket-side, not our bug.
+
+**The B1/B4 contradictions below are now mostly moot** — live evidence
+settled them. Pagination IS offset-based (matches the new batch);
+`volume24hr` IS the 24h field (matches B1, contradicts the new batch's
+sample-payload prose). The parser code is correct as-shipped. The
+remaining open Gamma item is the post-7d UMA finalization endpoint —
+see master-plan.md issue list, row "Zero `close_reason='market_resolved'`
+rows ever".
+
+## Original analysis (pre-cycle-23) — preserved for context
+
 A new external research batch (unstructured-1) overlaps with the
 already-distilled B-section in `research_answers.md`, but it **contradicts
 the earlier batch on three load-bearing claims**. We must resolve those

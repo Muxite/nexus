@@ -1,0 +1,14 @@
+[Unit]
+Description=Fire irene-soak.service every 2h
+Requires=irene-soak.service
+
+[Timer]
+# First fire 2 minutes after the timer is started, then every 2h thereafter.
+OnBootSec=2min
+OnUnitActiveSec=2h
+# Catch up on missed ticks across machine-off windows.
+Persistent=true
+Unit=irene-soak.service
+
+[Install]
+WantedBy=timers.target
