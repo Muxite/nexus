@@ -27,18 +27,27 @@ news as two independent signals.
 `article_clusters`, `article_cluster_members`. DDL registered with
 `db.register_schema()` at import time.
 
-**Freshness rules.** Wall-clock age is computed from the cluster's
-representative article's `ingested_at` vs. the incoming article's
-`ingested_at`:
+**Freshness rules (cycle 24, handoff B — recency-bias + burst).**
+The age driving REHASH/STALE_RETURN is **time since the cluster's
+most-recent article was attached**, not cluster age. A cluster being
+fed every few minutes = EVOLVING regardless of when it opened.
+A burst (≥`burst_min_articles` in the last `burst_window_minutes`)
+overrides the age check and forces EVOLVING.
 
-  - nearest_dist > _BREAKING_DIST → BREAKING (new cluster)
-  - nearest_dist <= _BREAKING_DIST AND age < 6h        → EVOLVING (join nearest)
-  - nearest_dist <= _BREAKING_DIST AND 6h <= age < 24h → REHASH (join nearest)
-  - nearest_dist <= _BREAKING_DIST AND age >= 24h      → STALE_RETURN (join nearest)
+  - nearest_dist > _BREAKING_DIST                          → BREAKING (new cluster)
+  - burst (≥N articles in last T min)                      → EVOLVING (join nearest)
+  - latest_article_age < evolving_age_hours (default 24h)  → EVOLVING (join nearest)
+  - latest_article_age < rehash_age_hours   (default 72h)  → REHASH   (join nearest)
+  - latest_article_age >= rehash_age_hours                 → STALE_RETURN (join nearest)
 
 `_BREAKING_DIST` defaults to `config.dedupe.breaking_distance` (0.55)
 — cosine distance, i.e. `1.0 - cosine_similarity`. The Chroma collection
 is created with `metadata={"hnsw:space": "cosine"}`.
+
+The `article_clusters.latest_article_at` column is stamped on every
+`_attach` so the rolling-recency check is a single column read; the
+burst check is a `SELECT COUNT(*)` over `article_cluster_members.added_at`
+inside the burst window.
 
 **Invariants.**
 - `is_tracer` and `tracer_id` are stamped on every owned-table row from
@@ -93,14 +102,13 @@ logger = logging.getLogger(__name__)
 # headline-rewrite vs. unrelated-news divide on MiniLM-L6-v2.
 _BREAKING_DIST_DEFAULT = 0.55
 
-# Age window (seconds) within which a near-duplicate is treated as
-# EVOLVING — the same story, still developing. 6 hours matches seulgi's
-# `news_memory.rehash_age_secs`.
-_EVOLVING_AGE_SECS = 6 * 3600
-
-# Above EVOLVING but below STALE_RETURN: REHASH — the same story being
-# republished within the same news day. 24 hours.
-_STALE_AGE_SECS = 24 * 3600
+# Cycle 24 (handoff B): fallback defaults if the config doesn't supply
+# them. The real values come from `config.dedupe.evolving_age_hours` /
+# `rehash_age_hours` and are passed into `_label` by the stage. These
+# constants are kept for backwards-compatibility with old test imports
+# and the pure-helper signature.
+_EVOLVING_AGE_SECS = 24 * 3600   # was 6h pre-cycle-24
+_STALE_AGE_SECS = 72 * 3600      # was 24h pre-cycle-24
 
 _COLLECTION_NAME = "irene_articles"
 
@@ -114,10 +122,18 @@ _DEDUPE_DDL = [
                                         ('BREAKING','EVOLVING','REHASH','STALE_RETURN')),
         created_at                  TEXT NOT NULL,
         is_tracer                   INTEGER NOT NULL DEFAULT 0,
-        tracer_id                   TEXT
+        tracer_id                   TEXT,
+        -- Cycle 24 (handoff B): timestamp of the most recently attached
+        -- article on this cluster. Drives the recency-bias freshness
+        -- label so a cluster being actively fed stays EVOLVING regardless
+        -- of when it was created. Backfilled on existing DBs by
+        -- `scripts/migrate/2026_05_26_cluster_latest.py`.
+        latest_article_at           TEXT
     )
     """,
     "CREATE INDEX IF NOT EXISTS idx_article_clusters_freshness ON article_clusters(freshness)",
+    "CREATE INDEX IF NOT EXISTS idx_article_clusters_latest_article_at "
+    "ON article_clusters(latest_article_at)",
     """
     CREATE TABLE IF NOT EXISTS article_cluster_members (
         cluster_id  INTEGER NOT NULL REFERENCES article_clusters(id),
@@ -147,13 +163,30 @@ def _parse_iso(s: str | None) -> Optional[datetime]:
         return None
 
 
-def _label(nearest_dist: float, age_secs: float, breaking_dist: float) -> str:
-    """Pure freshness-label decision — exposed for tests."""
+def _label(
+    nearest_dist: float,
+    latest_article_age_secs: float,
+    breaking_dist: float,
+    *,
+    burst_active: bool = False,
+    evolving_age_secs: float = _EVOLVING_AGE_SECS,
+    rehash_age_secs: float = _STALE_AGE_SECS,
+) -> str:
+    """Pure freshness-label decision — exposed for tests.
+
+    Cycle 24 (handoff B): `latest_article_age_secs` is "time since the
+    cluster's most recent article was attached," NOT cluster age. A
+    burst (≥N articles in last T minutes) forces EVOLVING regardless of
+    age — the caller computes the burst flag from
+    `article_cluster_members.added_at` history and passes it in.
+    """
     if nearest_dist > breaking_dist:
         return "BREAKING"
-    if age_secs < _EVOLVING_AGE_SECS:
+    if burst_active:
         return "EVOLVING"
-    if age_secs < _STALE_AGE_SECS:
+    if latest_article_age_secs < evolving_age_secs:
+        return "EVOLVING"
+    if latest_article_age_secs < rehash_age_secs:
         return "REHASH"
     return "STALE_RETURN"
 
@@ -224,8 +257,14 @@ class DedupeStage:
         self._db = deps.db
         self._bus = deps.bus
         self._embedder = deps.embedder
-        self._chroma_path = deps.config.dedupe.chroma_path
-        self._breaking_dist = float(deps.config.dedupe.breaking_distance)
+        cfg_dedupe = deps.config.dedupe
+        self._chroma_path = cfg_dedupe.chroma_path
+        self._breaking_dist = float(cfg_dedupe.breaking_distance)
+        # Cycle 24 (handoff B): freshness-window + burst knobs from config.
+        self._evolving_age_secs = float(cfg_dedupe.evolving_age_hours) * 3600.0
+        self._rehash_age_secs = float(cfg_dedupe.rehash_age_hours) * 3600.0
+        self._burst_min_articles = int(cfg_dedupe.burst_min_articles)
+        self._burst_window_secs = float(cfg_dedupe.burst_window_minutes) * 60.0
         self._enabled: bool = False
         self._provider: Optional[_NearestProvider] = None
 
@@ -332,6 +371,7 @@ class DedupeStage:
                 freshness="BREAKING",
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                latest_article_at=ingested_at,
             )
             await self._add_member(cluster_id, article_id, distance=None)
             return cluster_id, "BREAKING", None
@@ -344,13 +384,34 @@ class DedupeStage:
                 freshness="BREAKING",
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                latest_article_at=ingested_at,
             )
             await self._add_member(cluster_id, article_id, distance=None)
             return cluster_id, "BREAKING", None
 
-        rep_ingested_at = await self._fetch_ingested_at(existing["representative_article_id"])
-        age_secs = self._age_secs(rep_ingested_at, ingested_at)
-        freshness = _label(nearest_dist, age_secs, self._breaking_dist)
+        # Cycle 24 (handoff B): recency-bias + burst.
+        latest_at = await self._fetch_latest_article_at(existing["id"])
+        # Fall back to the rep's ingested_at if the cluster predates the
+        # `latest_article_at` column (i.e. migration hasn't backfilled yet
+        # or somehow returned NULL). Mirrors pre-cycle-24 behaviour minus
+        # the recency-bias, so worst case we revert to the old label.
+        if latest_at is None:
+            latest_at = await self._fetch_ingested_at(existing["representative_article_id"])
+        latest_age_secs = self._age_secs(latest_at, ingested_at)
+
+        burst_count = await self._count_recent_members(
+            existing["id"], ingested_at, self._burst_window_secs,
+        )
+        burst_active = burst_count >= self._burst_min_articles
+
+        freshness = _label(
+            nearest_dist,
+            latest_age_secs,
+            self._breaking_dist,
+            burst_active=burst_active,
+            evolving_age_secs=self._evolving_age_secs,
+            rehash_age_secs=self._rehash_age_secs,
+        )
 
         if freshness == "BREAKING":
             cluster_id = await self._create_cluster(
@@ -358,11 +419,13 @@ class DedupeStage:
                 freshness="BREAKING",
                 is_tracer=is_tracer,
                 tracer_id=tracer_id,
+                latest_article_at=ingested_at,
             )
             await self._add_member(cluster_id, article_id, distance=nearest_dist)
             return cluster_id, "BREAKING", nearest_dist
 
         await self._add_member(existing["id"], article_id, distance=nearest_dist)
+        await self._stamp_latest_article_at(existing["id"], ingested_at)
         return existing["id"], freshness, nearest_dist
 
     async def _create_cluster(
@@ -372,14 +435,18 @@ class DedupeStage:
         freshness: str,
         is_tracer: bool,
         tracer_id: Optional[str],
+        latest_article_at: Optional[str] = None,
     ) -> int:
+        # Cycle 24 (handoff B): stamp latest_article_at at creation so the
+        # first recency-bias read on the cluster is correct (= rep's
+        # ingested_at).
         async with self._db.batch() as cur:
             await cur.execute(
                 """
                 INSERT INTO article_clusters
                     (representative_article_id, freshness, created_at,
-                     is_tracer, tracer_id)
-                VALUES (?, ?, ?, ?, ?)
+                     is_tracer, tracer_id, latest_article_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
                 (
                     representative_article_id,
@@ -387,6 +454,7 @@ class DedupeStage:
                     _now_iso(),
                     1 if is_tracer else 0,
                     tracer_id,
+                    latest_article_at,
                 ),
             )
             new_id = cur.lastrowid
@@ -442,6 +510,72 @@ class DedupeStage:
         if row is None:
             return None
         return row["ingested_at"]
+
+    async def _fetch_latest_article_at(self, cluster_id: int) -> Optional[str]:
+        """Cycle 24 (handoff B): rolling-recency timestamp on the cluster."""
+        cur = await self._db.conn.execute(
+            "SELECT latest_article_at FROM article_clusters WHERE id=?",
+            (cluster_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return None
+        return row["latest_article_at"]
+
+    async def _count_recent_members(
+        self,
+        cluster_id: int,
+        incoming_ingested_at: str,
+        window_secs: float,
+    ) -> int:
+        """Cycle 24 (handoff B): burst detection.
+
+        Count members attached in the `window_secs` seconds preceding the
+        incoming article. Counts the incoming article too (incoming + N
+        existing in the window ≥ burst_min_articles → burst). We compare
+        against `article_cluster_members.added_at`, which is stamped at
+        attach time.
+        """
+        inc_dt = _parse_iso(incoming_ingested_at)
+        if inc_dt is None:
+            return 0
+        from datetime import timedelta
+        window_start_iso = (inc_dt - timedelta(seconds=window_secs)).isoformat()
+        cur = await self._db.conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM article_cluster_members
+            WHERE cluster_id = ? AND added_at >= ?
+            """,
+            (cluster_id, window_start_iso),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        existing = int(row["c"]) if row is not None else 0
+        # The incoming article hasn't been inserted yet — count it
+        # explicitly so the threshold check matches the user-facing
+        # "N articles including this one" semantics.
+        return existing + 1
+
+    async def _stamp_latest_article_at(self, cluster_id: int, ingested_at: str) -> None:
+        """Cycle 24 (handoff B): update the cluster's rolling-recency timestamp.
+
+        Uses MAX(existing, incoming) so an out-of-order ingest (a stale
+        feed catching up) never rewinds the recency stamp.
+        """
+        async with self._db.batch() as cur:
+            await cur.execute(
+                """
+                UPDATE article_clusters
+                SET latest_article_at = CASE
+                    WHEN latest_article_at IS NULL OR latest_article_at < ?
+                        THEN ?
+                    ELSE latest_article_at
+                END
+                WHERE id = ?
+                """,
+                (ingested_at, ingested_at, cluster_id),
+            )
 
     @staticmethod
     def _age_secs(rep_ingested_at: Optional[str], incoming_ingested_at: str) -> float:

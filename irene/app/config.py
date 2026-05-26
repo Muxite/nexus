@@ -158,10 +158,30 @@ class IngestSection(BaseModel):
 
 
 class DedupeSection(BaseModel):
-    """Dedupe stage — Chroma store path + freshness threshold. See stages/dedupe.py."""
+    """Dedupe stage — Chroma store path + freshness threshold. See stages/dedupe.py.
+
+    Cycle 24 (handoff B — dedupe/freshness fix): freshness labelling now
+    keys off **time since the cluster's MOST RECENT article**, not cluster
+    age. A burst of N articles in T minutes overrides the age check and
+    forces EVOLVING — captures "10 outlets reporting on the same strike
+    within an hour" even when the cluster is days old. Defaults widened
+    aggressively (6h→24h EVOLVING, 24h→72h REHASH) so sustained news
+    cycles like an active war stop collapsing into STALE_RETURN.
+    """
 
     chroma_path: str = "/data/news_chroma"
     breaking_distance: float = Field(default=0.55, gt=0.0, le=2.0)
+    # Was 6h (hard-coded); widened to 24h so any cluster fed within the
+    # last day stays EVOLVING.
+    evolving_age_hours: float = Field(default=24.0, ge=0.0)
+    # Was 24h (hard-coded); widened to 72h so quiet-but-not-dead clusters
+    # are REHASH (acceptable to the trade gate) instead of STALE_RETURN.
+    rehash_age_hours: float = Field(default=72.0, ge=0.0)
+    # Burst-detection promotion: ≥burst_min_articles in the last
+    # burst_window_minutes forces EVOLVING regardless of age. Cheap
+    # SELECT COUNT(*) at attach time.
+    burst_min_articles: int = Field(default=3, ge=1)
+    burst_window_minutes: int = Field(default=30, ge=1)
 
 
 class MatchSection(BaseModel):
@@ -349,7 +369,11 @@ class TradeSection(BaseModel):
     # mid-price fetching in a follow-up.
     default_mid_price: float = Field(default=0.5, gt=0.0, lt=1.0)
     # Freshness labels that the freshness gate accepts.
-    accept_freshness: list[str] = Field(default_factory=lambda: ["BREAKING", "EVOLVING"])
+    # Cycle 24 (handoff B): REHASH added to the default. Under the new
+    # recency-bias label, REHASH means "story still warm, no new article
+    # for 24-72h" — that's not stale, it's developing slower; still worth
+    # a trade-gate look. Only STALE_RETURN (≥72h quiet) stays rejected.
+    accept_freshness: list[str] = Field(default_factory=lambda: ["BREAKING", "EVOLVING", "REHASH"])
 
 
 # ---------------------------------------------------------------------------
