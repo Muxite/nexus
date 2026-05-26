@@ -70,6 +70,15 @@ from typing import Any, Optional
 import numpy as np
 import yaml
 
+from scripts.tracer._campaign import (  # noqa: E402
+    BurstSpec,
+    CampaignSpec,
+    campaign_from_args,
+    compose_tracer_id,
+    load_campaign,
+    resolve_prefix_root,
+)
+
 # Side-effect imports: every stage's DDL must register before db.connect().
 import app.ai  # noqa: F401
 import app.main  # noqa: F401 — cycles DDL
@@ -721,6 +730,24 @@ class TracerRunResult:
         return out
 
 
+@dataclass
+class CampaignResult:
+    """Aggregate result of a campaign run (multi-template, single-process).
+
+    Wraps a `TracerRunResult` for the overall run plus per-burst article
+    counters. The wrapped result carries the campaign-wide totals (counts,
+    drops, wallet snapshots, budget) — `per_burst` is purely for reporting
+    "iran_strike fired 50, of which N reached the LLM" style breakdowns.
+    """
+
+    spec: CampaignSpec
+    run: TracerRunResult
+    per_burst_requested: dict[str, int] = field(default_factory=dict)
+    # `per_burst_published` reflects rows where `_insert_tracer_article`
+    # actually returned an id (i.e. INSERT-OR-IGNORE inserted a new row).
+    per_burst_published: dict[str, int] = field(default_factory=dict)
+
+
 # ---------------------------------------------------------------------------
 # Live-externals helpers (Step 2 + Step 4.5 + Step 5)
 # ---------------------------------------------------------------------------
@@ -738,6 +765,12 @@ async def _live_externals_preflight(
     different prefix has written into `articles` within the last hour —
     catches the "two concurrent tracer prefixes mid-flight" footgun where
     audit_burst.py / cleanup.py output would conflate the two prefixes.
+
+    Campaign-mode aware: the preflight runs ONCE per process (campaign mode
+    boots externals once), so the second/third sub-burst inside the same
+    process never re-enters this guard. The `tracer_id_prefix` parameter is
+    the campaign ROOT in campaign mode, so rows written by an earlier sub-
+    burst in this same campaign are correctly recognized as "my prefix".
     """
     try:
         cur = await db.conn.execute(
@@ -993,8 +1026,14 @@ async def _run_async(
     template_cycle = itertools.cycle(templates)
 
     # Construct everything BEFORE bus.start() — late-subscribe is rejected.
+    # Live-externals shares the DB with the irene daemon (WAL mode); using
+    # MEMORY journal here would fight for the DB header and deadlock on the
+    # first transaction — symptom is "database is locked" after a long hang.
+    # See: legacy iran burst 2026-05-26 19:09 UTC.
     if db_path == ":memory:":
         db = DB.ephemeral()
+    elif live_externals:
+        db = DB(path=db_path, journal_mode="WAL", synchronous="NORMAL")
     else:
         db = DB(path=db_path, journal_mode="MEMORY", synchronous="OFF")
     await db.connect()
@@ -1265,6 +1304,379 @@ def run_inproc(
     )
 
 
+async def _run_campaign_async(
+    spec: CampaignSpec,
+    *,
+    concurrency: int,
+    db_path: str,
+    timeout_seconds: float,
+    prefer_high_quality: bool = False,
+    live_externals: bool = False,
+    live_externals_ai_mock: bool = False,
+    budget_cap_usd: Optional[float] = None,
+    force: bool = False,
+    config_path: Optional[str] = None,
+    progress_interval: int = 10,
+) -> CampaignResult:
+    """Single-process orchestrator for a multi-burst tracer campaign.
+
+    Mirrors `_run_async` but loops over `spec.bursts` instead of firing a
+    single template `count` times. The externals (Embedder/AIClient/CLOB/
+    Budget), DB connection, bus, and stage subscribers are constructed ONCE
+    and reused across every sub-burst. Tracer_ids are composed as
+    `<spec.prefix_root>-<burst.template>-<i>` so audit_burst.py can group
+    by the middle segment.
+    """
+    t0 = time.monotonic()
+    if concurrency <= 0:
+        raise ValueError("concurrency must be >= 1")
+
+    # ---- Templates: filter from the on-disk set to the campaign's subset.
+    templates_by_name = {t.name: t for t in load_all_templates()}
+    missing = [b.template for b in spec.bursts if b.template not in templates_by_name]
+    if missing:
+        raise RuntimeError(
+            f"campaign {spec.name!r} references unknown template(s): {missing}. "
+            f"Available: {sorted(templates_by_name)}"
+        )
+
+    # ---- DB ---------------------------------------------------------------
+    # Match the daemon's WAL mode when running against the live DB; MEMORY
+    # journal would deadlock on the shared db header. See _run_async docs.
+    if db_path == ":memory:":
+        db = DB.ephemeral()
+    elif live_externals:
+        db = DB(path=db_path, journal_mode="WAL", synchronous="NORMAL")
+    else:
+        db = DB(path=db_path, journal_mode="MEMORY", synchronous="OFF")
+    await db.connect()
+    cycle_id = await db.ensure_current_cycle("tracer")
+    set_cycle_id(cycle_id)
+
+    # ---- Live-externals preflight ----------------------------------------
+    # In campaign mode we pass the ROOT prefix; rows from earlier sub-bursts
+    # in this same process all start with that root, so the "different
+    # prefix in the last hour" check correctly treats them as "ours".
+    pre_burst_wallet: Optional[dict[str, Any]] = None
+    live_budget_baseline: Optional[float] = None
+    if live_externals:
+        await _live_externals_preflight(
+            db, tracer_id_prefix=spec.prefix_root, force=force
+        )
+        try:
+            pre_burst_wallet = await _snapshot_live_wallet(db)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("live wallet snapshot failed: %r", exc)
+
+    # ---- Config ----------------------------------------------------------
+    if live_externals and config_path:
+        try:
+            cfg = Config.from_yaml(config_path)
+        except AttributeError:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = Config.model_validate(yaml.safe_load(fh) or {})
+    else:
+        cfg = _build_tracer_config(
+            closer_timeout_hours=24.0,
+            closer_poll_seconds=60,
+        )
+
+    # ---- Externals (ONE bring-up for the whole campaign) -----------------
+    if live_externals:
+        embedder, ai, clob, budget = await _build_live_externals(
+            db,
+            cfg=cfg,
+            ai_mock=live_externals_ai_mock,
+            budget_cap_usd=budget_cap_usd,
+        )
+        live_budget_baseline = (
+            getattr(budget, "remaining_usd", None) if budget is not None else None
+        )
+    else:
+        embedder = _TracerEmbedder()
+        ai = _TracerAI(db)
+        clob = _TracerCLOB(default_mid=None)
+        budget = _TracerBudget()
+
+    bus = InProcBus()
+    pipeline = wire_pipeline(
+        db=db, bus=bus, cfg=cfg, embedder=embedder, ai=ai, budget=budget, clob=clob
+    )
+
+    if not live_externals:
+        await _seed_markets(db)
+    await pipeline.markets.index.load(db)
+
+    await bus.start()
+    await pipeline.dedupe.start()
+    await pipeline.match.start()
+    await pipeline.trade.start()
+
+    sem = asyncio.Semaphore(concurrency)
+    insert_lock = asyncio.Lock()
+
+    per_burst_requested: dict[str, int] = {}
+    per_burst_published: dict[str, int] = {}
+    total_requested = 0
+
+    async def _fire_one(burst_template: str, i: int) -> None:
+        async with sem:
+            template = templates_by_name[burst_template]
+            tracer_id = compose_tracer_id(spec.prefix_root, burst_template, i)
+            async with insert_lock:
+                article_id = await _insert_tracer_article(
+                    db,
+                    cycle_id=cycle_id,
+                    template=template,
+                    index=i,
+                    tracer_id=tracer_id,
+                    prefer_high_quality=prefer_high_quality,
+                    url_salt=spec.prefix_root + "-" + burst_template,
+                )
+            if article_id is None:
+                return
+            per_burst_published[burst_template] = (
+                per_burst_published.get(burst_template, 0) + 1
+            )
+            rendered = template.render(
+                i,
+                prefer_high_quality=prefer_high_quality,
+                url_salt=spec.prefix_root + "-" + burst_template,
+            )
+            await bus.publish(
+                TOPIC_ARTICLE_INGESTED,
+                {
+                    "article_id": article_id,
+                    "url": rendered["url"],
+                    "is_tracer": True,
+                    "tracer_id": tracer_id,
+                },
+            )
+
+    try:
+        for burst_idx, burst in enumerate(spec.bursts):
+            # Between-burst budget re-check (live externals only). The
+            # baseline OpenRouter snapshot was taken once at _build_live_;
+            # if a sub-burst pushed remaining below the cap, abort the
+            # campaign here BEFORE firing the next template's articles.
+            if (
+                live_externals
+                and budget_cap_usd is not None
+                and burst_idx > 0
+            ):
+                current_remaining = await _refresh_remaining(budget)
+                if (
+                    current_remaining is not None
+                    and current_remaining < budget_cap_usd
+                ):
+                    logger.warning(
+                        "campaign budget cap hit (remaining=$%.2f < cap=$%.2f) — "
+                        "skipping remaining %d burst(s)",
+                        current_remaining,
+                        budget_cap_usd,
+                        len(spec.bursts) - burst_idx,
+                    )
+                    break
+
+            per_burst_requested[burst.template] = (
+                per_burst_requested.get(burst.template, 0) + burst.count
+            )
+            total_requested += burst.count
+            logger.info(
+                "campaign %r firing burst %d/%d: %s × %d",
+                spec.name,
+                burst_idx + 1,
+                len(spec.bursts),
+                burst.template,
+                burst.count,
+            )
+
+            for batch_start in range(0, burst.count, max(progress_interval, 1)):
+                batch_end = min(batch_start + max(progress_interval, 1), burst.count)
+                await asyncio.gather(
+                    *(_fire_one(burst.template, i) for i in range(batch_start, batch_end))
+                )
+                logger.info(
+                    "  %s: published %d/%d",
+                    burst.template,
+                    batch_end,
+                    burst.count,
+                )
+
+        drained = await _drain_bus(bus, timeout_seconds=timeout_seconds)
+    finally:
+        await pipeline.trade.stop()
+        await pipeline.match.stop()
+        await pipeline.dedupe.stop()
+        await bus.stop()
+
+    counts = await _async_query_tracer_counts(db)
+
+    wallet_post: Optional[dict[str, Any]] = None
+    tracer_wallet: Optional[dict[str, Any]] = None
+    if live_externals:
+        try:
+            wallet_post = await _snapshot_live_wallet(db)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("post-campaign live wallet snapshot failed: %r", exc)
+        try:
+            tracer_wallet = await _snapshot_tracer_wallet(
+                db, tracer_id_prefix=spec.prefix_root
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tracer wallet snapshot failed: %r", exc)
+
+    budget_final = (
+        getattr(budget, "remaining_usd", None) if live_externals else None
+    )
+
+    elapsed = time.monotonic() - t0
+    await db.close()
+
+    run = TracerRunResult(
+        counts=counts,
+        telemetry_drops=bus.counters.telemetry,
+        handler_exceptions=bus.counters.handler_exceptions,
+        timed_out=not drained,
+        elapsed_seconds=elapsed,
+        articles_requested=total_requested,
+        wallet_pre=pre_burst_wallet,
+        wallet_post=wallet_post,
+        tracer_wallet=tracer_wallet,
+        budget_baseline_usd=live_budget_baseline,
+        budget_final_usd=budget_final,
+        tracer_id_prefix=spec.prefix_root,
+    )
+    return CampaignResult(
+        spec=spec,
+        run=run,
+        per_burst_requested=per_burst_requested,
+        per_burst_published=per_burst_published,
+    )
+
+
+async def _refresh_remaining(budget: Any) -> Optional[float]:
+    """Best-effort fetch of the current OpenRouter remaining balance.
+
+    Real Budget exposes either an awaitable refresher or a cached property
+    that ticks via its poll loop. The stub `_TracerBudget` just exposes
+    `remaining_usd` directly. Falls through to None on any failure.
+    """
+    for attr in ("poll_once", "refresh"):
+        fn = getattr(budget, attr, None)
+        if callable(fn):
+            try:
+                maybe = fn()
+                if asyncio.iscoroutine(maybe):
+                    await maybe
+                break
+            except Exception:  # noqa: BLE001
+                pass
+    val = getattr(budget, "remaining_usd", None)
+    try:
+        return float(val) if val is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def run_campaign_inproc(
+    spec: CampaignSpec,
+    *,
+    concurrency: int = 5,
+    db_path: str = ":memory:",
+    timeout_seconds: float = 30.0,
+    prefer_high_quality: bool = False,
+    live_externals: bool = False,
+    live_externals_ai_mock: bool = False,
+    budget_cap_usd: Optional[float] = None,
+    force: bool = False,
+    config_path: Optional[str] = None,
+    progress_interval: int = 10,
+) -> CampaignResult:
+    """Sync wrapper around `_run_campaign_async` — used by tests + main()."""
+    return asyncio.run(
+        _run_campaign_async(
+            spec,
+            concurrency=concurrency,
+            db_path=db_path,
+            timeout_seconds=timeout_seconds,
+            prefer_high_quality=prefer_high_quality,
+            live_externals=live_externals,
+            live_externals_ai_mock=live_externals_ai_mock,
+            budget_cap_usd=budget_cap_usd,
+            force=force,
+            config_path=config_path,
+            progress_interval=progress_interval,
+        )
+    )
+
+
+def _format_campaign_report(result: CampaignResult) -> str:
+    parts = [
+        f"campaign: {result.spec.name}   prefix_root={result.spec.prefix_root}",
+        f"  bursts: {len(result.spec.bursts)}   articles_requested={result.run.articles_requested}",
+        f"  elapsed: {result.run.elapsed_seconds:.2f}s   timed_out={result.run.timed_out}",
+        "",
+        "  per-burst:",
+    ]
+    for b in result.spec.bursts:
+        req = result.per_burst_requested.get(b.template, 0)
+        pub = result.per_burst_published.get(b.template, 0)
+        parts.append(f"    {b.template:24s} requested={req:5d}   published={pub:5d}")
+    parts.extend(
+        [
+            "",
+            "  aggregated counts (is_tracer=1 across stages):",
+            f"    articles            {result.run.counts.articles}",
+            f"    article_clusters    {result.run.counts.article_clusters}",
+            f"    signals             {result.run.counts.signals}",
+            f"    decisions           {result.run.counts.decisions}",
+            f"    trades              {result.run.counts.trades}",
+            f"    decision_inputs     {result.run.counts.decision_inputs}",
+            f"    telemetry_drops     {result.run.telemetry_drops}  (allowed)",
+            f"    handler_exceptions  {result.run.handler_exceptions}",
+            f"    trade_path_drops    {result.run.drops}",
+        ]
+    )
+    if result.run.tracer_wallet is not None:
+        tw = result.run.tracer_wallet
+        parts.extend(
+            [
+                "",
+                "  tracer wallet (paper, isolated by rule #4):",
+                f"    trades_opened     {tw.get('tracer_trades')}",
+                f"    trades_open       {tw.get('tracer_open')}",
+                f"    trades_closed     {tw.get('tracer_closed')}",
+                f"    invested_usdc     {tw.get('tracer_invested_usdc')}",
+                f"    realized_pnl_usdc {tw.get('tracer_realized_pnl_usdc')}",
+                f"    fees_usdc         {tw.get('tracer_fees_usdc')}",
+            ]
+        )
+    if result.run.wallet_pre is not None and result.run.wallet_post is not None:
+        pre, post = result.run.wallet_pre, result.run.wallet_post
+        delta_realized = (
+            (post.get("live_realized_total") or 0)
+            - (pre.get("live_realized_total") or 0)
+        )
+        delta_trades = (
+            (post.get("live_trades") or 0) - (pre.get("live_trades") or 0)
+        )
+        parts.extend(
+            [
+                "",
+                "  live wallet isolation (should both be ~0 from tracer activity):",
+                f"    delta_realized_usdc  {delta_realized}",
+                f"    delta_live_trades    {delta_trades}",
+            ]
+        )
+    if result.run.budget_baseline_usd is not None:
+        parts.append(
+            f"  openrouter_budget   baseline=${result.run.budget_baseline_usd} "
+            f"final=${result.run.budget_final_usd}"
+        )
+    return "\n".join(parts)
+
+
 def _format_report(result: TracerRunResult) -> str:
     c = result.counts
     parts = [
@@ -1336,8 +1748,33 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--template",
+        action="append",
         default=None,
-        help="Restrict to a single template (default: round-robin all).",
+        help=(
+            "Either a bare template name (legacy single-template path, used "
+            "with --count) OR a 'name:count' pair (campaign mode). Pass "
+            "repeatedly to fire several templates as one campaign: "
+            "--template iran_strike:50 --template market_crash:50. "
+            "If omitted, round-robins ALL templates."
+        ),
+    )
+    parser.add_argument(
+        "--campaign",
+        default=None,
+        help=(
+            "Path to a campaign YAML (scripts/tracer/campaigns/*.yaml). "
+            "Mutually exclusive with --template <name:count>. CLI flags "
+            "override values in the YAML's `shared:` section."
+        ),
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=10,
+        help=(
+            "Campaign mode: log a per-template progress line every N "
+            "published articles (default 10). Set to >= count to silence."
+        ),
     )
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument(
@@ -1415,12 +1852,71 @@ def main(argv: Optional[list[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
+    # ---- Decide between legacy single-template and new campaign path. ----
+    # Campaign mode is triggered by:
+    #   - --campaign <yaml>, OR
+    #   - --template <name:count> (one or many; the ':' is the marker), OR
+    #   - --template name --template name (multiple bare names).
+    # A single bare `--template name` (no colon, no second --template) stays
+    # on the legacy path so existing CI invocations are byte-identical.
+    template_args = args.template or []
+    is_campaign_mode = bool(args.campaign) or len(template_args) > 1 or any(
+        ":" in t for t in template_args
+    )
+
+    if is_campaign_mode:
+        try:
+            spec = _build_campaign_spec(args)
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"tracer FAILED parsing campaign spec: {exc.__class__.__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            cresult = run_campaign_inproc(
+                spec,
+                concurrency=args.concurrency,
+                db_path=args.db,
+                timeout_seconds=args.timeout_seconds,
+                prefer_high_quality=args.exercise_wallet,
+                live_externals=args.live_externals,
+                live_externals_ai_mock=args.live_externals_ai_mock,
+                budget_cap_usd=args.budget_cap_usd,
+                force=args.force,
+                config_path=args.config,
+                progress_interval=args.progress_interval,
+            )
+        except Exception as exc:  # noqa: BLE001 — surface to CLI
+            print(
+                f"tracer FAILED during campaign: {exc.__class__.__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        print(_format_campaign_report(cresult))
+        if cresult.run.drops > 0:
+            print(
+                f"FAIL: {cresult.run.drops} trade-path drop(s) across campaign.",
+                file=sys.stderr,
+            )
+            return 1
+        if cresult.run.timed_out:
+            print(
+                "FAIL: bus did not drain within timeout — pipeline back-pressured.",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
+    # ---- Legacy single-template / round-robin-all path -------------------
+    legacy_template = template_args[0] if template_args else None
+
     try:
         result = run_inproc(
             count=args.count,
             concurrency=args.concurrency,
             db_path=args.db,
-            template=args.template,
+            template=legacy_template,
             timeout_seconds=args.timeout_seconds,
             tracer_id_prefix=args.tracer_id_prefix,
             prefer_high_quality=args.exercise_wallet,
@@ -1449,6 +1945,33 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 1
     return 0
+
+
+def _build_campaign_spec(args: argparse.Namespace) -> CampaignSpec:
+    """Resolve --campaign + --template + CLI overrides into one CampaignSpec.
+
+    Priority: --template flags (if any) > --campaign YAML > error.
+    `prefix_root` resolution: CLI --tracer-id-prefix wins, else the YAML's
+    `prefix_root`. The `{ts}` placeholder is substituted at fire time.
+    """
+    template_args = list(args.template or [])
+    if template_args:
+        prefix_root = resolve_prefix_root(args.tracer_id_prefix)
+        return campaign_from_args(
+            template_args=template_args,
+            count_fallback=args.count,
+            prefix_root=prefix_root,
+        )
+    if args.campaign:
+        spec = load_campaign(Path(args.campaign))
+        prefix_root = (
+            args.tracer_id_prefix
+            if args.tracer_id_prefix != "tracer"
+            else spec.prefix_root
+        )
+        spec = spec.model_copy(update={"prefix_root": resolve_prefix_root(prefix_root)})
+        return spec
+    raise RuntimeError("campaign mode requires --campaign or --template name:count")
 
 
 if __name__ == "__main__":

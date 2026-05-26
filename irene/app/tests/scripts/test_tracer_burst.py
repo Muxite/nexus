@@ -374,3 +374,214 @@ def test_live_externals_preflight_blocks_concurrent_prefix():
             Path(tmp.name).unlink(missing_ok=True)
 
     asyncio.run(_go())
+
+
+# ---------------------------------------------------------------------------
+# Step 7 — centralized campaign mode (cycle 24 follow-up)
+# ---------------------------------------------------------------------------
+
+
+from datetime import datetime, timezone  # noqa: E402
+
+from scripts.tracer import _campaign  # noqa: E402
+
+
+def test_campaign_parse_template_count_arg():
+    b = _campaign.parse_template_count_arg("iran_strike:50")
+    assert b.template == "iran_strike"
+    assert b.count == 50
+    with pytest.raises(ValueError):
+        _campaign.parse_template_count_arg("missing-colon")
+    with pytest.raises(ValueError):
+        _campaign.parse_template_count_arg("iran-strike:50")  # hyphen banned
+    with pytest.raises(ValueError):
+        _campaign.parse_template_count_arg("iran_strike:0")  # gt=0
+
+
+def test_campaign_compose_and_parse_tracer_id_roundtrip():
+    tid = _campaign.compose_tracer_id("cycle24-root", "iran_strike", 42)
+    assert tid == "cycle24-root-iran_strike-42"
+    assert _campaign.parse_tracer_id_template(tid, "cycle24-root") == "iran_strike"
+    # Legacy form (no template segment) returns None, not error.
+    legacy = "cycle24-root-99"
+    assert _campaign.parse_tracer_id_template(legacy, "cycle24-root") is None
+    # Wrong root returns None.
+    assert _campaign.parse_tracer_id_template(tid, "other-root") is None
+
+
+def test_campaign_resolve_prefix_root_substitutes_ts():
+    out = _campaign.resolve_prefix_root(
+        "cycle-{ts}",
+        now=datetime(2026, 5, 26, 19, 8, tzinfo=timezone.utc),
+    )
+    assert out == "cycle-20260526T1908"
+    # No placeholder → identity.
+    assert _campaign.resolve_prefix_root("plain-root") == "plain-root"
+
+
+def test_campaign_from_args_multi_template():
+    spec = _campaign.campaign_from_args(
+        template_args=["iran_strike:50", "market_crash:30"],
+        count_fallback=5,
+        prefix_root="test-root",
+    )
+    assert spec.total_count() == 80
+    assert [b.template for b in spec.bursts] == ["iran_strike", "market_crash"]
+    # Bare name (no colon) uses count_fallback.
+    spec2 = _campaign.campaign_from_args(
+        template_args=["iran_strike"],
+        count_fallback=7,
+        prefix_root="r",
+    )
+    assert spec2.bursts[0].count == 7
+
+
+def test_campaign_load_campaign_yaml(tmp_path):
+    p = tmp_path / "campaign.yaml"
+    p.write_text(
+        "name: testc\n"
+        "prefix_root: testc-root\n"
+        "shared: {concurrency: 2}\n"
+        "bursts:\n"
+        "  - template: iran_strike\n"
+        "    count: 3\n"
+        "  - template: market_crash\n"
+        "    count: 2\n"
+    )
+    spec = _campaign.load_campaign(p)
+    assert spec.name == "testc"
+    assert spec.shared["concurrency"] == 2
+    assert spec.total_count() == 5
+    assert spec.bursts[1].template == "market_crash"
+
+
+def test_run_campaign_inproc_two_templates():
+    spec = _campaign.CampaignSpec(
+        name="t",
+        prefix_root="run-campaign-test",
+        bursts=[
+            _campaign.BurstSpec(template="iran_strike", count=3),
+            _campaign.BurstSpec(template="market_crash", count=2),
+        ],
+    )
+    with tempfile.NamedTemporaryFile(suffix=".db") as tmp:
+        result = fire.run_campaign_inproc(
+            spec,
+            concurrency=2,
+            db_path=tmp.name,
+            timeout_seconds=15.0,
+        )
+        assert result.run.drops == 0
+        assert result.run.counts.articles == 5
+        assert result.per_burst_requested == {"iran_strike": 3, "market_crash": 2}
+        assert result.per_burst_published == {"iran_strike": 3, "market_crash": 2}
+        # Tracer_ids carry the template middle segment.
+        conn = sqlite3.connect(tmp.name)
+        rows = list(
+            conn.execute(
+                "SELECT tracer_id FROM articles "
+                "WHERE is_tracer=1 AND tracer_id LIKE 'run-campaign-test%' "
+                "ORDER BY id"
+            )
+        )
+        conn.close()
+        templates_seen = set()
+        for (tid,) in rows:
+            t = _campaign.parse_tracer_id_template(tid, "run-campaign-test")
+            assert t in {"iran_strike", "market_crash"}
+            templates_seen.add(t)
+        assert templates_seen == {"iran_strike", "market_crash"}
+
+
+def test_audit_funnel_by_template_groups_correctly():
+    spec = _campaign.CampaignSpec(
+        name="t",
+        prefix_root="audit-grouped-test",
+        bursts=[
+            _campaign.BurstSpec(template="iran_strike", count=4),
+            _campaign.BurstSpec(template="market_crash", count=2),
+        ],
+    )
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    try:
+        fire.run_campaign_inproc(
+            spec, concurrency=2, db_path=tmp.name, timeout_seconds=15.0
+        )
+        conn = sqlite3.connect(tmp.name)
+        grouped = audit_burst.funnel_by_template(conn, "audit-grouped-test")
+        conn.close()
+        assert set(grouped) == {"iran_strike", "market_crash"}
+        assert grouped["iran_strike"].articles == 4
+        assert grouped["market_crash"].articles == 2
+        # Each template's per-funnel signals = articles × stub_market_count.
+        assert (
+            grouped["iran_strike"].signals
+            == 4 * fire.STUB_MARKET_COUNT
+        )
+        # Discover-templates utility returns the same set.
+        conn2 = sqlite3.connect(tmp.name)
+        discovered = audit_burst.discover_templates(conn2, "audit-grouped-test")
+        conn2.close()
+        assert sorted(discovered) == ["iran_strike", "market_crash"]
+    finally:
+        Path(tmp.name).unlink(missing_ok=True)
+
+
+def test_cli_multi_template_flag_triggers_campaign_mode(tmp_path):
+    """End-to-end CLI smoke: `--template a:N --template b:M` lowers into
+    campaign mode and produces the expected tracer_id middle segments.
+    """
+    db = tmp_path / "smoke.db"
+    rc = fire.main(
+        [
+            "--template", "iran_strike:3",
+            "--template", "market_crash:2",
+            "--tracer-id-prefix", "cli-smoke",
+            "--db", str(db),
+            "--concurrency", "2",
+            "--timeout-seconds", "15",
+        ]
+    )
+    assert rc == 0
+    conn = sqlite3.connect(db)
+    rows = list(
+        conn.execute(
+            "SELECT tracer_id FROM articles WHERE tracer_id LIKE 'cli-smoke%'"
+        )
+    )
+    conn.close()
+    assert len(rows) == 5
+    tmpls = {
+        _campaign.parse_tracer_id_template(tid, "cli-smoke") for (tid,) in rows
+    }
+    assert tmpls == {"iran_strike", "market_crash"}
+
+
+def test_cli_campaign_yaml_path(tmp_path):
+    """`--campaign <yaml>` is honored by main()."""
+    spec_path = tmp_path / "c.yaml"
+    spec_path.write_text(
+        "name: cli-yaml\n"
+        "prefix_root: cli-yaml-root\n"
+        "shared: {concurrency: 2}\n"
+        "bursts:\n"
+        "  - template: iran_strike\n"
+        "    count: 2\n"
+    )
+    db = tmp_path / "y.db"
+    rc = fire.main(
+        [
+            "--campaign", str(spec_path),
+            "--db", str(db),
+            "--concurrency", "2",
+            "--timeout-seconds", "15",
+        ]
+    )
+    assert rc == 0
+    conn = sqlite3.connect(db)
+    n = conn.execute(
+        "SELECT COUNT(*) FROM articles WHERE tracer_id LIKE 'cli-yaml-root%'"
+    ).fetchone()[0]
+    conn.close()
+    assert n == 2

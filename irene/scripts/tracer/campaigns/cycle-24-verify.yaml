@@ -1,0 +1,27 @@
+name: cycle-24-verify
+# `{ts}` substitutes UTC YYYYMMDDTHHmm at fire time so each invocation
+# gets a unique root and prior runs' cleanup is unambiguous.
+prefix_root: cycle24-verify-{ts}
+
+shared:
+  # Sane defaults for a manual verification run on the live container.
+  # CLI flags override anything here (e.g. --budget-cap-usd 70).
+  concurrency: 5
+  log_level: INFO
+  config: /config/config.yaml
+  db: /data/irene.db
+  # Floor on OpenRouter remaining. Current OpenRouter remaining is the
+  # caller's responsibility to know — set this to (current - intended_spend).
+  budget_cap_usd: 55
+  exercise_wallet: false
+
+# Two templates, 50 articles each, fired sequentially in a single process.
+# Verifies:
+#   B (dedupe/freshness fix) — iran_strike should land ≥70/100 BREAKING/EVOLVING.
+#   H (LLM context richness) — Y+N share of LLM-reached ≥40%.
+#   C (DKG safety gates) — zero contamination of the live wallet.
+bursts:
+  - template: iran_strike
+    count: 50
+  - template: market_crash
+    count: 50

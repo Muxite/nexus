@@ -38,6 +38,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from scripts.tracer._queries import open_readonly
+from scripts.tracer._campaign import parse_tracer_id_template
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +177,97 @@ def funnel(conn: sqlite3.Connection, prefix: str) -> Funnel:
         f.llm_reached += int(n)
 
     return f
+
+
+def discover_templates(conn: sqlite3.Connection, prefix_root: str) -> list[str]:
+    """Return the sorted distinct template names found under a campaign root.
+
+    Walks `articles.tracer_id` (the largest tracer-bearing table) and parses
+    the middle segment of every `<root>-<template>-<i>` id. Legacy single-
+    template bursts (no middle segment, `<root>-<i>`) contribute nothing.
+    """
+    pat = f"{prefix_root}-%"
+    rows = _rows(
+        conn,
+        "SELECT DISTINCT tracer_id FROM articles "
+        "WHERE is_tracer = 1 AND tracer_id LIKE ?",
+        (pat,),
+    )
+    templates: set[str] = set()
+    for (tid,) in rows:
+        t = parse_tracer_id_template(str(tid), prefix_root)
+        if t is not None:
+            templates.add(t)
+    return sorted(templates)
+
+
+def funnel_by_template(
+    conn: sqlite3.Connection, prefix_root: str
+) -> dict[str, Funnel]:
+    """Per-template funnel snapshots under a campaign root.
+
+    Returns `{template_name: Funnel}` — `funnel(conn, f"{root}-{tmpl}")`
+    reuses the existing LIKE-based aggregator for each template's subset.
+    Empty dict when no campaign-mode rows live under the root.
+    """
+    out: dict[str, Funnel] = {}
+    for t in discover_templates(conn, prefix_root):
+        sub_prefix = f"{prefix_root}-{t}"
+        out[t] = funnel(conn, sub_prefix)
+    return out
+
+
+def format_grouped_funnel(grouped: dict[str, Funnel], root: str) -> str:
+    """Per-template subsections + a grand-total funnel for a campaign."""
+    if not grouped:
+        return (
+            f"== Campaign audit — root: {root} ==\n"
+            f"(no campaign-mode tracer rows found — single-template "
+            f"prefixes use the default funnel format)"
+        )
+
+    lines = [f"== Campaign audit — root: {root} ==", ""]
+    grand_articles = sum(f.articles for f in grouped.values())
+    grand_signals = sum(f.signals for f in grouped.values())
+    grand_decisions = sum(f.decisions for f in grouped.values())
+    grand_executes = sum(f.decisions_execute for f in grouped.values())
+    grand_llm = sum(f.llm_reached for f in grouped.values())
+    grand_trades = sum(f.trades for f in grouped.values())
+
+    for tmpl in sorted(grouped):
+        f = grouped[tmpl]
+        match_rate = (f.signals / f.articles * 100) if f.articles else 0
+        llm_pct = (f.llm_reached / f.signals * 100) if f.signals else 0
+        lines.append(
+            f"  {tmpl:24s} articles={f.articles:5d}  signals={f.signals:5d}"
+            f" ({match_rate:5.1f}%)  decisions={f.decisions:5d}"
+            f"  LLM={f.llm_reached:5d} ({llm_pct:5.1f}%)  trades={f.trades:3d}"
+        )
+        if f.reject_reasons:
+            top = ", ".join(
+                f"{reason}={n}" for reason, n in list(f.reject_reasons.items())[:3]
+            )
+            lines.append(f"    top rejects: {top}")
+        if f.llm_label_counts:
+            lab = " ".join(
+                f"{k}={v}" for k, v in sorted(f.llm_label_counts.items())
+            )
+            lines.append(f"    labels: {lab}")
+        lines.append("")
+
+    grand_match = (grand_signals / grand_articles * 100) if grand_articles else 0
+    grand_llm_pct = (grand_llm / grand_signals * 100) if grand_signals else 0
+    lines.extend(
+        [
+            "== campaign totals ==",
+            f"  articles fired      {grand_articles}",
+            f"  signals matched     {grand_signals}  ({grand_match:.1f}% match rate)",
+            f"  decisions made      {grand_decisions}  (execute={grand_executes})",
+            f"  LLM reached         {grand_llm}  ({grand_llm_pct:.1f}% of signals)",
+            f"  trades executed     {grand_trades}",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def format_funnel(f: Funnel) -> str:
@@ -341,6 +433,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         action="store_true",
         help="Emit machine-readable JSON instead of the human funnel.",
     )
+    parser.add_argument(
+        "--group-by",
+        choices=("template",),
+        default=None,
+        help=(
+            "Campaign-aware grouping. When 'template', interprets "
+            "--tracer-id-prefix as a campaign ROOT and reports per-template "
+            "subsections + a grand-total funnel. Falls back to single-prefix "
+            "behavior when no campaign-mode rows live under the root."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -350,15 +453,63 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     try:
-        f = funnel(conn, args.tracer_id_prefix)
-        csv_path = (
-            Path(args.csv_out)
-            if args.csv_out
-            else Path("data/dashboard/plots") / f"tracer_burst_{args.tracer_id_prefix}.csv"
-        )
-        n_rows = write_csv(conn, args.tracer_id_prefix, csv_path)
+        if args.group_by == "template":
+            grouped = funnel_by_template(conn, args.tracer_id_prefix)
+            # CSV: per-template files + one combined file under the root.
+            csv_dir = (
+                Path(args.csv_out).parent
+                if args.csv_out
+                else Path("data/dashboard/plots")
+            )
+            csv_paths: dict[str, Path] = {}
+            for tmpl in grouped:
+                p = csv_dir / f"tracer_burst_{args.tracer_id_prefix}_{tmpl}.csv"
+                write_csv(conn, f"{args.tracer_id_prefix}-{tmpl}", p)
+                csv_paths[tmpl] = p
+            combined_path = csv_dir / f"tracer_burst_{args.tracer_id_prefix}_all.csv"
+            n_combined = write_csv(conn, args.tracer_id_prefix, combined_path)
+        else:
+            f = funnel(conn, args.tracer_id_prefix)
+            csv_path = (
+                Path(args.csv_out)
+                if args.csv_out
+                else Path("data/dashboard/plots")
+                / f"tracer_burst_{args.tracer_id_prefix}.csv"
+            )
+            n_rows = write_csv(conn, args.tracer_id_prefix, csv_path)
     finally:
         conn.close()
+
+    if args.group_by == "template":
+        if args.json:
+            out = {
+                "root": args.tracer_id_prefix,
+                "templates": {
+                    tmpl: {
+                        "articles": f.articles,
+                        "signals": f.signals,
+                        "decisions": f.decisions,
+                        "decisions_execute": f.decisions_execute,
+                        "decisions_reject": f.decisions_reject,
+                        "reject_reasons": f.reject_reasons,
+                        "trades": f.trades,
+                        "llm_reached": f.llm_reached,
+                        "llm_label_counts": f.llm_label_counts,
+                        "llm_label_avg_conf": f.llm_label_avg_conf,
+                        "csv_path": str(csv_paths.get(tmpl, "")),
+                    }
+                    for tmpl, f in grouped.items()
+                },
+                "combined_csv": str(combined_path),
+                "combined_csv_rows": n_combined,
+            }
+            print(json.dumps(out, indent=2, default=str))
+        else:
+            print(format_grouped_funnel(grouped, args.tracer_id_prefix))
+            for tmpl, p in csv_paths.items():
+                print(f"\n  CSV [{tmpl}]: {p}")
+            print(f"  CSV [combined]: {combined_path} ({n_combined} rows)")
+        return 0
 
     if args.json:
         out = {
