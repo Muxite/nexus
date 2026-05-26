@@ -288,6 +288,13 @@ class DKGTradeSection(BaseModel):
 class TradeSection(BaseModel):
     """Trade stage — gate cascade thresholds + sizing config (paper only)."""
 
+    # Cycle 23 execution kill switch — when False the trade and DKG
+    # cascades short-circuit at gate 0 (BEFORE any LLM/CLOB call) and
+    # write a `reason='execution_disabled'` decision row so the soak
+    # funnel distinguishes a halted bot from a silent stall. Set False
+    # via `IRENE__TRADE__EXECUTION_ENABLED=false` or config.yaml when
+    # pausing without stopping the container.
+    execution_enabled: bool = True
     balance_usdc: float = Field(default=1000.0, gt=0)
     min_similarity: float = Field(default=0.35, gt=0.0, lt=1.0)
     min_confidence: float = Field(default=0.55, gt=0.0, le=1.0)
