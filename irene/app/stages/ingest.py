@@ -99,6 +99,14 @@ _INGEST_DDL = [
     """,
     "CREATE INDEX IF NOT EXISTS idx_articles_ingested_at ON articles(ingested_at)",
     "CREATE INDEX IF NOT EXISTS idx_articles_tracer ON articles(is_tracer) WHERE is_tracer=1",
+    # Cycle 24 (handoff H — LLM context richness): full trafilatura-cleaned
+    # article body when the scraper-v2 combined/article response provides
+    # it. NULL on legacy rows + on every row whose upstream payload didn't
+    # carry the `body` field — the trade-stage prompt builder falls back
+    # to `summary` in that case. Backfill is unnecessary; new articles
+    # only. ALTER TABLE is sha1-tracked by `register_schema` so the
+    # second-and-later boots no-op.
+    "ALTER TABLE articles ADD COLUMN body TEXT",
 ]
 db_module.register_schema("app/stages/ingest.py", _INGEST_DDL)
 
@@ -374,6 +382,17 @@ class IngestStage:
             # its output here. Only guard against missing fields below.
             summary = link.get("summary") or None
             published = link.get("published") or None
+            # Cycle 24 (handoff H): when the scraper-v2 article-fan-out
+            # supplies a full `body` field alongside the first-paragraph
+            # `summary`, we capture it here so the trade-stage prompt
+            # builder can prefer it. Defensive: today's scraper-v2 only
+            # emits `summary` (first paragraph, ≤600 chars) for HTML-only
+            # enriched links — `body` is reserved for the future fuller
+            # payload. Empty string and non-string types collapse to None
+            # so the column stays NULL until a real body lands.
+            body = link.get("body")
+            if not isinstance(body, str) or not body:
+                body = None
             seen_in = link.get("seen_in") or []
             # source_detail records which sub-strategies surfaced this
             # so chunked decision audits can attribute back to RSS/HTML.
@@ -389,6 +408,7 @@ class IngestStage:
                     "title": title,
                     "summary": summary if isinstance(summary, str) else None,
                     "published_at": published if isinstance(published, str) else None,
+                    "body": body,
                 },
             )
 
@@ -453,6 +473,12 @@ class IngestStage:
             return
         summary = item.get("summary")
         published_at = item.get("published_at")
+        # Cycle 24 (handoff H): full article body from scraper-v2 when
+        # present. None on every path that doesn't populate it; the
+        # trade-stage prompt builder falls back to `summary` in that case.
+        body = item.get("body")
+        if not isinstance(body, str) or not body:
+            body = None
         cycle_id = current_cycle_id()
         ingested_at = _now_iso()
 
@@ -461,8 +487,8 @@ class IngestStage:
                 """
                 INSERT OR IGNORE INTO articles
                     (source, source_detail, url, title, summary, published_at,
-                     ingested_at, cycle_id, is_tracer, tracer_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL)
+                     ingested_at, cycle_id, is_tracer, tracer_id, body)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
                 """,
                 (
                     source,
@@ -473,6 +499,7 @@ class IngestStage:
                     published_at if isinstance(published_at, str) else None,
                     ingested_at,
                     cycle_id,
+                    body,
                 ),
             )
             inserted = cur.rowcount == 1

@@ -278,6 +278,14 @@ def _market_min_usdc(
     return ms * per_share, "mid_fallback"
 
 
+#: Cycle 24 (handoff H): hard cap on the article-body slice fed to the
+#: LLM. ~3000 chars ≈ 750 tokens — leaves comfortable room for the
+#: market block + instructions + system message inside the ~4000-token
+#: `cfg.openrouter.max_input_tokens` budget without unbounded LLM cost
+#: on a 12 KB long-form article.
+MAX_ARTICLE_CHARS_IN_PROMPT = 3000
+
+
 def compose_direction_prompt(article: dict, market: dict) -> str:
     """Shared LLM-direction prompt builder for the MVP + DKG trade paths.
 
@@ -285,18 +293,65 @@ def compose_direction_prompt(article: dict, market: dict) -> str:
     decisively resolves the market — see `docs/philosophy.md`. The
     function is module-level so `app/stages/dkg_trade.py` can call it
     without inheriting any state from `TradeStage`.
+
+    Cycle 24 (handoff H — LLM context richness):
+    - Prefer `body` (full trafilatura-cleaned article text) over
+      `summary` (often 1-sentence RSS lede) when the body is meaningfully
+      longer — gives the LLM the supporting context the cycle-22 Iran
+      "decisively resolve" audit flagged as missing.
+    - Hard-cap the article slice at `MAX_ARTICLE_CHARS_IN_PROMPT` so a
+      runaway long-form article cannot blow the input budget.
+    - Surface `end_date`, `volume_usdc`, `category` so the LLM can reason
+      about resolution timing and market depth, not just the question
+      text.
+    - Soften the NEUTRAL guidance (the bot was over-abstaining per the
+      cycle-22 audit) — the gate cascade still filters on confidence, so
+      letting the model express a low-confidence directional lean is
+      preferable to a hard NEUTRAL whenever there is any visible cue.
     """
     title = article.get("title") or ""
-    summary = article.get("summary") or "(none)"
+    summary = article.get("summary") or ""
+    body = article.get("body") or ""
+    # Prefer body when it adds meaningful context vs the (often very
+    # short) RSS summary. The 1.5× floor avoids swapping a clean
+    # 1-sentence lede for a 1-sentence trafilatura excerpt that happens
+    # to be a few characters longer.
+    if body and len(body) > max(len(summary) * 1.5, 200):
+        article_text = body
+    elif summary:
+        article_text = summary
+    else:
+        article_text = "(no body or summary available)"
+    if len(article_text) > MAX_ARTICLE_CHARS_IN_PROMPT:
+        article_text = (
+            article_text[:MAX_ARTICLE_CHARS_IN_PROMPT] + " […truncated]"
+        )
+
     question = market.get("question") or ""
     description = market.get("description") or "(none)"
+    end_date = market.get("end_date") or "(unknown)"
+    volume = market.get("volume_usdc")
+    if isinstance(volume, (int, float)):
+        volume_str = f"{float(volume):,.0f} USDC"
+    else:
+        volume_str = "?"
+    category = market.get("category") or "(uncategorized)"
+
     return (
-        f"NEWS HEADLINE: {title}\n"
-        f"NEWS SUMMARY:  {summary}\n"
+        f"=== NEWS ARTICLE ===\n"
+        f"Headline: {title}\n"
         f"\n"
-        f"MARKET QUESTION: {question}\n"
-        f"MARKET DETAILS:  {description}\n"
+        f"{article_text}\n"
         f"\n"
+        f"=== MARKET ===\n"
+        f"Question: {question}\n"
+        f"Resolution deadline: {end_date}\n"
+        f"Volume (24h): {volume_str}\n"
+        f"Category: {category}\n"
+        f"\n"
+        f"Details: {description}\n"
+        f"\n"
+        f"=== INSTRUCTIONS ===\n"
         f"Read the news as plain language. Does the news DECISIVELY\n"
         f"resolve this market?\n"
         f"\n"
@@ -304,9 +359,13 @@ def compose_direction_prompt(article: dict, market: dict) -> str:
         f"            will happen or has just happened.\n"
         f"  NO      — the news plainly says the market's NO outcome\n"
         f"            will happen or has just happened.\n"
-        f"  NEUTRAL — the news is unrelated, ambiguous, or doesn't\n"
-        f"            clearly push the market either way. Default to\n"
-        f"            this whenever you're unsure.\n"
+        f"  NEUTRAL — the news is unrelated, ambiguous, or genuinely\n"
+        f"            doesn't push the market either way. Prefer YES or\n"
+        f"            NO with a low confidence (e.g. 0.4) when you can\n"
+        f"            see a directional lean even if the resolution\n"
+        f"            isn't certain — the gate handles confidence\n"
+        f"            filtering downstream. Reserve NEUTRAL for the\n"
+        f"            truly orthogonal cases.\n"
         f"\n"
         f"`confidence` is how CLEARLY the news resolves the market\n"
         f"(not a probability of YES). 0.9 = the article spells out\n"
@@ -850,14 +909,25 @@ class TradeStage:
         return row is not None
 
     async def _fetch_article(self, article_id: int) -> Optional[dict]:
+        # Cycle 24 (handoff H): `body` joins the fetch so the prompt
+        # builder can prefer the full trafilatura-cleaned article over
+        # the (often 1-sentence) RSS summary. NULL on legacy rows + on
+        # any path where the upstream scraper-v2 payload didn't supply
+        # a body field — the prompt builder falls back to `summary` in
+        # that case.
         cur = await self._db.conn.execute(
-            "SELECT title, summary FROM articles WHERE id=?", (article_id,)
+            "SELECT title, summary, body FROM articles WHERE id=?",
+            (article_id,),
         )
         row = await cur.fetchone()
         await cur.close()
         if row is None:
             return None
-        return {"title": row["title"], "summary": row["summary"]}
+        return {
+            "title": row["title"],
+            "summary": row["summary"],
+            "body": row["body"],
+        }
 
     async def _fetch_market(self, market_id: str) -> Optional[dict]:
         cur = await self._db.conn.execute(

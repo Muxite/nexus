@@ -402,6 +402,20 @@ class AIClient:
         self._model = config.openrouter.direction_model
         self._api_key = config.openrouter.api_key
         self._timeout = config.openrouter.timeout_seconds
+        # Cycle 24 (handoff H — LLM context richness): high-level prompt
+        # truncation guard. The trade-stage `compose_direction_prompt`
+        # already caps the article slice at ~3000 chars; this is the
+        # safety net for any future caller that builds an unbounded
+        # prompt. Read defensively for test fakes that only set the
+        # legacy three OpenRouter fields. Token budget → char budget
+        # via the standard ~4 chars/token estimate.
+        self._max_input_tokens: int = int(
+            getattr(config.openrouter, "max_input_tokens", 4000)
+        )
+        self._max_input_chars: int = self._max_input_tokens * 4
+        # One-shot WARN per process so a runaway prompt is loud without
+        # spamming the log on every signal.
+        self._truncate_warn_emitted: bool = False
         # The client is created lazily so tests can patch httpx without
         # paying connection costs during construction.
         self._client: Optional[httpx.AsyncClient] = None
@@ -454,6 +468,22 @@ class AIClient:
         # `prompt` here is just the user content (Condition + News). The
         # system message is appended to the cache key so a future change
         # to it forces a fresh round-trip even at the same PROMPT_VERSION.
+        # Cycle 24 (handoff H): provider-level safety truncation. The
+        # callers in `compose_direction_prompt` already cap the article
+        # slice well below this threshold; this only fires if a future
+        # call-site builds a runaway prompt. Truncate BEFORE hashing so
+        # the cache key is stable.
+        if len(prompt) > self._max_input_chars:
+            if not self._truncate_warn_emitted:
+                logger.warning(
+                    "ai.direction: prompt %d chars exceeds max_input_chars "
+                    "%d (max_input_tokens=%d); truncating. This warning "
+                    "fires once per process — investigate the call-site.",
+                    len(prompt), self._max_input_chars,
+                    self._max_input_tokens,
+                )
+                self._truncate_warn_emitted = True
+            prompt = prompt[: self._max_input_chars] + " […truncated]"
         full_prompt = prompt
         prompt_sha = _sha1(
             f"{_SYSTEM_MESSAGE}|{full_prompt}|{self._model}|{self.PROMPT_VERSION}"

@@ -93,6 +93,18 @@ class OpenRouterSection(BaseModel):
     api_key: str = ""
     direction_model: str = "google/gemini-2.5-flash"
     timeout_seconds: float = Field(default=20.0, gt=0)
+    # Cycle 24 (handoff H — LLM context richness): soft cap on the
+    # PROMPT side of the call. The compose_direction_prompt builder
+    # already truncates the article slice at
+    # `trade.MAX_ARTICLE_CHARS_IN_PROMPT` (~3000 chars); this knob is
+    # the higher-level safety net read by `ai.AIClient` so a single
+    # config flip can dial overall prompt richness up or down without
+    # touching the prompt code. Gemini-2.5-flash supports very large
+    # contexts — the bottleneck is cost, not the context window — so
+    # ~4000 tokens is the soak-friendly default. Dial DOWN if the
+    # OpenRouter burn-rate exceeds 2× pre-fix in handoff H's
+    # verification window.
+    max_input_tokens: int = Field(default=4000, ge=256, le=200_000)
 
 
 class ProbeSection(BaseModel):

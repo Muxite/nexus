@@ -1426,3 +1426,145 @@ async def test_execute_path_still_records_latency(db_seeded):
     assert drow["outcome"] == "execute"
     assert drow["decision_latency_ms"] is None
     assert drow["decision_latency_breakdown"] is None
+
+
+# ---------------------------------------------------------------------------
+# Cycle 24 (handoff H): compose_direction_prompt — fuller article body,
+# expanded market context, softer NEUTRAL guidance. The downstream parser
+# (`ai._parse_response`) still expects a JSON-only reply, so the "Output
+# JSON ONLY." tail must stay intact.
+# ---------------------------------------------------------------------------
+
+
+from app.stages.trade import (  # noqa: E402 — module-level import OK; collated with H tests
+    MAX_ARTICLE_CHARS_IN_PROMPT,
+    compose_direction_prompt,
+)
+
+
+def _h_article(*, title="T", summary="", body=""):
+    """Minimal article dict for prompt-builder unit tests. Empty strings
+    collapse to "" (the builder's own empty-default handling kicks in)."""
+    return {"title": title, "summary": summary, "body": body}
+
+
+def _h_market(**overrides):
+    """Minimal market dict. Defaults populate every field the cycle-24
+    prompt surfaces so tests can override one knob at a time."""
+    base = {
+        "question": "Will X happen?",
+        "description": "Resolution details.",
+        "end_date": "2026-12-31T23:59:59Z",
+        "volume_usdc": 12345.0,
+        "category": "politics",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_h_prompt_prefers_body_over_summary_when_body_longer():
+    """body must win over summary when meaningfully longer (>=1.5×, >=200 chars)."""
+    body = "Full article body. " * 30  # ~570 chars
+    summary = "Short lede sentence."     # ~20 chars
+    prompt = compose_direction_prompt(
+        _h_article(title="Headline", summary=summary, body=body),
+        _h_market(),
+    )
+    assert body[:100] in prompt
+    # The short summary should NOT appear verbatim — body replaced it.
+    assert summary not in prompt
+
+
+def test_h_prompt_falls_back_to_summary_when_body_absent():
+    """Empty body → summary wins (the cycle-23 behaviour for legacy rows)."""
+    summary = "The Senate passed the bill with 67 votes."
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary=summary, body=""),
+        _h_market(),
+    )
+    assert summary in prompt
+
+
+def test_h_prompt_falls_back_to_summary_when_body_too_short():
+    """A body that's <1.5× the summary length is NOT preferred — protects
+    against trafilatura returning a 1-sentence excerpt that happens to be
+    a few characters longer than the RSS lede."""
+    summary = "A clean one-sentence RSS lede that gives real context here."
+    body = "A slightly longer one-sentence excerpt that gives real context."
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary=summary, body=body),
+        _h_market(),
+    )
+    assert summary in prompt
+    assert body not in prompt
+
+
+def test_h_prompt_truncates_long_article_at_cap():
+    """A 12 KB body must be capped at MAX_ARTICLE_CHARS_IN_PROMPT chars
+    with a truncation marker so the LLM knows the input is incomplete."""
+    body = "x" * 12_000
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="", body=body),
+        _h_market(),
+    )
+    # The "x" run must not exceed the cap inside the prompt.
+    longest_x_run = max((len(s) for s in prompt.split("\n")), default=0)
+    assert longest_x_run <= MAX_ARTICLE_CHARS_IN_PROMPT + 100, (
+        f"prompt has a {longest_x_run}-char x-run; cap is "
+        f"{MAX_ARTICLE_CHARS_IN_PROMPT}"
+    )
+    assert "truncated" in prompt
+
+
+def test_h_prompt_surfaces_market_end_date_volume_category():
+    """end_date, volume (formatted), and category must all appear in the
+    prompt body so the LLM can reason about timing + depth + topic."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        _h_market(
+            end_date="2026-06-15T00:00:00Z",
+            volume_usdc=987_654.0,
+            category="geopolitics",
+        ),
+    )
+    assert "2026-06-15T00:00:00Z" in prompt
+    # Comma-grouped formatting per the builder.
+    assert "987,654" in prompt
+    assert "geopolitics" in prompt
+
+
+def test_h_prompt_handles_missing_market_fields_gracefully():
+    """Missing optional market fields must NOT raise — placeholders only."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        {"question": "Q?", "description": "D"},
+    )
+    assert "(unknown)" in prompt          # end_date placeholder
+    assert "(uncategorized)" in prompt    # category placeholder
+    assert "?" in prompt                  # volume placeholder
+
+
+def test_h_prompt_softens_neutral_guidance():
+    """The cycle-24 wording must drop the hard "Default to … whenever
+    you're unsure" line and explicitly invite a low-confidence
+    directional lean. The downstream gate cascade still filters on
+    `min_confidence`, so a more permissive prompt is safe."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        _h_market(),
+    )
+    assert "Default to" not in prompt
+    # Anchor on the new permissive phrasing.
+    assert "low confidence" in prompt
+    assert "directional lean" in prompt
+
+
+def test_h_prompt_preserves_json_only_tail():
+    """The downstream parser (`ai._parse_response`) keys on a JSON-only
+    response; if the tail line ever drifts, the parser regresses to
+    NEUTRAL on every call."""
+    prompt = compose_direction_prompt(
+        _h_article(title="H", summary="s"),
+        _h_market(),
+    )
+    assert prompt.rstrip().endswith("Output JSON ONLY.")

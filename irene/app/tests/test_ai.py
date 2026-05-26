@@ -614,3 +614,173 @@ async def test_probe_does_not_change_production_call(db_ready, monkeypatch):
     # Probe's disagreeing label sits in the probe row, not in any
     # production-visible field.
     assert row["direction"] == "NO"
+
+
+# ---------------------------------------------------------------------------
+# Cycle 24 (handoff H): max_input_tokens knob + provider-level prompt
+# truncation. The trade-stage prompt builder caps the article slice at
+# ~3000 chars; this layer is the safety net for any future caller that
+# builds an unbounded prompt. `max_tokens=1` + logit_bias (cycle-7 design)
+# stays untouched — only INPUT context expands.
+# ---------------------------------------------------------------------------
+
+
+def _fake_config_with_input_cap(max_input_tokens: int) -> object:
+    """Variant of `_fake_config` that exposes the cycle-24
+    `max_input_tokens` field on `config.openrouter`."""
+
+    class _OR:
+        api_key = "test-key"
+        direction_model = "google/gemini-2.5-flash"
+        timeout_seconds = 5.0
+
+    _OR.max_input_tokens = max_input_tokens
+
+    class _Cfg:
+        openrouter = _OR()
+
+    return _Cfg()
+
+
+async def test_h_default_max_input_tokens_when_unset(db_ready):
+    """Tests using the legacy `_fake_config` (no `max_input_tokens`
+    attribute) get the 4000-token default — preserves test fakes
+    written before cycle 24."""
+    budget = _FakeBudget()
+    client = AIClient(db=db_ready, budget=budget, config=_fake_config())
+    try:
+        assert client._max_input_tokens == 4000
+        assert client._max_input_chars == 16_000
+    finally:
+        await client.close()
+
+
+async def test_h_max_input_tokens_read_from_config(db_ready):
+    """A config-supplied `max_input_tokens` overrides the default and
+    drives the char budget (chars = tokens × 4)."""
+    budget = _FakeBudget()
+    client = AIClient(
+        db=db_ready,
+        budget=budget,
+        config=_fake_config_with_input_cap(max_input_tokens=2_000),
+    )
+    try:
+        assert client._max_input_tokens == 2_000
+        assert client._max_input_chars == 8_000
+    finally:
+        await client.close()
+
+
+async def test_h_long_prompt_accepted_without_truncation(db_ready, monkeypatch):
+    """A 3500-char prompt (well under the 16k default char cap) must
+    pass through to the provider verbatim. Asserts the truncation
+    branch does NOT fire on the normal cycle-24 enriched prompt size."""
+    budget = _FakeBudget()
+    client = AIClient(db=db_ready, budget=budget, config=_fake_config())
+    captured: dict[str, str] = {}
+
+    async def capture_call(full_prompt: str) -> dict:
+        captured["prompt"] = full_prompt
+        return _ok_response("YES")
+
+    monkeypatch.setattr(client, "_call_openrouter", capture_call)
+    try:
+        long_prompt = "x" * 3_500
+        with cycle_scope(1):
+            await client.direction(signal_id=200, prompt=long_prompt)
+    finally:
+        await client.close()
+
+    assert captured["prompt"] == long_prompt
+    assert "truncated" not in captured["prompt"]
+    # The single-token-output (cycle-7 / cycle-4) design must be preserved:
+    # the stub we just used short-circuits the HTTP call, so the
+    # observable here is that the prompt reached _call_openrouter intact.
+
+
+async def test_h_oversized_prompt_truncated_at_char_cap(db_ready, monkeypatch):
+    """A 100k-char prompt exceeds the 16k default char budget and must be
+    truncated at the cap (with a marker). The stub still observes a
+    well-formed call, so the cache-key/hashing pipeline downstream stays
+    consistent."""
+    budget = _FakeBudget()
+    client = AIClient(db=db_ready, budget=budget, config=_fake_config())
+    captured: dict[str, str] = {}
+
+    async def capture_call(full_prompt: str) -> dict:
+        captured["prompt"] = full_prompt
+        return _ok_response("YES")
+
+    monkeypatch.setattr(client, "_call_openrouter", capture_call)
+    try:
+        runaway = "y" * 100_000
+        with cycle_scope(1):
+            await client.direction(signal_id=201, prompt=runaway)
+    finally:
+        await client.close()
+
+    sent = captured["prompt"]
+    # Cap is max_input_chars (16_000) + the truncation marker tail.
+    assert len(sent) <= 16_000 + 50, (
+        f"sent prompt is {len(sent)} chars; expected <= ~16_050"
+    )
+    assert "truncated" in sent
+
+
+async def test_h_output_max_tokens_unchanged_by_input_knob(db_ready, monkeypatch):
+    """The cycle-7 single-token output cap (`max_tokens=32` + logit_bias
+    on Y/N/P/U/R) must NOT change when handoff H raises the input budget.
+    This locks the contract: handoff H expands INPUT only. We assert by
+    inspecting the JSON payload the real `_call_openrouter` builds."""
+    budget = _FakeBudget()
+    client = AIClient(
+        db=db_ready,
+        budget=budget,
+        config=_fake_config_with_input_cap(max_input_tokens=8_000),
+    )
+    seen: dict = {}
+
+    class _StubResp:
+        status_code = 200
+
+        def __init__(self, body: str) -> None:
+            self.text = body
+
+        def json(self) -> dict:
+            return json.loads(self.text)
+
+    class _StubClient:
+        def __init__(self) -> None:
+            self.posted: list[dict] = []
+
+        async def post(self, _url, *, headers, json):  # noqa: A002 — match httpx sig
+            self.posted.append(json)
+            seen["payload"] = json
+            seen["headers"] = headers
+            body = {
+                "choices": [{"message": {"content": "Y"}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 1},
+            }
+            return _StubResp(json_lib.dumps(body))
+
+        async def aclose(self) -> None:
+            pass
+
+    import json as json_lib  # noqa: F401 — used inside _StubClient
+    client._client = _StubClient()
+    try:
+        with cycle_scope(1):
+            result = await client.direction(
+                signal_id=210, prompt="news A market B"
+            )
+    finally:
+        await client.close()
+
+    assert result.direction == "YES"
+    # The protected contract: max_tokens and logit_bias are unchanged.
+    # (Cycle 4 set max_tokens=32 to absorb gemini's ```json fence wrap.)
+    assert seen["payload"]["max_tokens"] == 32
+    assert seen["payload"]["temperature"] == 0
+    lb = seen["payload"]["logit_bias"]
+    assert set(lb.keys()) == {"Y", "N", "P", "U", "R"}
+    assert all(v == 100 for v in lb.values())
