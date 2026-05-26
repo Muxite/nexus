@@ -15,6 +15,7 @@ from .pages import (
     latency,
     latency_breakdown,
     main,
+    near_miss_audit,
     news_staleness,
     pnl,
     recent_trades,
@@ -34,6 +35,7 @@ PAGES = [
     entity_extraction,
     entity_resolutions,
     pnl,
+    near_miss_audit,
 ]
 
 # Files that have never existed (or have been deliberately removed) and
