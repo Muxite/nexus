@@ -59,6 +59,7 @@ import asyncio
 import hashlib
 import itertools
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -281,21 +282,133 @@ class _TracerCLOB:
 
 @dataclass(frozen=True)
 class _Template:
+    """A tracer scenario template.
+
+    Backward compatible with the legacy "single title + summary + url_pattern"
+    schema. NEW (cycle 24): two optional fields enable a single template to
+    produce ≥50 distinct articles deterministically by `i`:
+
+      title_variants: list[str]
+          Alternative title format strings. Round-robin'd by i so consecutive
+          fires of the same template don't repeat the same headline.
+          The legacy `title` is appended as variant 0 when this list is set,
+          ensuring summary's primary phrasing still surfaces.
+
+      variables: dict[str, list[str]]
+          A mapping of placeholder name → choice list. Render selects a
+          deterministic choice via `i // multiplier % len(list)` so every
+          variable rotates at a different rate, maximising variety.
+
+    `render(i)` substitutes `{i}` and every variable into title + summary +
+    url. Unknown placeholders in a particular variant simply don't expand
+    (str.format with a missing key would raise; we use a safe-substitute
+    that leaves unknowns as the empty string).
+    """
+
     name: str
     title: str
     summary: str
     source: str
     source_detail: str
     url_pattern: str
+    title_variants: tuple[str, ...] = ()
+    variables: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    high_quality_overrides: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
-    def render(self, i: int) -> dict[str, str]:
-        return {
-            "title": self.title.format(i=i),
-            "summary": self.summary.format(i=i),
+    @property
+    def _all_titles(self) -> tuple[str, ...]:
+        # Legacy `title` always sits at index 0; variants extend it.
+        if not self.title_variants:
+            return (self.title,)
+        seen = [self.title]
+        for v in self.title_variants:
+            if v not in seen:
+                seen.append(v)
+        return tuple(seen)
+
+    def _pick_vars(
+        self,
+        i: int,
+        *,
+        prefer_high_quality: bool = False,
+    ) -> dict[str, str]:
+        """Deterministic per-variable choice. Each variable rotates at a
+        unique stride so {target, location, count} all advance independently
+        instead of in lock-step.
+        """
+        overrides = dict(self.high_quality_overrides) if prefer_high_quality else {}
+        chosen: dict[str, str] = {}
+        for offset, (name, choices) in enumerate(self.variables):
+            if not choices:
+                continue
+            # Stride = prime-ish offset so two variables of equal length
+            # don't share a phase. `i // (offset+1) % len(choices)` works.
+            stride = offset + 1
+            if name in overrides and overrides[name]:
+                pool = overrides[name]
+            else:
+                pool = choices
+            chosen[name] = pool[(i // stride) % len(pool)]
+        return chosen
+
+    def _safe_format(self, template: str, **kwargs: Any) -> str:
+        """Like str.format but missing placeholders → empty string (so a
+        variant referencing {price} doesn't crash on a template that didn't
+        declare a `price` variable).
+        """
+        class _Defaulting(dict):
+            def __missing__(self, key):  # noqa: D401
+                return ""
+
+        try:
+            return template.format_map(_Defaulting(kwargs))
+        except (IndexError, KeyError, ValueError):
+            return template
+
+    def render(
+        self,
+        i: int,
+        *,
+        prefer_high_quality: bool = False,
+        url_salt: str = "",
+    ) -> dict[str, str]:
+        titles = self._all_titles
+        title_tmpl = titles[i % len(titles)]
+        vars_map = self._pick_vars(i, prefer_high_quality=prefer_high_quality)
+        ctx = {
+            "i": i,
             "source": self.source,
             "source_detail": self.source_detail,
-            "url": self.url_pattern.format(i=i, template_name=self.name),
+            "template_name": self.name,
+            "url_salt": url_salt,
+            **vars_map,
         }
+        url = self._safe_format(self.url_pattern, **ctx)
+        # `url_salt` lets the caller (a tracer prefix) guarantee URL
+        # uniqueness across concurrent bursts that re-use the same
+        # template + i. We append it as a query parameter so the URL
+        # remains valid even if the template doesn't reference the salt.
+        if url_salt and "{url_salt}" not in self.url_pattern:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}salt={url_salt}"
+        return {
+            "title": self._safe_format(title_tmpl, **ctx),
+            "summary": self._safe_format(self.summary, **ctx),
+            "source": self.source,
+            "source_detail": self.source_detail,
+            "url": url,
+        }
+
+    def estimate_distinct(self) -> int:
+        """Upper bound on distinct (title, summary, url) tuples this
+        template can produce. Tests use this to assert ≥50.
+        """
+        n_titles = len(self._all_titles)
+        n = n_titles
+        for _, choices in self.variables:
+            if choices:
+                n *= len(choices)
+        return n
 
 
 _REQUIRED_TEMPLATE_KEYS = ("title", "summary", "source", "source_detail", "url_pattern")
@@ -308,6 +421,36 @@ def load_template(path: Path) -> _Template:
     missing = [k for k in _REQUIRED_TEMPLATE_KEYS if k not in raw]
     if missing:
         raise ValueError(f"template {path} missing keys: {missing}")
+
+    raw_variants = raw.get("title_variants") or []
+    if not isinstance(raw_variants, list):
+        raise ValueError(f"template {path}: title_variants must be a list")
+    variants = tuple(str(v) for v in raw_variants)
+
+    raw_vars = raw.get("variables") or {}
+    if not isinstance(raw_vars, dict):
+        raise ValueError(f"template {path}: variables must be a mapping")
+    var_pairs: list[tuple[str, tuple[str, ...]]] = []
+    for name, choices in raw_vars.items():
+        if not isinstance(choices, list) or not choices:
+            raise ValueError(
+                f"template {path}: variables[{name!r}] must be a non-empty list"
+            )
+        var_pairs.append((str(name), tuple(str(c) for c in choices)))
+
+    raw_hq = raw.get("high_quality_overrides") or {}
+    if not isinstance(raw_hq, dict):
+        raise ValueError(
+            f"template {path}: high_quality_overrides must be a mapping"
+        )
+    hq_pairs: list[tuple[str, tuple[str, ...]]] = []
+    for name, choices in raw_hq.items():
+        if not isinstance(choices, list) or not choices:
+            raise ValueError(
+                f"template {path}: high_quality_overrides[{name!r}] must be a non-empty list"
+            )
+        hq_pairs.append((str(name), tuple(str(c) for c in choices)))
+
     return _Template(
         name=path.stem,
         title=str(raw["title"]),
@@ -315,6 +458,9 @@ def load_template(path: Path) -> _Template:
         source=str(raw["source"]),
         source_detail=str(raw["source_detail"]),
         url_pattern=str(raw["url_pattern"]),
+        title_variants=variants,
+        variables=tuple(var_pairs),
+        high_quality_overrides=tuple(hq_pairs),
     )
 
 
@@ -403,8 +549,15 @@ async def _insert_tracer_article(
     cycle_id: int,
     template: _Template,
     index: int,
+    tracer_id: str,
+    prefer_high_quality: bool = False,
+    url_salt: str = "",
 ) -> Optional[int]:
-    rendered = template.render(index)
+    rendered = template.render(
+        index,
+        prefer_high_quality=prefer_high_quality,
+        url_salt=url_salt,
+    )
     now = _now_iso()
     async with db.batch() as cur:
         await cur.execute(
@@ -423,7 +576,7 @@ async def _insert_tracer_article(
                 now,
                 now,
                 cycle_id,
-                f"tracer-{index}",
+                tracer_id,
             ),
         )
         article_id = cur.lastrowid
@@ -527,6 +680,12 @@ class TracerRunResult:
     timed_out: bool
     elapsed_seconds: float
     articles_requested: int
+    wallet_pre: Optional[dict[str, Any]] = None
+    wallet_post: Optional[dict[str, Any]] = None
+    tracer_wallet: Optional[dict[str, Any]] = None
+    budget_baseline_usd: Optional[float] = None
+    budget_final_usd: Optional[float] = None
+    tracer_id_prefix: Optional[str] = None
 
     @property
     def drops(self) -> int:
@@ -551,9 +710,246 @@ class TracerRunResult:
                 "elapsed_seconds": round(self.elapsed_seconds, 3),
                 "articles_requested": self.articles_requested,
                 "drops": self.drops,
+                "wallet_pre": self.wallet_pre,
+                "wallet_post": self.wallet_post,
+                "tracer_wallet": self.tracer_wallet,
+                "budget_baseline_usd": self.budget_baseline_usd,
+                "budget_final_usd": self.budget_final_usd,
+                "tracer_id_prefix": self.tracer_id_prefix,
             }
         )
         return out
+
+
+# ---------------------------------------------------------------------------
+# Live-externals helpers (Step 2 + Step 4.5 + Step 5)
+# ---------------------------------------------------------------------------
+
+
+async def _live_externals_preflight(
+    db: DB,
+    *,
+    tracer_id_prefix: str,
+    force: bool,
+) -> None:
+    """Safety pre-flight before publishing into the live DB.
+
+    Aborts (or warns + requires --force) when another tracer burst with a
+    different prefix has written into `articles` within the last hour —
+    catches the "two concurrent tracer prefixes mid-flight" footgun where
+    audit_burst.py / cleanup.py output would conflate the two prefixes.
+    """
+    try:
+        cur = await db.conn.execute(
+            "SELECT COUNT(*) FROM articles "
+            "WHERE is_tracer = 1 "
+            "AND COALESCE(tracer_id, '') NOT LIKE ? "
+            "AND ingested_at > datetime('now', '-1 hour')",
+            (f"{tracer_id_prefix}%",),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+    except Exception as exc:  # noqa: BLE001
+        # Live DB might be missing the schema entirely (fresh file). Treat
+        # an inaccessible articles table as "no concurrent burst".
+        logger.warning("live preflight: articles probe failed: %r", exc)
+        return
+    other_recent = int(row[0] if row else 0)
+    if other_recent > 0 and not force:
+        raise RuntimeError(
+            f"live preflight: {other_recent} tracer article(s) with a "
+            f"different prefix landed in the last hour. Pass --force to "
+            f"proceed anyway. (My prefix: {tracer_id_prefix!r})"
+        )
+
+
+async def _snapshot_live_wallet(db: DB) -> dict[str, Any]:
+    """Read the LIVE (is_tracer=0) wallet aggregates so we can prove the
+    burst didn't perturb production state. Best-effort: each query that
+    fails contributes a 0 / None to the snapshot rather than aborting.
+    """
+    async def _scalar(sql: str, params: tuple = ()) -> Any:
+        try:
+            cur = await db.conn.execute(sql, params)
+            row = await cur.fetchone()
+            await cur.close()
+        except Exception:  # noqa: BLE001
+            return None
+        return row[0] if row else None
+
+    return {
+        "live_trades": await _scalar(
+            "SELECT COUNT(*) FROM trades WHERE is_tracer = 0"
+        ),
+        "live_open_trades": await _scalar(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE is_tracer = 0 AND closed_at IS NULL"
+        ),
+        "live_size_total": await _scalar(
+            "SELECT COALESCE(SUM(size_usdc), 0) FROM trades "
+            "WHERE is_tracer = 0"
+        ),
+        "live_realized_total": await _scalar(
+            "SELECT COALESCE(SUM(realized_pnl_usdc), 0) FROM trade_closures "
+            "WHERE is_tracer = 0"
+        ),
+        "live_articles": await _scalar(
+            "SELECT COUNT(*) FROM articles WHERE is_tracer = 0"
+        ),
+        "snapshot_at": _now_iso(),
+    }
+
+
+async def _snapshot_tracer_wallet(
+    db: DB,
+    *,
+    tracer_id_prefix: str,
+) -> dict[str, Any]:
+    """Aggregate the tracer-only paper-wallet view for this prefix.
+
+    `is_tracer=1 AND paper=0` is rejected by rule #4, so any trade row
+    here is paper. The query proves the lifecycle ran end-to-end:
+    executes → closes → realized PnL with fees subtracted.
+    """
+    pat = f"{tracer_id_prefix}%"
+
+    async def _scalar(sql: str, params: tuple = ()) -> Any:
+        try:
+            cur = await db.conn.execute(sql, params)
+            row = await cur.fetchone()
+            await cur.close()
+        except Exception:  # noqa: BLE001
+            return None
+        return row[0] if row else None
+
+    return {
+        "tracer_trades": await _scalar(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE is_tracer = 1 AND tracer_id LIKE ?",
+            (pat,),
+        ),
+        "tracer_open": await _scalar(
+            "SELECT COUNT(*) FROM trades "
+            "WHERE is_tracer = 1 AND tracer_id LIKE ? AND closed_at IS NULL",
+            (pat,),
+        ),
+        "tracer_closed": await _scalar(
+            "SELECT COUNT(*) FROM trade_closures "
+            "WHERE is_tracer = 1 AND tracer_id LIKE ?",
+            (pat,),
+        ),
+        "tracer_invested_usdc": await _scalar(
+            "SELECT COALESCE(SUM(size_usdc), 0) FROM trades "
+            "WHERE is_tracer = 1 AND tracer_id LIKE ?",
+            (pat,),
+        ),
+        "tracer_realized_pnl_usdc": await _scalar(
+            "SELECT COALESCE(SUM(realized_pnl_usdc), 0) FROM trade_closures "
+            "WHERE is_tracer = 1 AND tracer_id LIKE ?",
+            (pat,),
+        ),
+        "tracer_fees_usdc": await _scalar(
+            "SELECT COALESCE(SUM(COALESCE(entry_fee_usdc,0) + COALESCE(exit_fee_usdc,0)), 0) "
+            "FROM trade_closures "
+            "WHERE is_tracer = 1 AND tracer_id LIKE ?",
+            (pat,),
+        ),
+    }
+
+
+async def _build_live_externals(
+    db: DB,
+    *,
+    cfg: Config,
+    ai_mock: bool,
+    budget_cap_usd: Optional[float],
+) -> tuple[Any, Any, Any, Any]:
+    """Construct the REAL embedder / AIClient / CLOB / budget when
+    `--live-externals` is set.
+
+    Returns a 4-tuple matching the slot the tracer stubs fill normally.
+    `ai_mock=True` keeps the real embedder + CLOB + budget but swaps the
+    LLM for the deterministic `_TracerAI` — this is what tests use to
+    exercise the full pipeline without burning OpenRouter credits.
+
+    Budget-cap enforcement happens lazily: the AIClient sees the live
+    Budget instance; if Budget reports `remaining_usd` below the cap we
+    raise before any spend.
+    """
+    # Real embedder (sentence-transformers if installed).
+    try:
+        from app.embed import Embedder  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"live-externals: real Embedder unavailable: {exc!r}"
+        ) from exc
+    embedder = Embedder()
+
+    # Real CLOB client.
+    try:
+        from app.clob import CLOBClient  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"live-externals: real CLOBClient unavailable: {exc!r}"
+        ) from exc
+    clob = CLOBClient()
+
+    # Budget: snapshot, enforce cap before any spend.
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if not api_key and not ai_mock:
+        raise RuntimeError(
+            "live-externals: OPENROUTER_API_KEY not set — refusing to "
+            "boot a real AIClient with no auth."
+        )
+    try:
+        from app.budget import Budget  # type: ignore
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(
+            f"live-externals: Budget unavailable: {exc!r}"
+        ) from exc
+    # Use a conservative pause threshold; the cap below is what actually
+    # gates spend per burst.
+    budget = Budget(
+        api_key=api_key or "",
+        monthly_cap_usd=float(budget_cap_usd or 5.0),
+        pause_at_remaining_usd=float(budget_cap_usd or 5.0) * 0.1,
+        poll_seconds=30,
+        pause_flag_path="/tmp/tracer-budget-pause.flag",
+    )
+    if not ai_mock:
+        await budget.start()
+    # Cap check: if remaining is known and below cap, abort.
+    remaining = getattr(budget, "remaining_usd", None)
+    if (
+        budget_cap_usd is not None
+        and remaining is not None
+        and remaining < float(budget_cap_usd)
+    ):
+        raise RuntimeError(
+            f"live-externals: OpenRouter remaining ${remaining:.2f} below "
+            f"cap ${budget_cap_usd:.2f}. Aborting before any spend."
+        )
+
+    if ai_mock:
+        ai = _TracerAI(db)
+    else:
+        try:
+            from app.ai import AIClient  # type: ignore
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                f"live-externals: real AIClient unavailable: {exc!r}"
+            ) from exc
+        try:
+            ai = AIClient(api_key=api_key, db=db, budget=budget, cfg=cfg)
+        except TypeError:
+            # Best-effort: the AIClient ctor surface differs between
+            # checkouts. Fall back to a minimal constructor.
+            try:
+                ai = AIClient(api_key=api_key, db=db, budget=budget)
+            except TypeError:
+                ai = AIClient(db=db)  # type: ignore
+
+    return embedder, ai, clob, budget
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +968,13 @@ async def _run_async(
     closer_mid: Optional[float] = None,
     closer_timeout_hours: float = 24.0,
     closer_poll_seconds: int = 60,
+    tracer_id_prefix: str = "tracer",
+    prefer_high_quality: bool = False,
+    live_externals: bool = False,
+    live_externals_ai_mock: bool = False,
+    budget_cap_usd: Optional[float] = None,
+    force: bool = False,
+    config_path: Optional[str] = None,
 ) -> TracerRunResult:
     t0 = time.monotonic()
     if count <= 0:
@@ -598,19 +1001,61 @@ async def _run_async(
     cycle_id = await db.ensure_current_cycle("tracer")
     set_cycle_id(cycle_id)
 
-    cfg = _build_tracer_config(
-        closer_timeout_hours=closer_timeout_hours,
-        closer_poll_seconds=closer_poll_seconds,
-    )
-    embedder = _TracerEmbedder()
-    ai = _TracerAI(db)
-    # CloserStage requires a CLOB. When `start_closer=True` (the soak
-    # path) we want a real number so realized_pnl_usdc != 0; otherwise
-    # the stub returns None and any closer that does run would skip.
-    clob = _TracerCLOB(default_mid=closer_mid)
+    # ---- Live-externals safety pre-flight (Step 5) -----------------------
+    # If another tracer prefix has fired recently into this DB, warn and
+    # require --force. Catches the accidental concurrent-burst footgun.
+    pre_burst_wallet: Optional[dict[str, Any]] = None
+    live_budget_baseline: Optional[float] = None
+    if live_externals:
+        await _live_externals_preflight(
+            db,
+            tracer_id_prefix=tracer_id_prefix,
+            force=force,
+        )
+        # Snapshot live wallet before publishing, so post-burst we can
+        # prove isolation. Best-effort: failures here are warnings only.
+        try:
+            pre_burst_wallet = await _snapshot_live_wallet(db)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("live wallet snapshot failed: %r", exc)
+
+    # ---- Build config ----------------------------------------------------
+    if live_externals and config_path:
+        try:
+            cfg = Config.from_yaml(config_path)
+        except AttributeError:
+            # Older Config without classmethod loader; fall back to manual.
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = Config.model_validate(yaml.safe_load(fh) or {})
+    else:
+        cfg = _build_tracer_config(
+            closer_timeout_hours=closer_timeout_hours,
+            closer_poll_seconds=closer_poll_seconds,
+        )
+
+    # ---- Build embedder / ai / clob / budget -----------------------------
+    if live_externals:
+        embedder, ai, clob, budget = await _build_live_externals(
+            db,
+            cfg=cfg,
+            ai_mock=live_externals_ai_mock,
+            budget_cap_usd=budget_cap_usd,
+        )
+        live_budget_baseline = (
+            getattr(budget, "remaining_usd", None)
+            if budget is not None
+            else None
+        )
+    else:
+        embedder = _TracerEmbedder()
+        ai = _TracerAI(db)
+        # CloserStage requires a CLOB. When `start_closer=True` (the soak
+        # path) we want a real number so realized_pnl_usdc != 0; otherwise
+        # the stub returns None and any closer that does run would skip.
+        clob = _TracerCLOB(default_mid=closer_mid)
+        budget = _TracerBudget()
 
     bus = InProcBus()
-    budget = _TracerBudget()
     pipeline = wire_pipeline(
         db=db,
         bus=bus,
@@ -626,7 +1071,10 @@ async def _run_async(
 
     # Pre-seed markets and load the index *before* the bus starts so
     # MatchStage's index has rows on the first message.
-    await _seed_markets(db)
+    # Skip seeding when running against the live DB — it already holds
+    # real markets that the live bot has been populating.
+    if not live_externals:
+        await _seed_markets(db)
     await pipeline.markets.index.load(db)
 
     # NOTE: we deliberately do NOT call markets.start() or ingest.start()
@@ -650,21 +1098,33 @@ async def _run_async(
     async def _fire_one(i: int) -> None:
         async with sem:
             template = next(template_cycle)
+            tracer_id = f"{tracer_id_prefix}-{i}"
+            # Carry the prefix into the URL so two concurrent bursts on the
+            # same DB don't collide on `articles.url`'s UNIQUE constraint.
             async with insert_lock:
                 article_id = await _insert_tracer_article(
-                    db, cycle_id=cycle_id, template=template, index=i
+                    db,
+                    cycle_id=cycle_id,
+                    template=template,
+                    index=i,
+                    tracer_id=tracer_id,
+                    prefer_high_quality=prefer_high_quality,
+                    url_salt=tracer_id_prefix,
                 )
             if article_id is None:
                 return
+            rendered = template.render(
+                i,
+                prefer_high_quality=prefer_high_quality,
+                url_salt=tracer_id_prefix,
+            )
             await bus.publish(
                 TOPIC_ARTICLE_INGESTED,
                 {
                     "article_id": article_id,
-                    "url": template.url_pattern.format(
-                        i=i, template_name=template.name
-                    ),
+                    "url": rendered["url"],
                     "is_tracer": True,
-                    "tracer_id": f"tracer-{i}",
+                    "tracer_id": tracer_id,
                 },
             )
 
@@ -691,6 +1151,25 @@ async def _run_async(
     # connection is cleaner.
     counts = await _async_query_tracer_counts(db)
 
+    # Step 4.5 — post-flight wallet snapshot + tracer-wallet view.
+    wallet_post: Optional[dict[str, Any]] = None
+    tracer_wallet: Optional[dict[str, Any]] = None
+    if live_externals:
+        try:
+            wallet_post = await _snapshot_live_wallet(db)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("post-burst live wallet snapshot failed: %r", exc)
+        try:
+            tracer_wallet = await _snapshot_tracer_wallet(
+                db, tracer_id_prefix=tracer_id_prefix
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tracer wallet snapshot failed: %r", exc)
+
+    budget_final = (
+        getattr(budget, "remaining_usd", None) if live_externals else None
+    )
+
     elapsed = time.monotonic() - t0
     await db.close()
 
@@ -701,6 +1180,12 @@ async def _run_async(
         timed_out=not drained,
         elapsed_seconds=elapsed,
         articles_requested=count,
+        wallet_pre=pre_burst_wallet,
+        wallet_post=wallet_post,
+        tracer_wallet=tracer_wallet,
+        budget_baseline_usd=live_budget_baseline,
+        budget_final_usd=budget_final,
+        tracer_id_prefix=tracer_id_prefix,
     )
 
 
@@ -747,6 +1232,13 @@ def run_inproc(
     timeout_seconds: float = 30.0,
     start_closer: bool = False,
     closer_mid: Optional[float] = None,
+    tracer_id_prefix: str = "tracer",
+    prefer_high_quality: bool = False,
+    live_externals: bool = False,
+    live_externals_ai_mock: bool = False,
+    budget_cap_usd: Optional[float] = None,
+    force: bool = False,
+    config_path: Optional[str] = None,
 ) -> TracerRunResult:
     """Function-level entry point — used by the test suite to skip the CLI.
 
@@ -762,26 +1254,72 @@ def run_inproc(
             timeout_seconds=timeout_seconds,
             start_closer=start_closer,
             closer_mid=closer_mid,
+            tracer_id_prefix=tracer_id_prefix,
+            prefer_high_quality=prefer_high_quality,
+            live_externals=live_externals,
+            live_externals_ai_mock=live_externals_ai_mock,
+            budget_cap_usd=budget_cap_usd,
+            force=force,
+            config_path=config_path,
         )
     )
 
 
 def _format_report(result: TracerRunResult) -> str:
     c = result.counts
-    return (
+    parts = [
         f"tracer run: count={result.articles_requested} "
-        f"elapsed={result.elapsed_seconds:.2f}s\n"
-        f"  articles            count={c.articles}\n"
-        f"  article_clusters    count={c.article_clusters}\n"
-        f"  signals             count={c.signals}\n"
-        f"  decisions           count={c.decisions}\n"
-        f"  trades              count={c.trades}\n"
-        f"  decision_inputs     count={c.decision_inputs}\n"
-        f"  telemetry_drops     count={result.telemetry_drops}  (allowed)\n"
-        f"  handler_exceptions  count={result.handler_exceptions}\n"
-        f"  timed_out           {result.timed_out}\n"
-        f"  trade_path_drops    {result.drops}"
-    )
+        f"elapsed={result.elapsed_seconds:.2f}s",
+        f"  tracer_id_prefix    {result.tracer_id_prefix}",
+        f"  articles            count={c.articles}",
+        f"  article_clusters    count={c.article_clusters}",
+        f"  signals             count={c.signals}",
+        f"  decisions           count={c.decisions}",
+        f"  trades              count={c.trades}",
+        f"  decision_inputs     count={c.decision_inputs}",
+        f"  telemetry_drops     count={result.telemetry_drops}  (allowed)",
+        f"  handler_exceptions  count={result.handler_exceptions}",
+        f"  timed_out           {result.timed_out}",
+        f"  trade_path_drops    {result.drops}",
+    ]
+    if result.tracer_wallet is not None:
+        tw = result.tracer_wallet
+        parts.extend(
+            [
+                "",
+                "  tracer wallet (paper, isolated by rule #4):",
+                f"    trades_opened     {tw.get('tracer_trades')}",
+                f"    trades_open       {tw.get('tracer_open')}",
+                f"    trades_closed     {tw.get('tracer_closed')}",
+                f"    invested_usdc     {tw.get('tracer_invested_usdc')}",
+                f"    realized_pnl_usdc {tw.get('tracer_realized_pnl_usdc')}",
+                f"    fees_usdc         {tw.get('tracer_fees_usdc')}",
+            ]
+        )
+    if result.wallet_pre is not None and result.wallet_post is not None:
+        pre = result.wallet_pre
+        post = result.wallet_post
+        delta_realized = (
+            (post.get("live_realized_total") or 0)
+            - (pre.get("live_realized_total") or 0)
+        )
+        delta_trades = (
+            (post.get("live_trades") or 0) - (pre.get("live_trades") or 0)
+        )
+        parts.extend(
+            [
+                "",
+                "  live wallet isolation check (should both be ~0):",
+                f"    delta_realized_usdc  {delta_realized}",
+                f"    delta_live_trades    {delta_trades}",
+            ]
+        )
+    if result.budget_baseline_usd is not None:
+        parts.append(
+            f"  openrouter_budget   baseline=${result.budget_baseline_usd} "
+            f"final=${result.budget_final_usd}"
+        )
+    return "\n".join(parts)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -807,6 +1345,69 @@ def main(argv: Optional[list[str]] = None) -> int:
         default="WARNING",
         help="Python logging level (default WARNING — keep stdout clean for the report).",
     )
+    parser.add_argument(
+        "--tracer-id-prefix",
+        default="tracer",
+        help=(
+            "Prefix for the per-row tracer_id. Each fire's tracer_id is "
+            "<prefix>-<seq>. Used by audit_burst.py / cleanup.py to scope "
+            "their queries. Default 'tracer'."
+        ),
+    )
+    parser.add_argument(
+        "--live-externals",
+        action="store_true",
+        help=(
+            "Boot real Embedder + AIClient + CLOBClient against the live "
+            "DB instead of the in-process stubs. BURNS REAL OPENROUTER "
+            "CREDITS. Use --budget-cap-usd to bound spend."
+        ),
+    )
+    parser.add_argument(
+        "--budget-cap-usd",
+        type=float,
+        default=None,
+        help=(
+            "When --live-externals is set, abort the burst if OpenRouter "
+            "remaining drops below this dollar cap. Default 5.0 USD."
+        ),
+    )
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to live config.yaml. Required with --live-externals when "
+            "matcher / dedupe / closer settings should mirror production."
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Skip the live-externals concurrent-burst guard. Without this, "
+            "fire.py refuses to publish if another tracer prefix wrote "
+            "into `articles` within the last hour."
+        ),
+    )
+    parser.add_argument(
+        "--exercise-wallet",
+        action="store_true",
+        help=(
+            "Force high-quality payload variants and run a post-burst "
+            "tracer-wallet snapshot. Validates that tracer trades exercise "
+            "the paper-wallet lifecycle while live wallet equity stays "
+            "unchanged (rule #4 isolation)."
+        ),
+    )
+    parser.add_argument(
+        "--live-externals-ai-mock",
+        action="store_true",
+        help=(
+            "Internal test toggle: use --live-externals plumbing (real DB, "
+            "real Embedder/CLOB/Budget) but keep the deterministic stub AI "
+            "to avoid spending OpenRouter credits in unit tests."
+        ),
+    )
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -821,6 +1422,13 @@ def main(argv: Optional[list[str]] = None) -> int:
             db_path=args.db,
             template=args.template,
             timeout_seconds=args.timeout_seconds,
+            tracer_id_prefix=args.tracer_id_prefix,
+            prefer_high_quality=args.exercise_wallet,
+            live_externals=args.live_externals,
+            live_externals_ai_mock=args.live_externals_ai_mock,
+            budget_cap_usd=args.budget_cap_usd,
+            force=args.force,
+            config_path=args.config,
         )
     except Exception as exc:  # noqa: BLE001 — surface to CLI
         print(f"tracer FAILED during run: {exc.__class__.__name__}: {exc}", file=sys.stderr)

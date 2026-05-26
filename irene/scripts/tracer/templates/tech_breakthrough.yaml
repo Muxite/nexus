@@ -1,0 +1,86 @@
+title: "OpenAI releases GPT-{version} with {trait} capability"
+summary: "Tracer #{i} ({source_detail}): {company} unveiled {product}, claiming {trait} beats {competitor} on {benchmark}. Pricing: ${price}/M tokens. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "tech_breakthrough"
+url_pattern: "https://tracer.local/tech_breakthrough/{i}"
+
+title_variants:
+  - "OpenAI releases GPT-{version} with {trait} capability, prices at ${price}/M tokens"
+  - "Apple announces {product} launch for Q{quarter} {year}"
+  - "SpaceX {stage} explodes during {phase} test, FAA pauses launches"
+  - "Anthropic launches Claude {version} matching {competitor} on {benchmark}"
+  - "Google DeepMind achieves {trait} milestone with {product} on {benchmark}"
+  - "{company} stock {dir} {percent}% after {product} announcement"
+
+variables:
+  version:
+    - "5"
+    - "5.5"
+    - "6"
+    - "Opus 5"
+    - "Sonnet 5"
+  trait:
+    - autonomous agentic
+    - real-time multimodal
+    - 10M-token context
+    - tool-using reasoning
+    - sub-second inference
+    - on-device
+  company:
+    - OpenAI
+    - Anthropic
+    - Google
+    - Meta
+    - xAI
+    - Mistral
+  product:
+    - a flagship coding agent
+    - a consumer hardware device
+    - an enterprise inference platform
+    - a developer SDK rewrite
+    - a vision-language model
+  competitor:
+    - GPT-4.5
+    - Claude 4.7
+    - Gemini 3
+    - Llama 5
+    - Grok 4
+  benchmark:
+    - SWE-bench Verified
+    - MMLU-Pro
+    - HumanEval+
+    - GPQA Diamond
+    - MATH-500
+  price:
+    - "1.50"
+    - "3.00"
+    - "8.00"
+    - "15.00"
+    - "30.00"
+  quarter:
+    - "1"
+    - "2"
+    - "3"
+    - "4"
+  year:
+    - "2026"
+    - "2027"
+  stage:
+    - Starship upper stage
+    - Super Heavy booster
+    - F9 second stage
+    - Dragon test article
+  phase:
+    - static-fire
+    - hop
+    - orbital insertion
+    - re-entry
+  dir:
+    - jumps
+    - tanks
+    - whipsaws
+  percent:
+    - "8"
+    - "14"
+    - "22"
+    - "37"

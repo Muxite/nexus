@@ -1,0 +1,40 @@
+title: "U.S. and Iran reach nuclear framework agreement"
+summary: "Tracer #{i} ({source_detail}): Negotiators in {city} announce a {percent}% reduction in Iran's enriched uranium stockpile, framed as a {duration} step toward a final deal. Tehran agrees to inspections. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "iran_peace_deal"
+url_pattern: "https://tracer.local/iran_peace_deal/{i}"
+
+title_variants:
+  - "U.S. and Iran reach nuclear framework agreement in {city}"
+  - "Rubio: breakthrough on uranium stockpile, {percent}% cut agreed"
+  - "Tehran accepts {percent}% reduction in enriched uranium, ceasefire holds {days} days"
+  - "U.S.-Iran prisoner swap clears path to nuclear deal signing in {city}"
+  - "Khamenei greenlights {duration} framework with Washington, sources say"
+
+variables:
+  city:
+    - Geneva
+    - Vienna
+    - Muscat
+    - Doha
+    - Oslo
+    - Baghdad
+  percent:
+    - "20"
+    - "35"
+    - "50"
+    - "70"
+    - "85"
+    - "95"
+  days:
+    - "7"
+    - "14"
+    - "30"
+    - "60"
+    - "90"
+  duration:
+    - 18-month
+    - two-year
+    - five-year
+    - interim
+    - permanent

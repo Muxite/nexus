@@ -1,0 +1,86 @@
+title: "{exchange} halts withdrawals; {coin} crashes {percent}%"
+summary: "Tracer #{i} ({source_detail}): {exchange} suspended withdrawals citing {reason}. {coin} plunged {percent}% intraday; broader crypto market lost ${marketcap}B in cap. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "crypto_event"
+url_pattern: "https://tracer.local/crypto_event/{i}"
+
+title_variants:
+  - "{exchange} halts withdrawals; {coin} crashes {percent}%"
+  - "SEC approves {coin} ETF, inflows top ${etf_inflow}M day one"
+  - "{stablecoin} de-pegs to ${rate}, $${tvl}B drained from DeFi"
+  - "{exchange} declares Chapter 11 after ${loss}M hack of {coin} reserves"
+  - "{coin} {dir} ${price}k after {trigger}; open interest hits record"
+
+variables:
+  exchange:
+    - Binance
+    - Coinbase
+    - Kraken
+    - OKX
+    - Bybit
+    - a top-five exchange
+  coin:
+    - BTC
+    - ETH
+    - SOL
+    - XRP
+    - DOGE
+    - SUI
+  percent:
+    - "14"
+    - "27"
+    - "41"
+    - "58"
+    - "72"
+  reason:
+    - regulatory inquiry
+    - liquidity crunch
+    - insider-trading probe
+    - hot-wallet compromise
+    - depositor run
+  marketcap:
+    - "180"
+    - "420"
+    - "780"
+    - "1,200"
+  etf_inflow:
+    - "85"
+    - "240"
+    - "510"
+    - "1,100"
+  stablecoin:
+    - USDT
+    - USDC
+    - DAI
+    - PYUSD
+    - a top-3 stablecoin
+  rate:
+    - "0.92"
+    - "0.85"
+    - "0.71"
+    - "0.42"
+  tvl:
+    - "3"
+    - "8"
+    - "18"
+    - "35"
+  loss:
+    - "240"
+    - "650"
+    - "1,400"
+    - "2,800"
+  dir:
+    - rockets above
+    - collapses below
+    - retests
+    - flash-crashes through
+  price:
+    - "65"
+    - "95"
+    - "120"
+    - "150"
+  trigger:
+    - ETF approval
+    - halving narrative
+    - macro liquidity surge
+    - on-chain whale activity

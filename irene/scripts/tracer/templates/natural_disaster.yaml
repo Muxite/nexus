@@ -1,0 +1,78 @@
+title: "Magnitude {mag} earthquake strikes {location}; {count} dead"
+summary: "Tracer #{i} ({source_detail}): A magnitude {mag} earthquake struck {location} at {time}, killing at least {count}. {agency} confirms aftershocks ongoing. Synthetic article emitted by scripts/tracer/fire.py."
+source: "tracer"
+source_detail: "natural_disaster"
+url_pattern: "https://tracer.local/natural_disaster/{i}"
+
+title_variants:
+  - "Magnitude {mag} earthquake strikes {location}; {count} dead"
+  - "Hurricane {name} makes landfall in {state} as Cat {cat}"
+  - "{count} dead in {city} chemical tank rupture"
+  - "Tsunami warning issued after M{mag} quake off {location}"
+  - "Wildfire torches {acres} acres outside {city}; {count} structures lost"
+  - "Volcanic eruption at {volcano} forces {count}-person evacuation"
+
+variables:
+  mag:
+    - "5.8"
+    - "6.4"
+    - "7.1"
+    - "7.9"
+    - "8.5"
+  location:
+    - off northern Japan
+    - central Turkey
+    - the Andes
+    - southern California
+    - the Aleutian arc
+    - Indonesia's Sunda Strait
+  count:
+    - "11"
+    - "47"
+    - "210"
+    - "1,400"
+    - "4,800"
+  time:
+    - "03:14 UTC"
+    - "11:42 local"
+    - "18:00 GMT"
+    - "dawn"
+  agency:
+    - USGS
+    - EMSC
+    - JMA
+    - the local civil-defense agency
+  name:
+    - Marcus
+    - Lila
+    - Tropical Storm Owen
+    - Cyclone Verity
+    - Typhoon Hana
+  state:
+    - Florida
+    - Louisiana
+    - the Carolinas
+    - east Texas
+    - Yucatán
+  cat:
+    - "2"
+    - "3"
+    - "4"
+    - "5"
+  city:
+    - Houston
+    - Bhopal
+    - Tianjin
+    - Rotterdam
+    - Mumbai
+  acres:
+    - "2,400"
+    - "18,000"
+    - "75,000"
+    - "240,000"
+  volcano:
+    - Mount Etna
+    - Sakurajima
+    - Mauna Loa
+    - Popocatépetl
+    - Mount Rainier

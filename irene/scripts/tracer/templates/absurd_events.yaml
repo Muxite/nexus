@@ -1,0 +1,83 @@
+# Adversarial/absurd-payload template. These bullets are SHAPED LIKE NEWS
+# but deliberately reference events that should not cleanly match any real
+# Polymarket market. Acceptance: most should reject at similarity_floor or
+# at direction_neutral. If many *do* match a real market with high confidence,
+# we have a false-positive matcher problem worth investigating.
+
+title: "Bigfoot sighted in Yellowstone, NPS {confirmation}"
+summary: "Tracer #{i} ({source_detail}): {witness} reports {creature} sighting in {park}. {agency} {confirmation}. Synthetic adversarial article emitted by scripts/tracer/fire.py to stress the matcher."
+source: "tracer"
+source_detail: "absurd_events"
+url_pattern: "https://tracer.local/absurd_events/{i}"
+
+title_variants:
+  - "Bigfoot sighted in {park}, {agency} {confirmation}"
+  - "Cure for cancer announced by {lab}; trials {phase}"
+  - "Aliens land at {landing_site}; {official} confirms first contact"
+  - "Time-travel device demoed at {conference}, peer review pending"
+  - "{creature} terrorizes {city}; mayor declares state of emergency"
+  - "Loch Ness Monster confirmed by sonar, Scottish government to {action}"
+
+variables:
+  witness:
+    - A park ranger
+    - A group of hikers
+    - A film crew
+    - A camping family
+  creature:
+    - a 9-foot bipedal
+    - a chupacabra
+    - a yeti
+    - a mothman
+    - a kraken-like
+  park:
+    - Yellowstone
+    - Yosemite
+    - Glacier National Park
+    - the Olympic Peninsula
+    - the Smoky Mountains
+  agency:
+    - NPS
+    - the FBI
+    - state troopers
+    - the local sheriff
+  confirmation:
+    - confirms the sighting
+    - declines to comment
+    - opens an investigation
+    - calls it a hoax
+  lab:
+    - Stanford Medical
+    - the Karolinska Institute
+    - a Boston biotech startup
+    - the WHO research arm
+  phase:
+    - to begin Q3
+    - already underway
+    - pending FDA fast-track
+    - undergoing peer review
+  landing_site:
+    - the White House lawn
+    - Area 51
+    - Tiananmen Square
+    - Times Square
+    - the Vatican
+  official:
+    - the Pentagon
+    - the President
+    - the UN Secretary-General
+    - a senior NASA administrator
+  conference:
+    - CES
+    - SXSW
+    - the AAAS meeting
+    - Davos
+  city:
+    - Cleveland
+    - Reykjavik
+    - Perth
+    - Cape Town
+  action:
+    - launch a salvage mission
+    - declare it protected wildlife
+    - convene a royal commission
