@@ -89,6 +89,7 @@ from app import db as db_module
 from app.cycle import current_cycle_id
 from app.deps import StageDeps
 from app.stages._entity_overlap import article_entities_overlap_market
+from app.stages._gates import _gate_entry
 from app.topics import TOPIC_TRADE_DECIDED
 
 logger = logging.getLogger(__name__)
@@ -210,10 +211,6 @@ db_module.register_schema("app/stages/trade.py", _TRADE_DDL)
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _gate_entry(name: str, outcome: str, value, threshold) -> dict:
-    return {"gate": name, "outcome": outcome, "value": value, "threshold": threshold}
 
 
 def _market_min_usdc(

@@ -98,6 +98,9 @@ class _TradeCfg:
     min_mid: float = 0.02
     max_mid: float = 0.98
     accept_freshness: list = field(default_factory=lambda: ["BREAKING", "EVOLVING"])
+    # Cycle 24: DKG-path parity with cycle-23 safety gates on the MVP path.
+    execution_enabled: bool = True
+    min_hours_to_expiry: float = 6.0
 
 
 @dataclass
@@ -111,6 +114,16 @@ class _DKGTradeCfg:
 class _Config:
     trade: _TradeCfg = field(default_factory=_TradeCfg)
     dkg_trade: _DKGTradeCfg = field(default_factory=_DKGTradeCfg)
+
+
+class _FakeCLOB:
+    """Async CLOB stand-in for DKG tests — same shape as test_trade.py."""
+
+    def __init__(self, prices: dict[str, float]) -> None:
+        self.prices = dict(prices)
+
+    async def get_mid(self, token_id: str):
+        return self.prices.get(token_id)
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +229,14 @@ async def db_seeded():
 
 
 def _make_stage(db, bus, ai, cfg: Optional[_Config] = None, *, clob=None) -> DKGTradeStage:
+    # Cycle 24: pre-cycle-24 a missing clob produced mid=0.5 via the silent
+    # fallback in DKG's `_resolve_mid`. After cycle 24 that path returns
+    # None and rejects on mid_unavailable. Most existing tests exercise
+    # downstream gate logic and assume a workable mid; provide a sane
+    # default CLOB so they keep passing. Tests that specifically exercise
+    # the mid_unavailable path pass `clob=_FakeCLOB(prices={})` explicitly.
+    if clob is None:
+        clob = _FakeCLOB({"ty": 0.5, "tn": 0.5})
     deps = StageDeps(
         db=db,
         bus=bus,
@@ -414,16 +435,6 @@ async def test_direction_reuse_calls_ai_with_article_prompt(db_seeded):
     # Prompt contains the article title + market question.
     assert "Trump strikes Iran" in call["prompt"]
     assert "Will Trump strike Iran?" in call["prompt"]
-
-
-class _FakeCLOB:
-    """Async CLOB stand-in for DKG tests — same shape as test_trade.py."""
-
-    def __init__(self, prices: dict[str, float]) -> None:
-        self.prices = dict(prices)
-
-    async def get_mid(self, token_id: str):
-        return self.prices.get(token_id)
 
 
 async def test_mid_degenerate_rejects_yes_at_low_mid(db_seeded):

@@ -99,6 +99,11 @@ from typing import Optional
 from app import db as db_module
 from app.cycle import current_cycle_id
 from app.deps import StageDeps
+from app.stages._gates import (
+    _gate_entry,
+    _gate_market_state,
+    _gate_mid_unavailable,
+)
 from app.stages.trade import compose_direction_prompt
 from app.topics import TOPIC_MARKET_LINKS_UPDATED, TOPIC_TRADE_DECIDED
 
@@ -137,10 +142,6 @@ db_module.register_schema("app/stages/dkg_trade.py", _DKG_TRADE_DDL)
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-
-def _gate_entry(name: str, outcome: str, value, threshold) -> dict:
-    return {"gate": name, "outcome": outcome, "value": value, "threshold": threshold}
 
 
 class DKGTradeStage:
@@ -220,6 +221,28 @@ class DKGTradeStage:
             _gate_entry("score_floor", "ok", final_score, self._cfg.score_floor)
         ]
 
+        # 0. execution kill switch (cycle 24, mirrors cycle-23 trade.py) ----
+        # Lands BEFORE any LLM/CLOB-cost work so a halted bot doesn't burn
+        # tokens or hit Polymarket. The claim_link row above gives us
+        # idempotency; we then write a decisions row + reject_reason on the
+        # link so the soak funnel sees the rejection — operationally
+        # distinguishable from a silent stall.
+        if not self._trade_cfg.execution_enabled:
+            gate_history.append(
+                _gate_entry("execution_enabled", "reject", False, True)
+            )
+            await self._record_reject(
+                event_id=event_id,
+                market_condition_id=market_condition_id,
+                reason="execution_disabled",
+                gate_history=gate_history,
+                prediction_id=None,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
+
         # 2. lookup ----------------------------------------------------
         event = await self._fetch_event(event_id)
         article = await self._fetch_article_for_event(event_id) if event else None
@@ -260,6 +283,27 @@ class DKGTradeStage:
                 gate_history=gate_history + [
                     _gate_entry("lookup", "reject", "market_missing", None)
                 ],
+                prediction_id=None,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
+
+        # 2.25 market_state (cycle 24, mirrors cycle-23 trade.py) -----------
+        # Refuses entries on closed / inactive / near-expiry markets. Lands
+        # before the LLM direction call so a bad market never burns tokens.
+        # Permissive when the relevant columns are NULL (don't reject on
+        # missing data). Trade 40 (cycle 23 audit) would have been rejected
+        # here under `market_closed` + `market_near_expiry`.
+        status, entry, reason = _gate_market_state(market, self._trade_cfg)
+        if status == "reject":
+            gate_history.append(entry)
+            await self._record_reject(
+                event_id=event_id,
+                market_condition_id=market_condition_id,
+                reason=reason,
+                gate_history=gate_history,
                 prediction_id=None,
                 cycle_id=cycle_id,
                 is_tracer=is_tracer,
@@ -322,6 +366,25 @@ class DKGTradeStage:
         confidence = result.confidence
         p_hat = confidence if direction == "YES" else (1.0 - confidence)
         mid = await self._resolve_mid(direction=direction, market=market)
+        # 4-pre. mid_unavailable (cycle 24, mirrors cycle-23 trade.py) ------
+        # `_resolve_mid` now returns None on any non-real-mid path (no clob,
+        # missing token, clob returned None). Pre-cycle-24 the DKG path
+        # silently fell back to `cfg.trade.default_mid_price` (0.5), the
+        # same blind-bot behaviour cycle 23 fixed on the MVP path.
+        status, entry, reason = _gate_mid_unavailable(mid)
+        if status == "reject":
+            gate_history.append(entry)
+            await self._record_reject(
+                event_id=event_id,
+                market_condition_id=market_condition_id,
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
         # 4a. degenerate-mid guard — mirrors trade.py:405 (cycle 4 fix).
         # cycle 5.1: applied to the DKG path too. The dashboard caught a
         # dkg trade opened at mid=0.998 on a "Will X drop out?" market
@@ -500,8 +563,12 @@ class DKGTradeStage:
         }
 
     async def _fetch_market(self, market_condition_id: str) -> Optional[dict]:
+        # Cycle 24: widen the SELECT to include `active`, `closed_at`, and
+        # `end_date` so `_gate_market_state` can read them. Mirrors the
+        # cycle-23 trade.py change.
         cur = await self._db.conn.execute(
-            "SELECT question, description, token_yes, token_no "
+            "SELECT question, description, token_yes, token_no, "
+            "       active, closed_at, end_date "
             "FROM markets WHERE condition_id=?",
             (market_condition_id,),
         )
@@ -514,20 +581,58 @@ class DKGTradeStage:
             "description": row["description"],
             "token_yes": row["token_yes"],
             "token_no": row["token_no"],
+            # Cycle 24: read by `_gate_market_state` so the DKG path can
+            # refuse entries on closed / inactive / near-expiry markets.
+            "active": row["active"],
+            "closed_at": row["closed_at"],
+            "end_date": row["end_date"],
         }
 
-    async def _resolve_mid(self, *, direction: str, market: dict) -> float:
+    async def _resolve_mid(
+        self, *, direction: str, market: Optional[dict]
+    ) -> Optional[float]:
+        """Return the mid-price for the side we're betting on, or `None`
+        when no real CLOB price is available.
+
+        Cycle 24: removed the silent fallback to `cfg.default_mid_price`.
+        Pre-cycle-24 this returned 0.5 on (a) `self._clob is None`,
+        (b) missing token, (c) `clob.get_mid()` returning None — the bot
+        then placed real BUYs at the stub price (the cycle-22 audit caught
+        21/39 MVP trades doing this, which cycle 23 patched on the MVP
+        path; this is the DKG-path mirror). `_gate_mid_unavailable` now
+        rejects on `None`. The clob WARN-once defense is in
+        `_warn_once_clob_missing` below.
+        """
         if self._clob is None:
-            return self._trade_cfg.default_mid_price
+            self._warn_once_clob_missing("_resolve_mid")
+            return None
+        if market is None:
+            return None
         token_id: Optional[str] = (
             market.get("token_yes") if direction == "YES" else market.get("token_no")
         )
         if not token_id:
-            return self._trade_cfg.default_mid_price
+            return None
         mid = await self._clob.get_mid(str(token_id))
         if mid is None:
-            return self._trade_cfg.default_mid_price
+            return None
         return float(mid)
+
+    # Cycle 24: per-process one-shot WARN log mirroring trade.py so the
+    # DKG-side silent-fallback regression is impossible to overlook. Keyed
+    # by call-site so each surface logs exactly once per process lifetime.
+    _CLOB_WARN_SEEN: set[str] = set()
+
+    def _warn_once_clob_missing(self, site: str) -> None:
+        if site in self._CLOB_WARN_SEEN:
+            return
+        self._CLOB_WARN_SEEN.add(site)
+        logger.warning(
+            "dkg_trade: %s observed self._clob is None — pre-trade gate "
+            "will reject with mid_unavailable. This is a SILENT-FALLBACK "
+            "regression: investigate build_deps() / build_clob() wiring.",
+            site,
+        )
 
     # ------------------------------------------------------------------
     # Writes
@@ -744,6 +849,14 @@ class DKGTradeStage:
         is_tracer: bool,
         tracer_id: Optional[str],
     ) -> int:
+        # Cycle 24: post-condition (mirrors trade.py:_insert_trade). After
+        # the mid_unavailable + mid_degenerate gates a degenerate mid
+        # should be unreachable here; assert so any regression is loud,
+        # never a silent bad row.
+        assert mid is not None and 0.0 < float(mid) < 1.0, (
+            f"_insert_trade refusing degenerate mid: market={market_id} "
+            f"direction={direction} mid={mid!r}"
+        )
         async with self._db.batch() as cur:
             await cur.execute(
                 """
