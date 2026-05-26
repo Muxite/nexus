@@ -329,6 +329,13 @@ class TradeSection(BaseModel):
     min_market_volume_usdc: float = Field(default=10_000.0, ge=0.0)
     far_future_days: int = Field(default=180, ge=1)
     min_days_to_expiry: int = Field(default=1, ge=0)
+    # Cycle 23 (_gates.py::_gate_market_state — handoff C wired this into
+    # both trade.py and dkg_trade.py): reject any market whose `end_date`
+    # is within this many hours of now. Finer-grained than `min_days_to_expiry`
+    # because the cycle-19 retro (trade 40) showed a 4h-out market is already
+    # too thin to safely enter — the post-resolution UMA wait eats the edge.
+    # Default 6h matches the test fixtures and the gate's docstring.
+    min_hours_to_expiry: float = Field(default=6.0, ge=0.0)
     extreme_mid_low: float = Field(default=0.15, ge=0.0, lt=0.5)
     extreme_mid_high: float = Field(default=0.85, gt=0.5, le=1.0)
     require_breaking_for_extreme_mid: bool = True
