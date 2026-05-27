@@ -204,6 +204,12 @@ class DB:
         await self._conn.execute(f"PRAGMA journal_mode={self.journal_mode}")
         await self._conn.execute(f"PRAGMA synchronous={self.synchronous}")
         await self._conn.execute("PRAGMA foreign_keys=ON")
+        # Cycle 26 followup: dual-container (irene + irene-explorer) write
+        # contention on the same WAL surfaces as `database is locked` when
+        # SQLite's default busy_timeout=0 makes the second writer fail
+        # immediately. 5s is long enough that real contention resolves; if
+        # we're waiting past 5s something is genuinely stuck.
+        await self._conn.execute("PRAGMA busy_timeout=5000")
         self._batch_lock = asyncio.Lock()
         await self._apply_schema()
         logger.info("irene DB connected at %s", self.path)

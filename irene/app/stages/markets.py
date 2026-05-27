@@ -1386,7 +1386,12 @@ class MarketsStage:
         await cur.close()
         if row is None:
             return
-        first_seen = row["fee_rate"] is None
+        # Cycle 26 followup: `first_seen` must ALSO require
+        # fee_rate_fetched_at IS NULL — otherwise dead-endpoint markets
+        # (fee_rate stays NULL forever) would re-qualify every poll
+        # despite the new fetched_at stamping. `_is_market_info_stale`
+        # carries the cadence after the first attempt.
+        first_seen = row["fee_rate"] is None and row["fee_rate_fetched_at"] is None
         stale = self._is_market_info_stale(row["fee_rate_fetched_at"])
         if not (first_seen or stale):
             return
@@ -1394,23 +1399,27 @@ class MarketsStage:
         min_order_size: Optional[float] = None
         if hasattr(self._clob, "get_market_info"):
             info = await self._clob.get_market_info(condition_id)
-            if info is None:
-                return  # CLOB miss; leave fetched_at unchanged so we retry
-            fee_rate = info.get("fee_rate")
-            min_order_size = info.get("min_order_size")
+            fee_rate = info.get("fee_rate") if info else None
+            min_order_size = info.get("min_order_size") if info else None
         else:
             fee_rate = await self._clob.get_market_fee_rate(condition_id)
-        if fee_rate is None and min_order_size is None:
-            # Got a 200 but no usable fields — treat as a fetch failure
-            # for refresh purposes (don't advance `fetched_at`), so the
-            # next poll retries instead of waiting another full window.
-            return
+        # Cycle 26 followup: stamp `fee_rate_fetched_at = now` on EVERY
+        # attempt — success, miss (info is None), or partial. Pre-fix the
+        # miss path left fetched_at NULL so the next poll re-queued the
+        # same market 120s later; with cycle-26's events-endpoint adding
+        # ~2700 markets without CLOB endpoints (sub-markets, event
+        # aggregators), that meant a sustained ~10/min ReadTimeout rate
+        # forever. Soft-cooldown via fetched_at means dead-endpoint
+        # markets get retried only on the cycle-15 cadence
+        # (default 168h) instead of every poll.
         now = _now_iso()
         # Build a partial UPDATE that only touches the columns we
         # actually have values for; preserves any already-populated
-        # column on the row. `fee_rate_fetched_at` is stamped whenever
-        # we got at least one usable field back — this is what marks
-        # the refresh as successful for cadence purposes.
+        # column on the row. `fee_rate_fetched_at` is stamped on EVERY
+        # attempt (see comment above) — markets without CLOB endpoints
+        # will retain `fee_rate IS NULL` but get `fee_rate_fetched_at`
+        # advanced, so the cycle-15 cadence prevents re-querying them
+        # every poll.
         set_clauses = []
         params: list = []
         if fee_rate is not None:
