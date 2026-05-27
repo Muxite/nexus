@@ -207,9 +207,11 @@ class DB:
         # Cycle 26 followup: dual-container (irene + irene-explorer) write
         # contention on the same WAL surfaces as `database is locked` when
         # SQLite's default busy_timeout=0 makes the second writer fail
-        # immediately. 5s is long enough that real contention resolves; if
-        # we're waiting past 5s something is genuinely stuck.
-        await self._conn.execute("PRAGMA busy_timeout=5000")
+        # immediately. 30s covers the long-held write window during the
+        # cycle-26 dual-read upsert loop (~69k markets via /events +
+        # /markets union per poll). If we wait past 30s, something is
+        # genuinely stuck and surfacing the error is correct.
+        await self._conn.execute("PRAGMA busy_timeout=30000")
         self._batch_lock = asyncio.Lock()
         await self._apply_schema()
         logger.info("irene DB connected at %s", self.path)
