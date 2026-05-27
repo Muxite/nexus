@@ -481,13 +481,19 @@ class MarketsStage:
     # so the flag survives across stage instances (tests construct many).
     _fee_warn_seen: bool = False
 
-    def __init__(self, deps: StageDeps) -> None:
+    def __init__(self, deps: StageDeps, *, read_only_replica: bool = False) -> None:
         if deps.embedder is None:
             raise RuntimeError("MarketsStage requires deps.embedder")
         self._db = deps.db
         self._bus = deps.bus
         self._config = deps.config
         self._embedder = deps.embedder
+        # Cycle 26 stage-1 soak fix #5: when True, this instance is a
+        # read-only replica — production owns the writes and we just
+        # keep `self.index` warm by reloading from the DB. Set in
+        # MODE_EXPLORER to remove the duplicate 69k-row upsert loop
+        # that was the dominant WAL writer-lock contender.
+        self._read_only_replica = bool(read_only_replica)
         # Cycle 10/15: CLOB client is OPTIONAL on MarketsStage. When
         # present, `_upsert_market` triggers a per-market fee_rate /
         # min_order_size fetch on first-seen (cycles 10/13) AND on a
@@ -553,6 +559,12 @@ class MarketsStage:
         # (Gamma drops them from the active list at `closed=true`,
         # BEFORE UMA proposes — so the main poll never re-sees them).
         self._resolution_poll_task: Optional[asyncio.Task] = None
+        # Cycle 26 stage-1 soak fix #5: replica-mode refresh task; only
+        # set when `read_only_replica=True`. Periodically reloads the
+        # in-memory MarketIndex from the DB so explorer's downstream
+        # stages (LinkerStage, MatchStage) see new markets within one
+        # refresh cycle.
+        self._index_refresh_task: Optional[asyncio.Task] = None
         self._stopped = False
 
     # ---- lifecycle ------------------------------------------------------
@@ -565,7 +577,21 @@ class MarketsStage:
         # stalls. Index reload after subsequent embed cycles is handled
         # in `refresh_embeddings_once`.
         loaded = await self.index.load(self._db)  # type: ignore[attr-defined]
-        logger.info("markets: index warmed (%d rows)", loaded)
+        logger.info(
+            "markets: index warmed (%d rows)%s",
+            loaded,
+            " [replica]" if self._read_only_replica else "",
+        )
+        # Cycle 26 stage-1 soak fix #5: in replica mode, production owns
+        # all market writes. Skip the boot resolution-rescan, the WS pool
+        # (production drives the live feed), and all three writer loops.
+        # We spin up a single read-only refresh loop instead.
+        if self._read_only_replica:
+            self._index_refresh_task = asyncio.create_task(
+                self._index_refresh_loop()
+            )
+            return
+
         # Cycle 23: synchronous resolution-rescan on boot. Closes the gap
         # where a graceful restart during a market's post-close window
         # misses the UMA finalization stamp until the periodic loop
@@ -604,6 +630,7 @@ class MarketsStage:
             self._poll_task,
             self._embed_task,
             self._resolution_poll_task,
+            self._index_refresh_task,
         )
         for task in tasks:
             if task is not None:
@@ -617,6 +644,7 @@ class MarketsStage:
         self._poll_task = None
         self._embed_task = None
         self._resolution_poll_task = None
+        self._index_refresh_task = None
         if self._client is not None:
             await self._client.aclose()
             self._client = None
@@ -669,6 +697,33 @@ class MarketsStage:
                 )
             await asyncio.sleep(self._resolution_poll_seconds)
 
+    async def _index_refresh_loop(self) -> None:
+        """Cycle 26 stage-1 soak fix #5: replica-mode loop.
+
+        Production owns the markets writes; this replica just keeps the
+        in-memory `MarketIndex` fresh by reloading from the DB every
+        `replica_refresh_seconds` (default matches `poll_seconds` so
+        downstream stages see new markets within one production cycle).
+
+        `MarketIndex.load()` is a single indexed read against the
+        markets table — it doesn't contend with writers."""
+        interval = float(_config_get(
+            self._config,
+            "replica_refresh_seconds",
+            float(self._poll_seconds),
+        ))
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                n = await self.index.load(self._db)
+                logger.debug("markets[replica]: index refreshed (%d rows)", n)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 — keep the loop alive
+                logger.exception(
+                    "markets[replica]: index refresh failed; will retry"
+                )
+
     # ---- single-cycle entry points (also called directly in tests) ----
 
     async def poll_once(self) -> int:
@@ -679,6 +734,10 @@ class MarketsStage:
         the markets-vs-events sourcing choice. `poll_once` is unchanged
         in shape: parse → upsert → deactivate → publish.
         """
+        if self._read_only_replica:
+            raise RuntimeError(
+                "MarketsStage.poll_once: write op called in read-only replica mode"
+            )
         try:
             parsed = await self._fetch_universe()
         except httpx.HTTPError as exc:
@@ -826,6 +885,11 @@ class MarketsStage:
     async def refresh_embeddings_once(self) -> int:
         """Embed every row missing an embedding OR stamped with a stale
         `embedder_id`. Returns the number of rows updated."""
+        if self._read_only_replica:
+            raise RuntimeError(
+                "MarketsStage.refresh_embeddings_once: write op called in "
+                "read-only replica mode"
+            )
         target_id = self._embedder.embedder_id
         cur = await self._db.conn.execute(
             """
@@ -886,6 +950,11 @@ class MarketsStage:
         any single market are caught and logged so one bad market
         cannot abort the cycle (per the loop's failure contract).
         """
+        if self._read_only_replica:
+            raise RuntimeError(
+                "MarketsStage.poll_resolved_markets_once: write op called in "
+                "read-only replica mode"
+            )
         timeout_hours = float(
             _config_get(self._config, "resolution_timeout_hours", 168.0)
         )

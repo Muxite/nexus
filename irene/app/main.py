@@ -269,7 +269,12 @@ def wire_pipeline(
         clob=clob,
         ws_pool=ws_pool,
     )
-    markets = MarketsStage(base_deps)
+    # Cycle 26 stage-1 soak fix #5: in MODE_EXPLORER, MarketsStage runs as
+    # a read-only replica — production owns the writes; explorer just keeps
+    # its in-memory MarketIndex warm by reloading from the DB. Eliminates
+    # the duplicate 69k-row upsert that was the dominant WAL writer-lock
+    # contender.
+    markets = MarketsStage(base_deps, read_only_replica=(mode == MODE_EXPLORER))
 
     full_deps = StageDeps(
         db=db,
@@ -415,7 +420,11 @@ async def main() -> int:
     # `_sync_ws_subscriptions` is a no-op.
     live_cache: Optional[LiveMarketCache] = None
     ws_pool: Optional[ClobWsPool] = None
-    if cfg.markets.enable_ws_feed:
+    # Cycle 26 stage-1 soak fix #5: WS pool is production-only. Explorer
+    # mode is now a read-only replica for markets (no Gamma polling) and
+    # explorer/odds_capture go through CLOBClient REST — they never
+    # reference live_cache or ws_pool.
+    if cfg.markets.enable_ws_feed and mode == MODE_PRODUCTION:
         live_cache = LiveMarketCache(
             stale_after_s=cfg.markets.ws_stale_after_seconds,
         )

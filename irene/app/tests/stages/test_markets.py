@@ -169,11 +169,13 @@ def _make_stage(
     embedder: _FakeEmbedder,
     dim: int = 8,
     clob=None,
+    *,
+    read_only_replica: bool = False,
 ) -> MarketsStage:
     deps = StageDeps(
         db=db, bus=bus, config=_config(dim=dim), embedder=embedder, clob=clob,
     )
-    return MarketsStage(deps)
+    return MarketsStage(deps, read_only_replica=read_only_replica)
 
 
 class _FakeCLOB:
@@ -1942,3 +1944,129 @@ async def test_fetch_all_gamma_re_raises_422_when_no_markets_accumulated(
 
     with pytest.raises(httpx.HTTPStatusError):
         await stage._fetch_all_gamma()
+
+
+# ---------------------------------------------------------------------------
+# Cycle 26 stage-1 soak fix #5: read-only replica mode (explorer container)
+# ---------------------------------------------------------------------------
+
+
+async def test_replica_mode_skips_writer_loops(db_ready, bus, embedder):
+    """Replica mode must NOT spawn the three writer background loops
+    (poll/embed/resolution) — those are what duplicate the 69k-row
+    upsert burst and contend on the WAL writer lock. Instead it spawns
+    a single `_index_refresh_task`."""
+    stage = _make_stage(db_ready, bus, embedder, read_only_replica=True)
+    await stage.start()
+    try:
+        assert stage._poll_task is None
+        assert stage._embed_task is None
+        assert stage._resolution_poll_task is None
+        assert stage._index_refresh_task is not None
+        assert not stage._index_refresh_task.done()
+    finally:
+        await stage.stop()
+
+
+async def test_replica_mode_warms_index_at_start(db_ready, bus, embedder):
+    """Even in replica mode, MarketIndex.load() must run at start —
+    downstream stages (LinkerStage, MatchStage) depend on the in-memory
+    index being populated before the bus starts dispatching."""
+    calls: list[int] = []
+    original_load = MarketIndex.load
+
+    async def counting_load(self, db):
+        n = await original_load(self, db)
+        calls.append(n)
+        return n
+
+    MarketIndex.load = counting_load
+    try:
+        stage = _make_stage(db_ready, bus, embedder, read_only_replica=True)
+        await stage.start()
+        try:
+            assert len(calls) == 1, (
+                f"expected exactly one warm-load at start; got {len(calls)}"
+            )
+        finally:
+            await stage.stop()
+    finally:
+        MarketIndex.load = original_load
+
+
+async def test_replica_mode_rejects_write_paths(db_ready, bus, embedder):
+    """The three public write methods must raise in replica mode so a
+    future test/boot regression that calls them directly fails loudly
+    instead of silently re-introducing the dual-writer contention."""
+    stage = _make_stage(db_ready, bus, embedder, read_only_replica=True)
+    with pytest.raises(RuntimeError, match="read-only replica"):
+        await stage.poll_once()
+    with pytest.raises(RuntimeError, match="read-only replica"):
+        await stage.refresh_embeddings_once()
+    with pytest.raises(RuntimeError, match="read-only replica"):
+        await stage.poll_resolved_markets_once()
+
+
+async def test_replica_refresh_loop_reloads_index(db_ready, bus, embedder):
+    """The replica refresh loop must call `index.load()` on each tick.
+    We set `replica_refresh_seconds=0` so the loop spins as fast as the
+    event loop allows; then poll until at least one refresh-load fires
+    on top of the warm-load."""
+    import asyncio
+
+    load_calls: list[int] = []
+    original_load = MarketIndex.load
+
+    async def counting_load(self, db):
+        n = await original_load(self, db)
+        load_calls.append(n)
+        return n
+
+    MarketIndex.load = counting_load
+    try:
+        # Inject a markets-section with a 0-second refresh interval so
+        # the loop yields immediately on each tick.
+        cfg = _config(dim=8)
+
+        class _MarketsCfg:
+            replica_refresh_seconds = 0.0
+
+        cfg.markets = _MarketsCfg()
+        deps = StageDeps(db=db_ready, bus=bus, config=cfg, embedder=embedder)
+        stage = MarketsStage(deps, read_only_replica=True)
+        await stage.start()
+        # Warm-load is synchronous in start() (one load). Wait for the
+        # refresh loop to fire at least once on top of that — poll with
+        # a generous timeout so a slow CI runner can't flake the assert.
+        async def wait_for_refresh():
+            while len(load_calls) < 2:
+                await asyncio.sleep(0)
+
+        try:
+            await asyncio.wait_for(wait_for_refresh(), timeout=2.0)
+        finally:
+            await stage.stop()
+
+        assert len(load_calls) >= 2, (
+            f"expected refresh loop to fire at least once after warm-load; "
+            f"got {len(load_calls)} loads"
+        )
+    finally:
+        MarketIndex.load = original_load
+
+
+async def test_default_construction_spawns_writer_loops(db_ready, bus, embedder):
+    """Regression guard: default (production) construction must still
+    spawn the three original writer tasks. The replica flag is opt-in
+    and must not change existing behavior when omitted."""
+    stage = _make_stage(db_ready, bus, embedder)
+    assert stage._read_only_replica is False
+    await stage.start()
+    try:
+        assert stage._poll_task is not None
+        assert stage._embed_task is not None
+        assert stage._resolution_poll_task is not None
+        assert stage._index_refresh_task is None
+    finally:
+        await stage.stop()
+
