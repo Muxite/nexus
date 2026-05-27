@@ -50,6 +50,7 @@ from pathlib import Path
 from typing import Optional
 
 from app import db as db_module
+from app import system_stats as system_stats_module
 from app.ai import AIClient
 from app.budget import Budget
 from app.bus import InProcBus
@@ -485,6 +486,16 @@ async def main() -> int:
     if dashboard is not None:
         dashboard._task = asyncio.create_task(dashboard.run())
 
+    # Cycle 26: per-container CPU/RAM collector feeds the dashboard's
+    # system_stats page + plot. Production-only — explorer mode skips
+    # the dashboard, so the collector has no reader and is pointless.
+    # Survives a missing docker.sock by logging at WARNING per tick.
+    system_stats_task: Optional[asyncio.Task] = None
+    if mode == MODE_PRODUCTION:
+        system_stats_task = asyncio.create_task(
+            system_stats_module.run_collector(db)
+        )
+
     logger.info(
         "irene boot OK, %d stages wired (mode=%s cycle=%s id=%d db=%s budget=%s)",
         len(pipeline.start_order),
@@ -504,6 +515,12 @@ async def main() -> int:
         await stop
     finally:
         logger.info("irene shutting down")
+        if system_stats_task is not None:
+            system_stats_task.cancel()
+            try:
+                await system_stats_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         if dashboard is not None:
             await dashboard.stop()
         for stage in pipeline.stop_order:

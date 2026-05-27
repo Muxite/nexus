@@ -19,6 +19,7 @@ from .pages import (
     news_staleness,
     pnl,
     recent_trades,
+    system_stats,
     throughput,
 )
 
@@ -36,6 +37,7 @@ PAGES = [
     entity_resolutions,
     pnl,
     near_miss_audit,
+    system_stats,
 ]
 
 # Files that have never existed (or have been deliberately removed) and

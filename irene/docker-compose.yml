@@ -28,6 +28,9 @@ services:
       # Shared sentence-transformers cache so we don't re-download the
       # ~500MB model into a separate volume from seulgi.
       - irene_model_cache:/root/.cache/torch/sentence_transformers
+      # Cycle 26: read-only docker socket for the system_stats collector
+      # that powers the per-container CPU/RAM dashboard panel + plot.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - IRENE_CONFIG=/config/config.yaml
       # Cycle 4: default to scraper-v2 (port 9001). Override via env

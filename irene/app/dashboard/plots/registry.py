@@ -15,6 +15,7 @@ from . import (
     per_gate_rejection,
     pnl_cumulative,
     speed_overlay,
+    system_stats,
     throughput_overlay,
 )
 
@@ -28,4 +29,5 @@ PLOTS = [
     missed_edge,
     throughput_overlay,
     speed_overlay,
+    system_stats,
 ]
