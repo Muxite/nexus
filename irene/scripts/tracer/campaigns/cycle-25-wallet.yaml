@@ -1,0 +1,34 @@
+name: cycle-25-wallet
+# Cycle-25-I wallet correctness harness — verifies the post-cycle-25
+# real-money cash model (`wallet.cash_balance` now deducts fees) by firing
+# a wide template mix and reconciling every closure line-by-line via
+# `scripts.cycle25.audit_wallet_harness`.
+#
+# Use against either the live DB (paper trades only) OR a fresh DB
+# created by `scripts/cycle25/run_wallet_harness.sh`.
+prefix_root: cycle25-wallet-{ts}
+
+shared:
+  concurrency: 5
+  log_level: INFO
+  config: /config/config.yaml
+  db: /data/irene.db
+  # Conservative; the audit run is a verification, not a production burst.
+  budget_cap_usd: 5
+  # We want closures during the run so the audit has data to reconcile.
+  exercise_wallet: true
+
+# 5 templates × 30 articles = 150 tracer articles. Wide enough to hit
+# diverse markets so we exercise the fee / cash / identity path with
+# variety.
+bursts:
+  - template: iran_strike
+    count: 30
+  - template: market_crash
+    count: 30
+  - template: central_bank_surprise
+    count: 30
+  - template: regulatory_decision
+    count: 30
+  - template: tech_breakthrough
+    count: 30

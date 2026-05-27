@@ -100,8 +100,10 @@ from app import db as db_module
 from app.cycle import current_cycle_id
 from app.deps import StageDeps
 from app.stages._gates import (
+    _gate_binary_dedup,
     _gate_entry,
     _gate_market_state,
+    _gate_market_vanished,
     _gate_mid_unavailable,
 )
 from app.stages.trade import compose_direction_prompt
@@ -360,6 +362,52 @@ class DKGTradeStage:
         gate_history.append(
             _gate_entry("direction", "ok", result.direction, result.confidence)
         )
+
+        # 3.5 market_vanished re-check (cycle 25, mirrors trade.py) -----
+        # Re-fetch the markets row after the LLM call. If the row was
+        # deleted or transitioned to inactive/closed between the initial
+        # lookup and the decision, refuse the trade and log the decision
+        # with `reason='market_vanished'` so the audit layer can quantify
+        # how often discovery is unreliable.
+        fresh_market = await self._fetch_market(market_condition_id)
+        status, entry, reason = _gate_market_vanished(market, fresh_market)
+        if status == "reject":
+            gate_history.append(entry)
+            await self._record_reject(
+                event_id=event_id,
+                market_condition_id=market_condition_id,
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
+
+        # 3.6 binary_dedup (cycle 25-B) --------------------------------
+        # Trades 38+39 (NO on opposite legs of the Bank-of-Israel binary)
+        # were the smoking-gun proof that DKG enters per market without
+        # awareness of sibling outcomes. Refuse when another open trade
+        # already sits on a market sharing the same canonical event.
+        from app.stages._gates import query_open_sibling_markets
+        siblings = await query_open_sibling_markets(
+            self._db.conn, market_condition_id
+        )
+        status, entry, reason = _gate_binary_dedup(siblings)
+        if status == "reject":
+            gate_history.append(entry)
+            await self._record_reject(
+                event_id=event_id,
+                market_condition_id=market_condition_id,
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+            )
+            return
 
         # 4. edge ------------------------------------------------------
         direction = result.direction

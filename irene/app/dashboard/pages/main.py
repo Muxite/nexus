@@ -47,7 +47,8 @@ async def _fetch_closed_pairs(dash) -> tuple[list[dict], list[dict], list[dict]]
         f"""
         SELECT t.id, t.size_usdc, t.direction, t.mid_price AS entry_mid,
                t.decision_path,
-               c.exit_mid_price, c.realized_pnl_usdc, c.close_reason
+               c.exit_mid_price, c.realized_pnl_usdc, c.close_reason,
+               c.entry_fee_usdc, c.exit_fee_usdc
         FROM trades t
         JOIN trade_closures c ON c.trade_id = t.id
         WHERE t.is_tracer = 0 {cycle_sql}
@@ -279,9 +280,14 @@ async def render(dash) -> str:
     closed_size = wallet.sum_closed_size_invested(closed_trades)
     closed_exit_value = wallet.sum_closed_exit_value(closed_pairs)
     realized = wallet.sum_realized_pnl(closures)
+    fees_paid = wallet.sum_fees_paid(closures)
     open_value = wallet.sum_open_positions_value(open_with_mid)
     unreal = wallet.sum_unrealized_pnl(open_with_mid)
-    cash = wallet.cash_balance(initial_balance, open_size, closed_exit_value, closed_size)
+    # Cycle 25: cash is real-money-like — fees deducted on close.
+    cash = wallet.cash_balance(
+        initial_balance, open_size, closed_exit_value, closed_size,
+        fees_paid_total=fees_paid,
+    )
     eq = wallet.equity(cash, open_value)
     ok, drift = wallet.accounting_identity_check(
         initial_balance, realized, unreal, eq, tol=0.05
@@ -311,7 +317,7 @@ async def render(dash) -> str:
         f"open positions ({n_open}, {n_pricable} priced{unpriceable_tail}): "
         f"invested ${open_size:>8.2f} → current ${open_value:>8.2f}",
         f"  realized:  {realized:>+9.2f}    unrealized: {unreal:>+9.2f}    "
-        f"closed: {n_closed}",
+        f"fees paid: ${fees_paid:>7.2f}    closed: {n_closed}",
         f"  EQUITY:    ${eq:>9.2f}    "
         f"identity {'OK' if ok else 'DRIFT'}{f' ({drift:+.2f})' if not ok else ''}",
     ]

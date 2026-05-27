@@ -92,6 +92,7 @@ from app.deps import StageDeps
 from app.stages._entity_overlap import article_entities_overlap_market
 from app.stages._gates import (
     _eval_market_news_imbalance_subrules,
+    _gate_binary_dedup,
     _gate_cash,
     _gate_direction,
     _gate_edge,
@@ -100,6 +101,7 @@ from app.stages._gates import (
     _gate_freshness,
     _gate_market_news_imbalance,
     _gate_market_state,
+    _gate_market_vanished,
     _gate_mid_degenerate,
     _gate_mid_unavailable,
     _gate_similarity_floor,
@@ -907,6 +909,59 @@ class TradeStage:
         )
         gate_history.append(entry)
         if status == "reject":
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
+
+        # 3.5 market_vanished re-check (cycle 25) ----------------------------
+        # The markets-stage poller can update `closed_at` / `active` between
+        # the lookup at the top of handle() and the LLM result landing here.
+        # Re-fetch and compare; if the market vanished, refuse to trade but
+        # KEEP the decision row (with reason='market_vanished') so the audit
+        # layer can count how often discovery is unreliable. The * in the
+        # `decisions` log is exactly that reason code.
+        _t = time.perf_counter()
+        fresh_market = await self._fetch_market(str(market_id))
+        breakdown["recheck_market"] = (time.perf_counter() - _t) * 1000.0
+        status, entry, reason = _gate_market_vanished(market, fresh_market)
+        if status == "reject":
+            gate_history.append(entry)
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
+
+        # 3.6 binary_dedup (cycle 25-B) --------------------------------------
+        # Refuses to open a second leg of the same Polymarket binary event.
+        # Live evidence: trades 38+39 opened NO on opposite legs of the
+        # Bank-of-Israel rate decision (event 6218 via market_links),
+        # guaranteeing one loss + round-trip fees on both. Without this gate
+        # MVP wouldn't catch DKG's siblings, and DKG's own `dkg_trade_links`
+        # idempotency keys per market — not per event.
+        from app.stages._gates import query_open_sibling_markets
+        _t = time.perf_counter()
+        siblings = await query_open_sibling_markets(self._db.conn, str(market_id))
+        breakdown["binary_dedup"] = (time.perf_counter() - _t) * 1000.0
+        status, entry, reason = _gate_binary_dedup(siblings)
+        if status == "reject":
+            gate_history.append(entry)
             await self._record_reject(
                 signal_id=int(signal_id),
                 reason=reason,

@@ -184,6 +184,144 @@ def _gate_market_state(
     return ("ok", None, None)
 
 
+def _gate_market_vanished(
+    cached: dict, fresh: Optional[dict]
+) -> tuple[str, Optional[dict], Optional[str]]:
+    """Cycle 25: post-decision re-check that the market still exists.
+
+    `_gate_market_state` runs BEFORE the LLM call against the cached
+    market dict captured at lookup time. The markets-stage poller can
+    update `active` / `closed_at` mid-flight, so by the time the LLM
+    decision lands the cached dict may be stale. This gate re-compares a
+    fresh DB read against the cached dict and refuses the trade when the
+    market has vanished (row deleted) or transitioned to inactive/closed
+    since lookup.
+
+    Why a distinct reason: `market_vanished` is a signal to the audit
+    layer that **market discovery / tracking** is unreliable, not that
+    the bot itself is misbehaving. Operators triage these differently
+    from a pre-decision `market_inactive` (which says "we never should
+    have considered this market in the first place").
+
+    `fresh=None` means the row has been deleted between lookup and the
+    re-check — flagged as `row_deleted`. Otherwise we report the
+    transition direction (was active → now inactive, etc.).
+    """
+    if fresh is None:
+        return (
+            "reject",
+            _gate_entry("market_vanished", "reject", "row_deleted", "row_exists"),
+            "market_vanished",
+        )
+    cached_active = cached.get("active")
+    fresh_active = fresh.get("active")
+    if fresh_active is not None and int(fresh_active) != 1 and (
+        cached_active is None or int(cached_active) == 1
+    ):
+        return (
+            "reject",
+            _gate_entry(
+                "market_vanished",
+                "reject",
+                f"active {cached_active} -> {fresh_active}",
+                "active=1",
+            ),
+            "market_vanished",
+        )
+    if fresh.get("closed_at") and not cached.get("closed_at"):
+        return (
+            "reject",
+            _gate_entry(
+                "market_vanished",
+                "reject",
+                f"closed_at appeared ({fresh.get('closed_at')})",
+                "closed_at IS NULL",
+            ),
+            "market_vanished",
+        )
+    return ("ok", None, None)
+
+
+async def query_open_sibling_markets(db_conn, market_id: str) -> list[str]:
+    """Cycle 25-B helper: list open trades on OTHER markets that share the
+    same canonical Polymarket event as `market_id`.
+
+    "Canonical event" = the top-scoring row in `market_links` for the
+    market (the linker ranks all candidate events; we trust the strongest).
+    Two markets sharing the canonical event are mutually-exclusive legs of
+    the same binary. The caller passes this list to `_gate_binary_dedup`.
+
+    Lives in `_gates.py` so both `trade.py` (MVP) and `dkg_trade.py` (DKG)
+    can use a single query without crossing the no-stage-import rule.
+    """
+    cur = await db_conn.execute(
+        """
+        WITH ranked AS (
+            SELECT ml.market_condition_id, ml.event_id,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY ml.market_condition_id
+                       ORDER BY ml.final_score DESC, ml.event_id ASC
+                   ) AS rk
+            FROM market_links ml
+        ),
+        canonical AS (
+            SELECT market_condition_id, event_id
+            FROM ranked WHERE rk = 1
+        ),
+        my_event AS (
+            SELECT event_id FROM canonical WHERE market_condition_id = ?
+        )
+        SELECT DISTINCT t.market_id
+        FROM trades t
+        LEFT JOIN trade_closures c ON c.trade_id = t.id
+        JOIN canonical other ON other.market_condition_id = t.market_id
+        JOIN my_event me ON me.event_id = other.event_id
+        WHERE c.id IS NULL
+          AND t.is_tracer = 0
+          AND t.market_id != ?
+        """,
+        (market_id, market_id),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [r["market_id"] for r in rows]
+
+
+def _gate_binary_dedup(
+    open_sibling_market_ids: list[str],
+) -> tuple[str, Optional[dict], Optional[str]]:
+    """Cycle 25-B: refuse trades on the second leg of a binary event.
+
+    Polymarket binary events have multiple `markets` rows (one per outcome
+    leg). Two markets sharing the same canonical event are mutually
+    exclusive — buying NO on both guarantees one leg loses. The pre-cycle-25
+    bot did this (trades 38+39: NO on both legs of the Bank of Israel rate
+    decision).
+
+    The caller is responsible for fetching the canonical event for the
+    candidate market (top-scoring `market_links.event_id` per market) and
+    finding open trades on OTHER markets that share that event. This gate
+    is then a sync decision: if `open_sibling_market_ids` is non-empty,
+    refuse with `reason='binary_dedup'`.
+
+    `open_sibling_market_ids` is the list of OTHER market_ids the bot has
+    open positions on within the same canonical event. An empty list
+    passes the gate.
+    """
+    if open_sibling_market_ids:
+        return (
+            "reject",
+            _gate_entry(
+                "binary_dedup",
+                "reject",
+                f"open sibling markets: {','.join(open_sibling_market_ids[:3])}",
+                "0 open siblings",
+            ),
+            "binary_dedup",
+        )
+    return ("ok", None, None)
+
+
 def _gate_mid_degenerate(
     mid: float, cfg
 ) -> tuple[str, Optional[dict], Optional[str]]:

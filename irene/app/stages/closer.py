@@ -110,6 +110,48 @@ _CLOSER_DDL = [
     # they exist so audits can attribute total fees paid per cycle.
     "ALTER TABLE trade_closures ADD COLUMN entry_fee_usdc REAL DEFAULT 0",
     "ALTER TABLE trade_closures ADD COLUMN exit_fee_usdc  REAL DEFAULT 0",
+    # Cycle 25-A: expand the close_reason CHECK constraint to allow
+    # `market_dead_unresolved` (force-close path for State 1 markets that
+    # never finalize via UMA). SQLite can't ALTER a CHECK in place, so
+    # we rebuild the table. The new table OMITS the `REFERENCES trades(id)`
+    # FK clause that the original had — the FK was decorative (the closer
+    # already validates trade existence before insert) and including it
+    # forces SQLite to resolve `trades` during the migration, which fails
+    # in test fixtures that boot only the closer's DDL. Guarded against
+    # re-execution by the SHA-based migrations table.
+    """
+    CREATE TABLE IF NOT EXISTS trade_closures_cycle25 (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        trade_id        INTEGER NOT NULL UNIQUE,
+        closed_at       TEXT NOT NULL,
+        close_reason    TEXT NOT NULL CHECK(close_reason IN (
+            'timeout','target','stop','market_resolved','manual',
+            'edge_decay','stagnation','market_dead_unresolved'
+        )),
+        exit_mid_price  REAL NOT NULL CHECK(exit_mid_price >= 0.0 AND exit_mid_price <= 1.0),
+        realized_pnl_usdc REAL NOT NULL,
+        cycle_id        INTEGER NOT NULL,
+        is_tracer       INTEGER NOT NULL DEFAULT 0,
+        tracer_id       TEXT,
+        entry_fee_usdc  REAL DEFAULT 0,
+        exit_fee_usdc   REAL DEFAULT 0
+    )
+    """,
+    """
+    INSERT OR IGNORE INTO trade_closures_cycle25
+        (id, trade_id, closed_at, close_reason, exit_mid_price,
+         realized_pnl_usdc, cycle_id, is_tracer, tracer_id,
+         entry_fee_usdc, exit_fee_usdc)
+    SELECT id, trade_id, closed_at, close_reason, exit_mid_price,
+           realized_pnl_usdc, cycle_id, is_tracer, tracer_id,
+           COALESCE(entry_fee_usdc, 0), COALESCE(exit_fee_usdc, 0)
+    FROM trade_closures
+    """,
+    "DROP TABLE IF EXISTS trade_closures",
+    "ALTER TABLE trade_closures_cycle25 RENAME TO trade_closures",
+    "CREATE INDEX IF NOT EXISTS idx_trade_closures_close_reason ON trade_closures(close_reason)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_closures_closed_at ON trade_closures(closed_at)",
+    "CREATE INDEX IF NOT EXISTS idx_trade_closures_cycle_id ON trade_closures(cycle_id)",
 ]
 db_module.register_schema("app/stages/closer.py", _CLOSER_DDL)
 
@@ -309,10 +351,14 @@ async def write_trade_closure(
         fee_rate=fee_rate,
         gas_cost_usdc=gas_usdc,
     )
-    if close_reason == "market_resolved":
-        # Polymarket charges no trading fee at resolution — winning shares
-        # redeem at $1, losing at $0, no taker fill on the exit leg.
-        # The entry-leg fee still stands (paid at entry).
+    if close_reason in ("market_resolved", "market_dead_unresolved"):
+        # No taker fill on the exit leg in either case:
+        # - `market_resolved`: shares redeem at $1/$0 (Polymarket charges
+        #   no fee at resolution).
+        # - `market_dead_unresolved` (cycle 25-A): force-close at entry_mid
+        #   because the market closed but UMA never finalized in the
+        #   force-close window. No actual exit transaction occurred, so no
+        #   exit fee applies. The entry-leg fee still stands.
         exit_fee = 0.0
     net_pnl = gross_pnl - entry_fee - exit_fee
 

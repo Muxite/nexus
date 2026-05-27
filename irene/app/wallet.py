@@ -14,6 +14,12 @@ equity == initial_balance + realized_pnl + unrealized_pnl
 break this. Dashboard panels call it on every tick; tests assert it on
 seeded scenarios.
 
+**Real-money cash model (cycle 25).** `cash_balance` deducts cumulative
+fees (`entry_fee_usdc + exit_fee_usdc` per closure) so the wallet behaves
+the way a live exchange would: fees actually leave the cash bucket on
+close. `realized_pnl_usdc` is already net of fees (per `closer.py`), so
+once cash is also net the identity holds exactly — no DRIFT line.
+
 **The Polymarket position math** (kept in sync with `closer._compute_pnl`):
 - A YES bet of `size_usdc` at `entry_mid` buys `shares = size_usdc / entry_mid`.
   Current value = `current_mid * shares = size_usdc * current_mid / entry_mid`.
@@ -92,22 +98,30 @@ def cash_balance(
     open_size_invested: float,
     closed_exit_value_total: float,
     closed_size_invested: float,
+    fees_paid_total: float = 0.0,
 ) -> float:
     """Cash is what's NOT currently locked in positions or paid out.
 
     Step through the lifecycle:
       - At init: cash = initial.
       - Trade opens (size=S): cash -= S (locked into position).
-      - Trade closes (exit=V): cash += V (position cashed out).
+      - Trade closes (exit=V, fees=F): cash += V - F.
 
-    So: cash = initial - sum(every size ever opened) + sum(exit values).
-              = initial - (open_size + closed_size) + closed_exit_value
+    So: cash = initial - sum(sizes opened) + sum(exit values) - sum(fees).
+              = initial - (open_size + closed_size) + closed_exit_value - fees
+
+    Cycle 25: `fees_paid_total` defaults to 0 to keep legacy callers
+    working, but the dashboard passes `SUM(entry_fee + exit_fee)` from
+    `trade_closures` so the wallet matches what a real exchange would
+    show. With this subtraction, `equity = initial + realized_net +
+    unrealized` holds exactly — no separate DRIFT bucket needed.
     """
     return (
         float(initial_balance)
         - float(open_size_invested)
         - float(closed_size_invested)
         + float(closed_exit_value_total)
+        - float(fees_paid_total)
     )
 
 
@@ -157,6 +171,35 @@ def sum_closed_exit_value(closed_pairs: Iterable) -> float:
 
 def sum_realized_pnl(closures: Iterable) -> float:
     return float(sum(float(c["realized_pnl_usdc"]) for c in closures))
+
+
+def _row_get(row, key: str):
+    """Best-effort field lookup that works on both dicts and sqlite3.Row.
+
+    dict.get(key) returns None on miss; sqlite3.Row only supports __getitem__
+    and raises IndexError on miss. We wrap both so callers don't need to
+    care about row provenance.
+    """
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
+
+
+def sum_fees_paid(closures: Iterable) -> float:
+    """Cumulative Polymarket taker fees deducted across all closures.
+
+    Each closure row carries `entry_fee_usdc` + `exit_fee_usdc` (cycle 7).
+    Missing or NULL columns are treated as 0 so we don't crash on legacy
+    rows that pre-date the columns. The dashboard subtracts this total
+    from cash so the wallet matches a real exchange's books.
+    """
+    total = 0.0
+    for c in closures:
+        entry = _row_get(c, "entry_fee_usdc")
+        exit_ = _row_get(c, "exit_fee_usdc")
+        total += float(entry or 0.0) + float(exit_ or 0.0)
+    return total
 
 
 def sum_unrealized_pnl(open_with_mid: Iterable) -> float:
