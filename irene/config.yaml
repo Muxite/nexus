@@ -230,3 +230,15 @@ impact:
   # Cycle 11: raised to 24h so the +24h long-tail bucket
   # (BUCKETS_SECONDS=86400 in impact_tracker.py) has time to fire.
   max_age_hours: 24.0
+
+markets:
+  # Cycle 26 promotion — stage 1: events-endpoint dual-read shadow mode.
+  # Fetch BOTH /events and /markets every poll, reconcile, write the
+  # union, and log per-cycle counts as
+  # `events= markets= both= only_events= only_markets=`.
+  # Promote `events_endpoint_dual_read=false` (events-only) once
+  # `only_markets / total < 1%` for ~3 days. WS feed stays OFF; the
+  # probe + soak come later in the ledger.
+  use_events_endpoint: true
+  events_endpoint_dual_read: true
+  enable_ws_feed: false
