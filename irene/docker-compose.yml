@@ -50,39 +50,14 @@ services:
         max-size: "50m"
         max-file: "3"
 
-  # Cycle 25 noisy-explorer: sister of `irene` that reuses the same
-  # image, the same DB (./data), and the same scraper-v2 feed, but
-  # swaps the trade-path tail for the explorer + odds_capture stages.
-  # See plans/plan-out-a-major-moonlit-kitten.md.
-  #
-  # Run alongside production:
-  #   docker compose -f irene/docker-compose.yml up -d irene-explorer
-  irene-explorer:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: irene-explorer
-    restart: unless-stopped
-    volumes:
-      - ./data:/data
-      - ./explorer.yaml:/config/explorer.yaml:ro
-      - irene_model_cache:/root/.cache/torch/sentence_transformers
-    environment:
-      - IRENE_CONFIG=/config/explorer.yaml
-      - IRENE_MODE=explorer
-      - IRENE_CYCLE=${IRENE_EXPLORER_CYCLE:-explorer-0}
-      - SCRAPER_URL=${SCRAPER_URL:-http://jennie-scraper-v2:9001}
-      - LOG_LEVEL=${LOG_LEVEL:-INFO}
-    env_file:
-      - path: ./.env
-        required: false
-    networks:
-      - jennie_default
-    logging:
-      driver: json-file
-      options:
-        max-size: "50m"
-        max-file: "3"
+  # Cycle 26 stage-1 soak fix #6: the dedicated `irene-explorer` service
+  # was removed when we collapsed the two-container setup into a single
+  # hybrid container. `irene` now runs the production trade tail AND the
+  # explorer tail in one process — zero cross-container WAL contention,
+  # halved Polymarket / scraper-v2 load, one cycle_id per row. The
+  # explorer.yaml file stays in-tree as a reference (and for tests that
+  # still pin IRENE_MODE=explorer); re-adding the service is a one-block
+  # docker-compose change if the dataset ever needs a separate writer.
 
   irene-test:
     profiles: ["test"]

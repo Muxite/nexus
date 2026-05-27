@@ -216,8 +216,28 @@ trade:
 dkg_trade:
   # Chunk-3 dual-path trader. final_score >= 0.8 gives ~69% precision
   # per reports/2026-05-24-irene-link-backfill.md.
+  #
+  # Cycle 26 stage-1 soak fix #6: dropped to 0.5 for the collapsed
+  # single-container data-collection mode. Wider gate → 3-5× more
+  # candidate trades land in the `trades` table for backtest. The
+  # direction-LLM and edge gates downstream still filter; the score
+  # floor just admits borderline cases that 0.8 would silently discard.
   enabled: true
-  score_floor: 0.8
+  score_floor: 0.5
+
+# Cycle 26 stage-1 soak fix #6: explorer tail now runs in production
+# mode too (one container). Defaults from ExplorerSection are already
+# permissive — we set them explicitly here so this file documents the
+# data-collection intent without surprising a future reader who expects
+# explorer.yaml to be the only place these knobs appear.
+explorer:
+  score_floor: 0.5
+  relatedness_model: google/gemini-2.5-flash
+  relatedness_max_article_chars: 800
+  relatedness_max_output_tokens: 80
+  odds_poll_secs: 15
+  capture_post_secs: 1200   # 20 min
+  capture_pre_secs: 600     # 10 min
 
 closer:
   # Hold positions for 24h then exit. Real Polymarket markets typically

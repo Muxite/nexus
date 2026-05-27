@@ -448,3 +448,22 @@ async def test_tracer_flags_propagate(db_seeded):
     assert ai.calls[0]["tracer_id"] == "t-1"
     assert bus.published[0][1]["is_tracer"] is True
     assert bus.published[0][1]["tracer_id"] == "t-1"
+
+
+def test_wire_pipeline_production_wires_explorer_and_odds_capture():
+    """Cycle 26 stage-1 soak fix #6: the two-container setup was
+    collapsed into one. MODE_PRODUCTION must now wire ExplorerStage and
+    OddsCaptureStage alongside the trade-tail stages so we get the
+    labeled `explorations` + `odds_observations` dataset in the same
+    writer process. Source-level assertion mirrors the pattern used by
+    `test_wire_pipeline_subscribes_link_to_event_updated`."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent.parent.parent
+           / "app" / "main.py").read_text()
+    # Both subscriptions must be registered in MODE_PRODUCTION wiring.
+    assert "bus.subscribe(TOPIC_MARKET_LINKS_UPDATED, explorer.handle)" in src
+    assert "bus.subscribe(TOPIC_EXPLORATION_CREATED, odds_capture.handle)" in src
+    # And both stages must be constructed in the production branch
+    # (the production return tuple includes them).
+    assert "explorer=explorer," in src
+    assert "odds_capture=odds_capture," in src

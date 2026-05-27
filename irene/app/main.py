@@ -354,10 +354,19 @@ def wire_pipeline(
     # `decision_path='dkg'`. Sister of TradeStage; both feed the impact
     # tracker via TOPIC_TRADE_DECIDED.
     dkg_trade = DKGTradeStage(full_deps)
+    # Cycle 26 stage-1 soak fix #6: collapse the two-container setup.
+    # Production now also wires the explorer tail so we get the labeled
+    # `explorations` + `odds_observations` dataset in the same DB writer
+    # process — eliminating the cross-container ingest contention that
+    # was the dominant remaining lock source after fix #5.
+    explorer = ExplorerStage(full_deps)
+    odds_capture = OddsCaptureStage(full_deps)
 
     bus.subscribe(TOPIC_SIGNAL_CREATED, trade.handle)
     bus.subscribe(TOPIC_TRADE_DECIDED, impact_tracker.handle)
     bus.subscribe(TOPIC_MARKET_LINKS_UPDATED, dkg_trade.handle)
+    bus.subscribe(TOPIC_MARKET_LINKS_UPDATED, explorer.handle)
+    bus.subscribe(TOPIC_EXPLORATION_CREATED, odds_capture.handle)
 
     return Pipeline(
         markets=markets,
@@ -372,6 +381,8 @@ def wire_pipeline(
         link=link,
         dkg_trade=dkg_trade,
         impact_tracker=impact_tracker,
+        explorer=explorer,
+        odds_capture=odds_capture,
     )
 
 

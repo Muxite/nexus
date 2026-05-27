@@ -95,6 +95,12 @@ _GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 _GAMMA_PAGE_SIZE = 100
 _GAMMA_MAX_PAGES = 1000  # ~100k markets hard ceiling; current universe ~50k
 _GAMMA_TIMEOUT_SECONDS = 15.0
+# Cycle 26 stage-1 soak fix #6: send a real User-Agent on Gamma requests.
+# Cloudflare's bot filter is more lenient on identified clients; a 403
+# burst correlated with the dual-container peak load suggests we were
+# pattern-matching as a scraper. This is polite hygiene — the structural
+# fix (one container, halved load) is what actually solves the rate.
+_GAMMA_HEADERS = {"User-Agent": "irene-markets-poller/1.0"}
 # Cycle 13: Cloudflare-fronted Gamma occasionally returns 429. Honor
 # `Retry-After` (seconds) when present; fall back to exponential backoff
 # with jitter when not. Cap retries to prevent a poll task from getting
@@ -570,7 +576,9 @@ class MarketsStage:
     # ---- lifecycle ------------------------------------------------------
 
     async def start(self) -> None:
-        self._client = httpx.AsyncClient(timeout=_GAMMA_TIMEOUT_SECONDS)
+        self._client = httpx.AsyncClient(
+            timeout=_GAMMA_TIMEOUT_SECONDS, headers=_GAMMA_HEADERS,
+        )
         # Warm the MarketIndex from existing embedded rows BEFORE the
         # poll/embed loops fire. Without this, MatchStage sees an empty
         # index and `signals` stays 0 — the live-trade path silently
@@ -1047,7 +1055,9 @@ class MarketsStage:
         5xx) are returned unchanged for the caller to handle.
         """
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=_GAMMA_TIMEOUT_SECONDS)
+            self._client = httpx.AsyncClient(
+                timeout=_GAMMA_TIMEOUT_SECONDS, headers=_GAMMA_HEADERS,
+            )
         delay = _GAMMA_429_INITIAL_BACKOFF_S
         resp = None
         for attempt in range(max_retries + 1):
