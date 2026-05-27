@@ -1378,13 +1378,20 @@ class MarketsStage:
                 )
             return
         cur = await self._db.conn.execute(
-            "SELECT fee_rate, fee_rate_fetched_at "
+            "SELECT active, fee_rate, fee_rate_fetched_at "
             "FROM markets WHERE condition_id = ?",
             (condition_id,),
         )
         row = await cur.fetchone()
         await cur.close()
         if row is None:
+            return
+        # Cycle 26 followup #2: skip inactive markets entirely. Cycle 26's
+        # events endpoint pulls in tens of thousands of inactive event
+        # aggregators / closed sub-markets that have no CLOB endpoint;
+        # every one of them would cost a 5s ReadTimeout on first-seen.
+        # Inactive markets are not tradable, so fee_rate is irrelevant.
+        if not row["active"]:
             return
         # Cycle 26 followup: `first_seen` must ALSO require
         # fee_rate_fetched_at IS NULL — otherwise dead-endpoint markets
