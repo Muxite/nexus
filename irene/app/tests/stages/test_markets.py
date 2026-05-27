@@ -1261,22 +1261,29 @@ async def _seed_market_row(
         )
 
 
-async def test_close_machine_state1_does_not_close(db_ready, bus, embedder):
-    """State 1: market is closed (active=0) but no UMA status recorded yet.
-    The 2h UMA challenge window has not even started — auto-closing now
-    would book PnL at a stale mid instead of the actual $1/$0 redemption.
-    Must NOT write a closure."""
+async def test_close_machine_state1_within_force_close_window_does_not_close(
+    db_ready, bus, embedder,
+):
+    """State 1 (closed, no UMA status) WITHIN the cycle-25-A force-close
+    window: the closer still waits to give UMA a chance to finalize. Only
+    once the market has sat closed past `dead_market_force_close_hours`
+    (default 24h) does the State-4 force-close path fire.
+
+    `closed_at` set to ~10 minutes ago — well within any reasonable
+    force-close threshold."""
+    from datetime import datetime, timedelta, timezone
     from app.cycle import cycle_scope
     stage = _make_stage(db_ready, bus, embedder)
+    just_now = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
     await _seed_market_row(
         db_ready, condition_id="0xS1",
         last_resolution_status=None,
         last_outcome_prices=None,
-        closed_at="2026-05-25T00:00:00+00:00",
+        closed_at=just_now,
     )
     await _seed_open_trade_async(
         db_ready, trade_id=201, market_id="0xS1", direction="YES",
-        decided_at="2026-05-25T00:02:00+00:00", cycle_id=1,
+        decided_at=just_now, cycle_id=1,
     )
     with cycle_scope(1):
         n = await stage._close_orphaned_trades_for(["0xS1"])
@@ -1285,6 +1292,41 @@ async def test_close_machine_state1_does_not_close(db_ready, bus, embedder):
         "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=201"
     )
     assert (await cur.fetchone())["n"] == 0
+
+
+async def test_close_machine_state4_force_closes_dead_markets(db_ready, bus, embedder):
+    """Cycle 25-A: State 4 path. Once a market has been closed for longer
+    than `dead_market_force_close_hours` (default 24h) and UMA still
+    hasn't finalized, force-close at entry_mid with reason
+    `market_dead_unresolved`. Pre-cycle-25 these would have hung as
+    zombies forever."""
+    from app.cycle import cycle_scope
+    stage = _make_stage(db_ready, bus, embedder)
+    await _seed_market_row(
+        db_ready, condition_id="0xS4",
+        last_resolution_status=None,
+        last_outcome_prices=None,
+        closed_at="2026-05-25T00:00:00+00:00",  # ~46h ago vs test wall clock
+    )
+    await _seed_open_trade_async(
+        db_ready, trade_id=204, market_id="0xS4", direction="YES",
+        decided_at="2026-05-24T23:55:00+00:00", cycle_id=1,
+    )
+    with cycle_scope(1):
+        n = await stage._close_orphaned_trades_for(["0xS4"])
+    assert n == 1
+    cur = await db_ready.conn.execute(
+        "SELECT close_reason, exit_mid_price, exit_fee_usdc "
+        "FROM trade_closures WHERE trade_id=204"
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    assert row["close_reason"] == "market_dead_unresolved"
+    # Exit mid = entry mid (gross PnL ≈ 0).
+    # _seed_open_trade_async defaults entry mid to 0.5 in this test file.
+    assert abs(float(row["exit_mid_price"]) - 0.5) < 1e-6
+    # No taker fill on close → no exit fee.
+    assert float(row["exit_fee_usdc"] or 0.0) == 0.0
 
 
 async def test_close_machine_state2_records_proposed_at_no_close(
@@ -1435,15 +1477,25 @@ async def test_close_machine_state3_resolved_no_closes_at_zero(
 async def test_close_machine_human_review_timeout_logs_warning(
     db_ready, bus, embedder, caplog,
 ):
-    """State 1 with age > resolution_timeout_hours: emit RESOLUTION_TIMEOUT
-    WARNING and STILL do NOT auto-close (the trade is left open for human
-    review — better than guessing at a $1/$0 outcome we can't verify)."""
+    """State 1 with age past BOTH the cycle-25-A force-close window AND
+    the human-review timeout: force-close the trade AND emit the
+    RESOLUTION_TIMEOUT warning. Pre-cycle-25 this case just emitted the
+    warning and left the trade open; cycle-25-A force-closes it at
+    entry_mid with reason `market_dead_unresolved`, no exit fee."""
     import logging
     from app.cycle import cycle_scope
     stage = _make_stage(db_ready, bus, embedder)
-    # Patch the timeout to a tiny value so we don't have to fake "now".
-    stage._config.markets = type("MarketsCfg", (), {"resolution_timeout_hours": 0.001})()
-    # closed_at well in the past so we breach the timeout.
+    # Tiny timeouts so we don't have to fake "now". Force-close window
+    # set below resolution timeout (the normal ordering).
+    stage._config.markets = type(
+        "MarketsCfg",
+        (),
+        {
+            "resolution_timeout_hours": 0.001,
+            "dead_market_force_close_hours": 0.0005,
+        },
+    )()
+    # closed_at well in the past so we breach both thresholds.
     await _seed_market_row(
         db_ready, condition_id="0xST",
         last_resolution_status=None,
@@ -1456,16 +1508,21 @@ async def test_close_machine_human_review_timeout_logs_warning(
     with caplog.at_level(logging.WARNING, logger="app.stages.markets"):
         with cycle_scope(1):
             n = await stage._close_orphaned_trades_for(["0xST"])
-    assert n == 0
-    # Trade still open.
+    # Cycle-25-A behaviour: 1 force-close written.
+    assert n == 1
     cur = await db_ready.conn.execute(
-        "SELECT COUNT(*) AS n FROM trade_closures WHERE trade_id=206"
+        "SELECT close_reason FROM trade_closures WHERE trade_id=206"
     )
-    assert (await cur.fetchone())["n"] == 0
-    # And a tagged warning was logged.
+    row = await cur.fetchone()
+    assert row is not None and row["close_reason"] == "market_dead_unresolved"
+    # The legacy RESOLUTION_TIMEOUT warning still fires (audit visibility).
     assert any(
         "RESOLUTION_TIMEOUT" in rec.getMessage() and "trade_id=206" in rec.getMessage()
         for rec in caplog.records
+    )
+    # Force-close warning also fires.
+    assert any(
+        "force-closed trade_id=206" in rec.getMessage() for rec in caplog.records
     )
 
 

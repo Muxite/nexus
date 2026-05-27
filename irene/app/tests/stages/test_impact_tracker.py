@@ -61,7 +61,13 @@ class _FakeCLOB:
     histories: dict = field(default_factory=dict)
     history_calls: list = field(default_factory=list)
 
-    async def get_mid(self, token_id: str) -> Optional[float]:
+    async def get_mid(
+        self, token_id: str, *, prefer_live: bool = True,
+    ) -> Optional[float]:
+        # Cycle 26: real CLOBClient.get_mid accepts a `prefer_live` kwarg;
+        # the impact-tracker passes False to bypass the WS-fed cache and
+        # read REST. Accept-and-ignore here — the fake has no cache.
+        del prefer_live
         self.calls.append(token_id)
         if self.fixed is not None:
             return self.fixed

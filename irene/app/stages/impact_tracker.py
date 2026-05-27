@@ -358,7 +358,12 @@ class ImpactTrackerStage:
                 # *also* be unfilled but earlier ones (in seconds-order)
                 # short-circuit so we never poll a future cell.
                 break
-            mid = await self._clob.get_mid(token_id)
+            # Cycle 26: impact-tracker measures post-trade drift against an
+            # authoritative source. The WebSocket-fed cache is fresh enough
+            # for the closer's hot path, but here we explicitly want the
+            # REST midpoint — otherwise we'd be measuring the bot's own
+            # reflection of the live feed it's reading from.
+            mid = await self._clob.get_mid(token_id, prefer_live=False)
             if mid is None:
                 # CLOB transient failure: leave the cell NULL for the
                 # next sweep. Don't bail on the whole row — later buckets

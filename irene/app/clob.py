@@ -8,18 +8,25 @@ Returns the current mid-point price for a given outcome token. Consumed by
 open positions).
 
 **Public interface.**
-- `CLOBClient(base_url: str, timeout_seconds: float = 5.0)`
-- `await client.get_mid(token_id: str) -> float | None` — reads the
-  midpoint from `GET /midpoint?token_id=<id>` which returns
-  `{"mid":"0.545"}`. NOTE: per Polymarket's own docs, this scalar is
-  the bid-ask midpoint only when spread ≤ $0.10; on wider spreads it
-  falls back to the **last traded price** (which can be hours stale).
-  Use `get_top_of_book()` to detect this case before trusting `mid`.
-- `await client.get_top_of_book(token_id: str) -> (best_bid, best_ask) | None`
-  — reads `GET /book?token_id=<id>` and returns the best executable
-  prices. Spread = `best_ask - best_bid`. Returns `None` on any
-  failure (network, non-2xx, missing fields, crossed book, out-of-
-  range prices). The path-param form `/book/<id>` 404s; the
+- `CLOBClient(base_url: str, timeout_seconds: float = 5.0, *,
+  live_cache: LiveMarketCache | None = None)`
+- `await client.get_mid(token_id: str, *, prefer_live: bool = True) ->
+  float | None` — reads the midpoint. When `live_cache` is wired AND
+  `prefer_live=True` AND the cached tick is non-stale, returns it
+  without any HTTP. Otherwise falls back to `GET /midpoint?token_id=
+  <id>` which returns `{"mid":"0.545"}`. NOTE: per Polymarket's own
+  docs, the REST scalar is the bid-ask midpoint only when spread ≤
+  $0.10; on wider spreads it falls back to the **last traded price**
+  (which can be hours stale). Use `get_top_of_book()` to detect this
+  case before trusting `mid`. Callers that need an authoritative REST
+  reading (e.g. impact_tracker measuring its own bot's trade drift)
+  pass `prefer_live=False` to skip the cache.
+- `await client.get_top_of_book(token_id: str, *, prefer_live: bool =
+  True) -> (best_bid, best_ask) | None` — reads `GET /book?token_id=
+  <id>` and returns the best executable prices. Spread = `best_ask -
+  best_bid`. Same cache opt-out shape as `get_mid`. Returns `None` on
+  any failure (network, non-2xx, missing fields, crossed book, out-
+  of-range prices). The path-param form `/book/<id>` 404s; the
   query-param form is the correct API (2026-05-25 live probe).
 - `await client.get_market_fee_rate(condition_id: str) -> float | None`
   — reads `GET /markets/<condition_id>` and returns the **taker** fee
@@ -68,9 +75,12 @@ more.
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 import httpx
+
+if TYPE_CHECKING:
+    from app.live_market_cache import LiveMarketCache
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +88,20 @@ DEFAULT_BASE_URL = "https://clob.polymarket.com"
 
 
 class CLOBClient:
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, timeout_seconds: float = 5.0) -> None:
+    def __init__(
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        timeout_seconds: float = 5.0,
+        *,
+        live_cache: Optional["LiveMarketCache"] = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout_seconds
         self._client: Optional[httpx.AsyncClient] = None
+        # Cycle 26: optional read-through to the WebSocket-fed cache.
+        # When `live_cache` is None (e.g. feature flag off, minimal test
+        # wirings), every call hits REST — original behavior preserved.
+        self._live_cache: Optional["LiveMarketCache"] = live_cache
 
     async def close(self) -> None:
         if self._client is not None:
@@ -142,9 +162,24 @@ class CLOBClient:
                 continue
         return out or None
 
-    async def get_mid(self, token_id: str) -> Optional[float]:
+    async def get_mid(
+        self, token_id: str, *, prefer_live: bool = True,
+    ) -> Optional[float]:
         if not token_id:
             return None
+        # Cycle 26: read-through cache. Skip when (a) feature-flag-off
+        # (cache is None), (b) caller pinned `prefer_live=False` because
+        # it needs an authoritative REST mid (e.g. impact_tracker post-
+        # trade drift measurement), or (c) the cached tick is stale or
+        # has no mid yet — fall through to REST in all cases.
+        if prefer_live and self._live_cache is not None:
+            tick = self._live_cache.get(token_id)
+            if (
+                tick is not None
+                and tick.mid is not None
+                and self._live_cache.is_fresh(tick)
+            ):
+                return tick.mid
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self._timeout)
         url = f"{self._base_url}/midpoint"
@@ -173,7 +208,7 @@ class CLOBClient:
         return None
 
     async def get_top_of_book(
-        self, token_id: str
+        self, token_id: str, *, prefer_live: bool = True,
     ) -> Optional[tuple[float, float]]:
         """Return `(best_bid, best_ask)` from `GET /book?token_id=<id>`.
 
@@ -190,6 +225,16 @@ class CLOBClient:
         """
         if not token_id:
             return None
+        # Cycle 26: read-through cache. Same opt-out shape as `get_mid`.
+        if prefer_live and self._live_cache is not None:
+            tick = self._live_cache.get(token_id)
+            if (
+                tick is not None
+                and tick.best_bid is not None
+                and tick.best_ask is not None
+                and self._live_cache.is_fresh(tick)
+            ):
+                return (tick.best_bid, tick.best_ask)
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self._timeout)
         url = f"{self._base_url}/book"

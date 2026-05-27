@@ -299,3 +299,127 @@ async def test_get_market_fee_rate_still_works_after_cycle13_refactor():
     c = CLOBClient(base_url="http://x")
     _install(c, _Mock(body=_ok_market(taker_base_fee=1000, minimum_order_size=5)))
     assert await c.get_market_fee_rate("0xabc") == pytest.approx(0.10)
+
+
+# -------------------------------------------------------------------------
+# Cycle 26: LiveMarketCache read-through behavior
+# -------------------------------------------------------------------------
+
+import time as _time  # noqa: E402
+
+from app.live_market_cache import LiveMarketCache, LiveTick  # noqa: E402
+
+
+def _fresh_tick(
+    token_id: str = "tk1",
+    *,
+    mid: float | None = 0.42,
+    bid: float | None = 0.40,
+    ask: float | None = 0.44,
+    age_s: float = 0.0,
+) -> LiveTick:
+    return LiveTick(
+        token_id=token_id,
+        mid=mid,
+        best_bid=bid,
+        best_ask=ask,
+        last_trade=None,
+        updated_at=_time.monotonic() - age_s,
+        sequence=1,
+    )
+
+
+async def test_get_mid_returns_cached_value_without_http_when_fresh():
+    cache = LiveMarketCache(stale_after_s=5.0)
+    cache.set_tick(_fresh_tick(mid=0.55))
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body=_ok_midpoint(0.99))  # would dominate if REST runs
+    _install(c, mock)
+    assert await c.get_mid("tk1") == pytest.approx(0.55)
+    # Cache hit: no HTTP made.
+    assert mock.calls == []
+
+
+async def test_get_mid_falls_through_to_rest_when_cache_stale():
+    cache = LiveMarketCache(stale_after_s=0.01)
+    cache.set_tick(_fresh_tick(mid=0.55, age_s=5.0))  # well past stale
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body=_ok_midpoint(0.30))
+    _install(c, mock)
+    assert await c.get_mid("tk1") == pytest.approx(0.30)
+    assert mock.calls == [("http://x/midpoint", {"token_id": "tk1"})]
+
+
+async def test_get_mid_falls_through_to_rest_when_cache_missing_token():
+    cache = LiveMarketCache(stale_after_s=5.0)
+    # No tick for tk1.
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body=_ok_midpoint(0.30))
+    _install(c, mock)
+    assert await c.get_mid("tk1") == pytest.approx(0.30)
+    assert len(mock.calls) == 1
+
+
+async def test_get_mid_prefer_live_false_skips_cache():
+    """impact_tracker passes prefer_live=False to ensure REST is the
+    source. The cache must be ignored even when it has a fresh tick."""
+    cache = LiveMarketCache(stale_after_s=5.0)
+    cache.set_tick(_fresh_tick(mid=0.55))
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body=_ok_midpoint(0.30))
+    _install(c, mock)
+    assert await c.get_mid("tk1", prefer_live=False) == pytest.approx(0.30)
+    assert mock.calls == [("http://x/midpoint", {"token_id": "tk1"})]
+
+
+async def test_get_mid_no_cache_attached_is_pure_rest_path():
+    """Default constructor (no live_cache=) preserves cycle-10 behavior
+    so every existing test wiring keeps working."""
+    c = CLOBClient(base_url="http://x")  # no live_cache
+    mock = _Mock(body=_ok_midpoint(0.42))
+    _install(c, mock)
+    assert await c.get_mid("tk1") == pytest.approx(0.42)
+
+
+async def test_get_mid_cache_tick_with_no_mid_falls_through():
+    """A tick that has bid/ask but no mid (e.g. crossed book) must
+    not be returned — REST is the safety net."""
+    cache = LiveMarketCache(stale_after_s=5.0)
+    cache.set_tick(_fresh_tick(mid=None))
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body=_ok_midpoint(0.42))
+    _install(c, mock)
+    assert await c.get_mid("tk1") == pytest.approx(0.42)
+    assert len(mock.calls) == 1
+
+
+# get_top_of_book read-through
+
+
+async def test_get_top_of_book_returns_cached_when_fresh():
+    cache = LiveMarketCache(stale_after_s=5.0)
+    cache.set_tick(_fresh_tick(bid=0.40, ask=0.44))
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body={"bids": [{"price": "0.10"}], "asks": [{"price": "0.90"}]})
+    _install(c, mock)
+    assert await c.get_top_of_book("tk1") == (0.40, 0.44)
+    assert mock.calls == []
+
+
+async def test_get_top_of_book_falls_through_when_cache_incomplete():
+    cache = LiveMarketCache(stale_after_s=5.0)
+    cache.set_tick(_fresh_tick(bid=0.40, ask=None))  # half-populated
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body={"bids": [{"price": "0.30"}], "asks": [{"price": "0.50"}]})
+    _install(c, mock)
+    assert await c.get_top_of_book("tk1") == (0.30, 0.50)
+
+
+async def test_get_top_of_book_prefer_live_false_skips_cache():
+    cache = LiveMarketCache(stale_after_s=5.0)
+    cache.set_tick(_fresh_tick(bid=0.40, ask=0.44))
+    c = CLOBClient(base_url="http://x", live_cache=cache)
+    mock = _Mock(body={"bids": [{"price": "0.30"}], "asks": [{"price": "0.50"}]})
+    _install(c, mock)
+    assert await c.get_top_of_book("tk1", prefer_live=False) == (0.30, 0.50)
+    assert len(mock.calls) == 1

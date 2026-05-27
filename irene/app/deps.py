@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:  # avoid import cycles at runtime
     from app.bus import Bus
     from app.clob import CLOBClient
+    from app.clob_ws_pool import ClobWsPool
     from app.config import Config
     from app.db import DB
     from app.embed import Embedder
@@ -53,3 +54,9 @@ class StageDeps:
     # Polymarket CLOB client — pure resource (no tables). Used by
     # trade.py (entry mid) and closer.py (exit mid).
     clob: Optional["CLOBClient"] = None
+    # Cycle 26: sharded WebSocket pool feeding the LiveMarketCache that
+    # CLOBClient reads through. MarketsStage owns the subscription set
+    # (drives `subscribe`/`unsubscribe` from each `poll_once`). When
+    # None (default; `cfg.markets.enable_ws_feed=False`), the cache
+    # stays empty and every CLOB read goes to REST.
+    ws_pool: Optional["ClobWsPool"] = None

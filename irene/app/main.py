@@ -54,6 +54,8 @@ from app.ai import AIClient
 from app.budget import Budget
 from app.bus import InProcBus
 from app.clob import CLOBClient
+from app.clob_ws_pool import ClobWsPool
+from app.live_market_cache import LiveMarketCache
 from app.config import Config, ConfigManager, load_config
 from app.cycle import set_cycle_id
 from app.db import DB
@@ -69,6 +71,7 @@ from app.stages.dkg_trade import DKGTradeStage
 # constraint for link.py — it references events(id) via FK, so eventize
 # must register before link.) Keep the explicit ordering below; do not
 # resort alphabetically.
+from app.stages.explorer import ExplorerStage
 from app.stages.extract import ExtractStage
 from app.stages.eventize import EventizeStage
 from app.stages.link import LinkerStage
@@ -76,18 +79,27 @@ from app.stages.impact_tracker import ImpactTrackerStage
 from app.stages.ingest import IngestStage
 from app.stages.markets import MarketIndex, MarketsStage
 from app.stages.match import MatchStage
+from app.stages.odds_capture import OddsCaptureStage
 from app.stages.resolve import ResolveStage
 from app.stages.trade import TradeStage
 from app.topics import (
     TOPIC_ARTICLE_DEDUPED,
     TOPIC_ARTICLE_INGESTED,
     TOPIC_EVENT_UPDATED,
+    TOPIC_EXPLORATION_CREATED,
     TOPIC_EXTRACTION_COMPLETED,
     TOPIC_MARKET_LINKS_UPDATED,
     TOPIC_RESOLUTION_COMPLETED,
     TOPIC_SIGNAL_CREATED,
     TOPIC_TRADE_DECIDED,
 )
+
+# IRENE_MODE = "production" (default) wires the trade-path stages
+# (trade, dkg_trade, closer, impact_tracker, dashboard). IRENE_MODE =
+# "explorer" wires the noisy-exploration stages (explorer, odds_capture)
+# instead and skips dashboard. See plan-out-a-major-moonlit-kitten.md.
+MODE_PRODUCTION = "production"
+MODE_EXPLORER = "explorer"
 
 logger = logging.getLogger(__name__)
 
@@ -144,6 +156,13 @@ class Pipeline:
 
     Carries enough handle state for a clean shutdown — main.py simply
     iterates `stages_in_stop_order` and calls `.stop()` on each.
+
+    Cycle 25 (noisy-exploration): trade-path stages (trade / closer /
+    impact_tracker / dkg_trade) and explorer-path stages (explorer /
+    odds_capture) are now all Optional. Production mode constructs the
+    trade-path; explorer mode constructs the explorer-path. The shared
+    head (markets / ingest / dedupe / match / extract / resolve /
+    eventize / link) runs in both modes.
     """
 
     def __init__(
@@ -153,56 +172,58 @@ class Pipeline:
         ingest: IngestStage,
         dedupe: DedupeStage,
         match: MatchStage,
-        trade: TradeStage,
-        closer: CloserStage,
         extract: ExtractStage,
         resolve: ResolveStage,
         eventize: EventizeStage,
         link: LinkerStage,
-        impact_tracker: ImpactTrackerStage,
+        # Trade-path (production mode) — Optional so explorer mode
+        # can leave them unset.
+        trade: Optional[TradeStage] = None,
+        closer: Optional[CloserStage] = None,
+        impact_tracker: Optional[ImpactTrackerStage] = None,
         dkg_trade: Optional["DKGTradeStage"] = None,
+        # Explorer-path (explorer mode) — Optional in production.
+        explorer: Optional[ExplorerStage] = None,
+        odds_capture: Optional[OddsCaptureStage] = None,
     ) -> None:
         self.markets = markets
         self.ingest = ingest
         self.dedupe = dedupe
         self.match = match
-        self.trade = trade
-        self.closer = closer
         self.extract = extract
         self.resolve = resolve
         self.eventize = eventize
         self.link = link
+        self.trade = trade
+        self.closer = closer
         self.impact_tracker = impact_tracker
         # P3 chunk 3 (workstream B): DKG trade path. Optional in the
         # ctor so older test wirings that pre-date this param keep
         # working; production wiring (wire_pipeline) always sets it.
         self.dkg_trade = dkg_trade
+        # Cycle 25: noisy-exploration stages.
+        self.explorer = explorer
+        self.odds_capture = odds_capture
 
     @property
     def start_order(self) -> tuple:
-        # P2: extract is wired alongside match on article.deduped.
-        # P3 chunk 1: resolve subscribes to extraction.completed.
-        # P3 chunk 3 (workstream A): eventize subscribes to
-        # resolution.completed; link subscribes to event.updated. Together
-        # they finish the DKG pipeline live (extract → resolve → eventize
-        # → link → market_links). Trade path does not read market_links
-        # yet (workstream B wires that).
-        # Impact tracker (observability): subscribes to trade.decided and
-        # polls CLOB at +1m/5m/15m/30m/60m. Pure diagnostic — never feeds
-        # the trade path (docs/philosophy.md "we don't predict; we
-        # verify the speed thesis holds via this data").
-        # P3 chunk 3 (workstream B): dkg_trade is started AFTER link so
-        # `market_links.updated` has a producer before the subscriber
-        # turns on. Filtered out when unset so older test wirings that
-        # don't construct it continue to boot.
-        stages = (
+        # Shared head (both modes): markets → ingest → dedupe → match →
+        # extract → resolve → eventize → link.
+        stages: tuple = (
             self.markets, self.ingest, self.dedupe, self.match,
-            self.trade, self.closer, self.extract, self.resolve,
-            self.eventize, self.link,
-            self.impact_tracker,
+            self.extract, self.resolve, self.eventize, self.link,
         )
-        if self.dkg_trade is not None:
-            stages = stages + (self.dkg_trade,)
+        # Production tail: trade → closer → impact_tracker → dkg_trade.
+        for stage in (self.trade, self.closer, self.impact_tracker,
+                      self.dkg_trade):
+            if stage is not None:
+                stages = stages + (stage,)
+        # Explorer tail: explorer → odds_capture. odds_capture goes
+        # AFTER explorer so its bus subscription is live before any
+        # `TOPIC_EXPLORATION_CREATED` event could be published.
+        for stage in (self.explorer, self.odds_capture):
+            if stage is not None:
+                stages = stages + (stage,)
         return stages
 
     @property
@@ -219,12 +240,24 @@ def wire_pipeline(
     ai: AIClient,
     budget: Budget,
     clob: Optional[CLOBClient] = None,
+    ws_pool: Optional[ClobWsPool] = None,
+    mode: str = MODE_PRODUCTION,
 ) -> Pipeline:
     """Construct every stage and register their subscriptions.
 
     Returns the `Pipeline` handle. Caller is responsible for `bus.start()`
     + `stage.start()` calls (this function only wires; it doesn't run).
+
+    `mode='production'` (default) wires the trade-path stages. `mode=
+    'explorer'` wires the noisy-exploration stages (explorer +
+    odds_capture) instead. The shared head (markets → … → link) runs
+    in both modes.
     """
+    if mode not in (MODE_PRODUCTION, MODE_EXPLORER):
+        raise ValueError(
+            f"unknown IRENE_MODE={mode!r} — expected "
+            f"{MODE_PRODUCTION!r} or {MODE_EXPLORER!r}"
+        )
     base_deps = StageDeps(
         db=db,
         bus=bus,
@@ -233,6 +266,7 @@ def wire_pipeline(
         ai=ai,
         budget=budget,
         clob=clob,
+        ws_pool=ws_pool,
     )
     markets = MarketsStage(base_deps)
 
@@ -249,11 +283,6 @@ def wire_pipeline(
     ingest = IngestStage(full_deps)
     dedupe = DedupeStage(full_deps)
     match = MatchStage(full_deps)
-    trade = TradeStage(full_deps)
-    # Closer needs `deps.clob`; if `clob is None`, construction raises and
-    # the boot fails loudly — a paper-trading bot without a price source
-    # can't reason about exits.
-    closer = CloserStage(full_deps)
     # Extract (P2) needs `deps.budget`. It runs alongside match on the
     # same `article.deduped` topic — the bus fans out to both subscribers.
     extract = ExtractStage(full_deps)
@@ -269,6 +298,45 @@ def wire_pipeline(
     # candidates to `market_links`. `start()` loads ALL market embeddings
     # into memory — takes a beat at boot. Owns `market_links`.
     link = LinkerStage(full_deps)
+
+    # Subscriptions MUST be registered before bus.start() — the bus
+    # rejects late subscribers (catches the wiring bug where a stage
+    # silently misses messages).
+    bus.subscribe(TOPIC_ARTICLE_INGESTED, dedupe.handle)
+    bus.subscribe(TOPIC_ARTICLE_DEDUPED, match.handle)
+    bus.subscribe(TOPIC_ARTICLE_DEDUPED, extract.handle)
+    bus.subscribe(TOPIC_EXTRACTION_COMPLETED, resolve.handle)
+    bus.subscribe(TOPIC_RESOLUTION_COMPLETED, eventize.handle)
+    bus.subscribe(TOPIC_EVENT_UPDATED, link.handle)
+
+    if mode == MODE_EXPLORER:
+        # Noisy-exploration tail. Permissive DKG-score floor + cheap
+        # LLM relatedness check → exploration row → 30-min odds capture
+        # window. No trades, no dashboard, no PnL pretense. See
+        # `irene/app/stages/explorer.py` for the full design.
+        explorer = ExplorerStage(full_deps)
+        odds_capture = OddsCaptureStage(full_deps)
+        bus.subscribe(TOPIC_MARKET_LINKS_UPDATED, explorer.handle)
+        bus.subscribe(TOPIC_EXPLORATION_CREATED, odds_capture.handle)
+        return Pipeline(
+            markets=markets,
+            ingest=ingest,
+            dedupe=dedupe,
+            match=match,
+            extract=extract,
+            resolve=resolve,
+            eventize=eventize,
+            link=link,
+            explorer=explorer,
+            odds_capture=odds_capture,
+        )
+
+    # Production tail.
+    trade = TradeStage(full_deps)
+    # Closer needs `deps.clob`; if `clob is None`, construction raises and
+    # the boot fails loudly — a paper-trading bot without a price source
+    # can't reason about exits.
+    closer = CloserStage(full_deps)
     # Impact tracker (observability): subscribes to trade.decided. Polls
     # CLOB at +1m/5m/15m/30m/60m to measure whether the price moved the
     # way we bet. Pure diagnostic; never reads back into the trade path.
@@ -281,16 +349,7 @@ def wire_pipeline(
     # tracker via TOPIC_TRADE_DECIDED.
     dkg_trade = DKGTradeStage(full_deps)
 
-    # Subscriptions MUST be registered before bus.start() — the bus
-    # rejects late subscribers (catches the wiring bug where a stage
-    # silently misses messages).
-    bus.subscribe(TOPIC_ARTICLE_INGESTED, dedupe.handle)
-    bus.subscribe(TOPIC_ARTICLE_DEDUPED, match.handle)
-    bus.subscribe(TOPIC_ARTICLE_DEDUPED, extract.handle)
     bus.subscribe(TOPIC_SIGNAL_CREATED, trade.handle)
-    bus.subscribe(TOPIC_EXTRACTION_COMPLETED, resolve.handle)
-    bus.subscribe(TOPIC_RESOLUTION_COMPLETED, eventize.handle)
-    bus.subscribe(TOPIC_EVENT_UPDATED, link.handle)
     bus.subscribe(TOPIC_TRADE_DECIDED, impact_tracker.handle)
     bus.subscribe(TOPIC_MARKET_LINKS_UPDATED, dkg_trade.handle)
 
@@ -320,7 +379,17 @@ async def main() -> int:
     cfg = load_config(config_path)
     _setup_logging(cfg.irene.log_level)
 
-    logger.info("irene boot starting (config=%s)", config_path)
+    mode = os.environ.get("IRENE_MODE", MODE_PRODUCTION).strip().lower()
+    if mode not in (MODE_PRODUCTION, MODE_EXPLORER):
+        logger.warning(
+            "irene: unknown IRENE_MODE=%r — falling back to %r",
+            mode, MODE_PRODUCTION,
+        )
+        mode = MODE_PRODUCTION
+
+    logger.info(
+        "irene boot starting (config=%s mode=%s)", config_path, mode
+    )
 
     cfg_mgr = ConfigManager(config_path)
     await cfg_mgr.start()
@@ -337,7 +406,28 @@ async def main() -> int:
     embedder = Embedder(cfg.embedder.name, cfg.embedder.dim)
     budget = _build_budget(cfg)
     ai = AIClient(db=db, budget=budget, config=cfg)
-    clob = CLOBClient(base_url=cfg.clob.base_url, timeout_seconds=cfg.clob.timeout_seconds)
+    # Cycle 26: optional WebSocket live feed. The cache is constructed
+    # unconditionally (so CLOBClient holds a stable reference) but stays
+    # empty when `enable_ws_feed=False` — every read then falls through
+    # to REST exactly as in cycle 25. Pool construction is gated; when
+    # off, `wire_pipeline` receives `ws_pool=None` and MarketsStage's
+    # `_sync_ws_subscriptions` is a no-op.
+    live_cache: Optional[LiveMarketCache] = None
+    ws_pool: Optional[ClobWsPool] = None
+    if cfg.markets.enable_ws_feed:
+        live_cache = LiveMarketCache(
+            stale_after_s=cfg.markets.ws_stale_after_seconds,
+        )
+        ws_pool = ClobWsPool(
+            live_cache,
+            chunk_size=cfg.markets.ws_subscription_chunk_size,
+            max_subscriptions=cfg.markets.ws_max_subscriptions,
+        )
+    clob = CLOBClient(
+        base_url=cfg.clob.base_url,
+        timeout_seconds=cfg.clob.timeout_seconds,
+        live_cache=live_cache,
+    )
     # Cycle 23: refuse to start if the CLOB client is somehow None while
     # execution_enabled is True. Belt-and-braces — the unconditional
     # construction above means this should be unreachable, but the assert
@@ -345,7 +435,10 @@ async def main() -> int:
     # (e.g. "skip clob in tests / paper mode"). The kill-switch escape
     # hatch (`IRENE_TRADE__EXECUTION_ENABLED=false`) lets you boot without
     # clob if you genuinely need to.
-    if cfg.trade.execution_enabled and clob is None:
+    # Explorer mode never trades — skip the production-only assertion so
+    # an explorer container with `trade.execution_enabled=false` (and no
+    # need for the production trade-path wiring) boots cleanly.
+    if mode == MODE_PRODUCTION and cfg.trade.execution_enabled and clob is None:
         raise RuntimeError(
             "CLOBClient construction returned None but trade.execution_enabled "
             "is True. Refusing to start — fix the clob wiring or set "
@@ -354,26 +447,32 @@ async def main() -> int:
     bus = InProcBus()
 
     pipeline = wire_pipeline(
-        db=db, bus=bus, cfg=cfg, embedder=embedder, ai=ai, budget=budget, clob=clob,
+        db=db, bus=bus, cfg=cfg, embedder=embedder, ai=ai, budget=budget,
+        clob=clob, ws_pool=ws_pool, mode=mode,
     )
 
-    # Dashboard runs in the background, writing text panels every
-    # interval_secs. Self-contained; reads the DB but never writes.
-    # Dashboard directory derives from the DB path so dev runs with
-    # `:memory:` route to /tmp and don't try to write to /data (which
-    # only the container has permissions for).
-    if cfg.db.path == ":memory:":
-        dashboard_dir = "/tmp/irene_dashboard"
-    else:
-        dashboard_dir = str(Path(cfg.db.path).parent / "dashboard")
-    dashboard = Dashboard(
-        data_dir=dashboard_dir,
-        db=db,
-        interval_secs=30,
-        budget=budget,
-        cfg=cfg,
-        current_cycle_id=cycle_id,
-    )
+    # Dashboard runs in production mode only. The explorer is a research
+    # dataset producer; its progress is visible via the `explorations`
+    # and `odds_observations` tables, not a text dashboard.
+    dashboard: Optional[Dashboard] = None
+    if mode == MODE_PRODUCTION:
+        # Dashboard runs in the background, writing text panels every
+        # interval_secs. Self-contained; reads the DB but never writes.
+        # Dashboard directory derives from the DB path so dev runs with
+        # `:memory:` route to /tmp and don't try to write to /data (which
+        # only the container has permissions for).
+        if cfg.db.path == ":memory:":
+            dashboard_dir = "/tmp/irene_dashboard"
+        else:
+            dashboard_dir = str(Path(cfg.db.path).parent / "dashboard")
+        dashboard = Dashboard(
+            data_dir=dashboard_dir,
+            db=db,
+            interval_secs=30,
+            budget=budget,
+            cfg=cfg,
+            current_cycle_id=cycle_id,
+        )
 
     # Only start the OpenRouter poll if we have a credential — a blank
     # key would loop on 401s and clutter the boot log.
@@ -383,11 +482,13 @@ async def main() -> int:
     await bus.start()
     for stage in pipeline.start_order:
         await stage.start()
-    dashboard._task = asyncio.create_task(dashboard.run())
+    if dashboard is not None:
+        dashboard._task = asyncio.create_task(dashboard.run())
 
     logger.info(
-        "irene boot OK, %d stages wired (cycle=%s id=%d db=%s budget=%s extract=shadow resolve=shadow eventize=shadow link=shadow impact=tracking)",
+        "irene boot OK, %d stages wired (mode=%s cycle=%s id=%d db=%s budget=%s)",
         len(pipeline.start_order),
+        mode,
         cfg.irene.cycle,
         cycle_id,
         cfg.db.path,
@@ -403,7 +504,8 @@ async def main() -> int:
         await stop
     finally:
         logger.info("irene shutting down")
-        await dashboard.stop()
+        if dashboard is not None:
+            await dashboard.stop()
         for stage in pipeline.stop_order:
             try:
                 await stage.stop()

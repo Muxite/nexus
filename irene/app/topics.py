@@ -34,6 +34,10 @@ TOPIC_EXTRACTION_COMPLETED = "extraction.completed"
 TOPIC_RESOLUTION_COMPLETED = "resolution.completed"
 TOPIC_EVENT_UPDATED = "event.updated"
 TOPIC_MARKET_LINKS_UPDATED = "market_links.updated"
+# Explorer-mode topic — emitted by explorer.py after a relatedness=True
+# decision; subscribed by odds_capture.py to start the [-10m, +20m]
+# odds time-series capture. Never published in production wiring.
+TOPIC_EXPLORATION_CREATED = "exploration.created"
 
 # Telemetry topics (best-effort; dropped first under back-pressure) ---------
 

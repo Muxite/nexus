@@ -229,6 +229,44 @@ class CLOBSection(BaseModel):
     timeout_seconds: float = Field(default=5.0, gt=0)
 
 
+class MarketsSection(BaseModel):
+    """MarketsStage discovery + live-feed config.
+
+    Pre-cycle-26 the stage read its knobs through `_config_get`'s
+    duck-typed lookup; the section is introduced now because the
+    events-endpoint and WebSocket-feed rollout needs honest typed flags.
+    Existing knobs (`poll_seconds`, `embed_refresh_seconds`,
+    `resolution_poll_seconds`, `market_info_refresh_hours`,
+    `resolution_timeout_hours`, `dead_market_force_close_hours`) keep
+    their pre-section defaults so a deploy without `markets:` in YAML
+    behaves identically.
+    """
+
+    poll_seconds: int = Field(default=120, ge=1)
+    embed_refresh_seconds: int = Field(default=3600, ge=1)
+    resolution_poll_seconds: int = Field(default=600, ge=1)
+    market_info_refresh_hours: float = Field(default=168.0, ge=0.0)
+    resolution_timeout_hours: float = Field(default=168.0, ge=0.0)
+    dead_market_force_close_hours: float = Field(default=24.0, ge=0.0)
+
+    # Cycle 26: switch primary market discovery to Gamma's `/events`
+    # endpoint. `/markets` is capped at offset=10_000 by Gamma; events
+    # bundle their associated markets and have a much smaller universe,
+    # so the cap stops mattering. Defaults keep the old behavior; the
+    # dual-read flag layers events on top of markets without removing
+    # the safety net.
+    use_events_endpoint: bool = False
+    events_endpoint_dual_read: bool = True
+
+    # Cycle 26: WebSocket live-feed for CLOB orderbook/midpoint reads.
+    # All three knobs are inert when `enable_ws_feed=False` (default).
+    # See `app/clob_ws_pool.py` and `app/live_market_cache.py`.
+    enable_ws_feed: bool = False
+    ws_subscription_chunk_size: int = Field(default=500, ge=1)
+    ws_max_subscriptions: int = Field(default=20000, ge=1)
+    ws_stale_after_seconds: float = Field(default=5.0, gt=0.0)
+
+
 class CloserSection(BaseModel):
     """Position-closer poll cadence + close rules.
 
@@ -267,6 +305,49 @@ class ImpactSection(BaseModel):
     # cycle 11 so the new +24h long-tail bucket has time to fire
     # (impact_tracker.py BUCKETS_SECONDS now ends at 86400s).
     max_age_hours: float = Field(default=24.0, gt=0)
+
+
+class ExplorerSection(BaseModel):
+    """Noisy-exploration mode — `IRENE_MODE=explorer` sister container.
+
+    The explorer reuses ingest → match → DKG link scoring, then runs a
+    cheap LLM relatedness check and captures Polymarket odds in a
+    [-10m, +20m] window around the article. It writes ONLY to the new
+    `explorations` + `odds_observations` tables; production tables
+    (trades / decisions / wallet) are read-only from the explorer's
+    perspective. Cycle-25 dual-container hazard (see
+    project_dual_container memo) is honored by partitioning all
+    explorer rows under `IRENE_CYCLE=explorer-*` cycle_ids.
+
+    Defaults are permissive on admission and cheap on LLM cost — the
+    goal is a labeled dataset for offline filter/hypothesis backtests,
+    not positive PnL.
+    """
+
+    # Lower than `dkg_trade.score_floor` (0.8) so borderline cases that
+    # production would discard still produce a row we can learn from.
+    score_floor: float = Field(default=0.5, ge=0.0, le=1.0)
+    # OpenRouter model for the relatedness call. Kept on gemini-2.5-flash
+    # per `feedback_models.md` memory — cost savings come from a much
+    # shorter prompt + 80-token cap on output, not a cheaper model.
+    relatedness_model: str = "google/gemini-2.5-flash"
+    # Char cap on the article body slice fed to the relatedness prompt.
+    # ~800 chars ≈ 200 tokens of body; well under the relatedness budget.
+    relatedness_max_article_chars: int = Field(default=800, ge=100, le=4000)
+    # Max tokens the relatedness call is allowed to emit. 80 is enough
+    # for {"related": true, "confidence": 0.9, "reason": "<≤30 words>"}.
+    relatedness_max_output_tokens: int = Field(default=80, ge=8, le=512)
+    # Forward odds poll cadence (seconds). 15s gives ~80 ticks across the
+    # 20-minute post-news window — fine-grained enough to see early
+    # repricing without hammering the CLOB.
+    odds_poll_secs: int = Field(default=15, ge=1, le=300)
+    # Post-news capture window (seconds). 1200 = 20 minutes.
+    capture_post_secs: int = Field(default=1200, ge=60, le=86400)
+    # Pre-news lookback window (seconds). 600 = 10 minutes. Used to
+    # filter `clob.get_price_history` samples at handle-time. The API
+    # fidelity is coarse — most explorations get 1-2 pre-news points,
+    # some get none (NULL data is honest).
+    capture_pre_secs: int = Field(default=600, ge=60, le=86400)
 
 
 class DKGTradeSection(BaseModel):
@@ -427,8 +508,10 @@ class Config(BaseModel):
     match: MatchSection = Field(default_factory=MatchSection)
     trade: TradeSection = Field(default_factory=TradeSection)
     dkg_trade: DKGTradeSection = Field(default_factory=DKGTradeSection)
+    explorer: ExplorerSection = Field(default_factory=ExplorerSection)
     clob: CLOBSection = Field(default_factory=CLOBSection)
     closer: CloserSection = Field(default_factory=CloserSection)
+    markets: MarketsSection = Field(default_factory=MarketsSection)
     extract: ExtractSection = Field(default_factory=ExtractSection)
     impact: ImpactSection = Field(default_factory=ImpactSection)
 

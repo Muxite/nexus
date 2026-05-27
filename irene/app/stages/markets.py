@@ -32,12 +32,9 @@ registered with `db.register_schema()` at import time.
   `similarity >= floor`, sorted by descending similarity. Empty index ⇒ `[]`.
 
 **Documented exception to modularization rule 5** ("no shared mutable
-state across messages"). `MarketIndex` is process-local mutable state by
-design: cosine math wants ndarray locality, and rebuilding the matrix per
-query would dominate the match-stage budget. The state lives on a
-`MarketIndex` INSTANCE — not at module scope — and mutation is guarded by
-an `asyncio.Lock`. This exception is named in `docs/modularization.md`
-rule 5; no other stage adds a similar exception without a reports/ entry.
+state across messages"). `MarketIndex` (now in `market_index.py`) is
+process-local mutable state by design. See that module's docstring for
+the full rationale; it is named in `docs/modularization.md` rule 5.
 
 **Side effects.**
 - HTTP GET to `https://gamma-api.polymarket.com/markets` (paged 100/req).
@@ -71,7 +68,6 @@ import json
 import logging
 import os
 import random
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -91,6 +87,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _GAMMA_URL = "https://gamma-api.polymarket.com/markets"
+# Cycle 26: events endpoint — bundles markets per Polymarket-event and
+# bypasses the offset=10_000 cap that `/markets` enforces, because the
+# events universe is ~3-4× smaller. Same pagination shape (limit/offset,
+# 422-as-EOP guard).
+_GAMMA_EVENTS_URL = "https://gamma-api.polymarket.com/events"
 _GAMMA_PAGE_SIZE = 100
 _GAMMA_MAX_PAGES = 1000  # ~100k markets hard ceiling; current universe ~50k
 _GAMMA_TIMEOUT_SECONDS = 15.0
@@ -200,6 +201,21 @@ _MARKETS_DDL = [
     # status columns above record WHEN we transitioned, this records WHAT
     # the final payout is. NULL = never observed.
     "ALTER TABLE markets ADD COLUMN last_outcome_prices TEXT",
+    # Cycle 26: Polymarket-event grouping discovered via the Gamma
+    # `/events` endpoint. NULL when (a) the events endpoint is disabled,
+    # (b) the dual-read pass surfaced this market only via `/markets`, or
+    # (c) the market is event-less on Polymarket's side. `polymarket_*`
+    # prefix because the `events` TABLE (owned by eventize.py) holds
+    # article-cluster events — a name collision here would be a footgun.
+    "ALTER TABLE markets ADD COLUMN polymarket_event_id TEXT",
+    "ALTER TABLE markets ADD COLUMN polymarket_event_slug TEXT",
+    # 0/1 flag stamped each poll: did this market appear under
+    # `/events?active=true&closed=false` on the most recent cycle?
+    # Used to log the events-vs-markets coverage gap during the
+    # dual-read shadow window before promoting `/events` to sole source.
+    "ALTER TABLE markets ADD COLUMN events_seen_in_last_poll INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_markets_polymarket_event_id "
+    "ON markets(polymarket_event_id)",
 ]
 db_module.register_schema("app/stages/markets.py", _MARKETS_DDL)
 
@@ -207,16 +223,6 @@ db_module.register_schema("app/stages/markets.py", _MARKETS_DDL)
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class MarketIndexEmbedderMismatch(RuntimeError):
-    """Raised by `MarketIndex.load()` when rows carry mixed `embedder_id`s.
-
-    A mixed state is the signature of a mid-flight model rotation; mixing
-    vector spaces in a cosine search silently returns garbage (a seulgi
-    lesson). The stage catches this, re-runs the embedding refresh, and
-    retries.
-    """
 
 
 def _now_iso() -> str:
@@ -297,7 +303,11 @@ def _hours_since(iso_ts: Optional[str], now_dt: datetime) -> Optional[float]:
     return delta.total_seconds() / 3600.0
 
 
-def _parse_gamma_row(raw: dict) -> Optional[dict]:
+def _parse_gamma_row(
+    raw: dict,
+    *,
+    event_meta: Optional[dict] = None,
+) -> Optional[dict]:
     """Pull the fields we care about out of a raw Gamma API row.
 
     Returns ``None`` when the row lacks the bare minimum (`conditionId` +
@@ -305,6 +315,11 @@ def _parse_gamma_row(raw: dict) -> Optional[dict]:
     JSON-encoded string in production responses — the seulgi-era bug where
     `clob_ids[0]` returned the single character ``"["`` is the reason we
     parse the string here rather than treating it as a list.
+
+    `event_meta` (cycle 26) is the parent event's `{"id": ..., "slug": ...}`
+    when the row was harvested from `/events`. Stamped into
+    `polymarket_event_id` / `polymarket_event_slug` on the returned dict;
+    ``None`` when the row came from `/markets`.
     """
     condition_id = raw.get("conditionId") or raw.get("condition_id") or ""
     question = raw.get("question") or ""
@@ -398,141 +413,25 @@ def _parse_gamma_row(raw: dict) -> Optional[dict]:
         "outcome_prices": outcome_prices,
         "closed": closed_flag,
         "closed_time": closed_time,
+        "polymarket_event_id": (
+            str(event_meta["id"]) if event_meta and event_meta.get("id") else None
+        ),
+        "polymarket_event_slug": (
+            str(event_meta["slug"]) if event_meta and event_meta.get("slug") else None
+        ),
     }
 
 
-# ---------------------------------------------------------------------------
-# MarketIndex (the documented rule-5 exception)
-# ---------------------------------------------------------------------------
+# MarketIndex / _IndexSnapshot / MarketIndexEmbedderMismatch live in
+# `app/stages/market_index.py` as of the cycle-26 extraction. The names
+# are re-imported into this module's namespace below so existing
+# `from app.stages.markets import MarketIndex` call sites stay valid.
+from app.stages.market_index import (  # noqa: E402
+    MarketIndex,
+    MarketIndexEmbedderMismatch,
+)
 
-
-@dataclass
-class _IndexSnapshot:
-    """Immutable view of the index used by `topk()` so a concurrent
-    `load()` can swap the live state without corrupting an in-flight search."""
-
-    condition_ids: tuple[str, ...]
-    matrix: Optional[np.ndarray]   # shape (N, dim) or None when empty
-    embedder_id: Optional[str]
-
-
-class MarketIndex:
-    """In-process cosine-search index over active market embeddings.
-
-    Process-local mutable state by design — see the module spec block for
-    the rule-5 exception.
-    """
-
-    def __init__(self, embedder, dim: int) -> None:
-        self._embedder = embedder
-        self._dim = dim
-        # The snapshot pattern: `load()` builds a fresh snapshot under the
-        # lock and atomically replaces `self._snapshot`. `topk()` reads the
-        # reference once (atomic in CPython) and works off that view.
-        self._snapshot = _IndexSnapshot(condition_ids=(), matrix=None, embedder_id=None)
-        self._lock = asyncio.Lock()
-
-    @property
-    def size(self) -> int:
-        return len(self._snapshot.condition_ids)
-
-    @property
-    def loaded_embedder_id(self) -> Optional[str]:
-        return self._snapshot.embedder_id
-
-    async def load(self, db: DB) -> int:
-        """Read every active embedded market into memory.
-
-        Returns the number of rows loaded. Raises
-        `MarketIndexEmbedderMismatch` if the active set spans more than one
-        `embedder_id` value.
-        """
-        async with self._lock:
-            cur = await db.conn.execute(
-                """
-                SELECT condition_id, embedding, embedder_id
-                FROM markets
-                WHERE active = 1
-                  AND embedding IS NOT NULL
-                  AND embedder_id IS NOT NULL
-                """
-            )
-            rows = await cur.fetchall()
-            await cur.close()
-
-            if not rows:
-                self._snapshot = _IndexSnapshot(condition_ids=(), matrix=None, embedder_id=None)
-                return 0
-
-            seen_ids = {r["embedder_id"] for r in rows}
-            if len(seen_ids) > 1:
-                raise MarketIndexEmbedderMismatch(
-                    f"markets table holds {len(seen_ids)} embedder_id values "
-                    f"({sorted(seen_ids)!r}); re-embed before loading the index"
-                )
-            (the_id,) = seen_ids
-
-            condition_ids: list[str] = []
-            vectors: list[np.ndarray] = []
-            for r in rows:
-                blob = r["embedding"]
-                vec = np.frombuffer(blob, dtype=np.float32)
-                if vec.shape[0] != self._dim:
-                    # Defensive: if a row's blob doesn't match dim, the table
-                    # has rotted somehow. Skip the row and log loudly rather
-                    # than build a matrix with a ragged stack.
-                    logger.warning(
-                        "markets: skipping %s — embedding dim=%d, expected %d",
-                        r["condition_id"], vec.shape[0], self._dim,
-                    )
-                    continue
-                condition_ids.append(r["condition_id"])
-                vectors.append(vec)
-
-            if not vectors:
-                self._snapshot = _IndexSnapshot(condition_ids=(), matrix=None, embedder_id=the_id)
-                return 0
-
-            matrix = np.stack(vectors).astype(np.float32, copy=False)
-            self._snapshot = _IndexSnapshot(
-                condition_ids=tuple(condition_ids),
-                matrix=matrix,
-                embedder_id=the_id,
-            )
-            return len(condition_ids)
-
-    def topk(
-        self,
-        query_embedding: np.ndarray,
-        k: int,
-        floor: float,
-    ) -> list[tuple[str, float]]:
-        """Return up to `k` `(condition_id, similarity)` pairs above `floor`.
-
-        Reads the live snapshot once — concurrent `load()` calls produce a
-        new snapshot reference rather than mutating the one we're reading.
-        """
-        snap = self._snapshot  # single read; atomic in CPython
-        if snap.matrix is None or len(snap.condition_ids) == 0:
-            return []
-
-        q = np.asarray(query_embedding, dtype=np.float32).reshape(-1)
-        if q.shape[0] != self._dim:
-            raise ValueError(
-                f"query embedding dim {q.shape[0]} does not match index dim {self._dim}"
-            )
-
-        scores = snap.matrix @ q
-        order = np.argsort(-scores)
-        out: list[tuple[str, float]] = []
-        for idx in order:
-            sim = float(scores[idx])
-            if sim < floor:
-                break
-            out.append((snap.condition_ids[idx], sim))
-            if len(out) >= k:
-                break
-        return out
+__all__ = ["MarketIndex", "MarketIndexEmbedderMismatch", "MarketsStage"]
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +540,10 @@ class MarketsStage:
         self._dim = dim
 
         self._client: Optional[httpx.AsyncClient] = None
+        # Cycle 26: optional WS pool. Owned by main.py; MarketsStage
+        # drives the subscription set from each poll cycle's tradable
+        # universe. None when `cfg.markets.enable_ws_feed=False`.
+        self._ws_pool = getattr(deps, "ws_pool", None)
         self._poll_task: Optional[asyncio.Task] = None
         self._embed_task: Optional[asyncio.Task] = None
         # Cycle 12: separate task that re-polls markets sitting in
@@ -678,6 +581,14 @@ class MarketsStage:
                 "markets: startup resolution-rescan failed; "
                 "periodic loop will retry"
             )
+        # Cycle 26: kick the WS pool BEFORE the poll loop fires. The
+        # first `poll_once` then drives the initial subscription set
+        # off the freshly-upserted active markets. No-op when the pool
+        # is None (feature flag off).
+        if self._ws_pool is not None:
+            await self._ws_pool.start()
+            logger.info("markets: ws pool started")
+
         self._poll_task = asyncio.create_task(self._poll_loop())
         self._embed_task = asyncio.create_task(self._embed_loop())
         # Cycle 12: closed-but-not-finalized re-poll task.
@@ -709,6 +620,11 @@ class MarketsStage:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+        # Cycle 26: tear the WS pool down AFTER the poll loops so a
+        # final in-flight `_sync_ws_subscriptions` doesn't race the
+        # pool stop. No-op when the pool is None.
+        if self._ws_pool is not None:
+            await self._ws_pool.stop()
 
     async def handle(self, payload: dict) -> None:  # noqa: ARG002
         raise NotImplementedError("MarketsStage is a poller, not a subscriber")
@@ -757,18 +673,17 @@ class MarketsStage:
 
     async def poll_once(self) -> int:
         """Run one Gamma fetch + upsert cycle. Returns the number of open
-        markets observed (0 on a network failure)."""
+        markets observed (0 on a network failure).
+
+        Cycle 26: `_fetch_universe` is the single orchestrator that owns
+        the markets-vs-events sourcing choice. `poll_once` is unchanged
+        in shape: parse → upsert → deactivate → publish.
+        """
         try:
-            raw_markets = await self._fetch_all_gamma()
+            parsed = await self._fetch_universe()
         except httpx.HTTPError as exc:
             logger.warning("markets: Gamma fetch failed (%s); skipping upsert", exc)
             return 0
-
-        parsed: list[dict] = []
-        for raw in raw_markets:
-            row = _parse_gamma_row(raw)
-            if row is not None:
-                parsed.append(row)
 
         open_ids: set[str] = set()
         for row in parsed:
@@ -777,11 +692,136 @@ class MarketsStage:
 
         await self._deactivate_missing(open_ids)
 
+        # Cycle 26: drive the WS pool's subscription set off the latest
+        # tradable universe. No-op when `cfg.markets.enable_ws_feed=False`
+        # (deps.ws_pool is None). Wrapped so a transient pool error
+        # never blocks the bus publish — the cache going stale is
+        # already a safe degradation mode (REST fallback in CLOBClient).
+        try:
+            await self._sync_ws_subscriptions()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "markets: ws subscription sync failed; "
+                "cache will degrade to REST on the affected tokens"
+            )
+
         await self._bus.publish(
             TOPIC_MARKETS_REFRESHED,
             {"count": len(parsed), "refreshed_at": _now_iso()},
         )
         return len(parsed)
+
+    async def _sync_ws_subscriptions(self) -> None:
+        """Drive the `ClobWsPool` subscribed-set to match the current
+        tradable universe (every market with `active=1`). Idempotent —
+        the pool computes the sub/unsub delta internally."""
+        if self._ws_pool is None:
+            return
+        cur = await self._db.conn.execute(
+            "SELECT token_yes, token_no FROM markets WHERE active = 1"
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        desired: set[str] = set()
+        for r in rows:
+            if r["token_yes"]:
+                desired.add(r["token_yes"])
+            if r["token_no"]:
+                desired.add(r["token_no"])
+        current = self._ws_pool.subscribed_set()
+        to_sub = desired - current
+        to_unsub = current - desired
+        if to_sub:
+            await self._ws_pool.subscribe(to_sub)
+        if to_unsub:
+            await self._ws_pool.unsubscribe(to_unsub)
+        if to_sub or to_unsub:
+            status = self._ws_pool.status()
+            logger.info(
+                "markets: ws subscriptions synced (+%d -%d) — "
+                "clients=%d total=%d",
+                len(to_sub), len(to_unsub),
+                status["clients"], status["total_subscriptions"],
+            )
+
+    async def _fetch_universe(self) -> list[dict]:
+        """Cycle 26: orchestrate the markets discovery strategy.
+
+        Three modes, controlled by `cfg.markets.use_events_endpoint` and
+        `cfg.markets.events_endpoint_dual_read`:
+
+        1. `use_events_endpoint=False` — legacy `/markets` sweep only.
+        2. `use_events_endpoint=True, dual_read=False` — `/events` sweep
+           only; safest only after dual-read telemetry has shown the
+           events endpoint covers the universe.
+        3. `use_events_endpoint=True, dual_read=True` — fetch BOTH,
+           union on `condition_id` with the events row winning on
+           conflict (so it carries the event metadata). Markets seen
+           only via `/markets` get `events_seen_in_last_poll=0`. Logs
+           a per-cycle coverage histogram. This is the default the
+           rollout sits in until promotion.
+
+        Tests monkeypatch this method or its two inputs in one place.
+        """
+        use_events = bool(_config_get(self._config, "use_events_endpoint", False))
+        dual_read = bool(_config_get(self._config, "events_endpoint_dual_read", True))
+
+        if not use_events:
+            raw_markets = await self._fetch_all_gamma()
+            parsed: list[dict] = []
+            for raw in raw_markets:
+                row = _parse_gamma_row(raw)
+                if row is not None:
+                    row["events_seen_in_last_poll"] = 0
+                    parsed.append(row)
+            return parsed
+
+        events_rows = await self._fetch_all_gamma_events()
+        from_events: dict[str, dict] = {}
+        for event_meta, raw in events_rows:
+            row = _parse_gamma_row(raw, event_meta=event_meta)
+            if row is None:
+                continue
+            row["events_seen_in_last_poll"] = 1
+            from_events[row["condition_id"]] = row
+
+        if not dual_read:
+            logger.info(
+                "markets: cycle-26 single-source via /events — %d markets",
+                len(from_events),
+            )
+            return list(from_events.values())
+
+        raw_markets = await self._fetch_all_gamma()
+        from_markets: dict[str, dict] = {}
+        for raw in raw_markets:
+            row = _parse_gamma_row(raw)
+            if row is None:
+                continue
+            from_markets[row["condition_id"]] = row
+
+        merged: dict[str, dict] = {}
+        only_events = 0
+        only_markets = 0
+        both = 0
+        for cid, row in from_events.items():
+            merged[cid] = row
+            if cid in from_markets:
+                both += 1
+            else:
+                only_events += 1
+        for cid, row in from_markets.items():
+            if cid in merged:
+                continue
+            row["events_seen_in_last_poll"] = 0
+            merged[cid] = row
+            only_markets += 1
+        logger.info(
+            "markets: cycle-26 dual-read coverage events=%d markets=%d "
+            "both=%d only_events=%d only_markets=%d",
+            len(from_events), len(from_markets), both, only_events, only_markets,
+        )
+        return list(merged.values())
 
     async def refresh_embeddings_once(self) -> int:
         """Embed every row missing an embedding OR stamped with a stale
@@ -920,7 +960,11 @@ class MarketsStage:
     # ---- helpers --------------------------------------------------------
 
     async def _gamma_get_with_backoff(
-        self, params: dict, *, max_retries: int = _GAMMA_429_MAX_RETRIES
+        self,
+        params: dict,
+        *,
+        max_retries: int = _GAMMA_429_MAX_RETRIES,
+        url: str = _GAMMA_URL,
     ) -> httpx.Response:
         """GET Gamma with Retry-After-aware backoff on 429s.
 
@@ -938,7 +982,7 @@ class MarketsStage:
         delay = _GAMMA_429_INITIAL_BACKOFF_S
         resp = None
         for attempt in range(max_retries + 1):
-            resp = await self._client.get(_GAMMA_URL, params=params)
+            resp = await self._client.get(url, params=params)
             if resp.status_code != 429:
                 return resp
             retry_after = resp.headers.get("Retry-After")
@@ -1016,6 +1060,68 @@ class MarketsStage:
         logger.info("markets: fetched %d markets from Gamma", len(markets))
         return markets
 
+    async def _fetch_all_gamma_events(self) -> list[tuple[dict, dict]]:
+        """Cycle 26: paginate Gamma's `/events?active=true&closed=false`
+        and return every (event_meta, market_row) pair.
+
+        Each event row carries a nested ``markets: [...]`` array of the
+        same shape as a `/markets` row. We flatten it here so the caller
+        can run the existing `_parse_gamma_row` over each market with
+        the parent event meta attached.
+
+        Pagination shape and 422-as-EOP guard mirror `_fetch_all_gamma`
+        — Gamma's offset cap behavior is consistent across the two
+        endpoints. Returns `[]` on a network error so the caller's
+        existing union-with-`/markets` keeps the cycle alive.
+        """
+        out: list[tuple[dict, dict]] = []
+        offset = 0
+        for _ in range(_GAMMA_MAX_PAGES):
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": str(_GAMMA_PAGE_SIZE),
+                "offset": str(offset),
+            }
+            try:
+                resp = await self._gamma_get_with_backoff(
+                    params, url=_GAMMA_EVENTS_URL
+                )
+                resp.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 422 and out:
+                    logger.info(
+                        "markets: events 422 at offset=%d — treating as "
+                        "end-of-pagination, preserving %d already-fetched "
+                        "events-markets",
+                        offset, len(out),
+                    )
+                    break
+                raise
+            page = resp.json()
+            if not isinstance(page, list) or not page:
+                break
+            for event_row in page:
+                if not isinstance(event_row, dict):
+                    continue
+                event_meta = {
+                    "id": event_row.get("id"),
+                    "slug": event_row.get("slug"),
+                }
+                nested = event_row.get("markets")
+                if not isinstance(nested, list):
+                    continue
+                for m in nested:
+                    if isinstance(m, dict):
+                        out.append((event_meta, m))
+            offset += len(page)
+            if len(page) < _GAMMA_PAGE_SIZE:
+                break
+        logger.info(
+            "markets: fetched %d markets nested under Gamma events", len(out)
+        )
+        return out
+
     async def _fetch_single_market(self, condition_id: str) -> Optional[dict]:
         """Cycle 12: fetch a single market by condition_id from Gamma.
 
@@ -1082,6 +1188,14 @@ class MarketsStage:
             closed_at_value = closed_time if closed_time else now
         else:
             closed_at_value = None
+        # Cycle 26: events-endpoint provenance. `polymarket_event_*` only
+        # overwrite NULL → non-NULL (preserves the parent event even when a
+        # single-market resolution re-poll later writes via `/markets`,
+        # which has no event metadata). `events_seen_in_last_poll` is per-
+        # cycle telemetry; always reflect the latest observation.
+        event_id = row.get("polymarket_event_id")
+        event_slug = row.get("polymarket_event_slug")
+        events_seen = int(row.get("events_seen_in_last_poll") or 0)
         async with self._db.batch() as cur:
             await cur.execute(
                 """
@@ -1089,8 +1203,10 @@ class MarketsStage:
                     condition_id, slug, question, description, category,
                     end_date, volume_usdc, token_yes, token_no,
                     active, closed_at, first_seen_at, updated_at,
-                    last_resolution_status, last_outcome_prices
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    last_resolution_status, last_outcome_prices,
+                    polymarket_event_id, polymarket_event_slug,
+                    events_seen_in_last_poll
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_id) DO UPDATE SET
                     slug = excluded.slug,
                     question = excluded.question,
@@ -1100,6 +1216,13 @@ class MarketsStage:
                     volume_usdc = excluded.volume_usdc,
                     token_yes = excluded.token_yes,
                     token_no = excluded.token_no,
+                    polymarket_event_id = COALESCE(
+                        markets.polymarket_event_id, excluded.polymarket_event_id
+                    ),
+                    polymarket_event_slug = COALESCE(
+                        markets.polymarket_event_slug, excluded.polymarket_event_slug
+                    ),
+                    events_seen_in_last_poll = excluded.events_seen_in_last_poll,
                     -- Cycle 24: markets do not re-open after closing on
                     -- Polymarket. If we already have a historical
                     -- `closed_at`, force `active=0` regardless of what
@@ -1144,6 +1267,9 @@ class MarketsStage:
                     now,
                     row.get("uma_resolution_status"),
                     outcome_json,
+                    event_id,
+                    event_slug,
+                    events_seen,
                 ),
             )
         # Cycle 11: stamp UMA resolution state transitions. Only set the
@@ -1409,6 +1535,16 @@ class MarketsStage:
         from app.stages.closer import write_trade_closure  # noqa: WPS433
 
         timeout_hours = float(_config_get(self._config, "resolution_timeout_hours", 168.0))
+        # Cycle 25-A: dead-market force-close. State 1 (closed_at set, no
+        # UMA finalization) used to wait forever then emit a
+        # RESOLUTION_TIMEOUT warning. We now actively close at entry_mid
+        # once a market has been closed long enough that UMA isn't going
+        # to deliver a real payout. Default 24h: well past the 2h
+        # uncontested challenge window, short enough that the bot
+        # un-sticks within a day.
+        force_close_hours = float(
+            _config_get(self._config, "dead_market_force_close_hours", 24.0)
+        )
         now_dt = datetime.now(timezone.utc)
 
         written = 0
@@ -1498,23 +1634,56 @@ class MarketsStage:
                     )
                     continue
 
-                # State 1: closed but no UMA status yet. Check the
-                # human-review timeout against the market's closed_at
-                # (when the row went inactive). Fall back to the trade's
-                # decided_at if closed_at is somehow NULL.
+                # State 1: closed but no UMA status yet. Check timeouts
+                # against the market's closed_at (or the trade's
+                # decided_at if closed_at is somehow NULL).
                 anchor_iso = r["closed_at"] or trade["decided_at"]
                 age_h = _hours_since(anchor_iso, now_dt)
-                if age_h is not None and age_h > timeout_hours:
-                    logger.warning(
-                        "RESOLUTION_TIMEOUT trade_id=%d market=%s waited=%.1fh "
-                        "(timeout=%.1fh); leaving trade open for human review",
-                        trade["id"], trade["market_id"], age_h, timeout_hours,
+
+                # State 4 (cycle 25-A): dead-market force-close. Once a
+                # market has been closed past force_close_hours and UMA
+                # still hasn't finalized, we stop waiting and close at
+                # entry_mid (gross PnL ≈ 0; entry fee was already paid).
+                # This unsticks the closer; without it the trade
+                # reschedules every 60s forever (the cycle-35 zombie bug).
+                if age_h is not None and age_h > force_close_hours:
+                    ok = await write_trade_closure(
+                        self._db,
+                        trade=trade,
+                        exit_mid=trade["mid_price"],  # entry mid → 0 gross PnL
+                        close_reason="market_dead_unresolved",
+                        trade_cfg=self._config.trade,
+                        category=r["category"],
+                        market_fee_rate=r["fee_rate"],
                     )
+                    if ok:
+                        written += 1
+                        logger.warning(
+                            "markets: force-closed trade_id=%d (market %s "
+                            "closed %0.1fh ago with no UMA finalization; "
+                            "exit_mid=entry_mid=%.4f, close_reason="
+                            "market_dead_unresolved)",
+                            trade["id"], trade["market_id"], age_h,
+                            trade["mid_price"],
+                        )
+                    if age_h > timeout_hours:
+                        # If we somehow missed the force-close window and
+                        # the trade is BEYOND the human-review threshold,
+                        # also emit the legacy WARNING so soak watchers
+                        # still see the long-tail alert. (Should be rare
+                        # once the force-close path is healthy.)
+                        logger.warning(
+                            "RESOLUTION_TIMEOUT trade_id=%d market=%s waited=%.1fh "
+                            "(timeout=%.1fh); force-close attempted above",
+                            trade["id"], trade["market_id"], age_h, timeout_hours,
+                        )
                     continue
                 logger.info(
                     "markets: trade_id=%d market %s closed but UMA not yet "
-                    "finalized; waiting (status=%r, age=%.1fh)",
+                    "finalized; waiting (status=%r, age=%.1fh, "
+                    "force_close_at=%.1fh)",
                     trade["id"], trade["market_id"],
                     status_raw, age_h if age_h is not None else -1.0,
+                    force_close_hours,
                 )
         return written

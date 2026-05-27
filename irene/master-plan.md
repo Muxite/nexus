@@ -2,8 +2,8 @@
 
 > The canonical roadmap. For current state, see [`architecture.md`](architecture.md). For the design north star, see [`docs/dkg_spec.md`](docs/dkg_spec.md). The full plan that authorised this build lives at `~/.claude/plans/based-on-the-new-lovely-coral.md` — this file is the in-repo working copy.
 
-- **Last updated:** 2026-05-26 (**cycle 23 shipped** — pre-trade safety gates + Gamma 422 pagination fix deployed; bot back in production with kill-switch infra and `mid_unavailable` / `market_state` rejects replacing the silent `mid=0.5` fallback that produced 21/39 stub trades).
-- **Current phase:** post-P3 iterative long-soak under `cycle-23`. Next session picks an item from `## Current open work` below, implements it, runs a 4h+ soak, then re-plans from data. Cadence is **implement-then-soak-long** — small batches mid-soak are explicitly avoided.
+- **Last updated:** 2026-05-27 (**cycles 24 + 25 + 26 shipped** — cycle 24 fanout (B–H) committed; cycle 25 dead-market force-close + binary-event dedup + wallet fee-cash + market-vanished re-check landed in the working tree with audit run clean; cycle 26 Gamma events-endpoint dual-read + CLOB WebSocket live cache landed behind 4 default-off flags. 836 tests pass (1 pre-existing dedupe failure).
+- **Current phase:** post-cycle-26 promotion. Next session promotes the cycle-26 flags one at a time per the ledger below — shadow events-endpoint first, then probe WS envelope, then turn on WS feed. Cadence remains **implement-then-soak-long**.
 
 ---
 
@@ -242,8 +242,11 @@ Each row = one implementation cycle the user explicitly scoped. Detail in commit
 | 2026-05-25 | cycle 21 (`23e051c`) | 12h soak audit (3 parallel Explore agents) + 5-fix queue handoff. No code. | Confirmed `0 calls to /markets/<cid>` in 24h vs 25,846 `/midpoint` — but cycle-22 disproved the "clob=None" diagnosis. |
 | 2026-05-26 | cycle 22 (this branch) | Durable systemd-user timer for `soak_check.py` + `scripts/replay/preflight.py` (P1 gate as `ExecStartPre`) + Fix B (state 1/2 alert split into actionable vs `legacy_uma_backlog`) + Fix D (`IRENE_CYCLE` → `cycle-22`). Preflight against live DB surfaced gross-vs-net drift on trade 19 ($-1.67 stored vs $+15.65 reconstructed). | Alerts dropped 3 → 2; soaks now survive Claude session boundaries. |
 | 2026-05-26 | cycle 23 (this branch) | **Halt blind trading.** Pre-trade hard gates (`_gate_mid_unavailable`, `_gate_market_state`, `_insert_trade` post-condition assert) replace silent `mid=0.5` fallback. Kill switch `IRENE__TRADE__EXECUTION_ENABLED`. **Real root cause found:** Gamma caps pagination at `offset=10000`; `_fetch_all_gamma` dropped accumulated markets on 422 — frozen markets table since 2026-05-23. Fix preserves partial pages. Startup-time resolution rescan. RESOLUTION_TIMEOUT audit (13 markets, all no-position). | 655 tests pass. Deployed; `volume_usdc` + `fee_rate` repopulating live (~225 markets/min); kill-switch confirmed firing then re-enabled. |
+| 2026-05-26 | cycle 24 (`6ff9442`…`41bf2e9`) | Iran-funnel handoff fanout: **B** dedupe/freshness (recency-bias + burst + widen + accept REHASH), **C** DKG safety-gate parity + `_gates.py` extract, **D** active-flicker SQL CASE + cleanup migration, **E** wallet honesty (None on closed markets, unpriceable annotation), **F** near-miss audit panel + CLI + `audit_confidence_floor`, **G** tracer stress harness (12 templates, live mode, cleanup), **H** LLM context richness (fuller body + market context + softer NEUTRAL + `max_input_tokens`). Post-merge: idempotent `articles.tier`/`breaking_score` migration, `TradeSection.min_hours_to_expiry`, `TradeSection.execution_enabled`, relaxed 4 trade thresholds, centralized tracer campaign mode + WAL fix. | One pre-existing dedupe regression (`test_burst_window_does_not_trip_with_too_few_articles`) accepted as known; remainder green. |
+| 2026-05-26 | cycle 25 (working tree, uncommitted) | **25-A** dead-market force-close (`stages/markets.py:_close_orphaned_trades_for`) after `dead_market_force_close_hours`=24 + state-4 logic + idempotent `close_reason` CHECK rebuild (`closer.py`) + zombie backlog migration (`scripts/cycle25/`). **25-B** binary-event dedup gate (`_gates.py:query_open_sibling_markets` + `_gate_binary_dedup`, called from both MVP and DKG paths). **25-C** wallet fee-cash model (`wallet.cash_balance` debits `fees_paid_total`, dashboard shows "fees paid: $X.XX" not phantom DRIFT, `audit_wallet_harness` PASS at $+0.0000 aggregate drift). Plus market-vanished re-check gate and `scripts/audit/market_tracking_audit.py` (read-only, +~25 tests across 4 new files). | 763 tests pass (1 pre-existing dedupe failure unchanged). Audit run: 0 zombies, 0 binary-event violations, 0 orphan trades, 8,949 markets tradable + fresh. |
+| 2026-05-27 | cycle 26 (working tree, uncommitted) | **Gamma events endpoint dual-read** (`MarketsSection.use_events_endpoint`/`events_endpoint_dual_read`, `_fetch_universe` orchestrator, schema columns `polymarket_event_id`/`polymarket_event_slug`/`events_seen_in_last_poll`, per-cycle telemetry line, 422 guard preserves partial pages). **WebSocket live market cache** (`clob_ws.py` client + `clob_ws_pool.py` sharded fanout @ chunk_size=500 + `live_market_cache.py` LiveTick/parsers + `stages/market_index.py` extract + `scripts/probe_clob_ws.py`). `CLOBClient.get_mid`/`get_top_of_book` accept `live_cache`+`prefer_live` (REST authoritative for impact_tracker drift). All four flags default OFF — promote in 5 stages (dual-read shadow → events-only → probe envelope → ws soak → prod). | 836 tests pass (1 pre-existing). Cache-fallback invariant verified: when `enable_ws_feed=False`, ws_pool is None and every read goes straight to REST. |
 
-**655 tests pass** as of cycle 23 (+265 across cycles 8–23). See `## Current open work — issue list` below for the consolidated post-cycle-23 issue ledger.
+**836 tests pass** as of cycle 26 (+181 across cycles 24–26 — net of one accepted pre-existing dedupe failure). See `## Current open work — issue list` below for the consolidated post-cycle-26 issue ledger.
 
 ---
 
@@ -251,18 +254,32 @@ Each row = one implementation cycle the user explicitly scoped. Detail in commit
 
 Single source of truth for next-cycle picks. **Cycle-24 work is now split into 8 self-contained handoff docs under `irene/handoffs/2026-05-26-{A..H}-*.md`.** Each is independently executable by a subagent; the reference doc is handoff A (the empirical funnel audit). Don't tackle the dependent work without reading A first.
 
-### Cycle-24 handoffs (active, post-cycle-23)
+### Cycle-24 handoffs (closed)
 
-| ID | Title | Status | Why |
+All cycle-24 work landed in commits `fff1467`…`41bf2e9`. Handoff docs under `irene/handoffs/2026-05-26-{A..H}-*.md` remain as historical reference.
+
+| ID | Title | Status | Commit |
 |---|---|---|---|
-| A | iran-funnel-audit | **reference doc, complete** | The empirical case for B–H. 556 Iran articles → 1656 signals → 1 LLM call → 0 trades on Iran markets. |
-| **B** | dedupe-freshness | **OPEN, CRITICAL** | 87% of signals labeled STALE_RETURN/REHASH; cluster age-based labeling starves sustained-news regimes. **Drastically reduce STALE aggression.** |
-| **C** | dkg-safety-gates | **OPEN, CRITICAL** | DKG path lacks the cycle-23 mid_unavailable / market_state / kill-switch gates; trade 40 proved it fires blind. |
-| D | active-flicker | open | 1,022 markets in `active=1 AND closed_at NOT NULL` state. SQL CASE fix + cleanup migration. |
-| E | wallet-honesty | open | Dashboard shows `current $200.00` on dead-market positions. `_current_mid_for_trade` should return None on closed markets. |
-| F | near-miss-audit | open | Original user ask. Dashboard panel + CLI to surface "decisive LLM verdict killed downstream." Most valuable post-B. |
-| G | tracer-stress-harness | open | Repurpose P1 tracer as interactive stress rig. Iran/peace-deal/market-crash templates + live-externals fire mode + wallet-exercise + cleanup. |
-| H | llm-context-richness | open | Reduce LLM-input truncation — give the model fuller article + market context. Cheap, possibly the difference between NEUTRAL and decisive YES/NO. |
+| A | iran-funnel-audit | reference doc, complete | (handoff only) |
+| B | dedupe-freshness (recency-bias + burst + widen + accept REHASH) | **done** | `6ff9442` |
+| C | dkg-safety-gates + `_gates.py` extract | **done** | `a02ee66` |
+| D | active-flicker (SQL CASE + cleanup migration) | **done** | `6013ab8` |
+| E | wallet-honesty (None on closed markets, unpriceable annotation) | **done** | `fff1467` |
+| F | near-miss-audit (panel + CLI + `audit_confidence_floor`) | **done** | `aa1aac8` |
+| G | tracer-stress-harness (12 templates, live mode, cleanup) | **done** | `aee8cfc` |
+| H | llm-context-richness (fuller context + `max_input_tokens`) | **done** | `89b023c` |
+
+### Cycle-25 / cycle-26 promotion ledger (active)
+
+Cycle 25 + 26 sit uncommitted in the working tree. All four cycle-26 feature flags default OFF; promote them one at a time per the 5-stage sequence.
+
+| Flag / step | Status | Promotion gate |
+|---|---|---|
+| `markets.use_events_endpoint=true` + `events_endpoint_dual_read=true` | **ready — shadow mode** | Watch `events= markets= both= only_events= only_markets=` per-cycle log for ~3 days |
+| `markets.events_endpoint_dual_read=false` | blocked on shadow data | `only_markets < 1%` of total |
+| (one-shot) `scripts/probe_clob_ws.py` envelope check | **ready** | Confirm WS field names match `live_market_cache.py:apply_*` before flipping `enable_ws_feed` |
+| `markets.enable_ws_feed=true` | blocked on probe | Watch cache-hit % + per-shard connection state |
+| Production flip | last | Sustained green soak |
 
 ### Long-cycle-history items (deferred or done)
 
@@ -276,8 +293,11 @@ Single source of truth for next-cycle picks. **Cycle-24 work is now split into 8
 | Soak | `IRENE_CYCLE` stale env (cycle-21 Fix D) | **done (cycle 22 → cycle-23)** | Functional, not cosmetic |
 | Soak | Cron `b4b3e445` session-local | **done (cycle 22)** | Replaced by `scripts/systemd/irene-soak.{service,timer}` |
 | Replay | Preflight gross-vs-net drift (~$17 on trade 19) | **open, no handoff yet** | `plans/preflight-pnl-reconciliation.md` |
-| Resolution | Zero `close_reason='market_resolved'` rows ever | **open, no handoff yet** | Investigate alternate Polymarket endpoint for `umaResolutionStatus` |
-| LLM | DKG path missing `market_news_imbalance` gate | **open, low priority** | Naturally addressed when extracting `_gates.py` per handoff C |
+| Resolution | Zero `close_reason='market_resolved'` rows ever | **partially addressed (cycle 25-A)** | New `market_dead_unresolved` force-close path covers dead-but-unresolved markets after 24h; true `market_resolved` via UMA still TBD |
+| Wallet | Phantom DRIFT in dashboard (fees not deducted from cash) | **done (cycle 25-C)** | `wallet.cash_balance` debits `fees_paid_total`; `audit_wallet_harness` PASS at $+0.0000 |
+| Markets | Binary-event over-allocation (sibling positions on same canonical event) | **done (cycle 25-B)** | `_gate_binary_dedup` blocks at both MVP and DKG entry paths |
+| Markets | Market vanishes between match and trade insert | **done (cycle 25)** | `_gate_market_vanished` re-checks fresh DB row; new `market_vanished` reject reason |
+| LLM | DKG path missing `market_news_imbalance` gate | **done (cycle 24-C)** | `_gates.py` extract gave DKG parity with MVP (`a02ee66`) |
 | Diagnostics | Throughput overlay process-time instrumentation | **partially done (cycle 14)** | Per-signal latency-chain landed |
 | Trading | Source-quality weighting | **deferred — needs ≥1 week pre_news_drift data** | Plan stub: `plans/source-quality-weighting.md` |
 | Trading | Asymmetric stop-loss | **deferred — needs ≥100 closed trades (~13 today)** | Plan stub: `plans/asymmetric-stop-loss.md` |

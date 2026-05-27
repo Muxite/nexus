@@ -127,6 +127,28 @@ _SYSTEM_MESSAGE = (
 _LOGIT_BIAS_YNU = {"Y": 100, "N": 100, "P": 100, "U": 100, "R": 100}
 
 
+# Noisy-explorer relatedness call — a cheap binary classifier that runs
+# AFTER the permissive DKG gate but BEFORE odds capture. The goal is to
+# burn as few tokens as possible while filtering out slop pairs the
+# embeddings happened to score high on. Output is `{related, confidence,
+# reason}` not direction; we never feed this into a trade gate.
+_RELATEDNESS_SYSTEM_MESSAGE = (
+    "You are a relevance classifier for prediction markets. Decide if "
+    "the News article is directly relevant to the Market — i.e. could "
+    "this news plausibly move the market's price.\n"
+    'Reply with JSON only: {"related": true|false, "confidence": 0.0-1.0, '
+    '"reason": "<=30 words"}. '
+    "related=true only when the news could move the market price. "
+    "related=false when the topics are unrelated, the news is about a "
+    "different entity, or the news is too generic to move the market.\n"
+    "No prose outside JSON; no markdown fences."
+)
+
+# Bumping invalidates the relatedness cache namespace (`llm_calls`
+# rows keyed on prompt_sha that includes this version).
+RELATEDNESS_PROMPT_VERSION: str = "v1"
+
+
 _AI_DDL = [
     """
     CREATE TABLE IF NOT EXISTS llm_calls (
@@ -251,6 +273,22 @@ class DirectionResult:
     # Raw v5 label (Y/N/P/U/R/?). Defaults to "?" so test fakes built
     # before v5 keep working — production paths always pass a real label.
     label: str = "?"
+
+
+@dataclass(frozen=True)
+class RelatednessResult:
+    """Output of `AIClient.relatedness()` — the noisy-explorer's cheap
+    binary classifier on (article ↔ market). The caller embeds the
+    fields inline on the `explorations` row; we deliberately do not
+    write to `predictions` (different output schema, different
+    analytics) — only to `llm_calls` for cache reuse."""
+
+    related: bool
+    confidence: float    # 0.0 on related=False, ≤1.0 on True
+    reason: str          # ≤30-word LLM-emitted reason, possibly empty
+    prompt_hash: str     # sha1 of the relatedness prompt envelope
+    cached: bool
+    raw_response: str
 
 
 def _sha1(s: str) -> str:
@@ -385,6 +423,92 @@ def _parse_response(raw: str) -> tuple[str, float, str] | None:
         return None
     direction, conf = _LABEL_TO_DIRECTION[label]
     return direction, conf, label
+
+
+def _compose_relatedness_prompt(
+    *,
+    article: dict,
+    market: dict,
+    max_article_chars: int,
+) -> str:
+    """Build the user-message body for `relatedness()`. Kept tiny —
+    headline + truncated body + market question + truncated market
+    description + deadline. Capped at ~`max_article_chars` chars of
+    article body to keep token cost predictable."""
+    title = (article.get("title") or "").strip()
+    body = (article.get("body") or "").strip()
+    if len(body) > max_article_chars:
+        body = body[:max_article_chars].rstrip() + " […truncated]"
+    question = (market.get("question") or "").strip()
+    description = (market.get("description") or "").strip()
+    if len(description) > 400:
+        description = description[:400].rstrip() + " […truncated]"
+    end_date = market.get("end_date") or "n/a"
+    return (
+        f"News headline: {title}\n"
+        f"News body: {body}\n"
+        f"---\n"
+        f"Market question: {question}\n"
+        f"Market description: {description}\n"
+        f"Market deadline: {end_date}\n"
+    )
+
+
+def _parse_relatedness_response(
+    raw: str,
+) -> Optional[tuple[bool, float, str]]:
+    """Parse a relatedness LLM response into `(related, confidence,
+    reason)` or return `None` on parse failure. Tolerant of:
+      - markdown fences (```json ... ```)
+      - extra fields the model emits
+      - boolean as 'true'/'false', 0/1, or 'related'/'unrelated'
+      - missing confidence (defaults to 0.5 on related=True, 0.0 otherwise)
+      - missing reason (defaults to '')
+    """
+    if not isinstance(raw, str):
+        return None
+    s = raw.replace("```json", "").replace("```", "").strip()
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    rel_raw = obj.get("related")
+    if rel_raw is None:
+        # Some providers omit the key; treat absence as parse-failure.
+        return None
+    if isinstance(rel_raw, bool):
+        related = rel_raw
+    elif isinstance(rel_raw, (int, float)):
+        related = bool(rel_raw)
+    elif isinstance(rel_raw, str):
+        t = rel_raw.strip().lower()
+        if t in ("true", "yes", "related", "1"):
+            related = True
+        elif t in ("false", "no", "unrelated", "0"):
+            related = False
+        else:
+            return None
+    else:
+        return None
+    conf_raw = obj.get("confidence")
+    try:
+        confidence = float(conf_raw) if conf_raw is not None else (
+            0.5 if related else 0.0
+        )
+    except (TypeError, ValueError):
+        confidence = 0.5 if related else 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    reason_raw = obj.get("reason") or ""
+    if not isinstance(reason_raw, str):
+        reason_raw = ""
+    reason = reason_raw.strip()
+    if len(reason) > 300:
+        reason = reason[:300]
+    return related, confidence, reason
 
 
 class AIClient:
@@ -535,6 +659,225 @@ class AIClient:
             full_prompt=full_prompt,
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Noisy-explorer relatedness (cycle 25)
+    # ------------------------------------------------------------------
+
+    async def relatedness(
+        self,
+        *,
+        article: dict,
+        market: dict,
+        max_article_chars: int = 800,
+        max_output_tokens: int = 80,
+        model: str = "google/gemini-2.5-flash",
+        is_tracer: bool = False,
+        tracer_id: Optional[str] = None,
+    ) -> RelatednessResult:
+        """Cheap binary relevance classifier on (article ↔ market).
+
+        Always returns a RelatednessResult; never raises. On budget
+        pause, network error, non-2xx response, or parse error,
+        returns `related=False` (conservative — drops the exploration
+        rather than capturing odds for an uncertain pair).
+
+        Caches via `llm_calls.prompt_sha` keyed on
+        `sha1(system | prompt | model | RELATEDNESS_PROMPT_VERSION)`
+        — repeated calls on the same (article, market) pair skip the
+        HTTP round-trip.
+        """
+        full_prompt = _compose_relatedness_prompt(
+            article=article,
+            market=market,
+            max_article_chars=max_article_chars,
+        )
+        prompt_sha = _sha1(
+            f"{_RELATEDNESS_SYSTEM_MESSAGE}|{full_prompt}|{model}|"
+            f"{RELATEDNESS_PROMPT_VERSION}"
+        )
+
+        if self._budget.is_paused():
+            return RelatednessResult(
+                related=False,
+                confidence=0.0,
+                reason="budget_paused",
+                prompt_hash=prompt_sha,
+                cached=False,
+                raw_response="",
+            )
+
+        cached_row = await self._lookup_cache(prompt_sha)
+        if cached_row is not None:
+            content = _extract_content(cached_row["response_body"])
+            parsed = _parse_relatedness_response(content) if content else None
+            if parsed is None:
+                return RelatednessResult(
+                    related=False,
+                    confidence=0.0,
+                    reason="cache_reparse_error",
+                    prompt_hash=prompt_sha,
+                    cached=True,
+                    raw_response=content or "",
+                )
+            related, confidence, reason = parsed
+            return RelatednessResult(
+                related=related,
+                confidence=confidence,
+                reason=reason,
+                prompt_hash=prompt_sha,
+                cached=True,
+                raw_response=content or "",
+            )
+
+        response = await self._call_openrouter_relatedness(
+            full_prompt=full_prompt,
+            model=model,
+            max_tokens=max_output_tokens,
+        )
+        await self._insert_relatedness_llm_call(
+            prompt_sha=prompt_sha,
+            full_prompt=full_prompt,
+            response=response,
+            model=model,
+            is_tracer=is_tracer,
+            tracer_id=tracer_id,
+        )
+        status = response["status_code"]
+        if status == 402:
+            self._budget.note_402()
+            return RelatednessResult(
+                related=False,
+                confidence=0.0,
+                reason="402_credits",
+                prompt_hash=prompt_sha,
+                cached=False,
+                raw_response=response["body"],
+            )
+        if status < 200 or status >= 300:
+            return RelatednessResult(
+                related=False,
+                confidence=0.0,
+                reason=response["error"] or f"http_status_{status}",
+                prompt_hash=prompt_sha,
+                cached=False,
+                raw_response=response["body"],
+            )
+        content = _extract_content(response["body"])
+        parsed = _parse_relatedness_response(content) if content else None
+        if parsed is None:
+            return RelatednessResult(
+                related=False,
+                confidence=0.0,
+                reason="parse_error",
+                prompt_hash=prompt_sha,
+                cached=False,
+                raw_response=response["body"],
+            )
+        self._budget.note_ok()
+        related, confidence, reason = parsed
+        return RelatednessResult(
+            related=related,
+            confidence=confidence,
+            reason=reason,
+            prompt_hash=prompt_sha,
+            cached=False,
+            raw_response=content,
+        )
+
+    async def _call_openrouter_relatedness(
+        self,
+        *,
+        full_prompt: str,
+        model: str,
+        max_tokens: int,
+    ) -> dict:
+        """Mirror of `_call_openrouter` but parameterized on model +
+        max_tokens and without logit_bias (the relatedness output is
+        JSON, not a single-character label)."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        t0 = time.monotonic()
+        try:
+            resp = await self._client.post(
+                _OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system",
+                         "content": _RELATEDNESS_SYSTEM_MESSAGE},
+                        {"role": "user", "content": full_prompt},
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                },
+            )
+        except httpx.HTTPError as exc:
+            return {
+                "status_code": 0,
+                "body": "",
+                "latency_ms": (time.monotonic() - t0) * 1000.0,
+                "tokens_in": None,
+                "tokens_out": None,
+                "error": f"http_error: {exc.__class__.__name__}",
+            }
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        body = resp.text
+        try:
+            parsed = resp.json()
+        except json.JSONDecodeError:
+            parsed = {}
+        usage = parsed.get("usage") or {}
+        return {
+            "status_code": resp.status_code,
+            "body": body,
+            "latency_ms": latency_ms,
+            "tokens_in": usage.get("prompt_tokens"),
+            "tokens_out": usage.get("completion_tokens"),
+            "error": None,
+        }
+
+    async def _insert_relatedness_llm_call(
+        self,
+        *,
+        prompt_sha: str,
+        full_prompt: str,
+        response: dict,
+        model: str,
+        is_tracer: bool,
+        tracer_id: Optional[str],
+    ) -> None:
+        """Write the relatedness call to `llm_calls`. Same table as
+        `direction()` — disambiguated by `model` + `prompt_version`
+        columns. ON CONFLICT(prompt_sha) DO NOTHING preserves the
+        cache invariant when two concurrent calls compose the same
+        prompt."""
+        async with self._db.batch() as cur:
+            await cur.execute(
+                """
+                INSERT INTO llm_calls
+                    (prompt_sha, model, prompt_version, prompt, response_body,
+                     status_code, latency_ms, tokens_in, tokens_out,
+                     is_tracer, tracer_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(prompt_sha) DO NOTHING
+                """,
+                (
+                    prompt_sha,
+                    model,
+                    RELATEDNESS_PROMPT_VERSION,
+                    full_prompt,
+                    response["body"],
+                    response["status_code"],
+                    response["latency_ms"],
+                    response["tokens_in"],
+                    response["tokens_out"],
+                    1 if is_tracer else 0,
+                    tracer_id,
+                    _now_iso(),
+                ),
+            )
 
     # ------------------------------------------------------------------
     # Internals

@@ -1,0 +1,163 @@
+# irene config — noisy-explorer mode (IRENE_MODE=explorer).
+#
+# Sister to `config.yaml` for the `irene-explorer` docker-compose service.
+# Same DB, same scraper, same upstream ingest → match → link pipeline as
+# production. The tail diverges: instead of trade/closer/impact_tracker
+# we wire explorer + odds_capture. See
+# `plans/plan-out-a-major-moonlit-kitten.md` for the design.
+#
+# Env overlay: IRENE__SECTION__KEY=value still works
+# (e.g. IRENE__EXPLORER__SCORE_FLOOR=0.6).
+
+irene:
+  # IRENE_CYCLE env var overrides this on container boot (compose sets
+  # IRENE_CYCLE=explorer-0 by default). Cycle partitioning is how we
+  # keep explorer rows distinguishable from production trades.
+  cycle: explorer-0
+  log_level: INFO
+
+db:
+  # Shared with production. Explorer writes ONLY to `explorations` and
+  # `odds_observations`; production tables (trades, decisions, wallet)
+  # are read-only from this container's perspective.
+  path: /data/irene.db
+
+scraper:
+  url: http://jennie-scraper-v2:9001
+  timeout_seconds: 12
+
+openrouter:
+  direction_model: google/gemini-2.5-flash
+
+budget:
+  monthly_cap_usd: 50.0
+  pause_at_remaining_usd: 2.0
+  poll_seconds: 60
+
+# Ingest feeds are inherited 1:1 from production config.yaml — we want
+# both containers consuming the same scraper-v2 stream so the explorer's
+# dataset reflects what production sees. To diverge feeds for an
+# experiment, override IRENE__INGEST__FEEDS in the explorer's env_file.
+ingest:
+  feeds:
+    - https://www.aljazeera.com/xml/rss/all.xml
+    - https://www.timesofisrael.com/feed/
+    - https://www.thehindu.com/news/feeder/default.rss
+    - http://feeds.bbci.co.uk/news/rss.xml
+    - https://www.theguardian.com/world/rss
+    - https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+    - https://feeds.npr.org/1001/rss.xml
+    - https://feeds.skynews.com/feeds/rss/world.xml
+    - https://www.cbsnews.com/latest/rss/world
+    - https://abcnews.go.com/abcnews/internationalheadlines
+    - https://www.economist.com/the-world-this-week/rss.xml
+    - https://feeds.feedburner.com/politico
+    - https://feeds.bbci.co.uk/news/business/rss.xml
+    - https://feeds.bbci.co.uk/news/politics/rss.xml
+    - https://feeds.bbci.co.uk/news/technology/rss.xml
+    - https://feeds.bbci.co.uk/news/science_and_environment/rss.xml
+    - https://feeds.bbci.co.uk/news/world/us_and_canada/rss.xml
+    - https://feeds.bbci.co.uk/news/world/europe/rss.xml
+    - https://feeds.bbci.co.uk/news/world/middle_east/rss.xml
+    - https://rss.nytimes.com/services/xml/rss/nyt/US.xml
+    - https://rss.nytimes.com/services/xml/rss/nyt/World.xml
+    - https://rss.nytimes.com/services/xml/rss/nyt/Politics.xml
+    - https://rss.nytimes.com/services/xml/rss/nyt/Technology.xml
+    - https://rss.nytimes.com/services/xml/rss/nyt/Science.xml
+    - https://www.theguardian.com/us-news/rss
+    - https://www.theguardian.com/business/rss
+    - https://feeds.a.dj.com/rss/RSSWorldNews.xml
+    - https://feeds.a.dj.com/rss/RSSOpinion.xml
+    - https://rss.politico.com/defense.xml
+    - https://thehill.com/feed/
+    - https://thehill.com/homenews/senate/feed/
+    - https://thehill.com/homenews/house/feed/
+    - https://thehill.com/homenews/administration/feed/
+    - https://feeds.npr.org/1006/rss.xml
+    - https://feeds.npr.org/1014/rss.xml
+    - https://feeds.npr.org/1004/rss.xml
+    - https://feeds.npr.org/1019/rss.xml
+    - https://feeds.skynews.com/feeds/rss/politics.xml
+    - https://feeds.skynews.com/feeds/rss/business.xml
+    - https://feeds.skynews.com/feeds/rss/technology.xml
+    - https://www.cbsnews.com/latest/rss/politics
+    - https://abcnews.go.com/abcnews/usheadlines
+    - https://www.motherjones.com/feed/
+    - https://www.propublica.org/feeds/propublica/main
+    - https://slate.com/feeds/news-and-politics.rss
+    - https://www.realclearpolitics.com/index.xml
+    - http://feeds.marketwatch.com/marketwatch/topstories/
+    - https://finance.yahoo.com/news/rssindex
+    - https://techcrunch.com/feed/
+    - https://feeds.arstechnica.com/arstechnica/index
+    - https://www.theverge.com/rss/index.xml
+    - https://www.wired.com/feed/rss
+    - https://indianexpress.com/feed/
+    - https://timesofindia.indiatimes.com/rssfeedstopstories.cms
+    - https://feeds.elpais.com/mrss-s/pages/ep/site/english.elpais.com/portada
+    - https://www.politico.eu/feed/
+    - https://rss.dw.com/rdf/rss-en-all
+    - https://www.france24.com/en/rss
+    - https://www.channelnewsasia.com/rssfeeds/8395986
+  poll_seconds: 60
+  html_sites: []
+  html_poll_seconds: 300
+  combined_sources:
+    - https://apnews.com
+    - https://www.reuters.com
+    - https://www.bbc.com/news
+    - https://www.theguardian.com/world
+    - https://www.nytimes.com
+    - https://www.washingtonpost.com
+    - https://www.cnn.com
+    - https://www.aljazeera.com
+    - https://www.ft.com
+    - https://www.wsj.com
+    - https://www.politico.com
+    - https://www.axios.com
+    - https://thehill.com
+    - https://www.bloomberg.com
+    - https://www.cnbc.com
+    - https://www.npr.org
+    - https://www.motherjones.com
+    - https://www.theatlantic.com
+    - https://slate.com
+    - https://www.realclearpolitics.com
+    - https://www.marketwatch.com
+    - https://finance.yahoo.com
+    - https://arstechnica.com
+    - https://www.wired.com
+    - https://indianexpress.com
+    - https://timesofindia.indiatimes.com
+    - https://english.elpais.com
+    - https://www.sueddeutsche.de
+    - https://www.politico.eu
+    - https://www.dw.com/en/top-stories/s-9097
+    - https://www.france24.com/en/
+    - https://www.channelnewsasia.com/
+  combined_poll_seconds: 180
+  combined_enrich_html_top_n: 3
+
+# Permissive: lower DKG score floor so borderline pairs that production
+# would discard still produce a row. The LLM relatedness call is the
+# guard against slop tokens.
+explorer:
+  score_floor: 0.5
+  relatedness_model: google/gemini-2.5-flash
+  relatedness_max_article_chars: 800
+  relatedness_max_output_tokens: 80
+  odds_poll_secs: 15
+  capture_post_secs: 1200   # 20 min
+  capture_pre_secs: 600     # 10 min
+
+# Belt-and-suspenders: explorer mode skips the trade-path wiring
+# entirely, but if a future change accidentally routes execution through
+# trade.py, this kill switch trips at gate 0 BEFORE any LLM/CLOB cost.
+trade:
+  execution_enabled: false
+
+# dkg_trade.enabled isn't read in explorer mode (the stage isn't wired),
+# but we keep it false here for defense in depth.
+dkg_trade:
+  enabled: false
+  score_floor: 0.8
