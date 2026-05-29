@@ -1,0 +1,281 @@
+# Default eval pairs for prompt_stability.py.
+#
+# 30 hand-crafted (article, market) pairs split roughly into:
+#   - 10 clearly related   (LLM SHOULD say related=true)
+#   - 10 clearly unrelated (LLM SHOULD say related=false)
+#   - 10 ambiguous/tricky  (no expected; we measure consistency only)
+#
+# `expected_related` is the ground-truth label. NULL/missing = no expected
+# (we still measure agreement across runs, just not accuracy).
+#
+# Edit freely — the runner just reads the list and ignores extra fields.
+
+pairs:
+  # --- 10 CLEARLY RELATED ---
+  - id: r01
+    expected_related: true
+    article_title: "Federal Reserve raises interest rates by 0.25% in unanimous decision"
+    market_question: "Will the Federal Reserve raise interest rates at the next FOMC meeting?"
+
+  - id: r02
+    expected_related: true
+    article_title: "Tesla Q3 deliveries hit record 466,000 vehicles"
+    market_question: "Will Tesla deliver more than 1.8 million vehicles in 2025?"
+
+  - id: r03
+    expected_related: true
+    article_title: "Trump wins Iowa Republican caucus by 30-point margin"
+    market_question: "Who will win the 2024 Republican presidential nomination?"
+
+  - id: r04
+    expected_related: true
+    article_title: "SpaceX Starship achieves first successful orbital launch"
+    market_question: "Will SpaceX complete a successful Starship orbital flight by end of 2024?"
+
+  - id: r05
+    expected_related: true
+    article_title: "Bitcoin price surges past $100,000 for the first time"
+    market_question: "Will Bitcoin close above $100,000 on December 31, 2025?"
+
+  - id: r06
+    expected_related: true
+    article_title: "Israel and Hamas agree to 30-day ceasefire, hostages to be released"
+    market_question: "Will an Israel-Hamas ceasefire be in effect on March 1?"
+
+  - id: r07
+    expected_related: true
+    article_title: "OpenAI announces GPT-5 launch with major reasoning improvements"
+    market_question: "Will OpenAI release a new GPT model in 2025?"
+
+  - id: r08
+    expected_related: true
+    article_title: "Russia and Ukraine sign preliminary peace framework in Geneva talks"
+    market_question: "Will Russia and Ukraine sign a peace deal by July 1, 2026?"
+
+  - id: r09
+    expected_related: true
+    article_title: "Apple unveils new headset to compete with Meta Quest in mixed reality"
+    market_question: "Will Apple's Vision Pro outsell Meta Quest 3 in Q4 2025?"
+
+  - id: r10
+    expected_related: true
+    article_title: "House passes border security bill 234-198, Senate vote scheduled"
+    market_question: "Will Congress pass a border security bill before March 31?"
+
+  # --- 10 CLEARLY UNRELATED ---
+  - id: u01
+    expected_related: false
+    article_title: "Recipe of the week: classic chocolate chip cookies"
+    market_question: "Will Bitcoin close above $100,000 on December 31, 2025?"
+
+  - id: u02
+    expected_related: false
+    article_title: "Lakers defeat Celtics 112-104 in overtime thriller"
+    market_question: "Will the Federal Reserve raise interest rates at the next FOMC meeting?"
+
+  - id: u03
+    expected_related: false
+    article_title: "New species of frog discovered in Costa Rican rainforest"
+    market_question: "Will Tesla deliver more than 1.8 million vehicles in 2025?"
+
+  - id: u04
+    expected_related: false
+    article_title: "Weather forecast: snow expected across the Midwest this weekend"
+    market_question: "Who will win the 2024 Republican presidential nomination?"
+
+  - id: u05
+    expected_related: false
+    article_title: "Local high school wins state debate championship"
+    market_question: "Will SpaceX complete a successful Starship orbital flight by end of 2024?"
+
+  - id: u06
+    expected_related: false
+    article_title: "Library hosts annual children's reading marathon this Saturday"
+    market_question: "Will an Israel-Hamas ceasefire be in effect on March 1?"
+
+  - id: u07
+    expected_related: false
+    article_title: "Top 10 hiking trails in the Pacific Northwest this fall"
+    market_question: "Will OpenAI release a new GPT model in 2025?"
+
+  - id: u08
+    expected_related: false
+    article_title: "Antique car show draws thousands to county fairgrounds"
+    market_question: "Will Russia and Ukraine sign a peace deal by July 1, 2026?"
+
+  - id: u09
+    expected_related: false
+    article_title: "City council debates new zoning rules for downtown parking"
+    market_question: "Will Apple's Vision Pro outsell Meta Quest 3 in Q4 2025?"
+
+  - id: u10
+    expected_related: false
+    article_title: "Local bakery wins regional croissant competition"
+    market_question: "Will Congress pass a border security bill before March 31?"
+
+  # --- 10 AMBIGUOUS / TRICKY ---
+  - id: a01
+    expected_related: null  # entity overlap (Tesla) but market is about S&P 500
+    article_title: "Tesla stock drops 5% on weak European sales"
+    market_question: "Will the S&P 500 close above 6,000 on December 31, 2025?"
+
+  - id: a02
+    expected_related: null  # general AI news, market is one specific model
+    article_title: "Anthropic, OpenAI, Google all release new models this week"
+    market_question: "Will Anthropic have the #1 AI model at the end of May 2026?"
+
+  - id: a03
+    expected_related: null  # could go either way — moderate effect
+    article_title: "Federal jury convicts former Trump campaign aide of perjury"
+    market_question: "Will Donald Trump be the 2024 Republican presidential nominee?"
+
+  - id: a04
+    expected_related: null  # adjacent — affects sentiment but not direct
+    article_title: "Iran arrests three German tourists on espionage charges"
+    market_question: "Will the US strike Iranian nuclear facilities by May 31, 2026?"
+
+  - id: a05
+    expected_related: null  # different time frame
+    article_title: "Bitcoin briefly spiked to $89,000 in overnight trading"
+    market_question: "Will Bitcoin close above $100,000 on December 31, 2025?"
+
+  - id: a06
+    expected_related: null  # entity overlap (Apple) but market is about a different metric
+    article_title: "Apple investors push back on board for excessive executive pay"
+    market_question: "Will Apple's Vision Pro outsell Meta Quest 3 in Q4 2025?"
+
+  - id: a07
+    expected_related: null  # too vague — could be construed as relevant
+    article_title: "Economists warn of recession risk in second half of 2025"
+    market_question: "Will the S&P 500 close above 6,000 on December 31, 2025?"
+
+  - id: a08
+    expected_related: null  # related to broader sector but not directly to one company
+    article_title: "EV sales in Europe down 14% year-over-year in Q3"
+    market_question: "Will Tesla deliver more than 1.8 million vehicles in 2025?"
+
+  - id: a09
+    expected_related: null  # adjacent — North Korea, market is about US-Iran
+    article_title: "North Korea conducts large-scale artillery drills near DMZ"
+    market_question: "Will the US strike Iranian nuclear facilities by May 31, 2026?"
+
+  - id: a10
+    expected_related: null  # entity match, weak news
+    article_title: "Trump golf course in Scotland reports record revenue year"
+    market_question: "Will Donald Trump be the 2024 Republican presidential nominee?"
+
+  # --- 21 SCENARIO PAIRS (real-feel: Hormuz / Iran peace / strikes / oil / midterms)
+  # These exercise reasoning chains the LLM should handle:
+  #   `true`  = clear causal link the prompt is supposed to catch
+  #   `false` = topic-adjacent but the link doesn't survive scrutiny
+  #   `null`  = genuinely contested — we only measure consistency
+
+  # --- Hormuz / oil supply ---
+  - id: h01
+    expected_related: true
+    article_title: "Iran threatens to close Strait of Hormuz amid escalating tensions with US"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  - id: h02
+    expected_related: true
+    article_title: "Iran's Supreme Leader rules out Hormuz closure in Friday sermon"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  - id: h03
+    expected_related: true
+    article_title: "Saudi Arabia announces production increase to offset Iran tensions"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  - id: h04
+    expected_related: null   # different chokepoint, same oil-supply theme
+    article_title: "Houthi rebels attack oil tanker in Red Sea"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  - id: h05
+    expected_related: false  # Iran headline but not oil-relevant
+    article_title: "Iran arrests British dual-national on espionage charges in Tehran"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  # --- Iran peace deal ---
+  - id: p01
+    expected_related: true
+    article_title: "Trump says Iran deal is 95% done, expects announcement this week"
+    market_question: "US x Iran permanent peace deal by June 30, 2026?"
+
+  - id: p02
+    expected_related: true
+    article_title: "Iran rejects US framework, calls negotiations 'a sham'"
+    market_question: "US x Iran permanent peace deal by June 30, 2026?"
+
+  - id: p03
+    expected_related: null   # broader diplomacy, not specifically US-Iran channel
+    article_title: "European Union diplomats arrive in Tehran for back-channel talks"
+    market_question: "US x Iran permanent peace deal by June 30, 2026?"
+
+  - id: p04
+    expected_related: null   # background pressure factor
+    article_title: "Iran's economy contracts 3% on sanctions impact"
+    market_question: "US x Iran permanent peace deal by June 30, 2026?"
+
+  - id: p05
+    expected_related: true   # escalation directly threatens the deal
+    article_title: "Israeli airstrike kills senior Iranian commander in Damascus"
+    market_question: "US x Iran permanent peace deal by June 30, 2026?"
+
+  # --- US strikes / military escalation ---
+  - id: s01
+    expected_related: true   # escalation ladder
+    article_title: "US conducts limited airstrike on Iranian-backed militia in Iraq"
+    market_question: "Will the US strike Iranian nuclear facilities by May 31, 2026?"
+
+  - id: s02
+    expected_related: true
+    article_title: "Pentagon denies reports of imminent Iran strike in press briefing"
+    market_question: "Will the US strike Iranian nuclear facilities by May 31, 2026?"
+
+  - id: s03
+    expected_related: false  # different conflict, no causal chain
+    article_title: "Russia launches largest drone barrage of war on Kyiv"
+    market_question: "Will the US strike Iranian nuclear facilities by May 31, 2026?"
+
+  # --- Oil prices (other channels) ---
+  - id: o01
+    expected_related: true   # supply-side direct
+    article_title: "OPEC+ extends production cuts through Q3 in surprise announcement"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  - id: o02
+    expected_related: null   # demand-side, indirect
+    article_title: "China's manufacturing PMI falls to 48.2, signaling contraction"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  - id: o03
+    expected_related: null   # supply factor but not a today-mover
+    article_title: "US strategic petroleum reserve at 30-year low"
+    market_question: "WTI Crude Oil closes above $90 today?"
+
+  # --- 2026 midterm performance ---
+  - id: m01
+    expected_related: true   # off-cycle election as bellwether
+    article_title: "Republicans flip Virginia state senate seat in special election"
+    market_question: "Will Republicans win the House in the 2026 midterms?"
+
+  - id: m02
+    expected_related: null   # endorsement in a different race
+    article_title: "Trump endorses Vance protégé in Ohio Senate Republican primary"
+    market_question: "Will Republicans win the House in the 2026 midterms?"
+
+  - id: m03
+    expected_related: true   # open-seat shifts a competitive district
+    article_title: "House Democrat announces retirement in R+2 competitive district"
+    market_question: "Will Republicans win the House in the 2026 midterms?"
+
+  - id: m04
+    expected_related: true   # midterm-of-incumbent bellwether
+    article_title: "Approval rating for Trump drops to 38% in Gallup poll"
+    market_question: "Will Republicans win the House in the 2026 midterms?"
+
+  - id: m05
+    expected_related: true   # most direct possible signal short of the election itself
+    article_title: "Generic congressional ballot: Democrats +4 in latest NYT/Siena poll"
+    market_question: "Will Republicans win the House in the 2026 midterms?"

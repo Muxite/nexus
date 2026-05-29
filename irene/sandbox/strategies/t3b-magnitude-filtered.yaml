@@ -1,0 +1,91 @@
+name: t3b-magnitude-filtered
+version: v1
+description: |
+  t3-magnitude-classifier + a second-stage pre-trade gate and a smarter
+  exit. The 2026-05-28 loss attribution showed ~100% of the loss came
+  from friction (entry spread + fees) on flat / extreme / mismatched
+  markets, not from wrong direction. This variant filters those out
+  before trading and adds take-profit / trailing exits to harvest the
+  volatile winners.
+
+model: google/gemini-2.5-flash
+
+# Second-stage gate — rows failing any predicate are skipped with a
+# "pretrade:<reason>" skip_reason (visible in trades.csv + leaderboard +
+# loss_attribution), so we can measure exactly what it removed.
+pretrade:
+  require_llm_related: true   # drop spurious DKG matches (Oura Ring ↔ LV Aces)
+  min_volume_usdc: 10000      # drop illiquid books
+  mid_band: [0.10, 0.90]      # drop near-0/1 markets that can't move
+  min_pre_stdev: 0.01         # drop flat-history (dead) markets
+  max_entry_spread: 0.05      # drop fat-spread books where entry friction kills us
+
+steps:
+  - name: classify
+    type: single
+    max_output_tokens: 50
+    system: |
+      You classify how much a news headline should move a prediction
+      market's price. Reply JSON only, no markdown fences:
+      {"impact": "none"|"small"|"medium"|"large", "direction": "YES"|"NO"|"NONE", "reason": "<=20 words"}
+
+      - "none" — news is unrelated or about a different entity.
+      - "small" — news is related but adds <1pp of new information.
+      - "medium" — news plausibly moves the market 1-5pp.
+      - "large" — news could move the market >5pp.
+
+      Set direction=YES if news raises p_yes, NO if it lowers, NONE if impact=none/small.
+    user_template: |
+      News: {{article_title}}
+      {{article_body_or_summary}}
+
+      Market: {{market_question}}
+      Description: {{market_description}}
+      Current YES price: {{market_mid_t0}}
+
+  - name: estimate
+    type: single
+    max_output_tokens: 40
+    inputs: [classify]
+    system: |
+      The market is "{{market_question}}". A prior step classified the
+      news impact as "{{classify.impact}}" in the {{classify.direction}}
+      direction. ONLY return a p_yes if classify.impact is "medium" or
+      "large". For "none" or "small", reply {"p_yes": -1, "reason": "low impact"}.
+
+      Reply JSON only, no markdown fences:
+      {"p_yes": -1 or 0.0-1.0, "reason": "<=15 words"}
+    user_template: |
+      News: {{article_title}}
+      {{article_body_or_summary}}
+
+      Market: {{market_question}}
+      Current YES price: {{market_mid_t0}}
+      Prior classification: impact={{classify.impact}} direction={{classify.direction}} reason={{classify.reason}}
+
+features:
+  article_body_max_chars: 400
+
+parse:
+  require_direction: false
+  require_p_yes: false
+  derive_direction_from_p_yes: true
+  final_field: estimate.p_yes
+
+backtest:
+  sizing: kelly
+  bankroll_usdc: 1000
+  kelly_fraction: 0.25
+  max_position_pct: 0.10
+  min_size_usdc: 1.0
+  min_edge: 0.02
+  entry: best_ask
+  exit_horizon_seconds: 600
+  fee_pct: 0.02
+  skip_when_no_book: true
+  # Smarter exit: lock a gain on a favorable spike, cap the downside,
+  # give back at most `trailing` from the peak.
+  exit:
+    take_profit: 0.04
+    stop_loss: 0.04
+    trailing: 0.03

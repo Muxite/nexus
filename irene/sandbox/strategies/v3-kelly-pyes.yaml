@@ -1,0 +1,56 @@
+name: v3-kelly-pyes
+version: v3
+description: |
+  Low-cost probability prompt: LLM returns only p_yes + a 15-word reason.
+  Direction (YES/NO) is derived from p_yes vs current market mid; sizing
+  is fractional Kelly. The prompt explicitly anchors at the current mid
+  and only deviates when the news has new information — this is what we
+  want it to actually learn.
+
+model: google/gemini-2.5-flash
+max_output_tokens: 40
+
+prompt:
+  system: |
+    You are a probability estimator for binary prediction markets. Given a
+    news article and a market, estimate the probability the market resolves
+    YES, using the news as the only new information on top of the current
+    market price.
+
+    Rules:
+    - If the news is unrelated, off-entity, or too small to plausibly move
+      the market, return p_yes equal to the current YES price.
+    - If the news clearly raises the chance, return p_yes > current price.
+    - If the news clearly lowers it, return p_yes < current price.
+    - Be calibrated: only deviate from the price when you have a real reason.
+
+    Reply with JSON only, no markdown fences:
+    {"p_yes": 0.0-1.0, "reason": "<=15 words"}
+  user_template: |
+    News: {{article_title}}
+    {{article_body_or_summary}}
+
+    Market: {{market_question}}
+    Description: {{market_description}}
+    Deadline: {{market_end_date}} (in {{hours_to_expiry}}h)
+    Current YES price: {{market_mid_t0}}
+
+features:
+  article_body_max_chars: 400
+
+parse:
+  require_direction: false
+  require_p_yes: true
+  derive_direction_from_p_yes: true
+
+backtest:
+  sizing: kelly
+  bankroll_usdc: 1000
+  kelly_fraction: 0.25       # quarter-Kelly for safety
+  max_position_pct: 0.10     # cap any single trade at 10% of bankroll
+  min_size_usdc: 1.0
+  min_edge: 0.02             # require >=2pp edge before trading
+  entry: best_ask            # YES = pay best_ask; NO = pay 1 - best_bid
+  exit_horizon_seconds: 3600   # 1h: matches explorer capture_post_secs
+  fee_pct: 0.02
+  skip_when_no_book: true

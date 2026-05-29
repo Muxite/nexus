@@ -1,0 +1,21 @@
+name: t7-fade-momentum
+version: v1
+description: |
+  Inverse of t5. Hypothesis: the first-minute post-news price move is
+  an overreaction; betting against it pays. Same window/threshold as
+  t5; direction flipped: price up -> buy NO; price down -> buy YES.
+
+kind: deterministic_momentum
+
+momentum:
+  window_s: 60
+  threshold: 0.005
+  invert: true
+
+backtest:
+  sizing: flat
+  notional_usdc: 25
+  entry: best_ask
+  exit_horizon_seconds: 600
+  fee_pct: 0.02
+  skip_when_no_book: true

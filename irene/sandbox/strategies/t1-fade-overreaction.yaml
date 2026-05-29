@@ -1,0 +1,59 @@
+name: t1-fade-overreaction
+version: v1
+description: |
+  Hypothesis: news markets overreact in the first minute, then mean-revert.
+  Prompt asks the LLM to estimate the STEADY-STATE p_yes (5-10 min after
+  the dust settles), not the immediate impulse. Direction is derived
+  from steady-state p_yes vs current mid; we expect the prompt to often
+  pull AGAINST the just-moved mid.
+
+model: google/gemini-2.5-flash
+max_output_tokens: 40
+
+prompt:
+  system: |
+    You are a probability estimator for binary prediction markets. The
+    market just absorbed a news headline and may have over- or
+    under-reacted in the first 30 seconds. Estimate the STEADY-STATE
+    probability that the market resolves YES after the initial impulse
+    has faded and traders have priced in the news calmly.
+
+    Rules:
+    - If the market is currently overpriced relative to a calm reading of
+      the news, return a p_yes BELOW the current price.
+    - If currently underpriced, return p_yes ABOVE the current price.
+    - If the news is unrelated or too small to materially move the
+      market, return p_yes equal to current price.
+    - Be calibrated. The current price is the crowd's first-take; you are
+      pricing the second-take.
+
+    Reply with JSON only, no markdown fences:
+    {"p_yes": 0.0-1.0, "reason": "<=15 words"}
+  user_template: |
+    News: {{article_title}}
+    {{article_body_or_summary}}
+
+    Market: {{market_question}}
+    Description: {{market_description}}
+    Deadline: {{market_end_date}} (in {{hours_to_expiry}}h)
+    Current YES price (impulse-reaction): {{market_mid_t0}}
+
+features:
+  article_body_max_chars: 400
+
+parse:
+  require_direction: false
+  require_p_yes: true
+  derive_direction_from_p_yes: true
+
+backtest:
+  sizing: kelly
+  bankroll_usdc: 1000
+  kelly_fraction: 0.25
+  max_position_pct: 0.10
+  min_size_usdc: 1.0
+  min_edge: 0.02
+  entry: best_ask
+  exit_horizon_seconds: 1200
+  fee_pct: 0.02
+  skip_when_no_book: true

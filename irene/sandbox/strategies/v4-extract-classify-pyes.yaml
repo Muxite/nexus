@@ -1,0 +1,83 @@
+name: v4-extract-classify-pyes
+version: v1
+description: |
+  Three-step chain. Step 1 extracts named entities + key factual claims
+  from the article. Step 2 decides whether those claims relate to the
+  market subject. Step 3 emits p_yes given the structured extract +
+  the current market mid. Each step caches independently, so prompt
+  edits to a later step don't reprice the earlier ones.
+
+model: google/gemini-2.5-flash
+
+steps:
+  - name: extract
+    type: single
+    max_output_tokens: 200
+    system: |
+      Extract structured facts from the news article.
+      Reply JSON only, no markdown fences:
+      {"entities": ["..."], "claims": ["..."]}
+      - entities: people, organizations, places named in the article (<=8)
+      - claims: short factual claims the article asserts (<=4, <=20 words each)
+    user_template: |
+      Headline: {{article_title}}
+      Body: {{article_body_or_summary}}
+
+  - name: relevance
+    type: single
+    inputs: [extract]
+    max_output_tokens: 80
+    system: |
+      Decide whether the extracted facts relate to the market subject.
+      Reply JSON only, no markdown fences:
+      {"related": bool, "why": "<=20 words"}
+    user_template: |
+      Article entities: {{extract.entities}}
+      Article claims: {{extract.claims}}
+      ---
+      Market question: {{market_question}}
+      Market description: {{market_description}}
+
+  - name: p_yes
+    type: single
+    inputs: [extract, relevance]
+    max_output_tokens: 40
+    system: |
+      Estimate the probability the market resolves YES, given the news.
+      Rules:
+      - If relevance.related is false, return p_yes equal to the current YES price.
+      - If the news raises YES probability, return p_yes > current price.
+      - If the news lowers it, return p_yes < current price.
+      - Be calibrated: only move from the price when the news warrants it.
+      Reply JSON only, no markdown fences:
+      {"p_yes": 0.0-1.0, "reason": "<=15 words"}
+    user_template: |
+      Article: {{article_title}}
+      Entities: {{extract.entities}}
+      Claims: {{extract.claims}}
+      Relevance: {{relevance.related}} ({{relevance.why}})
+      ---
+      Market: {{market_question}}
+      Current YES price: {{market_mid_t0}}  ·  Deadline: {{market_end_date}}
+
+features:
+  article_body_max_chars: 400
+
+parse:
+  require_direction: false
+  require_p_yes: false
+  derive_direction_from_p_yes: true
+  final_field: p_yes.p_yes
+
+backtest:
+  sizing: kelly
+  bankroll_usdc: 1000
+  kelly_fraction: 0.25
+  max_position_pct: 0.10
+  min_size_usdc: 1.0
+  min_edge: 0.02
+  entry: best_ask
+  fallback_entry: market_mid_t0
+  exit_horizon_seconds: 3600   # 1h: matches explorer capture_post_secs
+  fee_pct: 0.02
+  skip_when_no_book: true

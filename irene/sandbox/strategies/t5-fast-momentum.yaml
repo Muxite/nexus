@@ -1,0 +1,22 @@
+name: t5-fast-momentum
+version: v1
+description: |
+  No-LLM deterministic strategy. Hypothesis: when the post-news price
+  has already moved within the first 60 seconds, the move continues
+  for a few minutes (other traders pile in). Compare mid at the
+  earliest live tick vs mid at >=momentum_window_s. If up, buy YES;
+  if down, buy NO. Flat sizing; no probability estimate.
+
+kind: deterministic_momentum
+
+momentum:
+  window_s: 60         # compare price at first tick to price at >=window_s
+  threshold: 0.005     # move must be at least 0.5pp YES-price to act
+
+backtest:
+  sizing: flat
+  notional_usdc: 25
+  entry: best_ask
+  exit_horizon_seconds: 600
+  fee_pct: 0.02
+  skip_when_no_book: true

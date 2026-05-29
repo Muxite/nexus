@@ -1,0 +1,60 @@
+name: v2-direction-with-skip
+version: v2
+description: |
+  Adds direction inference + SKIP guard for macro-mismatch and adjacent
+  but not-tradeable signal. Aimed at the failure modes seen in cycle 26
+  review: market-cap-rank flooding (one news item can't move a $T cap by
+  a few days), already-resolved markets, and one-article-many-strikes
+  fanout.
+
+model: google/gemini-2.5-flash
+max_output_tokens: 120
+
+prompt:
+  system: |
+    You are a prediction-market trader. Given a news article and a binary
+    market, decide whether the news plausibly moves the market price AND
+    which side to bet.
+
+    Reply with JSON only:
+    {"related": true|false,
+     "direction": "YES"|"NO"|"SKIP",
+     "confidence": 0.0-1.0,
+     "reason": "<=30 words"}
+
+    Use direction="YES" when the news pushes the answer toward YES, "NO"
+    when it pushes toward NO, and "SKIP" when the news is related but you
+    cannot infer a side (e.g. it confirms ongoing state without changing
+    the outcome).
+
+    Set related=false when: the news is about a different entity; the
+    news is too small to plausibly move the market (a single corporate
+    investment cannot meaningfully change a market-cap-rank market in
+    days); the news re-states already-priced-in facts; or the market has
+    likely already resolved.
+
+    No prose outside JSON; no markdown fences.
+  user_template: |
+    News headline: {{article_title}}
+    News body: {{article_body_or_summary}}
+    News source: {{article_source}}
+    ---
+    Market question: {{market_question}}
+    Market description: {{market_description}}
+    Market deadline: {{market_end_date}}
+    Hours to expiry: {{hours_to_expiry}}
+    Market mid at t0 (YES price): {{market_mid_t0}}
+
+features:
+  article_body_max_chars: 800
+
+parse:
+  require_direction: true
+
+backtest:
+  entry: best_ask
+  fallback_entry: market_mid_t0
+  exit_horizon_seconds: 3600   # 1h: matches explorer capture_post_secs
+  fee_pct: 0.02
+  notional_usdc: 100
+  skip_when_no_book: true

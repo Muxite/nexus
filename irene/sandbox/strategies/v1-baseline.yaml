@@ -1,0 +1,38 @@
+name: v1-baseline
+version: v1
+description: |
+  Mirrors the production relatedness prompt verbatim (irene/app/ai.py
+  _RELATEDNESS_SYSTEM_MESSAGE + _compose_relatedness_prompt). Emits only
+  {related, confidence, reason} — no direction. Used as the baseline
+  reference. With --use-orig, run_strategy skips the LLM entirely and
+  reads orig_llm_* from the explorations table.
+
+model: google/gemini-2.5-flash
+max_output_tokens: 80
+
+prompt:
+  system: |
+    You are a relevance classifier for prediction markets. Decide if the News article is directly relevant to the Market — i.e. could this news plausibly move the market's price.
+    Reply with JSON only: {"related": true|false, "confidence": 0.0-1.0, "reason": "<=30 words"}. related=true only when the news could move the market price. related=false when the topics are unrelated, the news is about a different entity, or the news is too generic to move the market.
+    No prose outside JSON; no markdown fences.
+  user_template: |
+    News headline: {{article_title}}
+    News body: {{article_body_or_summary}}
+    ---
+    Market question: {{market_question}}
+    Market description: {{market_description}}
+    Market deadline: {{market_end_date}}
+
+features:
+  article_body_max_chars: 800
+
+parse:
+  require_direction: false
+
+backtest:
+  entry: best_ask
+  fallback_entry: market_mid_t0
+  exit_horizon_seconds: 3600   # 1h: matches explorer capture_post_secs
+  fee_pct: 0.02
+  notional_usdc: 100
+  skip_when_no_book: true

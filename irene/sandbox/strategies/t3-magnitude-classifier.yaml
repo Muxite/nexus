@@ -1,0 +1,74 @@
+name: t3-magnitude-classifier
+version: v1
+description: |
+  Hypothesis: most news doesn't move markets; trading on every signal
+  pollutes the alpha. Two-step chain: (1) classify news impact as
+  none/small/medium/large; (2) only the medium/large cases produce a
+  p_yes — none/small short-circuit to "no trade" via missing final
+  field. exit_horizon 600s to catch the fast move.
+
+model: google/gemini-2.5-flash
+
+steps:
+  - name: classify
+    type: single
+    max_output_tokens: 50
+    system: |
+      You classify how much a news headline should move a prediction
+      market's price. Reply JSON only, no markdown fences:
+      {"impact": "none"|"small"|"medium"|"large", "direction": "YES"|"NO"|"NONE", "reason": "<=20 words"}
+
+      - "none" — news is unrelated or about a different entity.
+      - "small" — news is related but adds <1pp of new information.
+      - "medium" — news plausibly moves the market 1-5pp.
+      - "large" — news could move the market >5pp.
+
+      Set direction=YES if news raises p_yes, NO if it lowers, NONE if impact=none/small.
+    user_template: |
+      News: {{article_title}}
+      {{article_body_or_summary}}
+
+      Market: {{market_question}}
+      Description: {{market_description}}
+      Current YES price: {{market_mid_t0}}
+
+  - name: estimate
+    type: single
+    max_output_tokens: 40
+    inputs: [classify]
+    system: |
+      The market is "{{market_question}}". A prior step classified the
+      news impact as "{{classify.impact}}" in the {{classify.direction}}
+      direction. ONLY return a p_yes if classify.impact is "medium" or
+      "large". For "none" or "small", reply {"p_yes": -1, "reason": "low impact"}.
+
+      Reply JSON only, no markdown fences:
+      {"p_yes": -1 or 0.0-1.0, "reason": "<=15 words"}
+    user_template: |
+      News: {{article_title}}
+      {{article_body_or_summary}}
+
+      Market: {{market_question}}
+      Current YES price: {{market_mid_t0}}
+      Prior classification: impact={{classify.impact}} direction={{classify.direction}} reason={{classify.reason}}
+
+features:
+  article_body_max_chars: 400
+
+parse:
+  require_direction: false
+  require_p_yes: false
+  derive_direction_from_p_yes: true
+  final_field: estimate.p_yes
+
+backtest:
+  sizing: kelly
+  bankroll_usdc: 1000
+  kelly_fraction: 0.25
+  max_position_pct: 0.10
+  min_size_usdc: 1.0
+  min_edge: 0.02
+  entry: best_ask
+  exit_horizon_seconds: 600
+  fee_pct: 0.02
+  skip_when_no_book: true

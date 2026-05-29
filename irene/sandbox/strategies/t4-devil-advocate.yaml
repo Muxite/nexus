@@ -1,0 +1,65 @@
+name: t4-devil-advocate
+version: v1
+description: |
+  Hypothesis: a single-shot LLM commits to its first-impression p_yes
+  too eagerly. Forcing it to enumerate arguments for BOTH sides before
+  estimating reduces overconfidence and produces more honest p_yes
+  values. Two-step chain: (1) emit pros_yes + pros_no bullets;
+  (2) given those, emit final p_yes.
+
+model: google/gemini-2.5-flash
+
+steps:
+  - name: pros
+    type: single
+    max_output_tokens: 200
+    system: |
+      You are an analyst. List arguments that the news SUPPORTS the
+      market resolving YES, and arguments that it SUPPORTS the market
+      resolving NO. Be concrete; cite specific facts from the news.
+
+      Reply JSON only, no markdown fences:
+      {"pros_yes": ["<=20 words", ...], "pros_no": ["<=20 words", ...]}
+    user_template: |
+      News: {{article_title}}
+      {{article_body_or_summary}}
+
+      Market: {{market_question}}
+      Description: {{market_description}}
+
+  - name: estimate
+    type: single
+    max_output_tokens: 40
+    inputs: [pros]
+    system: |
+      Given pros for YES and NO, estimate p_yes. Anchor on the current
+      market price; only deviate when the balance of pros clearly tilts.
+
+      Reply JSON only, no markdown fences:
+      {"p_yes": 0.0-1.0, "reason": "<=15 words"}
+    user_template: |
+      Market: {{market_question}}
+      Current YES price: {{market_mid_t0}}
+      Pros YES: {{pros.pros_yes}}
+      Pros NO:  {{pros.pros_no}}
+
+features:
+  article_body_max_chars: 400
+
+parse:
+  require_direction: false
+  require_p_yes: false
+  derive_direction_from_p_yes: true
+  final_field: estimate.p_yes
+
+backtest:
+  sizing: kelly
+  bankroll_usdc: 1000
+  kelly_fraction: 0.25
+  max_position_pct: 0.10
+  min_size_usdc: 1.0
+  min_edge: 0.02
+  entry: best_ask
+  exit_horizon_seconds: 1200
+  fee_pct: 0.02
+  skip_when_no_book: true
