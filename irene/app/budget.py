@@ -30,8 +30,12 @@ without IPC (seulgi lesson — the file IS the protocol).
 **Pause sources.**
 - `monthly_cap_near_zero` — `remaining = limit - usage < pause_at_remaining_usd`.
   Cleared when `remaining >= pause_at_remaining_usd`.
-- `account_credits_zero` — 402-streak reaches 5. Cleared when the streak
-  drops to 0 (one `note_ok()` per `note_402()` to climb back).
+- `account_credits_zero` — 402-streak reaches 5. Cleared either when the
+  streak drops to 0 (one `note_ok()` per `note_402()` to climb back) OR, while
+  paused, when the `/api/v1/credits` poll shows the account balance recovered
+  to `>= pause_at_remaining_usd` (self-heal after a top-up — without it the
+  pause deadlocks, since `ai.py` makes no calls while paused so the streak can
+  never decrement on its own).
 
 The streak counter is capped at 100 to bound the climb-back time after a
 prolonged outage.
@@ -74,6 +78,10 @@ logger = logging.getLogger(__name__)
 
 
 _OPENROUTER_KEY_URL = "https://openrouter.ai/api/v1/key"
+# Account-level prepaid balance. `/key` only exposes the per-key monthly cap;
+# the account credit ceiling (what 402s when exhausted) lives here. Polled
+# only while credits-paused, to detect a top-up and self-heal.
+_OPENROUTER_CREDITS_URL = "https://openrouter.ai/api/v1/credits"
 
 # Streak thresholds. Hard-coded because they're protocol-level constants
 # (OpenRouter's behaviour, not user config); tunability would invite
@@ -106,6 +114,9 @@ class Budget:
         self._paused_credits = False
         self._streak_402 = 0
         self._remaining_usd: Optional[float] = None
+        # Account-level prepaid balance from `/credits`; only refreshed while
+        # credits-paused (the self-heal probe). None until first such poll.
+        self._account_remaining_usd: Optional[float] = None
 
         self._task: Optional[asyncio.Task[None]] = None
         self._stopping = asyncio.Event()
@@ -118,6 +129,12 @@ class Budget:
             return
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(8.0))
         self._stopping.clear()
+        # A fresh process starts optimistically unpaused (__init__ zeroes the
+        # streak). A pause-flag left on disk by a prior process is therefore
+        # stale — remove it so the dashboard doesn't show a false pause. The
+        # first real 402 streak re-writes it.
+        if not self.is_paused() and os.path.exists(self._pause_flag_path):
+            self._remove_flag()
         self._task = asyncio.create_task(self._run(), name="budget-poll")
 
     async def stop(self) -> None:
@@ -162,6 +179,14 @@ class Budget:
         # streak in (0, _PAUSE_AT_STREAK): keep current value — hysteresis
         # so a single OK after a streak doesn't immediately unpause.
         self._sync_pause_flag(was_paused)
+
+    def _note_credits_recovered(self) -> None:
+        # Account balance is healthy again (top-up detected). The 402 streak is
+        # now stale — zero it so `_recompute_credits_pause` clears the pause and
+        # fires the true→false flag edge. Breaks the deadlock where no LLM call
+        # goes out while paused, so `note_ok()` could never decrement the streak.
+        self._streak_402 = 0
+        self._recompute_credits_pause()
 
     def _recompute_monthly_pause(self) -> None:
         was_paused = self.is_paused()
@@ -243,3 +268,31 @@ class Budget:
             # Network blip or malformed payload — keep last known value so a
             # real cap-out is not silently unpaused by a transient /key 5xx.
             logger.warning("budget /key poll failed: %r", exc)
+
+        # Self-heal the credits pause: while paused on a 402 streak, watch the
+        # account balance and unpause once a top-up lands. Gated to paused-only
+        # so normal operation makes no extra HTTP call.
+        if self._paused_credits:
+            await self._poll_credits_once()
+
+    async def _poll_credits_once(self) -> None:
+        assert self._client is not None
+        try:
+            resp = await self._client.get(
+                _OPENROUTER_CREDITS_URL,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data") or {}
+            total = float(data.get("total_credits") or 0.0)
+            used = float(data.get("total_usage") or 0.0)
+            self._account_remaining_usd = total - used
+            if self._account_remaining_usd >= self._pause_at_remaining_usd:
+                logger.warning(
+                    "budget credits self-heal: account_remaining=%.2f — clearing pause",
+                    self._account_remaining_usd,
+                )
+                self._note_credits_recovered()
+        except (httpx.HTTPError, ValueError, KeyError) as exc:
+            # Transient error — stay paused. Never unpause on a failed probe.
+            logger.warning("budget /credits poll failed: %r", exc)

@@ -138,17 +138,57 @@ ingest:
   combined_poll_seconds: 180
   combined_enrich_html_top_n: 3
 
-# Permissive: lower DKG score floor so borderline pairs that production
-# would discard still produce a row. The LLM relatedness call is the
-# guard against slop tokens.
+# Explorer v2: pluggable gate pipeline. Each (article, market) candidate
+# walks through `gates:` in order; survivors get odds capture started,
+# rejected candidates are written as audit rows (gate_status='rejected').
+# Capture window is 1h so backtests can evaluate at the realistic 1h
+# horizon ("as if we were trading now").
+#
+# Gate types:
+#   - dkg_threshold: pure-Python score filter (replaces the old inline check)
+#   - llm_batch:     one LLM call per `batch_size` candidates, returns the
+#                    indices that are related. Amortizes the system prompt.
+#
+# Tuning:
+#   - raise max_active_explorations if `firehose_stats` shows the cap is
+#     binding AND Polymarket calls/sec stays <50 (12% of the 400/s budget)
+#   - lower dkg_threshold.min_final_score if the firehose isn't filling fast
+#     enough, raise it if too much LLM-gate noise
+#   - bump llm_batch.prompt_version when you change the gate's behavior;
+#     it namespaces the llm_calls cache for that gate.
 explorer:
-  score_floor: 0.5
+  capture_post_secs: 3600         # 1h: enough horizon to test "trade at t0" backtests
+  capture_pre_secs: 86400         # 24h pre-news baseline — wider context for sandbox
+  capture_pre_interval: 1d        # Polymarket prices-history range
+  capture_pre_fidelity: 5         # minutes/bucket inside the range
+  odds_poll_secs: 15
+  max_active_explorations: 200    # 13 calls/s at 15s poll = 3% of 400/s budget
+  reject_capture_sample_rate: 0.05  # 5% of rejected rows still get odds capture
+  max_active_reject_samples: 40     # separate cap so rejects can't starve passes
+  # Legacy single-gate fields (only consulted if a llm_batch gate omits them):
   relatedness_model: google/gemini-2.5-flash
   relatedness_max_article_chars: 800
   relatedness_max_output_tokens: 80
-  odds_poll_secs: 15
-  capture_post_secs: 1200   # 20 min
-  capture_pre_secs: 600     # 10 min
+  gates:
+    # Runs first (pure-Python, free): drop candidates whose market is
+    # already closed/ended at t0. A dead market has no resting book, so
+    # odds capture would only yield empty post-news reads. Stops these
+    # before the paid LLM gate and before odds capture.
+    - type: market_open
+      name: market_open
+    - type: dkg_threshold
+      name: dkg
+      min_final_score: 0.65
+    - type: llm_batch
+      name: cheap_binary
+      model: google/gemini-2.5-flash
+      # v2 prompt asks for per-candidate descriptive features
+      # (entities_overlap, claim_horizon_hours, directional_lean,
+      # novelty, short_reason) alongside the binary related decision.
+      # Pass/fail logic unchanged — extras stored in gate_history JSON.
+      batch_size: 20
+      max_output_tokens: 800
+      prompt_version: v2
 
 # Belt-and-suspenders: explorer mode skips the trade-path wiring
 # entirely, but if a future change accidentally routes execution through

@@ -796,17 +796,15 @@ async def test_market_info_skips_when_fresh(
 async def test_market_info_first_seen_still_works(
     db_ready, bus, embedder, monkeypatch,
 ):
-    """Cycle 15 preserves the cycle-10/13 first-seen contract: a row
-    with `fee_rate IS NULL` triggers a fetch regardless of timestamp.
-    Here we seed the row with `fee_rate=NULL` but a *fresh* (would-be
-    skip) `fetched_at` to prove the NULL-fee path still fires."""
-    from datetime import datetime, timedelta, timezone
-
-    fresh_ts = (
-        datetime.now(timezone.utc) - timedelta(hours=1)
-    ).isoformat()
+    """Cycle 26 followup: true first-seen still fetches. `first_seen` now
+    requires BOTH `fee_rate IS NULL` AND `fee_rate_fetched_at IS NULL` —
+    so a genuinely-new row (both NULL) fires on the next poll. (The old
+    cycle-15 "NULL fee fires regardless of timestamp" rule was dropped so
+    dead-endpoint markets — fee_rate stays NULL forever — don't re-queue
+    every poll; that cooled-down case is covered by
+    `test_market_info_null_fee_with_fresh_stamp_is_skipped`.)"""
     await _seed_market_with_fee(
-        db_ready, "0xfirst", fee_rate=None, fetched_at=fresh_ts,
+        db_ready, "0xfirst", fee_rate=None, fetched_at=None,
     )
     clob = _FakeCLOB(fee_by_id={"0xfirst": 0.03})
     stage = _make_stage(db_ready, bus, embedder, clob=clob)
@@ -823,6 +821,40 @@ async def test_market_info_first_seen_still_works(
     )
     row = await cur.fetchone()
     assert row["fee_rate"] == pytest.approx(0.03)
+
+
+async def test_market_info_null_fee_with_fresh_stamp_is_skipped(
+    db_ready, bus, embedder, monkeypatch,
+):
+    """Cycle 26 followup soft-cooldown: a row with `fee_rate IS NULL` but
+    a *fresh* `fee_rate_fetched_at` (a dead-endpoint market we already
+    tried recently) must NOT re-fetch every poll — `first_seen` is False
+    (fetched_at not NULL) and the stamp is not yet stale."""
+    from datetime import datetime, timedelta, timezone
+
+    fresh_ts = (
+        datetime.now(timezone.utc) - timedelta(hours=1)
+    ).isoformat()
+    await _seed_market_with_fee(
+        db_ready, "0xcooldown", fee_rate=None, fetched_at=fresh_ts,
+    )
+    clob = _FakeCLOB(fee_by_id={"0xcooldown": 0.03})
+    stage = _make_stage(db_ready, bus, embedder, clob=clob)
+
+    async def fake_fetch(self):
+        return [_gamma_row("0xcooldown", "Q")]
+
+    monkeypatch.setattr(MarketsStage, "_fetch_all_gamma", fake_fetch)
+    await stage.poll_once()
+
+    assert clob.info_calls == []  # cooled down → no CLOB hit
+    cur = await db_ready.conn.execute(
+        "SELECT fee_rate, fee_rate_fetched_at FROM markets "
+        "WHERE condition_id='0xcooldown'"
+    )
+    row = await cur.fetchone()
+    assert row["fee_rate"] is None
+    assert row["fee_rate_fetched_at"] == fresh_ts  # untouched
 
 
 class _NoneReturningCLOB:
@@ -844,14 +876,17 @@ class _NoneReturningCLOB:
         return None
 
 
-async def test_market_info_failure_does_not_advance_timestamp(
+async def test_market_info_failure_stamps_cooldown_timestamp(
     db_ready, bus, embedder, monkeypatch,
 ):
-    """Cycle 15 fetch-failure discipline: when the CLOB returns None
-    (network blip, 5xx, unparseable JSON, etc.) we MUST leave
-    `fee_rate_fetched_at` unchanged so the next poll retries instead
-    of waiting another full refresh window. For a legacy row whose
-    prior value was NULL, that means it stays NULL."""
+    """Cycle 26 followup soft-cooldown (commit 35c4c46): when the CLOB
+    returns None (network blip, 5xx, dead endpoint) we now stamp
+    `fee_rate_fetched_at = now` on the *attempt* so the row isn't
+    re-queued every poll — cycle 26's events endpoint added thousands of
+    sub-markets without CLOB endpoints, and the old "don't advance on
+    failure" rule meant a sustained ReadTimeout storm. `fee_rate` itself
+    stays untouched (no value to write); the cycle-15 cadence governs the
+    next retry."""
     await _seed_market_with_fee(
         db_ready, "0xfail", fee_rate=0.02, fetched_at=None,
     )
@@ -871,9 +906,10 @@ async def test_market_info_failure_does_not_advance_timestamp(
         "WHERE condition_id='0xfail'"
     )
     row = await cur.fetchone()
-    # fee_rate untouched, fetched_at NOT advanced — next cycle retries.
+    # fee_rate untouched (CLOB had nothing); fetched_at advanced to a
+    # non-NULL cooldown stamp so the next poll doesn't immediately retry.
     assert row["fee_rate"] == pytest.approx(0.02)
-    assert row["fee_rate_fetched_at"] is None
+    assert row["fee_rate_fetched_at"] is not None
 
 
 async def test_fee_rate_column_stays_null_when_clob_absent(

@@ -808,6 +808,17 @@ async def test_burst_window_does_not_trip_with_too_few_articles(db_ready, bus):
             "UPDATE article_clusters SET latest_article_at=? WHERE id=?",
             (_iso(base), seed_id),
         )
+        # `_add_member` stamps `added_at` with the wall-clock attach time,
+        # so the seed article (run through the stage above) lands at real
+        # `now()` — which is *after* this incoming article's synthetic
+        # base+80h timestamp and would wrongly fall inside the burst
+        # window. Anchor it to `base` so the burst count reflects the
+        # intended timeline (only member 10 is recent → count=2 < 3).
+        await cur.execute(
+            "UPDATE article_cluster_members SET added_at=? "
+            "WHERE cluster_id=? AND article_id=?",
+            (_iso(base), seed_id, 1),
+        )
 
     fake.response = (1, 0.30)
     await _insert_article(

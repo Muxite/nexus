@@ -210,7 +210,9 @@ class OddsCaptureStage:
         history = None
         try:
             history = await self._clob.get_price_history(
-                token_id, interval="1h", fidelity=10
+                token_id,
+                interval=str(self._cfg.capture_pre_interval),
+                fidelity=int(self._cfg.capture_pre_fidelity),
             )
         except Exception:  # noqa: BLE001
             logger.warning(
@@ -278,20 +280,48 @@ class OddsCaptureStage:
     async def run_one_poll_cycle(self) -> None:
         """Single poll pass over the watchlist. Each active capture
         gets one CLOB read; expired captures are graduated to
-        `capture_status='complete'` and dropped from the watchlist."""
+        `capture_status='complete'` and dropped from the watchlist.
+
+        `capture_end_reason` is written when a capture exits so the
+        sandbox can distinguish full-window rows from cut-short rows.
+        """
         if not self._watch:
             return
         now = _now()
         now_iso = now.isoformat()
-        completed: list[int] = []
+        completed: list[tuple[int, str]] = []
         for exploration_id, meta in list(self._watch.items()):
             end_at = _parse_iso(meta["capture_end_at"])
             if end_at is None or now >= end_at:
-                completed.append(exploration_id)
+                # Window elapsed. The dense poll already covers every
+                # interior checkpoint; the only gap is the *final* one
+                # (the loop would otherwise graduate before any tick lands
+                # at/after t0+capture_post_secs). Force one last snapshot
+                # so the terminal checkpoint always has a usable book —
+                # the sandbox's `offset >= horizon` exit lookup depends on
+                # it. See irene/capture_schedule.py.
+                t0 = _parse_iso(meta["t0_iso"])
+                if t0 is not None:
+                    offset = int((now - t0).total_seconds())
+                    mid, bid, ask, spread = await self._read_book(
+                        meta["token_id"]
+                    )
+                    await self._write_live_sample(
+                        exploration_id=exploration_id,
+                        token_id=meta["token_id"],
+                        sampled_at=now_iso,
+                        offset_seconds=offset,
+                        mid=mid,
+                        bid=bid,
+                        ask=ask,
+                        spread=spread,
+                        cycle_id=meta.get("cycle_id"),
+                    )
+                completed.append((exploration_id, "window_complete"))
                 continue
             t0 = _parse_iso(meta["t0_iso"])
             if t0 is None:
-                completed.append(exploration_id)
+                completed.append((exploration_id, "capture_aborted"))
                 continue
             offset = int((now - t0).total_seconds())
             mid, bid, ask, spread = await self._read_book(meta["token_id"])
@@ -306,8 +336,8 @@ class OddsCaptureStage:
                 spread=spread,
                 cycle_id=meta.get("cycle_id"),
             )
-        for exploration_id in completed:
-            await self._mark_complete(exploration_id)
+        for exploration_id, reason in completed:
+            await self._mark_complete(exploration_id, reason=reason)
             self._watch.pop(exploration_id, None)
 
     async def _read_book(
@@ -379,12 +409,27 @@ class OddsCaptureStage:
                 (exploration_id,),
             )
 
-    async def _mark_complete(self, exploration_id: int) -> None:
+    async def _mark_complete(
+        self, exploration_id: int, *, reason: str = "window_complete",
+    ) -> None:
+        """Flip the exploration to `capture_status='complete'` and record
+        why the capture loop exited. Reason values:
+          - window_complete: t0+capture_post_secs reached (the happy path)
+          - capture_aborted: bad metadata (missing t0 / end_at) — should
+            be rare; if it isn't, something upstream is broken
+          - evicted_by_cap: bounced from the watchlist because we ran out
+            of capacity (currently never set; reserved for the future
+            backpressure path)
+          - market_closed:   not currently differentiated from
+            window_complete (we'd need a CLOB signal); reserved
+          - error:           reserved for unhandled-exception exits
+        """
         async with self._db.batch() as cur:
             await cur.execute(
-                "UPDATE explorations SET capture_status='complete' "
+                "UPDATE explorations "
+                "SET capture_status='complete', capture_end_reason=? "
                 "WHERE id=? AND capture_status IN ('pending','active')",
-                (exploration_id,),
+                (reason, exploration_id),
             )
 
     async def _rehydrate(self) -> None:
@@ -407,7 +452,9 @@ class OddsCaptureStage:
             if end_at is None or now >= end_at:
                 # Window already elapsed while we were down — graduate
                 # to `complete` so we don't poll forever.
-                await self._mark_complete(int(row["id"]))
+                await self._mark_complete(
+                    int(row["id"]), reason="window_complete",
+                )
                 continue
             token = row["token_yes"]
             t0 = row["t0_iso"]

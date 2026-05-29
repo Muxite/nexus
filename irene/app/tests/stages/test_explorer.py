@@ -9,6 +9,8 @@ payload through `handle()`, then assert on the `explorations` table
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -25,7 +27,7 @@ import app.stages.link  # noqa: F401
 import app.stages.markets  # noqa: F401
 import app.stages.match  # noqa: F401
 import app.stages.odds_capture  # noqa: F401  (owns odds_observations)
-from app.ai import RelatednessResult
+from app.config import DKGGateConfig, LLMBatchGateConfig, MarketOpenGateConfig
 from app.cycle import cycle_scope
 from app.db import DB
 from app.deps import StageDeps
@@ -56,40 +58,45 @@ class _FakeBus:
 
 
 @dataclass
-class _FakeAI:
-    """Returns `next_result` for the next relatedness() call and tracks
-    every invocation."""
+class _FakeGateAI:
+    """v2 gate LLM. `classify_batch_for_gate` is the only AI method the
+    explorer calls now — the old single-shot `relatedness()` was folded
+    into the `llm_batch` gate (irene/app/gates/llm_batch.py). Returns a
+    v2 `verdicts` JSON marking every (news, market) pair in the batch
+    `related=<self.related>`, so tests drive pass/reject by flipping the
+    flag. Records each call for assertions."""
 
-    next_result: RelatednessResult = field(
-        default_factory=lambda: RelatednessResult(
-            related=True,
-            confidence=0.85,
-            reason="news directly resolves market",
-            prompt_hash="sha-1-fake",
-            cached=False,
-            raw_response='{"related": true, "confidence": 0.85, '
-                         '"reason": "news directly resolves market"}',
-        )
-    )
+    related: bool = True
     calls: list[dict] = field(default_factory=list)
 
-    async def relatedness(
+    async def classify_batch_for_gate(
         self,
         *,
-        article: dict,
-        market: dict,
-        max_article_chars: int = 800,
-        max_output_tokens: int = 80,
-        model: str = "google/gemini-2.5-flash",
-        is_tracer: bool = False,
-        tracer_id: Optional[str] = None,
-    ) -> RelatednessResult:
+        system: str,
+        user: str,
+        model: str,
+        max_tokens: int,
+        prompt_version: str,
+    ) -> str:
         self.calls.append({
-            "article_id": article.get("id"),
-            "market_condition_id": market.get("condition_id"),
-            "is_tracer": is_tracer, "tracer_id": tracer_id,
+            "model": model, "prompt_version": prompt_version, "user": user,
         })
-        return self.next_result
+        # The gate labels each pair [A], [B], … in the rendered prompt;
+        # echo one verdict per label so this works at any batch size.
+        labels = re.findall(r"\[([A-Z]+)\]", user)
+        verdicts = [
+            {
+                "label": lbl,
+                "related": self.related,
+                "entities_overlap": ["Iran", "Trump"],
+                "claim_horizon_hours": 4,
+                "directional_lean": "bullish",
+                "novelty": "breaking",
+                "short_reason": "news resolves market",
+            }
+            for lbl in labels
+        ]
+        return json.dumps({"verdicts": verdicts})
 
 
 class _FakeCLOB:
@@ -110,12 +117,21 @@ class _FakeCLOB:
 @dataclass
 class _ExplorerCfg:
     score_floor: float = 0.5
-    relatedness_model: str = "google/gemini-2.5-flash"
-    relatedness_max_article_chars: int = 800
-    relatedness_max_output_tokens: int = 80
     odds_poll_secs: int = 15
     capture_post_secs: int = 1200
     capture_pre_secs: int = 600
+    max_active_explorations: int = 200
+    # 0 → deterministic: rejected rows are never sampled for capture, so
+    # the audit-row assertions below can't flake on the RNG.
+    reject_capture_sample_rate: float = 0.0
+    max_active_reject_samples: int = 40
+    # Mirrors the production explorer.yaml pipeline: free liveness +
+    # DKG-score gates, then the bundled LLM relatedness gate.
+    gates: list = field(default_factory=lambda: [
+        MarketOpenGateConfig(),
+        DKGGateConfig(name="dkg", min_final_score=0.5),
+        LLMBatchGateConfig(name="llm_batch"),
+    ])
 
 
 @dataclass
@@ -291,7 +307,7 @@ async def test_init_requires_ai(db_seeded):
 
 async def test_happy_path_writes_exploration_and_publishes(db_seeded):
     bus = _FakeBus()
-    ai = _FakeAI()  # related=True @ 0.85
+    ai = _FakeGateAI()  # related=True for the whole batch
     stage = _make_stage(db_seeded, bus, ai)
 
     with cycle_scope(1):
@@ -302,7 +318,7 @@ async def test_happy_path_writes_exploration_and_publishes(db_seeded):
         "       cosine_similarity, freshness, breaking_score, "
         "       article_tier, market_volume_24h, market_mid_t0, "
         "       market_spread_t0, hours_to_expiry, llm_related, "
-        "       llm_confidence, llm_reason, llm_prompt_hash, "
+        "       llm_confidence, llm_reason, llm_prompt_hash, gate_status, "
         "       capture_status, capture_end_at "
         "FROM explorations"
     )
@@ -322,9 +338,13 @@ async def test_happy_path_writes_exploration_and_publishes(db_seeded):
     assert r["market_spread_t0"] == pytest.approx(0.02)
     assert r["hours_to_expiry"] > 0  # not yet expired
     assert r["llm_related"] == 1
-    assert r["llm_confidence"] == pytest.approx(0.85)
-    assert r["llm_reason"] == "news directly resolves market"
-    assert r["llm_prompt_hash"] == "sha-1-fake"
+    assert r["gate_status"] == "passed"
+    # v2: the per-gate confidence/prompt-hash columns are retired — the
+    # llm_batch gate's verdict + features live in `gate_history` JSON, and
+    # `llm_reason` is now the gate-decision chain.
+    assert r["llm_confidence"] is None
+    assert r["llm_reason"] == "market_open:passed; dkg:passed; llm_batch:passed"
+    assert r["llm_prompt_hash"] is None
     assert r["capture_status"] == "pending"
     assert r["capture_end_at"]  # ISO string populated
 
@@ -342,40 +362,49 @@ async def test_happy_path_writes_exploration_and_publishes(db_seeded):
 
 async def test_score_below_floor_skips_silently(db_seeded):
     bus = _FakeBus()
-    ai = _FakeAI()
+    ai = _FakeGateAI()
     cfg = _Config(explorer=_ExplorerCfg(score_floor=0.9))  # link is 0.85
     stage = _make_stage(db_seeded, bus, ai, cfg)
 
     with cycle_scope(1):
         await stage.handle(_payload())
 
+    # The SQL `score_floor` pre-filter in `_fetch_high_score_links` drops
+    # the 0.85 link before any candidate is built, so no audit row, no
+    # gate run, no LLM call.
     cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM explorations")
     assert (await cur.fetchone())[0] == 0
     assert ai.calls == []  # no LLM call burned
     assert bus.published == []
 
 
-async def test_related_false_skips(db_seeded):
+async def test_related_false_writes_audit_row_no_capture(db_seeded):
     bus = _FakeBus()
-    ai = _FakeAI(next_result=RelatednessResult(
-        related=False, confidence=0.0, reason="off-topic",
-        prompt_hash="sha-1-fake", cached=False,
-        raw_response='{"related": false}',
-    ))
+    ai = _FakeGateAI(related=False)  # llm_batch gate rejects the pair
     stage = _make_stage(db_seeded, bus, ai)
 
     with cycle_scope(1):
         await stage.handle(_payload())
 
-    cur = await db_seeded.conn.execute("SELECT COUNT(*) FROM explorations")
-    assert (await cur.fetchone())[0] == 0
-    assert len(ai.calls) == 1  # LLM IS called; we just drop the result
+    # v2: a rejected candidate still writes an audit row (gate_status
+    # 'rejected'); it just doesn't get promoted to odds capture or
+    # published. The LLM gate IS called — we record the verdict.
+    cur = await db_seeded.conn.execute(
+        "SELECT gate_status, llm_related, rejected_by_gate FROM explorations"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    assert len(rows) == 1
+    assert rows[0]["gate_status"] == "rejected"
+    assert rows[0]["llm_related"] == 0
+    assert rows[0]["rejected_by_gate"] == "llm_batch"
+    assert len(ai.calls) == 1
     assert bus.published == []
 
 
 async def test_idempotent_on_repeat_handle(db_seeded):
     bus = _FakeBus()
-    ai = _FakeAI()
+    ai = _FakeGateAI()
     stage = _make_stage(db_seeded, bus, ai)
 
     with cycle_scope(1):
@@ -393,7 +422,7 @@ async def test_idempotent_on_repeat_handle(db_seeded):
 
 async def test_book_unavailable_still_writes_row(db_seeded):
     bus = _FakeBus()
-    ai = _FakeAI()
+    ai = _FakeGateAI()
     clob = _FakeCLOB(book=None)
     stage = _make_stage(db_seeded, bus, ai, clob=clob)
 
@@ -416,7 +445,7 @@ async def test_book_unavailable_still_writes_row(db_seeded):
 
 async def test_missing_article_or_market_skips(db_seeded):
     bus = _FakeBus()
-    ai = _FakeAI()
+    ai = _FakeGateAI()
     stage = _make_stage(db_seeded, bus, ai)
 
     # event_id 99 has no fact → no article → silent skip
@@ -431,7 +460,7 @@ async def test_missing_article_or_market_skips(db_seeded):
 
 async def test_tracer_flags_propagate(db_seeded):
     bus = _FakeBus()
-    ai = _FakeAI()
+    ai = _FakeGateAI()
     stage = _make_stage(db_seeded, bus, ai)
 
     with cycle_scope(1):
@@ -444,8 +473,10 @@ async def test_tracer_flags_propagate(db_seeded):
     await cur.close()
     assert row["is_tracer"] == 1
     assert row["tracer_id"] == "t-1"
-    assert ai.calls[0]["is_tracer"] is True
-    assert ai.calls[0]["tracer_id"] == "t-1"
+    # The tracer flags ride the payload through to the row and the
+    # published event. (The v2 batch gate call carries no per-candidate
+    # tracer metadata — that distinction was specific to the retired
+    # single-shot relatedness() path.)
     assert bus.published[0][1]["is_tracer"] is True
     assert bus.published[0][1]["tracer_id"] == "t-1"
 

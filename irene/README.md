@@ -13,6 +13,7 @@ Irene is studied-into-existence — every phase ends with a report, every paper 
 | Roadmap / phased build plan | [`master-plan.md`](master-plan.md) |
 | What exists today (current state) | [`architecture.md`](architecture.md) |
 | The DKG design spec (north star) | [`docs/dkg_spec.md`](docs/dkg_spec.md) |
+| **Exploration + sandbox system** (firehose, gates, backtest) | [`docs/exploration_system.md`](docs/exploration_system.md) |
 | **Modularization principles (every module follows these)** | [`docs/modularization.md`](docs/modularization.md) |
 | Decision-funnel walkthrough | `docs/decision_funnel.md` (TBD P1) |
 | Pitfalls / lessons from seulgi | `docs/pitfalls.md` (TBD P1) |

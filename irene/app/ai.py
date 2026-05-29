@@ -785,6 +785,96 @@ class AIClient:
             raw_response=content,
         )
 
+    async def classify_batch_for_gate(
+        self,
+        *,
+        system: str,
+        user: str,
+        model: str,
+        max_tokens: int,
+        prompt_version: str,
+    ) -> str:
+        """Generic LLM call used by `irene/app/gates/llm_batch.py`.
+
+        Returns the model's response *text* (empty string on error,
+        budget pause, parse failure — gates are responsible for handling
+        the empty case).
+
+        Caches on SHA1(system | user | model | prompt_version) in the
+        shared `llm_calls` table; reuses across calls with the same
+        prompt + model + version.
+        """
+        prompt_sha = _sha1(f"{system}|{user}|{model}|{prompt_version}")
+
+        if self._budget.is_paused():
+            return ""
+
+        cached_row = await self._lookup_cache(prompt_sha)
+        if cached_row is not None:
+            return _extract_content(cached_row["response_body"]) or ""
+
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self._timeout)
+        t0 = time.monotonic()
+        try:
+            resp = await self._client.post(
+                _OPENROUTER_URL,
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    "max_tokens": max_tokens,
+                    "temperature": 0,
+                },
+            )
+        except httpx.HTTPError:
+            return ""
+        latency_ms = (time.monotonic() - t0) * 1000.0
+        body = resp.text
+        try:
+            parsed = resp.json()
+        except json.JSONDecodeError:
+            parsed = {}
+        usage = parsed.get("usage") or {}
+        response = {
+            "status_code": resp.status_code,
+            "body": body,
+            "latency_ms": latency_ms,
+            "tokens_in": usage.get("prompt_tokens"),
+            "tokens_out": usage.get("completion_tokens"),
+            "error": None,
+        }
+        # Persist to llm_calls so the next call (any process) hits cache.
+        async with self._db.batch() as cur:
+            await cur.execute(
+                """
+                INSERT INTO llm_calls
+                    (prompt_sha, model, prompt_version, prompt, response_body,
+                     status_code, latency_ms, tokens_in, tokens_out,
+                     is_tracer, tracer_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)
+                ON CONFLICT(prompt_sha) DO NOTHING
+                """,
+                (
+                    prompt_sha, model, prompt_version,
+                    f"[SYSTEM]\n{system}\n[USER]\n{user}",
+                    response["body"], response["status_code"],
+                    response["latency_ms"],
+                    response["tokens_in"], response["tokens_out"],
+                    _now_iso(),
+                ),
+            )
+        if response["status_code"] == 402:
+            self._budget.note_402()
+            return ""
+        if response["status_code"] < 200 or response["status_code"] >= 300:
+            return ""
+        self._budget.note_ok()
+        return _extract_content(response["body"]) or ""
+
     async def _call_openrouter_relatedness(
         self,
         *,

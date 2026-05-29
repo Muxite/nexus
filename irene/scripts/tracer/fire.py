@@ -58,8 +58,10 @@ import argparse
 import asyncio
 import hashlib
 import itertools
+import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -237,6 +239,36 @@ class _TracerAI:
             cached=False,
             raw_response=raw,
         )
+
+    async def classify_batch_for_gate(
+        self,
+        *,
+        system: str,  # noqa: ARG002 — kept to match the AIClient surface
+        user: str,
+        model: str,  # noqa: ARG002
+        max_tokens: int,  # noqa: ARG002
+        prompt_version: str,  # noqa: ARG002
+    ) -> str:
+        """Duck-typed `AIClient.classify_batch_for_gate` for the explorer's
+        `llm_batch` gate (irene/app/gates/llm_batch.py). No network: mark
+        every labeled (news, market) pair related, mirroring the stub's
+        always-YES `direction()` so the tracer drives candidates all the
+        way through the gate pipeline deterministically."""
+        labels = re.findall(r"\[([A-Z]+)\]", user)
+        return json.dumps({
+            "verdicts": [
+                {
+                    "label": lbl,
+                    "related": True,
+                    "entities_overlap": [],
+                    "claim_horizon_hours": 1,
+                    "directional_lean": "bullish",
+                    "novelty": "breaking",
+                    "short_reason": "tracer stub",
+                }
+                for lbl in labels
+            ]
+        })
 
     async def close(self) -> None:
         return

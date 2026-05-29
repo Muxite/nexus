@@ -51,12 +51,16 @@ class Dashboard:
         self._plot_task = asyncio.create_task(self._plot_loop())
         while True:
             try:
-                await self.tick()
+                # Stagger pages across the interval so DB load is spread
+                # out rather than bursting at every tick boundary. Each
+                # page still refreshes every ~interval_secs; we just
+                # don't run them all back-to-back.
+                stagger = self.interval_secs / max(len(PAGES), 1)
+                await self.tick(stagger_secs=stagger)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — one bad tick can't kill the loop
                 logger.exception("dashboard tick failed; continuing")
-            await asyncio.sleep(self.interval_secs)
 
     async def stop(self) -> None:
         if self._stopped:
@@ -73,10 +77,18 @@ class Dashboard:
         self._task = None
         self._plot_task = None
 
-    async def tick(self) -> None:
+    async def tick(self, *, stagger_secs: float = 0.0) -> None:
         """One text-snapshot pass. Each page is independent — failure on
-        any one logs WARNING and leaves its file alone."""
-        for page in PAGES:
+        any one logs WARNING and leaves its file alone.
+
+        `stagger_secs > 0` sleeps between pages so DB load and CPU don't
+        burst at the tick boundary. The run loop sets this to
+        `interval_secs / len(PAGES)` so a full pass still completes in
+        roughly one interval. Tests leave it at 0 for synchronous
+        behavior.
+        """
+        last = len(PAGES) - 1
+        for i, page in enumerate(PAGES):
             try:
                 body = await page.render(self)
                 if body:
@@ -86,6 +98,11 @@ class Dashboard:
                     "dashboard page %r failed; leaving file alone",
                     page.FILENAME,
                 )
+            if stagger_secs > 0 and i < last:
+                try:
+                    await asyncio.sleep(stagger_secs)
+                except asyncio.CancelledError:
+                    raise
 
     async def _plot_loop(self) -> None:
         """Regenerate PNG plots every plot_interval_secs.

@@ -39,10 +39,19 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Literal, Optional, Union
 
 import yaml
 from pydantic import BaseModel, Field
+
+# Single source of truth for the odds-capture schedule (shared with the
+# offline sandbox). See irene/capture_schedule.py. Imported bare because
+# the app runs with irene/ on sys.path (PYTHONPATH=/app in the container).
+from capture_schedule import (
+    CAPTURE_POST_OFFSETS_SECS,
+    CAPTURE_POST_SECS,
+    CAPTURE_PRE_SECS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -341,13 +350,98 @@ class ExplorerSection(BaseModel):
     # 20-minute post-news window — fine-grained enough to see early
     # repricing without hammering the CLOB.
     odds_poll_secs: int = Field(default=15, ge=1, le=300)
-    # Post-news capture window (seconds). 1200 = 20 minutes.
-    capture_post_secs: int = Field(default=1200, ge=60, le=86400)
-    # Pre-news lookback window (seconds). 600 = 10 minutes. Used to
-    # filter `clob.get_price_history` samples at handle-time. The API
-    # fidelity is coarse — most explorations get 1-2 pre-news points,
-    # some get none (NULL data is honest).
-    capture_pre_secs: int = Field(default=600, ge=60, le=86400)
+    # Post-news checkpoints (seconds after t0) at which odds_capture
+    # guarantees a usable book snapshot, and the canonical exit horizons
+    # the sandbox backtests at. Defaults to CAPTURE_POST_OFFSETS_SECS from
+    # the shared schedule (irene/capture_schedule.py) — edit there to move
+    # the grid everywhere at once, or override here for the live explorer
+    # only. +5min / +30min / +1h.
+    capture_post_offsets_secs: list[int] = Field(
+        default_factory=lambda: list(CAPTURE_POST_OFFSETS_SECS)
+    )
+    # Post-news capture window (seconds). Live odds_capture polls
+    # `get_top_of_book` every `odds_poll_secs` until t0+this, and forces a
+    # final snapshot at the boundary so the last checkpoint is covered.
+    # Defaults to the last checkpoint (CAPTURE_POST_SECS = 3600 = 1h).
+    capture_post_secs: int = Field(default=CAPTURE_POST_SECS, ge=60, le=86400)
+    # Pre-news lookback window (seconds). Defaults to CAPTURE_PRE_SECS
+    # (86400 = 24h) from the shared schedule. Used to filter
+    # `clob.get_price_history` samples at handle-time; the bulk window
+    # costs ~one extra Polymarket history call per exploration and gives
+    # sandbox strategies a real baseline (overnight drift, pre-news vol).
+    # API fidelity is in the minutes range — we keep whatever points the
+    # API returns inside the window.
+    capture_pre_secs: int = Field(default=CAPTURE_PRE_SECS, ge=60, le=604800)
+    # Polymarket `prices-history?interval=` value used by the pre-news
+    # backfill call. Wider interval = wider time range the API will
+    # serve. Was "1h" pre-cycle-26; now "1d" to cover the 24h window.
+    # Polymarket accepts: 1h, 6h, 1d, 1w, max.
+    capture_pre_interval: str = Field(default="1d")
+    capture_pre_fidelity: int = Field(default=5, ge=1, le=60)
+    # Admission cap on concurrent `capture_status='active'` rows. When at
+    # cap, new candidates are dropped (debug-logged, not written). Keeps
+    # the sequential odds_capture poll loop under the CLOB rate budget
+    # even on news bursts. 200 → 13 calls/s at 15s poll cadence,
+    # well under Polymarket's 400 req/s ceiling. Raise if firehose_stats
+    # shows `evicted_by_cap` dominating capture_end_reason.
+    max_active_explorations: int = Field(default=200, ge=1, le=10_000)
+    # Probability of starting odds capture for a row the gate pipeline
+    # rejected. 0.05 = 5% sample. Lets the sandbox study "what if we
+    # lowered the gate?" without redeploying. Set to 0 to disable.
+    reject_capture_sample_rate: float = Field(default=0.05, ge=0.0, le=1.0)
+    # Separate admission cap for `capture_sample_reason='rejected_sample'`
+    # rows so a burst of rejects can't starve passed-row capture.
+    max_active_reject_samples: int = Field(default=40, ge=0, le=10_000)
+    # Gate pipeline: ordered list of filters every (article, market)
+    # candidate passes through before odds capture starts. Each gate
+    # writes a row to `explorations`; only `gate_status='passed'` rows
+    # trigger odds_capture. See irene/app/gates/ for available types.
+    gates: list["GateConfig"] = Field(default_factory=list)
+
+
+class MarketOpenGateConfig(BaseModel):
+    """Pure-Python market-liveness gate (irene.app.gates.market_open).
+    Rejects candidates whose market is closed (active=0) or past its
+    end_date at t0 — those have no resting book, so odds capture would
+    only yield empty post-news reads. Place first so dead markets never
+    reach the paid LLM gate or odds capture."""
+    type: Literal["market_open"] = "market_open"
+    name: str = "market_open"
+
+
+class DKGGateConfig(BaseModel):
+    """Pure-Python DKG-score threshold gate (irene.app.gates.dkg)."""
+    type: Literal["dkg_threshold"] = "dkg_threshold"
+    name: str = "dkg"
+    min_final_score: float = Field(default=0.5, ge=0.0, le=1.0)
+
+
+class LLMBatchGateConfig(BaseModel):
+    """Bundled LLM binary-classifier gate (irene.app.gates.llm_batch).
+    One OpenRouter call per `batch_size` candidates; cheap because the
+    system prompt amortizes across the batch.
+
+    v2 prompt asks for per-candidate descriptive features alongside the
+    binary related decision — pass/fail logic unchanged but
+    `gate_history` now carries metadata the sandbox can filter on
+    without re-LLM-ing rows.
+    """
+    type: Literal["llm_batch"] = "llm_batch"
+    name: str = "llm_batch"
+    model: str = "google/gemini-2.5-flash"
+    batch_size: int = Field(default=20, ge=1, le=200)
+    # Raised from 40 to 800 in v2 to accommodate the per-candidate
+    # JSON objects. At batch_size=20 each verdict is ~30-40 tokens.
+    max_output_tokens: int = Field(default=800, ge=8, le=4096)
+    # Bump to invalidate the LLM cache for this gate (mirrors
+    # RELATEDNESS_PROMPT_VERSION in irene/app/ai.py).
+    prompt_version: str = "v2"
+
+
+GateConfig = Annotated[
+    Union[MarketOpenGateConfig, DKGGateConfig, LLMBatchGateConfig],
+    Field(discriminator="type"),
+]
 
 
 class DKGTradeSection(BaseModel):

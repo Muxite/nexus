@@ -62,18 +62,27 @@ class _FakeResponse:
 
 class _FakeClient:
     """Stands in for `httpx.AsyncClient`. The poll loop only calls `.get()`
-    and `.aclose()`; we intercept both."""
+    and `.aclose()`; we intercept both. URL-aware so one fake serves both the
+    `/key` (monthly) and `/credits` (account self-heal) polls; `/credits`
+    requests draw from `credits` if given, else fall back to `behaviours`."""
 
-    def __init__(self, behaviours: list) -> None:
-        # `behaviours` entries are either a dict (payload) or an Exception
-        # (raised when get() is called).
+    def __init__(self, behaviours: list, credits: list | None = None) -> None:
+        # Entries are either a dict (payload) or an Exception (raised on get()).
         self._behaviours = behaviours
-        self.calls = 0
+        self._credits = credits
+        self.calls = 0  # total gets (back-compat)
+        self.key_calls = 0
+        self.credits_calls = 0
 
     async def get(self, url: str, headers: dict | None = None) -> _FakeResponse:
-        idx = min(self.calls, len(self._behaviours) - 1)
         self.calls += 1
-        b = self._behaviours[idx]
+        if "/credits" in url:
+            self.credits_calls += 1
+            seq = self._credits if self._credits is not None else self._behaviours
+            b = seq[min(self.credits_calls - 1, len(seq) - 1)]
+        else:
+            self.key_calls += 1
+            b = self._behaviours[min(self.key_calls - 1, len(self._behaviours) - 1)]
         if isinstance(b, Exception):
             raise b
         return _FakeResponse(b)
@@ -228,6 +237,99 @@ async def test_poll_survives_http_error(tmp_path, monkeypatch):
     assert fake.calls >= 1
     assert b.is_paused() is True
     assert b.remaining_usd is None  # never set on a failed poll
+
+
+# ---------------------------------------------------------------------------
+# Credits self-heal (account balance recovery while credits-paused)
+# ---------------------------------------------------------------------------
+
+
+async def test_credits_pause_self_heals_when_account_balance_recovers(
+    tmp_path, monkeypatch
+):
+    b = _make_budget(tmp_path, poll_seconds=3600)
+    # /key keeps the monthly source healthy; /credits shows a topped-up account.
+    fake = _FakeClient(
+        [{"data": {"limit": 200.0, "usage": 100.0}}],
+        credits=[{"data": {"total_credits": 100.0, "total_usage": 50.0}}],
+    )
+    monkeypatch.setattr("app.budget.httpx.AsyncClient", lambda *a, **kw: fake)
+    for _ in range(5):
+        b.note_402()
+    assert b.is_paused() is True
+    assert os.path.exists(b._pause_flag_path)
+    await b.start()
+    for _ in range(50):
+        if fake.credits_calls >= 1 and b.is_paused() is False:
+            break
+        await asyncio.sleep(0.02)
+    await b.stop()
+    assert b.is_paused() is False
+    assert not os.path.exists(b._pause_flag_path)
+    assert b._account_remaining_usd == pytest.approx(50.0)
+
+
+async def test_credits_poll_does_not_unpause_while_account_still_exhausted(
+    tmp_path, monkeypatch
+):
+    b = _make_budget(tmp_path, poll_seconds=3600)
+    fake = _FakeClient(
+        [{"data": {"limit": 200.0, "usage": 100.0}}],
+        # total_usage > total_credits → balance still negative.
+        credits=[{"data": {"total_credits": 100.0, "total_usage": 100.5}}],
+    )
+    monkeypatch.setattr("app.budget.httpx.AsyncClient", lambda *a, **kw: fake)
+    for _ in range(5):
+        b.note_402()
+    assert b.is_paused() is True
+    await b.start()
+    for _ in range(50):
+        if fake.credits_calls >= 1:
+            break
+        await asyncio.sleep(0.02)
+    await b.stop()
+    assert fake.credits_calls >= 1
+    assert b.is_paused() is True
+    assert os.path.exists(b._pause_flag_path)
+
+
+async def test_credits_poll_error_keeps_pause(tmp_path, monkeypatch):
+    b = _make_budget(tmp_path, poll_seconds=3600)
+    # /key healthy, /credits errors — a failed probe must NOT unpause.
+    fake = _FakeClient(
+        [{"data": {"limit": 200.0, "usage": 100.0}}],
+        credits=[httpx.ConnectError("offline")],
+    )
+    monkeypatch.setattr("app.budget.httpx.AsyncClient", lambda *a, **kw: fake)
+    for _ in range(5):
+        b.note_402()
+    assert b.is_paused() is True
+    await b.start()
+    for _ in range(50):
+        if fake.credits_calls >= 1:
+            break
+        await asyncio.sleep(0.02)
+    await b.stop()
+    assert fake.credits_calls >= 1
+    assert b.is_paused() is True
+    assert b._account_remaining_usd is None  # never set on a failed probe
+
+
+async def test_credits_poll_skipped_when_not_paused(tmp_path, monkeypatch):
+    b = _make_budget(tmp_path, poll_seconds=3600)
+    fake = _FakeClient(
+        [{"data": {"limit": 200.0, "usage": 100.0}}],
+        credits=[{"data": {"total_credits": 100.0, "total_usage": 50.0}}],
+    )
+    monkeypatch.setattr("app.budget.httpx.AsyncClient", lambda *a, **kw: fake)
+    await b.start()  # never paused
+    for _ in range(50):
+        if fake.key_calls >= 1:
+            break
+        await asyncio.sleep(0.02)
+    await b.stop()
+    assert fake.key_calls >= 1
+    assert fake.credits_calls == 0  # gated to paused-only
 
 
 async def test_stop_is_idempotent_and_cancels_task(tmp_path, monkeypatch):

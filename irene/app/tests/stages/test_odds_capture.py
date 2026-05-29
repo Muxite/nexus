@@ -82,7 +82,12 @@ class _ExplorerCfg:
     relatedness_max_output_tokens: int = 80
     odds_poll_secs: int = 15
     capture_post_secs: int = 1200  # 20 min
+    capture_post_offsets_secs: list = field(
+        default_factory=lambda: [300, 600, 1200]
+    )
     capture_pre_secs: int = 600    # 10 min
+    capture_pre_interval: str = "1d"
+    capture_pre_fidelity: int = 5
 
 
 @dataclass
@@ -338,9 +343,19 @@ async def test_poll_after_window_marks_complete(db, monkeypatch):
 
     await stage.run_one_poll_cycle()
 
-    # No tick written (the window had already elapsed).
-    cur = await db.conn.execute("SELECT COUNT(*) FROM odds_observations")
-    assert (await cur.fetchone())[0] == 0
+    # One final snapshot is forced at the window boundary so the terminal
+    # checkpoint always has a usable book (offset >= capture_post_secs).
+    cur = await db.conn.execute(
+        "SELECT offset_seconds, mid, best_bid, best_ask FROM odds_observations"
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    assert len(rows) == 1
+    final = rows[0]
+    assert final["offset_seconds"] >= 1200
+    assert final["mid"] == pytest.approx(0.51)  # (0.5 + 0.52) / 2
+    assert final["best_bid"] == pytest.approx(0.5)
+    assert final["best_ask"] == pytest.approx(0.52)
     # Exploration graduated.
     cur = await db.conn.execute(
         "SELECT capture_status FROM explorations WHERE id=1"

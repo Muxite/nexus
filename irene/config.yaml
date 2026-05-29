@@ -226,18 +226,38 @@ dkg_trade:
   score_floor: 0.5
 
 # Cycle 26 stage-1 soak fix #6: explorer tail now runs in production
-# mode too (one container). Defaults from ExplorerSection are already
-# permissive — we set them explicitly here so this file documents the
-# data-collection intent without surprising a future reader who expects
-# explorer.yaml to be the only place these knobs appear.
+# mode too (one container).
+#
+# Explorer v2 (this turn): pluggable gate pipeline. Every (article,
+# market) candidate walks through `gates:` in order; survivors get
+# odds capture started, rejected candidates are written as audit rows
+# (gate_status='rejected'). Capture window is 1h so backtests can
+# evaluate at the realistic 1h horizon. See irene/docs/exploration_system.md.
 explorer:
-  score_floor: 0.5
+  capture_post_secs: 3600         # 1h: enough horizon to backtest at +1h
+  capture_pre_secs: 86400         # 24h pre-news baseline — wider context for sandbox
+  capture_pre_interval: 1d        # Polymarket prices-history range
+  capture_pre_fidelity: 5         # minutes/bucket inside the range
+  odds_poll_secs: 15
+  max_active_explorations: 200    # 13 calls/s at 15s poll = 3% of 400/s budget
+  reject_capture_sample_rate: 0.05  # 5% of rejected rows still get odds capture
+  max_active_reject_samples: 40     # separate cap so rejects can't starve passes
+  # Legacy single-gate fields (only consulted if a gate omits them):
   relatedness_model: google/gemini-2.5-flash
   relatedness_max_article_chars: 800
   relatedness_max_output_tokens: 80
-  odds_poll_secs: 15
-  capture_post_secs: 1200   # 20 min
-  capture_pre_secs: 600     # 10 min
+  gates:
+    - type: dkg_threshold
+      name: dkg
+      min_final_score: 0.65
+    - type: llm_batch
+      name: cheap_binary
+      model: google/gemini-2.5-flash
+      # v2 prompt: per-candidate descriptive features alongside binary
+      # related decision. Pass/fail logic unchanged.
+      batch_size: 20
+      max_output_tokens: 800
+      prompt_version: v2
 
 closer:
   # Hold positions for 24h then exit. Real Polymarket markets typically

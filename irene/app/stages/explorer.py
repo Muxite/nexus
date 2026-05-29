@@ -4,10 +4,13 @@
 **Purpose.** Noisy-exploration sister of `app/stages/dkg_trade.py`.
 Subscribes to `TOPIC_MARKET_LINKS_UPDATED`; for every link with
 `final_score >= cfg.explorer.score_floor` (permissive, default 0.5
-vs production 0.8), runs a cheap LLM relatedness check and — when
-`related=True` — writes an `explorations` row and publishes
-`TOPIC_EXPLORATION_CREATED` so `odds_capture.py` can start the
-[-10m, +20m] odds time-series.
+vs production 0.8), builds a `Candidate` and runs it through the
+configured gate pipeline (`cfg.explorer.gates`, see irene/app/gates/ —
+default market_open → dkg_threshold → llm_batch). EVERY candidate
+writes an `explorations` audit row tagged with its `gate_status` +
+`gate_history`; only survivors (or a small reject sample) publish
+`TOPIC_EXPLORATION_CREATED` so `odds_capture.py` starts the odds
+time-series.
 
 This stage does NOT trade. It exists to build a labeled dataset for
 offline filter/hypothesis backtests. Treat the `explorations` log as
@@ -22,21 +25,27 @@ a research dataset, not a verdict on the strategy.
 `db_module.register_schema()` at import time.
 
 **Idempotency.** `UNIQUE(article_id, market_condition_id)` makes
-re-fires safe — `INSERT OR IGNORE` returns 0 on a duplicate and the
-stage short-circuits without re-calling the LLM.
+re-fires safe — the pre-pipeline `_exists()` check short-circuits a
+re-fire before any gate runs, so the LLM gate isn't re-called.
 
 **Side effects.**
 - Reads `market_links`, `events`, `facts`, `articles`, `markets`.
-- Calls `deps.ai.relatedness()` (charged to the OpenRouter budget).
-- Calls `deps.clob.get_top_of_book()` for the t0 mid/spread snapshot.
-- Writes `explorations`. Publishes `TOPIC_EXPLORATION_CREATED`.
+- The `llm_batch` gate calls `deps.ai.classify_batch_for_gate()`
+  (charged to the OpenRouter budget); pure-Python gates are free.
+- Calls `deps.clob.get_top_of_book()` for the t0 mid/spread snapshot
+  (only for rows that will be captured).
+- Writes `explorations`. Publishes `TOPIC_EXPLORATION_CREATED` for
+  captured rows.
 
 **Failure modes.**
-- Score below floor / event missing / article missing / market missing
-  → silent skip. No row written. The explorer is deliberately quiet
-  about rejections — we only persist the cases we *captured*.
-- Budget paused → relatedness call returns `related=False`; we skip.
-- LLM parse error → relatedness call returns `related=False`; we skip.
+- Score below floor (SQL pre-filter) / event missing / article missing
+  / market missing → silent skip, no row written.
+- Gate rejection (market dead / DKG below threshold / LLM unrelated) →
+  an audit row IS written with `gate_status='rejected'` +
+  `rejected_by_gate`, but no capture and no publish (unless picked by
+  the reject-capture sample).
+- Budget paused / LLM parse error → the `llm_batch` gate rejects the
+  affected candidates (audit row, no capture).
 - CLOB unavailable at t0 snapshot → `market_mid_t0` / `market_spread_t0`
   are NULL on the row but the row is still written.
 
@@ -50,6 +59,7 @@ stage short-circuits without re-calling the LLM.
 from __future__ import annotations
 
 import logging
+import random
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -102,6 +112,39 @@ _EXPLORER_DDL = [
     "ON explorations(t0_iso)",
     "CREATE INDEX IF NOT EXISTS idx_explorations_market "
     "ON explorations(market_condition_id)",
+    # Explorer-v2 gate pipeline: every candidate the explorer considers
+    # writes a row. `gate_status='passed'` rows are the survivors that go
+    # on to odds capture (existing behavior). `gate_status='rejected'`
+    # rows are audit records — no odds, just the gate trace.
+    # `gate_history` is a JSON list[dict] of {gate, outcome, value,
+    # threshold} entries built by the pipeline.
+    "ALTER TABLE explorations ADD COLUMN gate_status TEXT "
+    "NOT NULL DEFAULT 'passed' "
+    "CHECK(gate_status IN ('passed','rejected'))",
+    "ALTER TABLE explorations ADD COLUMN rejected_by_gate TEXT",
+    "ALTER TABLE explorations ADD COLUMN gate_history TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_explorations_gate_status "
+    "ON explorations(gate_status)",
+    # Explorer-v3 sandbox-feedback columns. All NULLABLE so legacy rows
+    # don't need backfill.
+    #   capture_end_reason:  why the per-exploration odds_capture loop
+    #     exited (window_complete | evicted_by_cap | market_closed |
+    #     capture_aborted | error). Sandbox uses this to filter out rows
+    #     whose post-news window was cut short.
+    #   cluster_id:          group key for "same news event across
+    #     related markets" so backtest Sharpe can deduplicate. Derived
+    #     from the article_id of the news that triggered the (article,
+    #     market) row — articles already get a dedup pass upstream, so
+    #     article_id IS the cluster across markets.
+    #   capture_sample_reason: explains why a non-passed row got odds
+    #     capture anyway. Currently 'rejected_sample' for the 5%
+    #     reject-sampling path; NULL means "passed row" or "rejected,
+    #     no capture".
+    "ALTER TABLE explorations ADD COLUMN capture_end_reason TEXT",
+    "ALTER TABLE explorations ADD COLUMN cluster_id TEXT",
+    "ALTER TABLE explorations ADD COLUMN capture_sample_reason TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_explorations_cluster "
+    "ON explorations(cluster_id)",
 ]
 db_module.register_schema("app/stages/explorer.py", _EXPLORER_DDL)
 
@@ -132,7 +175,14 @@ def _hours_until(end_date: Optional[str]) -> Optional[float]:
 
 
 class ExplorerStage:
-    """Permissive DKG + LLM-relatedness gate → exploration row + odds capture."""
+    """DKG → pluggable gate pipeline → exploration row + odds capture.
+
+    The gate pipeline is built once at construction from
+    `cfg.explorer.gates`. Each (article, market) candidate gets a
+    row in `explorations`; survivors get `gate_status='passed'` and
+    odds_capture starts, rejections get `gate_status='rejected'` as
+    audit-only.
+    """
 
     def __init__(self, deps: StageDeps) -> None:
         if deps.ai is None:
@@ -142,6 +192,11 @@ class ExplorerStage:
         self._ai = deps.ai
         self._clob = deps.clob
         self._cfg = deps.config.explorer
+        from app.gates import build_pipeline
+        self._pipeline = build_pipeline(
+            self._cfg.gates,
+            llm_caller=self._ai.classify_batch_for_gate,
+        )
 
     async def start(self) -> None:
         return
@@ -182,58 +237,110 @@ class ExplorerStage:
         is_tracer: bool,
         tracer_id: Optional[str],
     ) -> None:
+        import json as _json
+        from app.gates import Candidate
+
         market_condition_id = link["market_condition_id"]
         final_score = float(link["final_score"])
 
-        # Lookup — silent skip on any missing row. The explorer keeps no
-        # rejection log; only `related=True` rows are persisted.
         article = await self._fetch_article_for_event(event_id)
         market = await self._fetch_market(market_condition_id)
         if article is None or market is None:
             return
 
-        # Pre-check idempotency before paying for an LLM call.
         if await self._exists(article["id"], market_condition_id):
             return
 
-        # Best-effort signals lookup for the article ↔ market cosine +
-        # freshness label. Absent on DKG-only paths (signal_id=NULL).
-        signal = await self._fetch_signal(article["id"], market_condition_id)
-        cosine_similarity = signal.get("similarity") if signal else None
-        freshness = signal.get("freshness") if signal else None
-
-        # LLM relatedness — cheap binary check. Budget pause / parse
-        # error / network failure all return related=False, so the
-        # row is dropped without odds capture.
-        relatedness = await self._ai.relatedness(
-            article={
-                "id": article["id"],
-                "title": article.get("title") or "",
-                "body": article.get("body") or article.get("summary") or "",
-            },
-            market={
-                "condition_id": market_condition_id,
-                "question": market.get("question") or "",
-                "description": market.get("description") or "",
-                "end_date": market.get("end_date"),
-            },
-            max_article_chars=self._cfg.relatedness_max_article_chars,
-            max_output_tokens=self._cfg.relatedness_max_output_tokens,
-            model=self._cfg.relatedness_model,
-            is_tracer=is_tracer,
-            tracer_id=tracer_id,
-        )
-        if not relatedness.related:
+        # Admission cap is on PASSED rows (the ones that consume CLOB
+        # polling budget). Rejected rows are cheap audit-only unless they
+        # get picked by the reject-sample path below.
+        if await self._active_count() >= self._cfg.max_active_explorations:
+            logger.debug(
+                "explorer: at active cap (%d), skipping (article=%s, market=%s)",
+                self._cfg.max_active_explorations,
+                article["id"], market_condition_id,
+            )
             return
 
-        # t0 snapshot of the YES side mid/spread (best-effort; NULL on
-        # any failure). We snapshot YES by convention so downstream
-        # analysis has a stable reference token.
-        mid_t0, spread_t0 = await self._snapshot_book(market.get("token_yes"))
+        signal = await self._fetch_signal(article["id"], market_condition_id)
+        cosine_similarity = signal.get("similarity") if signal else None
+        # Pull cluster_id + cluster-freshness from the dedupe stage's
+        # `article_clusters` table — populated upstream and gives us a
+        # real BREAKING/EVOLVING/REHASH/STALE_RETURN signal regardless of
+        # whether the legacy `signals` row was created. Falls back to the
+        # signal-row freshness when the article isn't yet in a cluster.
+        cluster = await self._fetch_cluster(article["id"])
+        cluster_id = cluster.get("cluster_id") if cluster else None
+        freshness = (
+            (cluster.get("freshness") if cluster else None)
+            or (signal.get("freshness") if signal else None)
+        )
+
+        candidate = Candidate(
+            article_id=article["id"],
+            market_condition_id=market_condition_id,
+            final_score=final_score,
+            cosine_similarity=cosine_similarity,
+            freshness=freshness,
+            breaking_score=article.get("breaking_score"),
+            article_tier=article.get("tier"),
+            market_volume_24h=market.get("volume_24h"),
+            article_title=article.get("title") or "",
+            article_body=article.get("body") or article.get("summary") or "",
+            market_question=market.get("question") or "",
+            market_description=market.get("description") or "",
+            market_end_date=market.get("end_date"),
+            market_active=market.get("active"),
+        )
+
+        history_map = await self._pipeline.run([candidate])
+        key = f"{candidate.article_id}:{candidate.market_condition_id}"
+        history = history_map[key]
+        passed = self._pipeline.passed(history)
+        rejected_by = None if passed else self._pipeline.rejected_by(history)
+        gate_history_json = _json.dumps(
+            [d.model_dump(mode="json") for d in history]
+        )
 
         t0_iso = _now_iso()
         capture_end_at_iso = self._compute_capture_end_at(t0_iso)
         hours_to_expiry = _hours_until(market.get("end_date"))
+
+        # Reject-sample path: a configurable fraction of rejected rows
+        # still get odds capture so the sandbox can study "what if the
+        # gate were looser?". Sampling decision happens here so that
+        # `capture_sample_reason` and the captured t0 snapshot both
+        # land on the same row.
+        sample_reject = False
+        if not passed and self._cfg.reject_capture_sample_rate > 0:
+            under_cap = (
+                await self._active_reject_sample_count()
+                < self._cfg.max_active_reject_samples
+            )
+            if under_cap and random.random() < self._cfg.reject_capture_sample_rate:
+                sample_reject = True
+
+        capture_this_row = passed or sample_reject
+        capture_sample_reason = "rejected_sample" if sample_reject else None
+
+        if capture_this_row:
+            mid_t0, spread_t0 = await self._snapshot_book(market.get("token_yes"))
+        else:
+            mid_t0, spread_t0 = None, None
+
+        if passed:
+            llm_reason = "; ".join(
+                f"{d.gate_name}:{d.outcome.value}" for d in history
+            )
+        elif sample_reject:
+            llm_reason = (
+                f"rejected_by:{rejected_by}; sampled_for_capture"
+                if rejected_by else "rejected; sampled_for_capture"
+            )
+        else:
+            llm_reason = (
+                f"rejected_by:{rejected_by}" if rejected_by else "rejected"
+            )
 
         exploration_id = await self._insert_exploration(
             article_id=article["id"],
@@ -251,19 +358,25 @@ class ExplorerStage:
             market_spread_t0=spread_t0,
             market_mid_t0=mid_t0,
             hours_to_expiry=hours_to_expiry,
-            llm_related=True,
-            llm_confidence=relatedness.confidence,
-            llm_reason=relatedness.reason,
-            llm_prompt_hash=relatedness.prompt_hash,
+            llm_related=passed,
+            llm_confidence=None,
+            llm_reason=llm_reason,
+            llm_prompt_hash=None,
             capture_end_at=capture_end_at_iso,
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
+            gate_status="passed" if passed else "rejected",
+            rejected_by_gate=rejected_by,
+            gate_history=gate_history_json,
+            cluster_id=cluster_id,
+            capture_sample_reason=capture_sample_reason,
+            start_capture=capture_this_row,
         )
         if exploration_id is None:
-            # Lost the idempotency race — another payload for the same
-            # (article, market) inserted first. Silent skip.
             return
+        if not capture_this_row:
+            return  # audit row written; no odds capture
 
         await self._bus.publish(
             TOPIC_EXPLORATION_CREATED,
@@ -375,6 +488,31 @@ class ExplorerStage:
             ),
         }
 
+    async def _fetch_cluster(self, article_id: int) -> Optional[dict]:
+        """Return `{cluster_id, freshness}` for the article's dedupe
+        cluster, or None if the article hasn't been clustered yet. Used
+        to populate the exploration row's `cluster_id` and `freshness`
+        without depending on a `signals` row existing.
+        """
+        cur = await self._db.conn.execute(
+            "SELECT cm.cluster_id, ac.freshness "
+            "FROM article_cluster_members cm "
+            "JOIN article_clusters ac ON ac.id = cm.cluster_id "
+            "WHERE cm.article_id = ? LIMIT 1",
+            (article_id,),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None:
+            return None
+        return {
+            "cluster_id": (
+                str(row["cluster_id"])
+                if row["cluster_id"] is not None else None
+            ),
+            "freshness": row["freshness"],
+        }
+
     async def _fetch_signal(
         self, article_id: int, market_condition_id: str
     ) -> Optional[dict]:
@@ -439,6 +577,27 @@ class ExplorerStage:
         await cur.close()
         return row is not None
 
+    async def _active_count(self) -> int:
+        cur = await self._db.conn.execute(
+            "SELECT COUNT(*) FROM explorations WHERE capture_status = 'active'"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row else 0
+
+    async def _active_reject_sample_count(self) -> int:
+        """How many `capture_sample_reason='rejected_sample'` rows are
+        currently in flight. Gated separately from passed-row capacity
+        so a burst of rejects can't starve passed captures."""
+        cur = await self._db.conn.execute(
+            "SELECT COUNT(*) FROM explorations "
+            "WHERE capture_status IN ('pending','active') "
+            "AND capture_sample_reason = 'rejected_sample'"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        return int(row[0]) if row else 0
+
     # ------------------------------------------------------------------
     # Writes
     # ------------------------------------------------------------------
@@ -469,7 +628,18 @@ class ExplorerStage:
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
+        gate_status: str = "passed",
+        rejected_by_gate: Optional[str] = None,
+        gate_history: Optional[str] = None,
+        cluster_id: Optional[str] = None,
+        capture_sample_reason: Optional[str] = None,
+        start_capture: bool = True,
     ) -> Optional[int]:
+        # `start_capture=True` rows (gate-passed OR reject-sampled) get
+        # `capture_status='pending'` so odds_capture picks them up.
+        # `start_capture=False` rejected rows are audit-only: status
+        # 'complete' so odds_capture never picks them up.
+        capture_status = "pending" if start_capture else "complete"
         async with self._db.batch() as cur:
             await cur.execute(
                 """
@@ -483,9 +653,12 @@ class ExplorerStage:
                      llm_related, llm_confidence, llm_reason,
                      llm_prompt_hash,
                      capture_status, capture_end_at,
-                     cycle_id, is_tracer, tracer_id, created_at)
+                     cycle_id, is_tracer, tracer_id, created_at,
+                     gate_status, rejected_by_gate, gate_history,
+                     cluster_id, capture_sample_reason)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, 'pending', ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?)
                 """,
                 (
                     article_id, event_id, market_condition_id,
@@ -496,8 +669,10 @@ class ExplorerStage:
                     hours_to_expiry,
                     1 if llm_related else 0, llm_confidence, llm_reason,
                     llm_prompt_hash,
-                    capture_end_at,
+                    capture_status, capture_end_at,
                     cycle_id, 1 if is_tracer else 0, tracer_id, _now_iso(),
+                    gate_status, rejected_by_gate, gate_history,
+                    cluster_id, capture_sample_reason,
                 ),
             )
             if cur.rowcount == 0:
