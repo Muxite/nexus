@@ -28,8 +28,10 @@ off, the file is deleted. Ad-hoc scripts and the dashboard read the file
 without IPC (seulgi lesson — the file IS the protocol).
 
 **Pause sources.**
-- `monthly_cap_near_zero` — `remaining = limit - usage < pause_at_remaining_usd`.
-  Cleared when `remaining >= pause_at_remaining_usd`.
+- `monthly_cap_near_zero` — `remaining < pause_at_remaining_usd`, where
+  `remaining` is the `/key` `limit_remaining` field (monthly-reset-aware) when
+  present, else the legacy `limit - usage` (lifetime usage). Cleared when
+  `remaining >= pause_at_remaining_usd`.
 - `account_credits_zero` — 402-streak reaches 5. Cleared either when the
   streak drops to 0 (one `note_ok()` per `note_402()` to climb back) OR, while
   paused, when the `/api/v1/credits` poll shows the account balance recovered
@@ -260,9 +262,21 @@ class Budget:
             )
             resp.raise_for_status()
             data = resp.json().get("data") or {}
-            limit = float(data.get("limit") or self._monthly_cap_usd)
-            usage = float(data.get("usage") or 0.0)
-            self._remaining_usd = max(limit - usage, 0.0)
+            # `/key` exposes `limit_remaining` — spend left against the key's
+            # limit, already netting out the monthly reset (`limit_reset`).
+            # Prefer it. The legacy `limit - usage` path uses the LIFETIME
+            # `usage` field, which never resets, so it phantom-pauses once
+            # cumulative usage crosses the cap even though the month's
+            # allowance is full. Fall back to it only when `limit_remaining`
+            # is absent (older payloads / no key limit set), defaulting the
+            # cap to the configured monthly value.
+            limit_remaining = data.get("limit_remaining")
+            if limit_remaining is not None:
+                self._remaining_usd = max(float(limit_remaining), 0.0)
+            else:
+                limit = float(data.get("limit") or self._monthly_cap_usd)
+                usage = float(data.get("usage") or 0.0)
+                self._remaining_usd = max(limit - usage, 0.0)
             self._recompute_monthly_pause()
         except (httpx.HTTPError, ValueError, KeyError) as exc:
             # Network blip or malformed payload — keep last known value so a

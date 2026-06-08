@@ -196,6 +196,25 @@ async def test_poll_pauses_when_remaining_below_threshold(tmp_path, monkeypatch)
         assert json.load(fh)["reason"] == "monthly_cap_near_zero"
 
 
+async def test_poll_prefers_limit_remaining_over_lifetime_usage(tmp_path, monkeypatch):
+    # Real `/key` payload: lifetime `usage` (169.92) is near the cap, but the
+    # monthly allowance is full — `limit_remaining` must win so we don't
+    # phantom-pause. (limit - usage would give 30.08; limit_remaining = 200.)
+    b = _make_budget(tmp_path, poll_seconds=3600)
+    fake = _FakeClient(
+        [{"data": {"limit": 200.0, "usage": 169.92, "limit_remaining": 200.0}}]
+    )
+    monkeypatch.setattr("app.budget.httpx.AsyncClient", lambda *a, **kw: fake)
+    await b.start()
+    for _ in range(50):
+        if fake.calls >= 1 and b.remaining_usd is not None:
+            break
+        await asyncio.sleep(0.02)
+    await b.stop()
+    assert b.remaining_usd == pytest.approx(200.0)
+    assert b.is_paused() is False
+
+
 async def test_poll_resumes_when_remaining_recovers(tmp_path, monkeypatch):
     b = _make_budget(tmp_path, poll_seconds=3600)
     fake = _FakeClient([{"data": {"limit": 10.0, "usage": 8.0}}])
