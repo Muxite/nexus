@@ -23,6 +23,11 @@ For every signal, in order, until one rejects or all pass:
 
   1. `similarity_floor` — `payload.similarity` vs `cfg.trade.min_similarity`.
   2. `freshness`       — `payload.freshness` ∈ `cfg.trade.accept_freshness`.
+  2.1. `cluster_dedup` — cycle 28: one position per article cluster.
+                        Reject (`cluster_position_open`) while any trade
+                        from the signal's cluster is still open; re-checked
+                        inside the trade-insert transaction (race window).
+                        Runs pre-LLM so a dedup also saves the call.
   3. `direction`       — call `ai.direction()`, reject if NEUTRAL
                         (`direction_neutral`) or confidence below
                         `cfg.trade.min_confidence` (`direction_lowconf`).
@@ -108,6 +113,7 @@ from app.stages._gates import (
     _gate_binary_dedup,
     _gate_book_unavailable,
     _gate_cash,
+    _gate_cluster_dedup,
     _gate_direction,
     _gate_edge,
     _gate_entity_overlap,
@@ -121,6 +127,7 @@ from app.stages._gates import (
     _gate_similarity_floor,
     _gate_size,
     _gate_wide_spread,
+    query_open_cluster_trades,
 )
 from app.topics import TOPIC_TRADE_DECIDED
 
@@ -247,6 +254,14 @@ _TRADE_DDL = [
     "ALTER TABLE trades ADD COLUMN entry_best_bid   REAL",
     "ALTER TABLE trades ADD COLUMN entry_best_ask   REAL",
     "ALTER TABLE trades ADD COLUMN entry_fill_price REAL",
+    # Cycle 28 (cluster accounting): denormalize the article cluster onto
+    # the trade row. The 2026-06-12 retrospective showed 845 trades were
+    # ~52 independent bets — the cluster, not the trade, is the unit of
+    # risk. Populated from the signal payload at insert; NULL on legacy
+    # rows and on cluster-less signals. The cluster_dedup gate + the
+    # per-cluster PnL page key off this.
+    "ALTER TABLE trades ADD COLUMN cluster_id INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_trades_cluster_id ON trades(cluster_id)",
 ]
 db_module.register_schema("app/stages/trade.py", _TRADE_DDL)
 
@@ -539,6 +554,11 @@ class GateFeatures:
     # (overlaps, n_entities). None = skip the gate (older signals predate
     # the cycle-7 entity_overlap check).
     entity_overlap_result: Optional[tuple[bool, int]] = None
+    # Cycle 28: cluster_dedup inputs. `open_cluster_trade_ids=None` skips
+    # the gate (pre-cycle-28 snapshots have no cluster bookkeeping);
+    # replay of newer snapshots passes the list (possibly empty).
+    cluster_id: Optional[int] = None
+    open_cluster_trade_ids: Optional[list] = None
     # LLM result — must be populated before the direction gate runs.
     direction: Optional[str] = None  # 'YES' | 'NO' | 'NEUTRAL'
     confidence: Optional[float] = None
@@ -604,6 +624,16 @@ def evaluate_gates(features: GateFeatures, cfg) -> GateResult:
     history.append(entry)
     if status == "reject":
         return GateResult("reject", reason, history)
+
+    # Gate 2.1 — cluster_dedup (cycle 28). Skipped when the caller didn't
+    # supply the open-cluster list (pre-cycle-28 snapshots).
+    if features.open_cluster_trade_ids is not None:
+        status, entry, reason = _gate_cluster_dedup(
+            features.cluster_id, features.open_cluster_trade_ids,
+        )
+        history.append(entry)
+        if status == "reject":
+            return GateResult("reject", reason, history)
 
     # Presence checks (not gates, but they reject pre-LLM).
     if not features.article_present:
@@ -872,6 +902,37 @@ class TradeStage:
 
         # 2. freshness --------------------------------------------------------
         status, entry, reason = _gate_freshness(freshness, self._cfg)
+        gate_history.append(entry)
+        if status == "reject":
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=None,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
+
+        # 2.1 cluster_dedup (cycle 28) ----------------------------------------
+        # One position per article cluster — the retro's re-scoring showed
+        # 845 trades collapse to ~52 independent bets; a second trade on
+        # the same cluster is the same bet plus fees. Runs BEFORE the LLM
+        # call (cluster_id rides the signal payload; one indexed query),
+        # so the dedup also saves the call. A race-window re-check runs
+        # again inside the trade-insert transaction (see _insert_trade).
+        cluster_id = payload.get("cluster_id")
+        if cluster_id is None:
+            # Old payload shapes may omit the key; the signals row is
+            # authoritative (match.py writes it).
+            cluster_id = await self._cluster_id_for_signal(int(signal_id))
+        _t = time.perf_counter()
+        open_cluster = await query_open_cluster_trades(self._db.conn, cluster_id)
+        breakdown["cluster_dedup"] = (time.perf_counter() - _t) * 1000.0
+        status, entry, reason = _gate_cluster_dedup(cluster_id, open_cluster)
         gate_history.append(entry)
         if status == "reject":
             await self._record_reject(
@@ -1301,6 +1362,9 @@ class TradeStage:
             "kelly_capped": kelly_capped,
             "size_usdc": size,
             "balance_usdc": self._cfg.balance_usdc,
+            # Cycle 28: the unit of risk (article cluster) rides the
+            # snapshot so replay can re-run the cluster_dedup gate.
+            "cluster_id": cluster_id,
             # Cycle 27: the traded token's book at entry, position space.
             # Duplicated onto first-class trades columns for SQL; kept
             # here too so replay sees one self-contained snapshot.
@@ -1342,6 +1406,7 @@ class TradeStage:
             tracer_id=tracer_id,
             entry_best_bid=entry_best_bid,
             entry_best_ask=entry_best_ask,
+            cluster_id=cluster_id,
             breakdown=breakdown,
             t_start=t_start,
             db_insert_t_start=_t,
@@ -1424,6 +1489,18 @@ class TradeStage:
             "active": row["active"],
             "closed_at": row["closed_at"],
         }
+
+    async def _cluster_id_for_signal(self, signal_id: int) -> Optional[int]:
+        """Cycle 28: authoritative cluster lookup for payloads that omit
+        the key (old publisher shapes, manual replays)."""
+        cur = await self._db.conn.execute(
+            "SELECT cluster_id FROM signals WHERE id = ?", (signal_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None or row["cluster_id"] is None:
+            return None
+        return int(row["cluster_id"])
 
     async def _cluster_size_for_signal(self, signal_id: int) -> int:
         """COUNT(*) on article_cluster_members for the signal's cluster.
@@ -1793,6 +1870,7 @@ class TradeStage:
         tracer_id: Optional[str],
         entry_best_bid: Optional[float] = None,
         entry_best_ask: Optional[float] = None,
+        cluster_id: Optional[int] = None,
         breakdown: Optional[dict[str, float]] = None,
         t_start: Optional[float] = None,
         db_insert_t_start: Optional[float] = None,
@@ -1819,7 +1897,7 @@ class TradeStage:
         decision_latency_ms = (
             (time.perf_counter() - t_start) * 1000.0 if t_start is not None else None
         )
-        trade_id = await self._insert_trade(
+        trade_id, cluster_raced = await self._insert_trade(
             signal_id=signal_id,
             decision_id=decision_id,
             prediction_id=prediction_id,
@@ -1839,9 +1917,40 @@ class TradeStage:
             tracer_id=tracer_id,
             entry_best_bid=entry_best_bid,
             entry_best_ask=entry_best_ask,
+            cluster_id=cluster_id,
             decision_latency_ms=decision_latency_ms,
             decision_latency_breakdown=breakdown,
         )
+        if cluster_raced:
+            # Cycle 28: a concurrent signal from the same cluster won the
+            # insert between our gate check and this transaction. Convert
+            # the execute decision to an audited reject — never a silent
+            # drop, never two open positions on one cluster.
+            race_history = list(gate_history) + [
+                _gate_entry(
+                    "cluster_dedup", "reject", "race_recheck",
+                    "0 open cluster trades at insert",
+                )
+            ]
+            async with self._db.batch() as cur:
+                await cur.execute(
+                    "UPDATE decisions SET outcome='reject', "
+                    "reason='cluster_position_open', gate_history=? "
+                    "WHERE id=?",
+                    (json.dumps(race_history), decision_id),
+                )
+            await self._bus.publish(
+                TOPIC_TRADE_DECIDED,
+                {
+                    "trade_id": None,
+                    "decision_id": decision_id,
+                    "outcome": "reject",
+                    "reason": "cluster_position_open",
+                    "is_tracer": is_tracer,
+                    "tracer_id": tracer_id,
+                },
+            )
+            return
         if trade_id is None:
             return
         await self._insert_trade_features(
@@ -1944,9 +2053,21 @@ class TradeStage:
         tracer_id: Optional[str],
         entry_best_bid: Optional[float] = None,
         entry_best_ask: Optional[float] = None,
+        cluster_id: Optional[int] = None,
         decision_latency_ms: Optional[float] = None,
         decision_latency_breakdown: Optional[dict[str, float]] = None,
-    ) -> Optional[int]:
+    ) -> tuple[Optional[int], bool]:
+        """Returns `(trade_id, cluster_raced)`.
+
+        `cluster_raced=True` (cycle 28) means the in-transaction
+        cluster_dedup re-check found an open trade from the same cluster
+        that landed AFTER handle()'s gate check (the cascade awaits
+        between gate and insert, so concurrent signals from one cluster
+        can interleave). The SELECT and the INSERT share one transaction
+        on the single SQLite connection, so the re-check is airtight
+        in-process; the caller converts the decision to an audited
+        reject.
+        """
         # v6 → cycle 27: derive the target_mid where the model's edge
         # collapses, now in **position space** (the traded token's own
         # price, matching `mid_price` and the closer's poll): sell when
@@ -1979,6 +2100,27 @@ class TradeStage:
         # (defensive; the live cascade's book gate makes that impossible).
         entry_fill_price = entry_best_ask
         async with self._db.batch() as cur:
+            # Cycle 28: race re-check inside the insert transaction (the
+            # gate ran before the LLM call; the cascade awaited since).
+            # Non-tracer trades only — tracers must not block real ones.
+            if cluster_id is not None and not is_tracer:
+                await cur.execute(
+                    """
+                    SELECT t.id
+                    FROM trades t
+                    LEFT JOIN trade_closures c ON c.trade_id = t.id
+                    LEFT JOIN signals s ON s.id = t.signal_id
+                    WHERE c.id IS NULL
+                      AND t.is_tracer = 0
+                      AND (t.cluster_id = ?
+                           OR (t.cluster_id IS NULL AND s.cluster_id = ?))
+                    LIMIT 1
+                    """,
+                    (cluster_id, cluster_id),
+                )
+                raced_row = await cur.fetchone()
+                if raced_row is not None:
+                    return None, True
             await cur.execute(
                 """
                 INSERT OR IGNORE INTO trades
@@ -1987,8 +2129,9 @@ class TradeStage:
                      kelly_fraction, size_usdc, decision_path, features_snapshot,
                      cycle_id, is_tracer, tracer_id, decided_at, target_mid,
                      decision_latency_ms, decision_latency_breakdown,
-                     entry_best_bid, entry_best_ask, entry_fill_price)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     entry_best_bid, entry_best_ask, entry_fill_price,
+                     cluster_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal_id,
@@ -2015,11 +2158,12 @@ class TradeStage:
                     entry_best_bid,
                     entry_best_ask,
                     entry_fill_price,
+                    cluster_id,
                 ),
             )
             if cur.rowcount != 1:
-                return None
-            return cur.lastrowid
+                return None, False
+            return cur.lastrowid, False
 
     async def _insert_trade_features(
         self,

@@ -287,6 +287,76 @@ async def query_open_sibling_markets(db_conn, market_id: str) -> list[str]:
     return [r["market_id"] for r in rows]
 
 
+async def query_open_cluster_trades(db_conn, cluster_id) -> list[int]:
+    """Cycle 28 helper: ids of OPEN (un-closed, non-tracer) trades whose
+    article cluster matches `cluster_id`.
+
+    Two sources OR'd together: the denormalized `trades.cluster_id`
+    (cycle-28+ rows) and a join through `signals` for legacy rows whose
+    trades predate the column. The caller passes this list to
+    `_gate_cluster_dedup`. Lives in `_gates.py` per the no-stage-import
+    rule (mirrors `query_open_sibling_markets`).
+    """
+    if cluster_id is None:
+        return []
+    cur = await db_conn.execute(
+        """
+        SELECT t.id
+        FROM trades t
+        LEFT JOIN trade_closures c ON c.trade_id = t.id
+        LEFT JOIN signals s ON s.id = t.signal_id
+        WHERE c.id IS NULL
+          AND t.is_tracer = 0
+          AND (t.cluster_id = ? OR (t.cluster_id IS NULL AND s.cluster_id = ?))
+        """,
+        (cluster_id, cluster_id),
+    )
+    rows = await cur.fetchall()
+    await cur.close()
+    return [int(r["id"]) for r in rows]
+
+
+def _gate_cluster_dedup(
+    cluster_id,
+    open_cluster_trade_ids: list[int],
+) -> tuple[str, Optional[dict], Optional[str]]:
+    """Cycle 28: one position per article cluster.
+
+    The retrospective's cluster re-scoring showed the wallet's 845
+    trades collapse to ~52 independent bets — every additional trade on
+    the same news cluster is the same bet with more fees. Refuse to open
+    a second position while any trade from the cluster is still open.
+
+    Runs BEFORE the direction LLM (no fetch needed — cluster_id rides
+    the signal payload), so a dedup reject also saves the LLM call.
+    `cluster_id is None` (cluster-less signal) passes with an audited
+    entry — never silently.
+    """
+    if cluster_id is None:
+        return (
+            "ok",
+            _gate_entry("cluster_dedup", "ok", None, "no_cluster"),
+            None,
+        )
+    if open_cluster_trade_ids:
+        return (
+            "reject",
+            _gate_entry(
+                "cluster_dedup",
+                "reject",
+                f"open trades in cluster {cluster_id}: "
+                f"{','.join(str(t) for t in open_cluster_trade_ids[:3])}",
+                "0 open cluster trades",
+            ),
+            "cluster_position_open",
+        )
+    return (
+        "ok",
+        _gate_entry("cluster_dedup", "ok", int(cluster_id), "0 open cluster trades"),
+        None,
+    )
+
+
 def _gate_binary_dedup(
     open_sibling_market_ids: list[str],
 ) -> tuple[str, Optional[dict], Optional[str]]:

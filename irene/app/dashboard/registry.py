@@ -19,6 +19,7 @@ from .pages import (
     near_miss_audit,
     news_staleness,
     pnl,
+    pnl_clusters,
     recent_trades,
     system_stats,
     throughput,
@@ -38,6 +39,7 @@ PAGES = [
     entity_extraction,
     entity_resolutions,
     pnl,
+    pnl_clusters,
     near_miss_audit,
     system_stats,
 ]

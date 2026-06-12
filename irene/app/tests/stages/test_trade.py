@@ -320,9 +320,10 @@ async def test_happy_path_writes_trade_decision_and_features(db_seeded):
     assert t["decision_path"] == "mvp"
     snap = json.loads(t["features_snapshot"])
     assert snap["direction"] == "YES" and snap["confidence"] == 0.7
-    # 7 gates: similarity_floor, freshness, entity_overlap, direction,
-    # edge, size, cash
-    assert "gate_history" in snap and len(snap["gate_history"]) == 7
+    # 8 gates: similarity_floor, freshness, cluster_dedup (cycle 28),
+    # entity_overlap, direction, edge, size, cash
+    assert "gate_history" in snap and len(snap["gate_history"]) == 8
+    assert snap["gate_history"][2]["gate"] == "cluster_dedup"
 
     cur = await db_seeded.conn.execute(
         "SELECT feature_name FROM trade_features ORDER BY feature_name"
