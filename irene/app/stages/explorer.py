@@ -145,6 +145,19 @@ _EXPLORER_DDL = [
     "ALTER TABLE explorations ADD COLUMN capture_sample_reason TEXT",
     "CREATE INDEX IF NOT EXISTS idx_explorations_cluster "
     "ON explorations(cluster_id)",
+    # Cycle 29: long-horizon checkpoint bookkeeping (odds_capture's
+    # low-frequency loop — see capture_schedule.CAPTURE_LONG_OFFSETS_SECS).
+    #   long_capture_status: NULL = pending/not yet due; 'done' = the
+    #     final (+7d) checkpoint landed; 'history_unavailable' = the
+    #     final checkpoint's grace window passed and prices-history
+    #     could not serve it (market delisted, t0 older than the
+    #     history span at first deploy, ...). Partial checkpoint
+    #     coverage is normal for backlog rows and visible per-row in
+    #     odds_observations.
+    "ALTER TABLE explorations ADD COLUMN long_capture_status  TEXT",
+    "ALTER TABLE explorations ADD COLUMN long_capture_done_at TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_explorations_long_status "
+    "ON explorations(long_capture_status)",
 ]
 db_module.register_schema("app/stages/explorer.py", _EXPLORER_DDL)
 

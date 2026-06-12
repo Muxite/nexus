@@ -48,6 +48,7 @@ from pydantic import BaseModel, Field
 # offline sandbox). See irene/capture_schedule.py. Imported bare because
 # the app runs with irene/ on sys.path (PYTHONPATH=/app in the container).
 from capture_schedule import (
+    CAPTURE_LONG_OFFSETS_SECS,
     CAPTURE_POST_OFFSETS_SECS,
     CAPTURE_POST_SECS,
     CAPTURE_PRE_SECS,
@@ -378,6 +379,21 @@ class ExplorerSection(BaseModel):
     # Polymarket accepts: 1h, 6h, 1d, 1w, max.
     capture_pre_interval: str = Field(default="1d")
     capture_pre_fidelity: int = Field(default=5, ge=1, le=60)
+    # Cycle 29: sparse long-horizon checkpoints (+4h/+1d/+2d/+7d by
+    # default — CAPTURE_LONG_OFFSETS_SECS in irene/capture_schedule.py).
+    # A separate low-frequency loop backfills them from `prices-history`
+    # (mid only; the dense window already captured spread structure near
+    # t0). `capture_long_enabled=false` is the kill switch; the loop is
+    # additive and never touches the dense capture path.
+    capture_long_enabled: bool = True
+    capture_long_offsets_secs: list[int] = Field(
+        default_factory=lambda: list(CAPTURE_LONG_OFFSETS_SECS)
+    )
+    # Long-horizon loop cadence + per-pass budget. 50 history calls per
+    # 600s pass = 0.08 req/s — noise next to the dense poll; the
+    # 16-day historical backlog (~80k explorations) drains in days.
+    capture_long_poll_secs: int = Field(default=600, ge=30, le=86400)
+    capture_long_max_calls_per_poll: int = Field(default=50, ge=1, le=1000)
     # Admission cap on concurrent `capture_status='active'` rows. When at
     # cap, new candidates are dropped (debug-logged, not written). Keeps
     # the sequential odds_capture poll loop under the CLOB rate budget

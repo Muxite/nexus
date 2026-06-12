@@ -24,6 +24,15 @@ container. For every `explorations` row published on
 The watchlist is rehydrated from the DB at `start()` so explorer
 restarts resume in-flight captures without losing data.
 
+  3. Long-horizon checkpoints (cycle 29): a separate low-frequency loop
+     backfills sparse `source='checkpoint'` samples at
+     `cfg.explorer.capture_long_offsets_secs` (+4h/+1d/+2d/+7d) from
+     `prices-history`. Each exploration is processed once, when its
+     final checkpoint comes due — one '1w' history call fills every
+     checkpoint (mid only, no book). Completion is tracked on
+     `explorations.long_capture_status` ('done' /
+     'history_unavailable'). Kill switch: `capture_long_enabled`.
+
 This stage is purely observational — it never trades, never gates,
 never publishes back into the trade-decision path. It is the
 data-collection arm of the explorer container.
@@ -111,6 +120,50 @@ _ODDS_DDL = [
     # Guard against duplicate live ticks on a poll-loop replay.
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_odds_obs_sample "
     "ON odds_observations(exploration_id, sampled_at, source)",
+    # Cycle 29: admit `source='checkpoint'` (sparse long-horizon samples
+    # backfilled from prices-history). SQLite can't ALTER a CHECK in
+    # place, so we rebuild — same pattern as trade_closures_cycle25
+    # (closer.py). NOTE: on the production DB this copies ~2.2M rows
+    # once at boot (seconds-to-a-minute); a slow first start after the
+    # cycle-29 deploy is this migration, not a hang. The FK clause is
+    # dropped like the closer migration dropped its decorative one —
+    # the writer validates exploration existence by construction.
+    """
+    CREATE TABLE IF NOT EXISTS odds_observations_cycle29 (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        exploration_id  INTEGER NOT NULL,
+        token_id        TEXT NOT NULL,
+        source          TEXT NOT NULL CHECK(source IN ('history','live','checkpoint')),
+        sampled_at      TEXT NOT NULL,
+        offset_seconds  INTEGER NOT NULL,
+        mid             REAL,
+        best_bid        REAL,
+        best_ask        REAL,
+        spread          REAL,
+        cycle_id        INTEGER
+    )
+    """,
+    """
+    INSERT OR IGNORE INTO odds_observations_cycle29
+        (id, exploration_id, token_id, source, sampled_at,
+         offset_seconds, mid, best_bid, best_ask, spread, cycle_id)
+    SELECT id, exploration_id, token_id, source, sampled_at,
+           offset_seconds, mid, best_bid, best_ask, spread, cycle_id
+    FROM odds_observations
+    """,
+    "DROP TABLE IF EXISTS odds_observations",
+    "ALTER TABLE odds_observations_cycle29 RENAME TO odds_observations",
+    # NOTE: the recreated index statements below must be textually
+    # DISTINCT from the originals above — schema_migrations dedupes on
+    # (owner, statement_sha), so a byte-identical statement would be
+    # skipped and the rebuilt table would silently lose its indexes
+    # (including the uniqueness guard against duplicate ticks).
+    "CREATE INDEX IF NOT EXISTS idx_odds_obs_exploration "
+    "ON odds_observations(exploration_id) /* cycle29 rebuild */",
+    "CREATE INDEX IF NOT EXISTS idx_odds_obs_offset "
+    "ON odds_observations(exploration_id, offset_seconds) /* cycle29 rebuild */",
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_odds_obs_sample "
+    "ON odds_observations(exploration_id, sampled_at, source) /* cycle29 rebuild */",
 ]
 db_module.register_schema("app/stages/odds_capture.py", _ODDS_DDL)
 
@@ -132,6 +185,68 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+# ---------------------------------------------------------------------------
+# Cycle 29: long-horizon checkpoint helpers (pure functions — unit-tested
+# without a DB or clock).
+# ---------------------------------------------------------------------------
+
+
+def _grace_for_offset(offset_secs: int) -> int:
+    """Tolerance around a checkpoint's nominal time when matching a
+    prices-history sample. ±30min for the hours-scale checkpoint, ±2h
+    for day-scale — proportional to how fast the signal plausibly moves
+    at that horizon, and wide enough that hourly-fidelity history always
+    has a sample in range."""
+    return 1800 if offset_secs < 86_400 else 7200
+
+
+def _missing_due_checkpoints(
+    offsets: list[int],
+    *,
+    t0_ts: int,
+    now_ts: int,
+    existing_offsets: list[int],
+) -> list[int]:
+    """Nominal offsets that are DUE (t0+offset in the past) and not yet
+    covered by an existing checkpoint row. Existing rows store the
+    actual sample offset, so coverage = any existing offset within the
+    nominal offset's grace window."""
+    missing: list[int] = []
+    for off in sorted(offsets):
+        if t0_ts + off > now_ts:
+            continue
+        grace = _grace_for_offset(off)
+        if any(abs(have - off) <= grace for have in existing_offsets):
+            continue
+        missing.append(off)
+    return missing
+
+
+def _nearest_sample(
+    history: list[tuple[int, float]],
+    *,
+    target_ts: int,
+    grace_secs: int,
+) -> Optional[tuple[int, float]]:
+    """The (ts, mid) history sample closest to `target_ts`, or None when
+    nothing falls within ±grace_secs."""
+    best: Optional[tuple[int, float]] = None
+    best_dist: Optional[int] = None
+    for ts, mid in history:
+        try:
+            ts_i = int(ts)
+            mid_f = float(mid)
+        except (TypeError, ValueError):
+            continue
+        dist = abs(ts_i - target_ts)
+        if dist > grace_secs:
+            continue
+        if best_dist is None or dist < best_dist:
+            best = (ts_i, mid_f)
+            best_dist = dist
+    return best
+
+
 class OddsCaptureStage:
     """Pre-news backfill + continuous post-news odds capture."""
 
@@ -145,23 +260,32 @@ class OddsCaptureStage:
         # Each value is the cached exploration metadata needed per-tick.
         self._watch: dict[int, dict] = {}
         self._task: Optional[asyncio.Task] = None
+        self._long_task: Optional[asyncio.Task] = None
+        # Cycle 29: in-memory failure counters for the long-horizon loop
+        # (exploration_id → consecutive failed final-checkpoint attempts
+        # past its grace window). Reset on restart — harmless, just an
+        # extra retry before 'history_unavailable'.
+        self._long_failures: dict[int, int] = {}
         self._stop_event = asyncio.Event()
 
     async def start(self) -> None:
         await self._rehydrate()
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_forever())
+        if bool(getattr(self._cfg, "capture_long_enabled", False)):
+            self._long_task = asyncio.create_task(self._run_long_forever())
 
     async def stop(self) -> None:
         self._stop_event.set()
-        task = self._task
-        self._task = None
-        if task is not None:
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        for attr in ("_task", "_long_task"):
+            task = getattr(self, attr)
+            setattr(self, attr, None)
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                    pass
 
     async def handle(self, payload: dict) -> None:
         exploration_id = payload.get("exploration_id")
@@ -473,4 +597,196 @@ class OddsCaptureStage:
             logger.info(
                 "odds_capture: rehydrated %d in-flight captures",
                 len(self._watch),
+            )
+
+    # ------------------------------------------------------------------
+    # Cycle 29: long-horizon checkpoint loop (+4h/+1d/+2d/+7d)
+    # ------------------------------------------------------------------
+    #
+    # Design: prices-history is server-side and retroactive, so the data
+    # for a +4h checkpoint fetched at t0+7d is identical to one fetched
+    # at t0+4h. Each exploration is therefore processed exactly ONCE —
+    # when its FINAL checkpoint comes due — and a single '1w' history
+    # call fills every checkpoint at once. Steady-state cost: one history
+    # call per exploration, ever; the historical backlog drains at
+    # `capture_long_max_calls_per_poll` per pass. Checkpoints carry mid
+    # only (history has no book); the dense t0..+1h window already
+    # captured spread structure.
+
+    async def _run_long_forever(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    await self.run_one_long_horizon_cycle()
+                except Exception:  # noqa: BLE001
+                    logger.exception("odds_capture: long-horizon cycle failed")
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(),
+                        timeout=float(self._cfg.capture_long_poll_secs),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            pass
+
+    async def run_one_long_horizon_cycle(self) -> int:
+        """One long-horizon pass. Returns the number of explorations
+        processed (i.e. history calls spent). Tests drive this directly.
+        """
+        offsets = sorted(
+            int(o) for o in getattr(self._cfg, "capture_long_offsets_secs", [])
+        )
+        if not offsets:
+            return 0
+        max_off = offsets[-1]
+        now = _now()
+        now_ts = int(now.timestamp())
+        # prices-history '1w' serves ~[now-7d, now]; a final checkpoint
+        # older than that is unreachable forever.
+        history_span = 604_800
+        due_iso = datetime.fromtimestamp(
+            now_ts - max_off, tz=timezone.utc
+        ).isoformat()
+        lower_iso = datetime.fromtimestamp(
+            now_ts - max_off - history_span, tz=timezone.utc
+        ).isoformat()
+
+        # Bulk-expire rows that can never be filled: token-less rows, and
+        # rows whose final checkpoint already fell out of the history
+        # span (first-deploy backlog older than ~14d). Audited as
+        # 'history_unavailable', never silently skipped.
+        async with self._db.batch() as cur:
+            await cur.execute(
+                """
+                UPDATE explorations
+                SET long_capture_status='history_unavailable'
+                WHERE long_capture_status IS NULL
+                  AND t0_iso <= ?
+                  AND (token_yes IS NULL OR token_yes = '' OR t0_iso < ?)
+                """,
+                (due_iso, lower_iso),
+            )
+
+        cur = await self._db.conn.execute(
+            """
+            SELECT id, token_yes, t0_iso, cycle_id
+            FROM explorations
+            WHERE long_capture_status IS NULL
+              AND token_yes IS NOT NULL AND token_yes != ''
+              AND t0_iso >= ? AND t0_iso <= ?
+            ORDER BY t0_iso ASC
+            LIMIT ?
+            """,
+            (lower_iso, due_iso,
+             int(self._cfg.capture_long_max_calls_per_poll)),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        processed = 0
+        for row in rows:
+            exploration_id = int(row["id"])
+            t0 = _parse_iso(row["t0_iso"])
+            if t0 is None:
+                await self._mark_long_status(
+                    exploration_id, "history_unavailable"
+                )
+                continue
+            t0_ts = int(t0.timestamp())
+            existing = await self._existing_checkpoint_offsets(exploration_id)
+            missing = _missing_due_checkpoints(
+                offsets, t0_ts=t0_ts, now_ts=now_ts,
+                existing_offsets=existing,
+            )
+            if not missing:
+                # Final checkpoint is due (selection guarantees it) and
+                # everything due is covered → done.
+                await self._mark_long_status(exploration_id, "done")
+                continue
+            processed += 1
+            history = None
+            try:
+                history = await self._clob.get_price_history(
+                    str(row["token_yes"]), interval="1w", fidelity=60,
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "odds_capture: long-horizon get_price_history(%s) raised",
+                    row["token_yes"],
+                )
+            filled: list[int] = []
+            if history:
+                cycle_id = (
+                    int(row["cycle_id"]) if row["cycle_id"] is not None else None
+                )
+                for off in missing:
+                    sample = _nearest_sample(
+                        history, target_ts=t0_ts + off,
+                        grace_secs=_grace_for_offset(off),
+                    )
+                    if sample is None:
+                        continue
+                    ts_i, mid_f = sample
+                    async with self._db.batch() as cur2:
+                        await cur2.execute(
+                            """
+                            INSERT OR IGNORE INTO odds_observations
+                                (exploration_id, token_id, source, sampled_at,
+                                 offset_seconds, mid, best_bid, best_ask,
+                                 spread, cycle_id)
+                            VALUES (?, ?, 'checkpoint', ?, ?, ?, NULL, NULL,
+                                    NULL, ?)
+                            """,
+                            (
+                                exploration_id, str(row["token_yes"]),
+                                datetime.fromtimestamp(
+                                    ts_i, tz=timezone.utc
+                                ).isoformat(),
+                                ts_i - t0_ts, mid_f, cycle_id,
+                            ),
+                        )
+                    filled.append(off)
+            final_covered = max_off in filled or any(
+                abs(have - max_off) <= _grace_for_offset(max_off)
+                for have in existing
+            )
+            if final_covered:
+                self._long_failures.pop(exploration_id, None)
+                await self._mark_long_status(exploration_id, "done")
+            else:
+                fails = self._long_failures.get(exploration_id, 0) + 1
+                self._long_failures[exploration_id] = fails
+                if fails >= 2:
+                    self._long_failures.pop(exploration_id, None)
+                    await self._mark_long_status(
+                        exploration_id, "history_unavailable"
+                    )
+        if processed:
+            logger.info(
+                "odds_capture: long-horizon pass spent %d history calls",
+                processed,
+            )
+        return processed
+
+    async def _existing_checkpoint_offsets(
+        self, exploration_id: int
+    ) -> list[int]:
+        cur = await self._db.conn.execute(
+            "SELECT offset_seconds FROM odds_observations "
+            "WHERE exploration_id=? AND source='checkpoint'",
+            (exploration_id,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+        return [int(r["offset_seconds"]) for r in rows]
+
+    async def _mark_long_status(
+        self, exploration_id: int, status: str
+    ) -> None:
+        async with self._db.batch() as cur:
+            await cur.execute(
+                "UPDATE explorations "
+                "SET long_capture_status=?, long_capture_done_at=? "
+                "WHERE id=? AND long_capture_status IS NULL",
+                (status, _now_iso(), exploration_id),
             )

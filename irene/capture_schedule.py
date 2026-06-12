@@ -30,3 +30,12 @@ CAPTURE_POST_OFFSETS_SECS: tuple[int, ...] = (300, 1_800, 3_600)
 # Capture window end = the last checkpoint. Derived so there is no second
 # place to keep in sync.
 CAPTURE_POST_SECS: int = max(CAPTURE_POST_OFFSETS_SECS)
+
+# Cycle 29: sparse long-horizon checkpoints, +4h / +1d / +2d / +7d.
+# These are NOT covered by the dense 15s live poll (which still ends at
+# CAPTURE_POST_SECS) — a separate low-frequency loop backfills them from
+# Polymarket's server-side `prices-history` (mid only, no book), so they
+# cost ~4 rows per exploration instead of days of polling, work
+# retroactively on the historical corpus, and survive restarts. The H8
+# slow-catalyst lane (retro 2026-06-12 §8.1) backtests at these horizons.
+CAPTURE_LONG_OFFSETS_SECS: tuple[int, ...] = (14_400, 86_400, 172_800, 604_800)

@@ -88,6 +88,15 @@ class _ExplorerCfg:
     capture_pre_secs: int = 600    # 10 min
     capture_pre_interval: str = "1d"
     capture_pre_fidelity: int = 5
+    # Cycle 29: long-horizon checkpoint loop. Disabled here so existing
+    # tests' start() doesn't spawn the second task; the long-horizon
+    # tests drive `run_one_long_horizon_cycle()` directly.
+    capture_long_enabled: bool = False
+    capture_long_offsets_secs: list = field(
+        default_factory=lambda: [14_400, 86_400, 172_800, 604_800]
+    )
+    capture_long_poll_secs: int = 600
+    capture_long_max_calls_per_poll: int = 50
 
 
 @dataclass
@@ -420,3 +429,271 @@ async def test_duplicate_live_tick_at_same_timestamp_is_idempotent(
 
     cur = await db.conn.execute("SELECT COUNT(*) FROM odds_observations")
     assert (await cur.fetchone())[0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Cycle 29 — long-horizon checkpoints (+4h/+1d/+2d/+7d)
+# ---------------------------------------------------------------------------
+
+
+def test_grace_for_offset_scales_with_horizon():
+    from app.stages.odds_capture import _grace_for_offset
+    assert _grace_for_offset(14_400) == 1800       # ±30min at +4h
+    assert _grace_for_offset(86_400) == 7200       # ±2h at day scale
+    assert _grace_for_offset(604_800) == 7200
+
+
+def test_missing_due_checkpoints_pure():
+    from app.stages.odds_capture import _missing_due_checkpoints
+    offsets = [14_400, 86_400, 172_800, 604_800]
+    t0 = 1_000_000
+    # Only +4h and +1d are due; +1d already covered (within grace).
+    missing = _missing_due_checkpoints(
+        offsets, t0_ts=t0, now_ts=t0 + 100_000,
+        existing_offsets=[86_400 + 3600],
+    )
+    assert missing == [14_400]
+    # Nothing due yet.
+    assert _missing_due_checkpoints(
+        offsets, t0_ts=t0, now_ts=t0 + 100, existing_offsets=[]
+    ) == []
+    # All due, none covered.
+    assert _missing_due_checkpoints(
+        offsets, t0_ts=t0, now_ts=t0 + 700_000, existing_offsets=[]
+    ) == offsets
+
+
+def test_nearest_sample_respects_grace():
+    from app.stages.odds_capture import _nearest_sample
+    history = [(1000, 0.40), (4000, 0.45), (8000, 0.50)]
+    assert _nearest_sample(history, target_ts=4200, grace_secs=1000) == (4000, 0.45)
+    # Out of grace → None.
+    assert _nearest_sample(history, target_ts=20_000, grace_secs=1000) is None
+    # Garbled points skipped.
+    assert _nearest_sample(
+        [("x", "y"), (4000, 0.45)], target_ts=4100, grace_secs=500
+    ) == (4000, 0.45)
+
+
+async def test_long_horizon_cycle_fills_all_checkpoints_once_final_due(
+    db, monkeypatch,
+):
+    """An exploration whose +7d checkpoint is due gets ONE history call
+    that fills every checkpoint, then flips long_capture_status='done'."""
+    now = T0 + timedelta(seconds=604_800 + 3600)  # final due an hour ago
+    monkeypatch.setattr(oc_module, "_now", lambda: now)
+    t0_ts = int(T0.timestamp())
+    history = [
+        (t0_ts + 14_400 + 60, 0.41),
+        (t0_ts + 86_400 - 120, 0.47),
+        (t0_ts + 172_800 + 600, 0.52),
+        (t0_ts + 604_800 - 900, 0.61),
+    ]
+    clob = _FakeCLOB(histories={"ty": history})
+    await _seed_exploration(db, exploration_id=1, capture_status="complete")
+    stage = _make_stage(db, clob=clob)
+
+    n = await stage.run_one_long_horizon_cycle()
+    assert n == 1
+    assert clob.history_calls == ["ty"]
+
+    cur = await db.conn.execute(
+        "SELECT offset_seconds, mid, best_bid FROM odds_observations "
+        "WHERE exploration_id=1 AND source='checkpoint' ORDER BY offset_seconds"
+    )
+    rows = [dict(r) for r in await cur.fetchall()]
+    await cur.close()
+    assert len(rows) == 4
+    assert rows[0]["offset_seconds"] == 14_460
+    assert rows[-1]["mid"] == pytest.approx(0.61)
+    assert all(r["best_bid"] is None for r in rows)  # mid-only, no book
+
+    cur = await db.conn.execute(
+        "SELECT long_capture_status, long_capture_done_at "
+        "FROM explorations WHERE id=1"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    assert row["long_capture_status"] == "done"
+    assert row["long_capture_done_at"] is not None
+
+    # Second pass: nothing to do, no extra history calls.
+    n2 = await stage.run_one_long_horizon_cycle()
+    assert n2 == 0
+    assert clob.history_calls == ["ty"]
+
+
+async def test_long_horizon_not_picked_before_final_due(db, monkeypatch):
+    """Rows whose final checkpoint isn't due yet are not processed —
+    prices-history is retroactive, so earlier checkpoints lose nothing
+    by waiting (design note in odds_capture.py)."""
+    now = T0 + timedelta(seconds=86_400 * 2)  # +2d: final (+7d) not due
+    monkeypatch.setattr(oc_module, "_now", lambda: now)
+    clob = _FakeCLOB(histories={"ty": [(int(T0.timestamp()) + 14_400, 0.4)]})
+    await _seed_exploration(db, exploration_id=1, capture_status="complete")
+    stage = _make_stage(db, clob=clob)
+    n = await stage.run_one_long_horizon_cycle()
+    assert n == 0
+    assert clob.history_calls == []
+    cur = await db.conn.execute(
+        "SELECT long_capture_status FROM explorations WHERE id=1"
+    )
+    assert (await cur.fetchone())["long_capture_status"] is None
+    await cur.close()
+
+
+async def test_long_horizon_unreachable_history_marks_unavailable(
+    db, monkeypatch,
+):
+    """history=None twice → 'history_unavailable' (audited, not silent)."""
+    now = T0 + timedelta(seconds=604_800 + 3600)
+    monkeypatch.setattr(oc_module, "_now", lambda: now)
+    clob = _FakeCLOB(histories={})  # get_price_history → None
+    await _seed_exploration(db, exploration_id=1, capture_status="complete")
+    stage = _make_stage(db, clob=clob)
+    assert await stage.run_one_long_horizon_cycle() == 1
+    cur = await db.conn.execute(
+        "SELECT long_capture_status FROM explorations WHERE id=1"
+    )
+    assert (await cur.fetchone())["long_capture_status"] is None
+    await cur.close()
+    assert await stage.run_one_long_horizon_cycle() == 1
+    cur = await db.conn.execute(
+        "SELECT long_capture_status FROM explorations WHERE id=1"
+    )
+    assert (await cur.fetchone())["long_capture_status"] == "history_unavailable"
+    await cur.close()
+
+
+async def test_long_horizon_backlog_older_than_history_span_expired(
+    db, monkeypatch,
+):
+    """First-deploy backlog rows whose final checkpoint already fell out
+    of the ~7d history span are bulk-marked, zero history calls."""
+    now = T0 + timedelta(days=20)
+    monkeypatch.setattr(oc_module, "_now", lambda: now)
+    clob = _FakeCLOB()
+    await _seed_exploration(db, exploration_id=1, capture_status="complete")
+    stage = _make_stage(db, clob=clob)
+    n = await stage.run_one_long_horizon_cycle()
+    assert n == 0
+    assert clob.history_calls == []
+    cur = await db.conn.execute(
+        "SELECT long_capture_status FROM explorations WHERE id=1"
+    )
+    assert (await cur.fetchone())["long_capture_status"] == "history_unavailable"
+    await cur.close()
+
+
+async def test_checkpoint_source_admitted_and_legacy_rows_survive(db):
+    """The cycle-29 CHECK rebuild admits source='checkpoint' and keeps
+    legacy 'history'/'live' rows byte-identical."""
+    await _seed_exploration(db, exploration_id=1)
+    async with db.batch() as cur:
+        await cur.execute(
+            "INSERT INTO odds_observations "
+            "(exploration_id, token_id, source, sampled_at, offset_seconds, mid) "
+            "VALUES (1, 'ty', 'live', '2026-05-23T12:00:15+00:00', 15, 0.5)"
+        )
+        await cur.execute(
+            "INSERT INTO odds_observations "
+            "(exploration_id, token_id, source, sampled_at, offset_seconds, mid) "
+            "VALUES (1, 'ty', 'checkpoint', '2026-05-23T16:00:00+00:00', 14400, 0.52)"
+        )
+    cur = await db.conn.execute(
+        "SELECT source, COUNT(*) AS n FROM odds_observations GROUP BY 1 ORDER BY 1"
+    )
+    rows = {r["source"]: r["n"] for r in await cur.fetchall()}
+    await cur.close()
+    assert rows == {"checkpoint": 1, "live": 1}
+    # 'bogus' still rejected by the rebuilt CHECK.
+    import sqlite3 as _sq
+    with pytest.raises(Exception) as exc_info:
+        async with db.batch() as cur:
+            await cur.execute(
+                "INSERT INTO odds_observations "
+                "(exploration_id, token_id, source, sampled_at, offset_seconds) "
+                "VALUES (1, 'ty', 'bogus', '2026-05-23T17:00:00+00:00', 1)"
+            )
+    assert "CHECK" in str(exc_info.value) or isinstance(
+        exc_info.value, _sq.IntegrityError
+    )
+
+
+async def test_cycle29_migration_upgrades_populated_legacy_db(tmp_path):
+    """Production upgrade path: a file DB that already ran the PRE-cycle-29
+    statements and holds data. Re-connecting with the cycle-29 DDL must
+    rebuild the table, keep every legacy row identical, admit
+    'checkpoint', and preserve the duplicate-tick uniqueness guard."""
+    import sqlite3 as _sq
+
+    from app.db import DB as _DB, _REGISTRY, _sha1
+
+    db_path = str(tmp_path / "legacy.db")
+    owner = "app/stages/odds_capture.py"
+    stmts = next(m.statements for m in _REGISTRY if m.owner == owner)
+    # The first 4 statements are the pre-cycle-29 schema (table + 3
+    # indexes); everything after is the cycle-29 rebuild.
+    legacy, _rebuild = stmts[:4], stmts[4:]
+    assert "CREATE TABLE IF NOT EXISTS odds_observations\n" in legacy[0] or \
+        "CREATE TABLE IF NOT EXISTS odds_observations" in legacy[0]
+
+    conn = _sq.connect(db_path)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, owner TEXT NOT NULL, "
+        "statement_sha TEXT NOT NULL, applied_at TEXT NOT NULL, "
+        "UNIQUE(owner, statement_sha))"
+    )
+    for stmt in legacy:
+        conn.execute(stmt)
+        conn.execute(
+            "INSERT INTO schema_migrations (owner, statement_sha, applied_at) "
+            "VALUES (?, ?, '2026-06-01T00:00:00+00:00')",
+            (owner, _sha1(stmt)),
+        )
+    conn.execute(
+        "INSERT INTO odds_observations "
+        "(id, exploration_id, token_id, source, sampled_at, offset_seconds, "
+        " mid, best_bid, best_ask, spread, cycle_id) "
+        "VALUES (42, 7, 'ty', 'live', '2026-06-01T01:00:00+00:00', 15, "
+        "        0.5, 0.49, 0.51, 0.02, 3)"
+    )
+    conn.commit()
+    conn.close()
+
+    d = _DB(path=db_path, journal_mode="WAL", synchronous="NORMAL")
+    await d.connect()  # applies the remaining (cycle-29) statements
+    try:
+        cur = await d.conn.execute(
+            "SELECT id, exploration_id, source, mid, best_bid, cycle_id "
+            "FROM odds_observations"
+        )
+        rows = [dict(r) for r in await cur.fetchall()]
+        await cur.close()
+        assert rows == [{
+            "id": 42, "exploration_id": 7, "source": "live",
+            "mid": 0.5, "best_bid": 0.49, "cycle_id": 3,
+        }]
+        # 'checkpoint' admitted; duplicate-tick guard still enforced.
+        async with d.batch() as cur:
+            await cur.execute(
+                "INSERT INTO odds_observations "
+                "(exploration_id, token_id, source, sampled_at, offset_seconds, mid) "
+                "VALUES (7, 'ty', 'checkpoint', '2026-06-01T05:00:00+00:00', 14400, 0.52)"
+            )
+        async with d.batch() as cur:
+            await cur.execute(
+                "INSERT OR IGNORE INTO odds_observations "
+                "(exploration_id, token_id, source, sampled_at, offset_seconds, mid) "
+                "VALUES (7, 'ty', 'checkpoint', '2026-06-01T05:00:00+00:00', 14400, 0.99)"
+            )
+        cur = await d.conn.execute(
+            "SELECT COUNT(*) AS n, MIN(mid) AS mid FROM odds_observations "
+            "WHERE source='checkpoint'"
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        assert row["n"] == 1 and row["mid"] == pytest.approx(0.52)
+    finally:
+        await d.close()
