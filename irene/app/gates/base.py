@@ -45,6 +45,17 @@ class Candidate(BaseModel):
     # t0 — a closed market has no resting book, so odds capture would only
     # yield empty post-news reads. None = unknown (treated as open).
     market_active: Optional[int] = None
+    # Cycle 30 (H8 lane) enrichments — populated by the explorer only for
+    # the second (lane) pipeline, from data it already has in hand:
+    #   market_mid: the t0 book snapshot's mid (YES token), feeds the
+    #     midband + already_moving gates.
+    #   event_type: the triggering DKG event's type (events.event_type,
+    #     e.g. TRIAL / REGULATORY_DECISION), feeds document_heavy.
+    #   token_yes: lets already_moving fetch the lookback price history.
+    # All None on the main admission pipeline — its gates don't read them.
+    market_mid: Optional[float] = None
+    event_type: Optional[str] = None
+    token_yes: Optional[str] = None
 
 
 class GateDecision(BaseModel):

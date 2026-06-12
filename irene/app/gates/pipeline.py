@@ -71,17 +71,23 @@ class GatePipeline:
         return None
 
 
-def build_pipeline(configs: list, *, llm_caller=None) -> GatePipeline:
+def build_pipeline(configs: list, *, llm_caller=None, clob=None) -> GatePipeline:
     """Construct a GatePipeline from a list of `GateConfig` pydantic
     models (see irene/app/config.py). `llm_caller` is injected for
-    LLM-backed gates so the pipeline stays decoupled from the AIClient.
+    LLM-backed gates and `clob` for price-history-backed gates
+    (cycle 30: already_moving) so the pipeline stays decoupled from the
+    AIClient / CLOBClient.
 
     Dispatch is by `cfg.type`; unknown types raise so misconfiguration
     fails fast at startup.
     """
+    from app.gates.already_moving import AlreadyMovingGate
     from app.gates.dkg import DKGThresholdGate
+    from app.gates.document_heavy import DocumentHeavyGate
     from app.gates.llm_batch import LLMBatchGate
     from app.gates.market_open import MarketOpenGate
+    from app.gates.midband import MidbandGate
+    from app.gates.resolution_rules import ResolutionRulesGate
 
     gates: list[Gate] = []
     for cfg in configs:
@@ -98,6 +104,41 @@ def build_pipeline(configs: list, *, llm_caller=None) -> GatePipeline:
                     "llm_batch gate requires an llm_caller injection"
                 )
             gates.append(LLMBatchGate(
+                name=cfg.name,
+                llm_caller=llm_caller,
+                model=cfg.model,
+                batch_size=cfg.batch_size,
+                max_output_tokens=cfg.max_output_tokens,
+                prompt_version=cfg.prompt_version,
+            ))
+        elif t == "midband":
+            gates.append(MidbandGate(
+                name=cfg.name, min_mid=cfg.min_mid, max_mid=cfg.max_mid,
+            ))
+        elif t == "already_moving":
+            if clob is None:
+                raise RuntimeError(
+                    "already_moving gate requires a clob injection"
+                )
+            gates.append(AlreadyMovingGate(
+                name=cfg.name,
+                clob=clob,
+                lookback_secs=cfg.lookback_secs,
+                min_abs_move=cfg.min_abs_move,
+                memo_ttl_secs=cfg.memo_ttl_secs,
+            ))
+        elif t == "document_heavy":
+            gates.append(DocumentHeavyGate(
+                name=cfg.name,
+                event_types=cfg.event_types,
+                min_description_chars=cfg.min_description_chars,
+            ))
+        elif t == "resolution_rules":
+            if llm_caller is None:
+                raise RuntimeError(
+                    "resolution_rules gate requires an llm_caller injection"
+                )
+            gates.append(ResolutionRulesGate(
                 name=cfg.name,
                 llm_caller=llm_caller,
                 model=cfg.model,

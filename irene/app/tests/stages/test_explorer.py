@@ -498,3 +498,175 @@ def test_wire_pipeline_production_wires_explorer_and_odds_capture():
     # (the production return tuple includes them).
     assert "explorer=explorer," in src
     assert "odds_capture=odds_capture," in src
+
+
+# ---------------------------------------------------------------------------
+# Cycle 30 — H8 slow-catalyst lane (annotation-only second pipeline)
+# ---------------------------------------------------------------------------
+
+
+class _FakeLaneCLOB(_FakeCLOB):
+    """Adds price history so the already_moving gate can run. Seeded
+    history: 24h ago at 0.30, now-ish at 0.40 — vs the fixed book mid
+    0.41 that's a 0.11 move (≥ 0.05)."""
+
+    def __init__(self, book=(0.40, 0.42), history="moving"):
+        super().__init__(book=book)
+        import time as _time
+        now = int(_time.time())
+        if history == "moving":
+            self.history = [(now - 86_400 + 60, 0.30), (now - 300, 0.40)]
+        elif history == "flat":
+            self.history = [(now - 86_400 + 60, 0.41), (now - 300, 0.41)]
+        else:
+            self.history = None
+        self.history_calls: list[str] = []
+
+    async def get_price_history(self, token_id, *, interval, fidelity):
+        self.history_calls.append(token_id)
+        return self.history
+
+
+@dataclass
+class _FakeH8AI(_FakeGateAI):
+    """Extends the gate AI: the resolution_rules gate's system prompt
+    asks for `opens` verdicts; answer those with `self.opens`."""
+
+    opens: bool = True
+
+    async def classify_batch_for_gate(self, *, system, user, model,
+                                      max_tokens, prompt_version):
+        if "resolution-rules analyst" in system:
+            self.calls.append({"model": model,
+                               "prompt_version": prompt_version,
+                               "user": user})
+            labels = re.findall(r"\[([A-Z]+)\]", user)
+            return json.dumps({"verdicts": [
+                {"label": lbl, "opens": self.opens, "still_open": self.opens,
+                 "rule_relevant": True, "short_reason": "r"}
+                for lbl in labels
+            ]})
+        return await super().classify_batch_for_gate(
+            system=system, user=user, model=model,
+            max_tokens=max_tokens, prompt_version=prompt_version,
+        )
+
+
+def _h8_cfg(**overrides) -> _Config:
+    from app.config import (
+        AlreadyMovingGateConfig,
+        DocumentHeavyGateConfig,
+        MidbandGateConfig,
+        ResolutionRulesGateConfig,
+    )
+    cfg = _Config()
+    cfg.explorer.h8_lane_enabled = True
+    cfg.explorer.h8_gates = [
+        MidbandGateConfig(),
+        AlreadyMovingGateConfig(),
+        # Seeded market description is short; the seeded event type
+        # (REGULATORY_DECISION) is what should match.
+        DocumentHeavyGateConfig(),
+        ResolutionRulesGateConfig(),
+    ]
+    for k, v in overrides.items():
+        setattr(cfg.explorer, k, v)
+    return cfg
+
+
+async def _lane_row(db):
+    cur = await db.conn.execute(
+        "SELECT gate_status, capture_status, lane, h8_gate_history "
+        "FROM explorations WHERE article_id=1 AND market_condition_id='cond-1'"
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return row
+
+
+async def test_h8_lane_annotates_passing_row(db_seeded):
+    bus = _FakeBus()
+    ai = _FakeH8AI(related=True, opens=True)
+    stage = _make_stage(db_seeded, bus, ai, cfg=_h8_cfg(),
+                        clob=_FakeLaneCLOB())
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    row = await _lane_row(db_seeded)
+    assert row["gate_status"] == "passed"
+    assert row["capture_status"] == "pending"  # admission unchanged
+    assert row["lane"] == "h8"
+    history = json.loads(row["h8_gate_history"])
+    assert [d["gate_name"] for d in history] == [
+        "midband", "already_moving", "document_heavy", "resolution_rules",
+    ]
+    assert all(d["outcome"] == "passed" for d in history)
+
+
+async def test_h8_lane_reject_keeps_admission_and_audits(db_seeded):
+    # resolution_rules says "not opening" → lane NULL, but the row is
+    # still admitted and captured exactly as without the lane.
+    bus = _FakeBus()
+    ai = _FakeH8AI(related=True, opens=False)
+    stage = _make_stage(db_seeded, bus, ai, cfg=_h8_cfg(),
+                        clob=_FakeLaneCLOB())
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    row = await _lane_row(db_seeded)
+    assert row["gate_status"] == "passed"
+    assert row["capture_status"] == "pending"
+    assert row["lane"] is None
+    history = json.loads(row["h8_gate_history"])
+    assert history[-1]["gate_name"] == "resolution_rules"
+    assert history[-1]["outcome"] == "rejected"
+    # Capture event still published — admission decisions are the main
+    # pipeline's alone.
+    assert any(t == "exploration.created" or "exploration" in t
+               for t, _ in bus.published)
+
+
+async def test_h8_lane_not_run_on_rejected_rows(db_seeded):
+    # Main pipeline rejects (LLM unrelated) → no lane pipeline run, no
+    # resolution_rules call, lane NULL, h8_gate_history NULL.
+    bus = _FakeBus()
+    ai = _FakeH8AI(related=False, opens=True)
+    stage = _make_stage(db_seeded, bus, ai, cfg=_h8_cfg(),
+                        clob=_FakeLaneCLOB())
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    row = await _lane_row(db_seeded)
+    assert row["gate_status"] == "rejected"
+    assert row["lane"] is None
+    assert row["h8_gate_history"] is None
+    assert not any(
+        "resolution-rules" in (c.get("user") or "") for c in ai.calls
+        if "Rules:" in (c.get("user") or "")
+    )
+
+
+async def test_h8_lane_disabled_leaves_lane_null(db_seeded):
+    cfg = _h8_cfg()
+    cfg.explorer.h8_lane_enabled = False
+    stage = _make_stage(db_seeded, _FakeBus(), _FakeGateAI(related=True),
+                        cfg=cfg, clob=_FakeLaneCLOB())
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    row = await _lane_row(db_seeded)
+    assert row["gate_status"] == "passed"
+    assert row["lane"] is None
+    assert row["h8_gate_history"] is None
+
+
+async def test_h8_lane_flat_market_rejected_by_already_moving(db_seeded):
+    ai = _FakeH8AI(related=True, opens=True)
+    stage = _make_stage(db_seeded, _FakeBus(), ai, cfg=_h8_cfg(),
+                        clob=_FakeLaneCLOB(history="flat"))
+    with cycle_scope(1):
+        await stage.handle(_payload())
+    row = await _lane_row(db_seeded)
+    assert row["lane"] is None
+    history = json.loads(row["h8_gate_history"])
+    rejected = [d for d in history if d["outcome"] == "rejected"]
+    assert rejected and rejected[0]["gate_name"] == "already_moving"
+    assert rejected[0]["reason"] == "not_moving"
+    # The paid resolution_rules gate never ran (free gates short-circuit).
+    assert not any("Rules:" in (c.get("user") or "") for c in ai.calls)

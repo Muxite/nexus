@@ -413,6 +413,21 @@ class ExplorerSection(BaseModel):
     # writes a row to `explorations`; only `gate_status='passed'` rows
     # trigger odds_capture. See irene/app/gates/ for available types.
     gates: list["GateConfig"] = Field(default_factory=list)
+    # Cycle 30: H8 slow-catalyst lane — a SECOND pipeline run only on
+    # candidates the main pipeline already admitted. Its outcome never
+    # changes capture admission; it annotates `explorations.lane='h8'`
+    # (+ h8_gate_history) so the days-horizon dataset (cycle 29) carries
+    # the lane label for the eventual sandbox backtest. Capture-only by
+    # decision (2026-06-12): no wallet trades until that backtest clears
+    # |signal| > spread + fees per cluster. Order matters — the paid
+    # resolution_rules gate runs LAST, on survivors of the free gates.
+    h8_lane_enabled: bool = True
+    h8_gates: list["GateConfig"] = Field(default_factory=lambda: [
+        MidbandGateConfig(),
+        AlreadyMovingGateConfig(),
+        DocumentHeavyGateConfig(),
+        ResolutionRulesGateConfig(),
+    ])
 
 
 class MarketOpenGateConfig(BaseModel):
@@ -454,8 +469,62 @@ class LLMBatchGateConfig(BaseModel):
     prompt_version: str = "v2"
 
 
+# --- Cycle 30: H8 slow-catalyst lane gates (irene/app/gates/) ---------------
+
+
+class MidbandGateConfig(BaseModel):
+    """Pure-Python price-band gate (irene.app.gates.midband). Pass iff
+    the t0 book mid sits inside [min_mid, max_mid] — markets at the
+    poles already made up their mind (H8, synthesis §7)."""
+    type: Literal["midband"] = "midband"
+    name: str = "midband"
+    min_mid: float = Field(default=0.10, ge=0.0, lt=0.5)
+    max_mid: float = Field(default=0.90, gt=0.5, le=1.0)
+
+
+class AlreadyMovingGateConfig(BaseModel):
+    """Price-history movement gate (irene.app.gates.already_moving).
+    Pass iff |mid_now − mid(lookback ago)| ≥ min_abs_move. One history
+    call per token with an in-process TTL memo."""
+    type: Literal["already_moving"] = "already_moving"
+    name: str = "already_moving"
+    lookback_secs: int = Field(default=86_400, ge=3600, le=604_800)
+    min_abs_move: float = Field(default=0.05, gt=0.0, lt=1.0)
+    memo_ttl_secs: int = Field(default=3600, ge=60, le=86_400)
+
+
+class DocumentHeavyGateConfig(BaseModel):
+    """Pure-Python document-heavy heuristic (irene.app.gates.
+    document_heavy): triggering event type in the document set OR a
+    long resolution description."""
+    type: Literal["document_heavy"] = "document_heavy"
+    name: str = "document_heavy"
+    event_types: list[str] = Field(default_factory=lambda: [
+        "TRIAL", "REGULATORY_DECISION", "LAWSUIT",
+        "MERGER", "NOMINATION", "ELECTION",
+    ])
+    min_description_chars: int = Field(default=800, ge=0, le=20_000)
+
+
+class ResolutionRulesGateConfig(BaseModel):
+    """Batched LLM resolution-rules gate (irene.app.gates.
+    resolution_rules): does the news increment a STILL-OPEN,
+    rule-relevant probability under the market's resolution criteria?
+    Place LAST in the H8 pipeline — it's the only paid gate there."""
+    type: Literal["resolution_rules"] = "resolution_rules"
+    name: str = "resolution_rules"
+    model: str = "google/gemini-2.5-flash"
+    batch_size: int = Field(default=10, ge=1, le=100)
+    max_output_tokens: int = Field(default=600, ge=8, le=4096)
+    prompt_version: str = "rr-v1"
+
+
 GateConfig = Annotated[
-    Union[MarketOpenGateConfig, DKGGateConfig, LLMBatchGateConfig],
+    Union[
+        MarketOpenGateConfig, DKGGateConfig, LLMBatchGateConfig,
+        MidbandGateConfig, AlreadyMovingGateConfig,
+        DocumentHeavyGateConfig, ResolutionRulesGateConfig,
+    ],
     Field(discriminator="type"),
 ]
 

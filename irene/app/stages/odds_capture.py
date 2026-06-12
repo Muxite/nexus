@@ -675,7 +675,7 @@ class OddsCaptureStage:
             WHERE long_capture_status IS NULL
               AND token_yes IS NOT NULL AND token_yes != ''
               AND t0_iso >= ? AND t0_iso <= ?
-            ORDER BY t0_iso ASC
+            ORDER BY (CASE WHEN lane = 'h8' THEN 0 ELSE 1 END), t0_iso ASC
             LIMIT ?
             """,
             (lower_iso, due_iso,

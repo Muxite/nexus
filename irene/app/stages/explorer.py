@@ -158,6 +158,16 @@ _EXPLORER_DDL = [
     "ALTER TABLE explorations ADD COLUMN long_capture_done_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_explorations_long_status "
     "ON explorations(long_capture_status)",
+    # Cycle 30: H8 slow-catalyst lane annotation. `lane` is NULL for
+    # ordinary rows, 'h8' for rows that passed the second (lane)
+    # pipeline; `h8_gate_history` is that pipeline's full decision JSON
+    # for BOTH outcomes (rejected rows keep their funnel audit too,
+    # lane stays NULL). Annotation-only — capture admission is decided
+    # by the main pipeline before the lane runs.
+    "ALTER TABLE explorations ADD COLUMN lane TEXT",
+    "ALTER TABLE explorations ADD COLUMN h8_gate_history TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_explorations_lane "
+    "ON explorations(lane)",
 ]
 db_module.register_schema("app/stages/explorer.py", _EXPLORER_DDL)
 
@@ -210,6 +220,25 @@ class ExplorerStage:
             self._cfg.gates,
             llm_caller=self._ai.classify_batch_for_gate,
         )
+        # Cycle 30: H8 slow-catalyst lane — second pipeline, run only on
+        # main-pipeline survivors, annotation-only (never changes capture
+        # admission; a bug here degrades to lane=NULL, never lost rows).
+        self._h8_pipeline = None
+        if bool(getattr(self._cfg, "h8_lane_enabled", False)):
+            h8_gates = list(getattr(self._cfg, "h8_gates", []) or [])
+            if h8_gates and self._clob is None:
+                # already_moving needs price history; without a CLOB the
+                # lane can't run honestly. Loud once, lane stays NULL.
+                logger.warning(
+                    "explorer: h8 lane enabled but no CLOB wired — lane "
+                    "annotation disabled this process"
+                )
+            elif h8_gates:
+                self._h8_pipeline = build_pipeline(
+                    h8_gates,
+                    llm_caller=self._ai.classify_batch_for_gate,
+                    clob=self._clob,
+                )
 
     async def start(self) -> None:
         return
@@ -341,6 +370,32 @@ class ExplorerStage:
         else:
             mid_t0, spread_t0 = None, None
 
+        # Cycle 30: H8 lane pipeline — runs ONLY on main-pipeline
+        # survivors, after the t0 book snapshot (its gates read the mid).
+        # Pure annotation: whatever happens here, capture admission and
+        # the row write below are unchanged.
+        lane: Optional[str] = None
+        h8_gate_history_json: Optional[str] = None
+        if passed and self._h8_pipeline is not None:
+            h8_candidate = candidate.model_copy(update={
+                "market_mid": mid_t0,
+                "event_type": await self._fetch_event_type(event_id),
+                "token_yes": market.get("token_yes"),
+            })
+            try:
+                h8_map = await self._h8_pipeline.run([h8_candidate])
+                h8_history = h8_map[key]
+                if self._h8_pipeline.passed(h8_history):
+                    lane = "h8"
+                h8_gate_history_json = _json.dumps(
+                    [d.model_dump(mode="json") for d in h8_history]
+                )
+            except Exception:  # noqa: BLE001 — lane must never cost a row
+                logger.exception(
+                    "explorer: h8 lane pipeline failed (article=%s, market=%s)",
+                    article["id"], market_condition_id,
+                )
+
         if passed:
             llm_reason = "; ".join(
                 f"{d.gate_name}:{d.outcome.value}" for d in history
@@ -385,6 +440,8 @@ class ExplorerStage:
             cluster_id=cluster_id,
             capture_sample_reason=capture_sample_reason,
             start_capture=capture_this_row,
+            lane=lane,
+            h8_gate_history=h8_gate_history_json,
         )
         if exploration_id is None:
             return
@@ -500,6 +557,18 @@ class ExplorerStage:
                 if row["breaking_score"] is not None else None
             ),
         }
+
+    async def _fetch_event_type(self, event_id: int) -> Optional[str]:
+        """Cycle 30: the triggering DKG event's type (TRIAL,
+        REGULATORY_DECISION, ...) for the H8 document_heavy gate."""
+        cur = await self._db.conn.execute(
+            "SELECT event_type FROM events WHERE id=?", (event_id,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+        if row is None or not row["event_type"]:
+            return None
+        return str(row["event_type"])
 
     async def _fetch_cluster(self, article_id: int) -> Optional[dict]:
         """Return `{cluster_id, freshness}` for the article's dedupe
@@ -647,6 +716,8 @@ class ExplorerStage:
         cluster_id: Optional[str] = None,
         capture_sample_reason: Optional[str] = None,
         start_capture: bool = True,
+        lane: Optional[str] = None,
+        h8_gate_history: Optional[str] = None,
     ) -> Optional[int]:
         # `start_capture=True` rows (gate-passed OR reject-sampled) get
         # `capture_status='pending'` so odds_capture picks them up.
@@ -668,10 +739,11 @@ class ExplorerStage:
                      capture_status, capture_end_at,
                      cycle_id, is_tracer, tracer_id, created_at,
                      gate_status, rejected_by_gate, gate_history,
-                     cluster_id, capture_sample_reason)
+                     cluster_id, capture_sample_reason,
+                     lane, h8_gate_history)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                         ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                        ?, ?, ?, ?, ?)
+                        ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     article_id, event_id, market_condition_id,
@@ -686,6 +758,7 @@ class ExplorerStage:
                     cycle_id, 1 if is_tracer else 0, tracer_id, _now_iso(),
                     gate_status, rejected_by_gate, gate_history,
                     cluster_id, capture_sample_reason,
+                    lane, h8_gate_history,
                 ),
             )
             if cur.rowcount == 0:
