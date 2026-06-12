@@ -26,12 +26,25 @@ For every signal, in order, until one rejects or all pass:
   3. `direction`       — call `ai.direction()`, reject if NEUTRAL
                         (`direction_neutral`) or confidence below
                         `cfg.trade.min_confidence` (`direction_lowconf`).
+  4-pre. `book`        — cycle 27: ONE `get_top_of_book` read of the
+                        traded token feeds fill price (ask), spread and
+                        mid (= (bid+ask)/2, position space). Hard reject
+                        on missing/empty book (`book_unavailable`) or
+                        zero 24h volume (`zero_volume_market`) — no
+                        graceful degrade, no `/midpoint` fallback.
   4. `edge`            — `p_hat` (= confidence on YES, 1-confidence on NO) vs
-                        mid-price ± `cfg.trade.fee_buffer`. Mid defaults to
-                        `cfg.trade.default_mid_price` (P1 has no live CLOB).
+                        the executable side − per-market taker fee −
+                        half-spread (see `_compute_edge`).
   5. `size`            — fractional-Kelly sizing capped by
                         `cfg.trade.max_position_fraction * balance`; reject
                         if the size falls below `cfg.trade.min_position_usdc`.
+
+**Price-space convention (cycle 27).** Every stored price (`mid_price`,
+`entry_best_bid/ask`, `entry_fill_price`, `target_mid`) is **position
+space** — the traded token's own price (YES token for YES, NO token for
+NO). Entries fill at the traded token's ask; `closer.py` exits at its
+bid. See closer.py's spec block for the full convention note and the
+pre-cycle-27 NO-trade space bug it fixes.
 
 The first gate to reject writes a `decisions(outcome='reject', reason=<gate>)`
 row and stops. If every gate passes, a single `decisions(outcome='execute',
@@ -93,6 +106,7 @@ from app.stages._entity_overlap import article_entities_overlap_market
 from app.stages._gates import (
     _eval_market_news_imbalance_subrules,
     _gate_binary_dedup,
+    _gate_book_unavailable,
     _gate_cash,
     _gate_direction,
     _gate_edge,
@@ -223,6 +237,16 @@ _TRADE_DDL = [
     # are sha1-tracked so re-importing the module is idempotent.
     "ALTER TABLE decisions ADD COLUMN decision_latency_ms        REAL",
     "ALTER TABLE decisions ADD COLUMN decision_latency_breakdown TEXT",
+    # Cycle 27 (wallet honesty): spread-aware entries. The traded
+    # token's top-of-book at entry plus the fill price the wallet
+    # actually pays (= entry_best_ask — you buy at the ask). All three
+    # are in position space (the traded token's own prices) and NULL on
+    # legacy rows; `mid_price` stays as the position-space mid for
+    # target_mid / stagnation semantics. The closer prefers
+    # `entry_fill_price` over `mid_price` whenever it is non-NULL.
+    "ALTER TABLE trades ADD COLUMN entry_best_bid   REAL",
+    "ALTER TABLE trades ADD COLUMN entry_best_ask   REAL",
+    "ALTER TABLE trades ADD COLUMN entry_fill_price REAL",
 ]
 db_module.register_schema("app/stages/trade.py", _TRADE_DDL)
 
@@ -284,10 +308,12 @@ def _market_min_usdc(
         if per_share <= 0.0:
             return None, None
         return ms * per_share, "executable"
-    # Book-unavailable fallback: use mid (YES) or 1 - mid (NO). `mid` is
-    # the YES mid by convention (see `_resolve_mid`); guard against the
-    # degenerate edge so we don't multiply by 0.
-    per_share = mid if direction == "YES" else (1.0 - mid)
+    # Book-unavailable fallback. Cycle 27: `mid` is position space (the
+    # traded token's own mid), i.e. already the per-share cost of the
+    # bet's side for BOTH directions — the old `1 - mid` flip for NO
+    # assumed a YES-space mid that was never supplied. Guard against
+    # the degenerate edge so we don't multiply by 0.
+    per_share = mid
     if per_share <= 0.0:
         return None, None
     return ms * per_share, "mid_fallback"
@@ -413,28 +439,49 @@ def compose_direction_prompt(article: dict, market: dict) -> str:
 def _compute_edge(
     *, direction: str, p_hat: float, mid: float,
     executable_price: Optional[float], spread: Optional[float], cfg,
+    fee_rate: Optional[float] = None,
 ) -> tuple[float, dict]:
     """Cycle 10 explicit-spread formula when book is available, else legacy
-    lumped-fee fallback. Returns `(edge, edge_components_dict)`."""
+    lumped-fee fallback. Returns `(edge, edge_components_dict)`.
+
+    Cycle 27:
+    - The fee term uses the market's real taker rate when known:
+      `fee_rate * min(p, 1-p)` per share at the executable price
+      (`min` is symmetric, so YES/NO need no special-casing). Falls
+      back to the lumped `cfg.taker_fee_buffer` when `fee_rate` is
+      NULL.
+    - The book-unavailable fallback now treats `mid` as **position
+      space** (the traded token's own mid — which is what
+      `_resolve_mid` always returned): NO edge is
+      `(1 - p_hat) - mid - fee_buffer`, i.e. the NO token's modeled
+      value minus its price. The old `mid - p_hat` assumed a YES-space
+      mid that was never supplied. Live entries no longer reach this
+      branch (the book gate hard-rejects first); replay of legacy
+      snapshots and the DKG path still do.
+    """
     if executable_price is not None and spread is not None:
         half_spread = float(spread) / 2.0
-        if direction == "YES":
-            edge = p_hat - executable_price - cfg.taker_fee_buffer - half_spread
+        if fee_rate is not None:
+            exec_f = float(executable_price)
+            fee_term = float(fee_rate) * min(exec_f, 1.0 - exec_f)
         else:
-            edge = executable_price - p_hat - cfg.taker_fee_buffer - half_spread
+            fee_term = float(cfg.taker_fee_buffer)
+        if direction == "YES":
+            edge = p_hat - executable_price - fee_term - half_spread
+        else:
+            edge = executable_price - p_hat - fee_term - half_spread
         edge_components = {
             "mid": mid,
             "executable_price": float(executable_price),
             "spread": float(spread),
             "half_spread": half_spread,
-            "taker_fee_buffer": float(cfg.taker_fee_buffer),
+            "taker_fee_buffer": fee_term,
+            "fee_rate": (float(fee_rate) if fee_rate is not None else None),
             "fallback": False,
         }
     else:
-        if direction == "YES":
-            edge = p_hat - mid - cfg.fee_buffer
-        else:
-            edge = mid - p_hat - cfg.fee_buffer
+        p_win = p_hat if direction == "YES" else (1.0 - p_hat)
+        edge = p_win - mid - cfg.fee_buffer
         edge_components = {
             "mid": mid,
             "fee_buffer": float(cfg.fee_buffer),
@@ -447,15 +494,18 @@ def _compute_kelly_and_size(
     *, direction: str, p_hat: float, mid: float, cfg,
 ) -> tuple[float, float, float]:
     """Cycle 3 Kelly math + balance × max_position_fraction cap. Returns
-    `(kelly_full, kelly_capped, size_usdc)`."""
-    if direction == "YES":
-        b = (1.0 - mid) / mid
-        kelly_full = (p_hat * b - (1.0 - p_hat)) / b
-    else:
-        p_no = 1.0 - p_hat
-        mid_no = 1.0 - mid
-        b = (1.0 - mid_no) / mid_no
-        kelly_full = (p_no * b - (1.0 - p_no)) / b
+    `(kelly_full, kelly_capped, size_usdc)`.
+
+    Cycle 27: `mid` is **position space** (the traded token's own mid —
+    what `_resolve_mid` / the entry book read always supplied), so the
+    Kelly inputs are simply (P(our side wins), our token's price) for
+    both directions. The old NO branch re-flipped an already-flipped
+    price (`mid_no = 1 - mid` on a NO-token mid yields the YES mid) and
+    sized NO bets off the wrong space.
+    """
+    p_win = p_hat if direction == "YES" else (1.0 - p_hat)
+    b = (1.0 - mid) / mid
+    kelly_full = (p_win * b - (1.0 - p_win)) / b
     kelly_capped = max(0.0, kelly_full) * cfg.kelly_fraction
     size = min(
         kelly_capped * cfg.balance_usdc,
@@ -493,10 +543,17 @@ class GateFeatures:
     direction: Optional[str] = None  # 'YES' | 'NO' | 'NEUTRAL'
     confidence: Optional[float] = None
     prediction_id: Optional[int] = None
-    # Price scalars resolved from the CLOB (or stub).
+    # Price scalars resolved from the CLOB (or stub). `mid` is position
+    # space (the traded token's own mid — cycle 27 convention).
     mid: Optional[float] = None
     executable_price: Optional[float] = None
     spread: Optional[float] = None
+    # Cycle 27: raw top-of-book of the traded token (position space),
+    # from `features_snapshot.entry_book` on post-cycle-27 snapshots.
+    # Both None on legacy snapshots → the book_unavailable gate is
+    # skipped (permissive, mirrors market_state's missing-column rule).
+    best_bid: Optional[float] = None
+    best_ask: Optional[float] = None
     # Market dict — fed verbatim to imbalance sub-rules. Must carry
     # `volume_usdc`, `_days_to_expiry`, `min_order_size`.
     market: Optional[dict] = None
@@ -592,6 +649,24 @@ def evaluate_gates(features: GateFeatures, cfg) -> GateResult:
     confidence = features.confidence
     p_hat = confidence if direction == "YES" else (1.0 - confidence)
 
+    # Gate 4-pre-pre — book_unavailable (cycle 27). Runs only when the
+    # snapshot carries book data (post-cycle-27 `entry_book`); legacy
+    # snapshots skip it — permissive, mirroring market_state's
+    # missing-column behaviour — so historical replays don't change.
+    if features.best_bid is not None or features.best_ask is not None:
+        book_pair = (
+            (features.best_bid, features.best_ask)
+            if features.best_bid is not None and features.best_ask is not None
+            else None
+        )
+        volume = features.market.get("volume_usdc") if features.market else None
+        status, entry, reason = _gate_book_unavailable(book_pair, volume)
+        if status == "reject":
+            history.append(entry)
+            return GateResult(
+                "reject", reason, history, prediction_id=features.prediction_id,
+            )
+
     # Gate 4-pre — mid_unavailable (cycle 23). Replaces the
     # pre-cycle-23 `raise ValueError` so replay sees the same rejection a
     # live trade would see when CLOB returns no price.
@@ -636,6 +711,7 @@ def evaluate_gates(features: GateFeatures, cfg) -> GateResult:
     edge, edge_components = _compute_edge(
         direction=direction, p_hat=p_hat, mid=mid,
         executable_price=features.executable_price, spread=features.spread, cfg=cfg,
+        fee_rate=(features.market.get("fee_rate") if features.market else None),
     )
 
     # Gate 5 — edge.
@@ -979,13 +1055,45 @@ class TradeStage:
         direction = result.direction
         confidence = result.confidence
         p_hat = confidence if direction == "YES" else (1.0 - confidence)
+        # 4-pre. book read + book_unavailable gate (cycle 27) ----------------
+        # ONE CLOB read feeds everything downstream: the traded token's
+        # top-of-book gives the fill price (ask), the spread, and the mid
+        # (= (bid+ask)/2 — never the /midpoint scalar, which degrades to
+        # the last traded price on wide-spread books). A missing/empty
+        # book or a zero-volume market is a hard audited reject — the
+        # pre-cycle-27 graceful degrade is what minted mid-price ghosts
+        # on books nobody could trade (retro 2026-06-12 §3).
         _t = time.perf_counter()
-        mid = await self._resolve_mid(direction=direction, market=market)
-        breakdown["resolve_mid"] = (time.perf_counter() - _t) * 1000.0
-        # 4-pre. mid_unavailable (cycle 23) ----------------------------------
-        # Replaces the pre-cycle-23 silent fallback to default_mid_price=0.5
-        # which produced 21/39 trades at stub mid. `_resolve_mid` now returns
-        # None on any non-real-mid path; we reject loudly.
+        book = await self._resolve_executable_side(direction=direction, market=market)
+        breakdown["resolve_book"] = (time.perf_counter() - _t) * 1000.0
+        status, entry, reason = _gate_book_unavailable(
+            (book[2], book[3]) if book is not None else None,
+            market.get("volume_usdc"),
+        )
+        if status == "reject":
+            gate_history.append(entry)
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
+        executable_price, spread, entry_best_bid, entry_best_ask = book
+        # Position-space mid of the traded token — same convention the
+        # pre-cycle-27 `_resolve_mid` (traded token's /midpoint) stored,
+        # so `trades.mid_price` stays comparable across the migration.
+        mid = (entry_best_bid + entry_best_ask) / 2.0
+        # 4-pre-bis. mid_unavailable (cycle 23) ------------------------------
+        # Unreachable after the book gate (mid derives from the book);
+        # kept so the live cascade and `evaluate_gates` (which replays
+        # legacy snapshots without book data) stay gate-for-gate
+        # identical.
         status, entry, reason = _gate_mid_unavailable(mid)
         if status == "reject":
             gate_history.append(entry)
@@ -1019,19 +1127,8 @@ class TradeStage:
                 decision_latency_breakdown=dict(breakdown),
             )
             return
-        # 4a-bis. wide-spread guard — Polymarket's /midpoint returns the
-        # last traded price (not the true mid) when spread > $0.10. Any
-        # edge estimate built on that scalar is unreliable. Read the book
-        # and reject if spread exceeds the threshold. Graceful degrade:
-        # if the book read fails (None), skip this check rather than
-        # blocking the trade. See app/clob.py:get_top_of_book.
-        _t = time.perf_counter()
-        book = await self._resolve_executable_side(direction=direction, market=market)
-        breakdown["resolve_book"] = (time.perf_counter() - _t) * 1000.0
-        if book is not None:
-            executable_price, spread = book
-        else:
-            executable_price, spread = None, None
+        # 4a-bis. wide-spread guard — an edge estimate on a wide book is
+        # unreliable and the fill would eat it anyway.
         status, entry, reason = _gate_wide_spread(spread, self._cfg)
         if status == "reject":
             gate_history.append(entry)
@@ -1085,6 +1182,7 @@ class TradeStage:
         edge, edge_components = _compute_edge(
             direction=direction, p_hat=p_hat, mid=mid,
             executable_price=executable_price, spread=spread, cfg=self._cfg,
+            fee_rate=market.get("fee_rate"),
         )
         status, entry, reason = _gate_edge(edge, self._cfg)
         gate_history.append(entry)
@@ -1203,6 +1301,14 @@ class TradeStage:
             "kelly_capped": kelly_capped,
             "size_usdc": size,
             "balance_usdc": self._cfg.balance_usdc,
+            # Cycle 27: the traded token's book at entry, position space.
+            # Duplicated onto first-class trades columns for SQL; kept
+            # here too so replay sees one self-contained snapshot.
+            "entry_book": {
+                "best_bid": entry_best_bid,
+                "best_ask": entry_best_ask,
+                "fill_price": entry_best_ask,
+            },
             "market_at_trade": {
                 "fee_rate": market.get("fee_rate"),
                 "volume_usdc": market.get("volume_usdc"),
@@ -1234,6 +1340,8 @@ class TradeStage:
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
+            entry_best_bid=entry_best_bid,
+            entry_best_ask=entry_best_ask,
             breakdown=breakdown,
             t_start=t_start,
             db_insert_t_start=_t,
@@ -1538,34 +1646,6 @@ class TradeStage:
         # (article, market) pair.
         return compose_direction_prompt(article, market)
 
-    async def _resolve_mid(
-        self, *, direction: str, market: Optional[dict]
-    ) -> Optional[float]:
-        """Return the mid-price for the side we're betting on, or `None`
-        when no real CLOB price is available.
-
-        Cycle 23: removed the silent fallback to `cfg.default_mid_price`.
-        Pre-cycle-23 this returned 0.5 on (a) `self._clob is None`,
-        (b) missing token, (c) `clob.get_mid()` returning None — the bot
-        then placed real BUYs at the stub price (21/39 trades in the audit
-        window). `_gate_mid_unavailable` now rejects on `None`. The clob
-        WARN-once defense is in `_warn_once_*` below.
-        """
-        if self._clob is None:
-            self._warn_once_clob_missing("_resolve_mid")
-            return None
-        if market is None:
-            return None
-        token_id: Optional[str] = (
-            market.get("token_yes") if direction == "YES" else market.get("token_no")
-        )
-        if not token_id:
-            return None
-        mid = await self._clob.get_mid(str(token_id))
-        if mid is None:
-            return None
-        return float(mid)
-
     # Cycle 23: per-process one-shot WARN log so silent-fallback regressions
     # are impossible to overlook. Keyed by call-site so each surface logs
     # exactly once per process lifetime.
@@ -1577,40 +1657,22 @@ class TradeStage:
         self._CLOB_WARN_SEEN.add(site)
         logger.warning(
             "trade: %s observed self._clob is None — pre-trade gate "
-            "will reject with mid_unavailable. This is a SILENT-FALLBACK "
+            "will reject with book_unavailable. This is a SILENT-FALLBACK "
             "regression: investigate build_deps() / build_clob() wiring.",
             site,
         )
 
-    async def _resolve_spread(
-        self, *, direction: str, market: Optional[dict]
-    ) -> Optional[float]:
-        """Return `best_ask - best_bid` for the side we're betting on, or
-        `None` if the book read fails (no client, no token, network /
-        parse error, empty book). Callers use `None` to mean "can't
-        tell" and should NOT reject on that signal alone — the
-        degenerate-mid and market-news gates are still in force.
-        """
-        if self._clob is None or market is None:
-            return None
-        if not hasattr(self._clob, "get_top_of_book"):
-            return None
-        token_id: Optional[str] = (
-            market.get("token_yes") if direction == "YES" else market.get("token_no")
-        )
-        if not token_id:
-            return None
-        book = await self._clob.get_top_of_book(str(token_id))
-        if book is None:
-            return None
-        best_bid, best_ask = book
-        return float(best_ask) - float(best_bid)
-
     async def _resolve_executable_side(
         self, *, direction: str, market: Optional[dict]
-    ) -> Optional[tuple[float, float]]:
-        """Return ``(executable_price, spread)`` in YES-price units for the
-        side we're betting, or ``None`` when the book read fails.
+    ) -> Optional[tuple[float, float, float, float]]:
+        """Return ``(executable_price, spread, best_bid, best_ask)`` for
+        the side we're betting, or ``None`` when the book read fails.
+
+        ``executable_price`` is in YES-price units (edge-math convention,
+        below). ``best_bid`` / ``best_ask`` are the RAW top-of-book of
+        the **traded token** (position space) — cycle 27 persists them on
+        the trade row, fills the entry at ``best_ask``, and derives
+        ``mid_price`` as their midpoint.
 
         Edge-math convention. The whole edge gate works in YES-price
         space (mid is the YES mid, p_hat is P(YES)). The executable
@@ -1627,12 +1689,16 @@ class TradeStage:
             YES mid for both sides" convention — we're just swapping mid
             for the executable YES-side price.
 
-        Both branches read the YES token's book (``market['token_yes']``)
-        because the NO book is the mirror image; reading the YES side
-        once keeps the math in one price space and avoids a second
-        round-trip on every signal.
+        Each branch reads the **traded token's own book** (YES token for
+        YES, NO token for NO) — the raw bid/ask returned are therefore
+        position-space prices of the token we'd actually hold, and the
+        NO branch projects its ask into the YES-space ``executable``
+        scalar for the edge formula.
         """
-        if self._clob is None or market is None:
+        if self._clob is None:
+            self._warn_once_clob_missing("_resolve_executable_side")
+            return None
+        if market is None:
             return None
         if not hasattr(self._clob, "get_top_of_book"):
             return None
@@ -1663,7 +1729,7 @@ class TradeStage:
             # so `executable = 1 - best_ask_no` fits the symmetric
             # formula `edge = executable - p_hat - costs`.
             executable = 1.0 - best_ask_f
-        return executable, spread
+        return executable, spread, best_bid_f, best_ask_f
 
     async def _record_reject(
         self,
@@ -1725,6 +1791,8 @@ class TradeStage:
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
+        entry_best_bid: Optional[float] = None,
+        entry_best_ask: Optional[float] = None,
         breakdown: Optional[dict[str, float]] = None,
         t_start: Optional[float] = None,
         db_insert_t_start: Optional[float] = None,
@@ -1769,6 +1837,8 @@ class TradeStage:
             cycle_id=cycle_id,
             is_tracer=is_tracer,
             tracer_id=tracer_id,
+            entry_best_bid=entry_best_bid,
+            entry_best_ask=entry_best_ask,
             decision_latency_ms=decision_latency_ms,
             decision_latency_breakdown=breakdown,
         )
@@ -1872,23 +1942,22 @@ class TradeStage:
         cycle_id: int,
         is_tracer: bool,
         tracer_id: Optional[str],
+        entry_best_bid: Optional[float] = None,
+        entry_best_ask: Optional[float] = None,
         decision_latency_ms: Optional[float] = None,
         decision_latency_breakdown: Optional[dict[str, float]] = None,
     ) -> Optional[int]:
-        # v6: derive the target_mid where the model's edge collapses.
-        # `p_hat` is the model's implied P(YES). The target is always
-        # expressed in YES-mid terms (Polymarket's primary price).
-        # For YES we bought low expecting YES to rise toward p_hat —
-        # sell just BELOW p_hat (-fee_buffer) to lock profit before fees.
-        # For NO we bought expecting YES to fall toward p_hat — sell just
-        # ABOVE p_hat (+fee_buffer) by the same logic. (Cycle 3 had a
-        # sign bug here: target was 1-p_hat+fee, double-flipping and
-        # firing edge_decay on every NO trade's first poll.)
+        # v6 → cycle 27: derive the target_mid where the model's edge
+        # collapses, now in **position space** (the traded token's own
+        # price, matching `mid_price` and the closer's poll): sell when
+        # the traded token rises to its modeled value minus the fee
+        # buffer. P(our token pays out) is `p_hat` for YES and
+        # `1 - p_hat` for NO. (Legacy rows stored the NO target in
+        # YES-space terms — `p_hat + fee` — and the closer mirrors those
+        # via `1 - target` when `entry_fill_price` is NULL.)
         fee_buffer = float(self._cfg.fee_buffer)
-        if direction == "YES":
-            target_mid = max(0.0, min(1.0, float(p_hat) - fee_buffer))
-        else:  # NO
-            target_mid = max(0.0, min(1.0, float(p_hat) + fee_buffer))
+        p_win = float(p_hat) if direction == "YES" else (1.0 - float(p_hat))
+        target_mid = max(0.0, min(1.0, p_win - fee_buffer))
         # Cycle 14: serialise the per-step breakdown to JSON. NULL when
         # the caller didn't pass one (defensive — non-handle() callers
         # of _insert_trade simply omit the kwarg and legacy rows stay
@@ -1905,6 +1974,10 @@ class TradeStage:
             f"_insert_trade refusing degenerate mid: market={market_id} "
             f"direction={direction} mid={mid!r}"
         )
+        # Cycle 27: the fill is the ask of the traded token's book — the
+        # price a taker actually pays. NULL when the caller had no book
+        # (defensive; the live cascade's book gate makes that impossible).
+        entry_fill_price = entry_best_ask
         async with self._db.batch() as cur:
             await cur.execute(
                 """
@@ -1913,8 +1986,9 @@ class TradeStage:
                      confidence, similarity, freshness, p_hat, mid_price, edge,
                      kelly_fraction, size_usdc, decision_path, features_snapshot,
                      cycle_id, is_tracer, tracer_id, decided_at, target_mid,
-                     decision_latency_ms, decision_latency_breakdown)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?, ?, ?, ?)
+                     decision_latency_ms, decision_latency_breakdown,
+                     entry_best_bid, entry_best_ask, entry_fill_price)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'mvp', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     signal_id,
@@ -1938,6 +2012,9 @@ class TradeStage:
                     target_mid,
                     decision_latency_ms,
                     breakdown_json,
+                    entry_best_bid,
+                    entry_best_ask,
+                    entry_fill_price,
                 ),
             )
             if cur.rowcount != 1:

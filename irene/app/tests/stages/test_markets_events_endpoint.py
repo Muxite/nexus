@@ -432,3 +432,64 @@ async def test_fetch_all_gamma_events_preserves_partial_on_422(
     event_meta, market_row = result[0]
     assert event_meta["id"].startswith("evt-")
     assert market_row["conditionId"].startswith("0xE")
+
+
+# ---------------------------------------------------------------------------
+# Cycle 27 — category from event tags + operative fee_rate from gamma
+# ---------------------------------------------------------------------------
+
+
+def test_category_from_tags_first_match_wins():
+    from app.stages.markets import _category_from_tags
+    assert _category_from_tags(["exchange", "crypto"]) == "tech"
+    assert _category_from_tags(["crypto", "exchange"]) == "crypto"
+    assert _category_from_tags(["nba"]) == "sports"
+
+
+def test_category_from_tags_unmatched_tags_fall_back_to_general():
+    from app.stages.markets import _category_from_tags
+    assert _category_from_tags(["2025-predictions", "featured"]) == "general"
+
+
+def test_category_from_tags_none_when_no_tags():
+    from app.stages.markets import _category_from_tags
+    assert _category_from_tags(None) is None
+    assert _category_from_tags([]) is None
+
+
+def test_parse_gamma_row_derives_category_from_event_tags():
+    from app.stages.markets import _parse_gamma_row
+    raw = {
+        "conditionId": "0xc27", "question": "Q?",
+        "clobTokenIds": json.dumps(["t1", "t2"]),
+    }
+    row = _parse_gamma_row(
+        raw, event_meta={"id": "9", "slug": "ev", "tags": ["geopolitics"]}
+    )
+    assert row is not None
+    assert row["category"] == "geopolitics"
+    # No event meta (legacy /markets row) → category stays NULL.
+    row2 = _parse_gamma_row(raw)
+    assert row2["category"] is None
+
+
+def test_parse_gamma_row_fee_rate_from_fees_enabled():
+    from app.stages.markets import _parse_gamma_row
+    base = {
+        "conditionId": "0xfee", "question": "Q?",
+        "clobTokenIds": json.dumps(["t1", "t2"]),
+    }
+    # Fee-disabled market: operative rate is 0 — an explicit value, not
+    # a missing one (it must not fall back to default_fee_rate later).
+    row = _parse_gamma_row({**base, "feesEnabled": False, "takerBaseFee": None})
+    assert row["fee_rate"] == 0.0
+    # Fee-enabled sports market: 1000 bps → 0.10.
+    row = _parse_gamma_row({**base, "feesEnabled": True, "takerBaseFee": 1000})
+    assert row["fee_rate"] == pytest.approx(0.10)
+    # Legacy payload without the fields → unknown (NULL; the upsert
+    # COALESCEs so it never clobbers a known rate).
+    row = _parse_gamma_row(base)
+    assert row["fee_rate"] is None
+    # feesEnabled=True but bps missing/garbled → unknown, not 0.
+    row = _parse_gamma_row({**base, "feesEnabled": True, "takerBaseFee": "x"})
+    assert row["fee_rate"] is None

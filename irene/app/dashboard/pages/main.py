@@ -24,6 +24,7 @@ async def _fetch_open_trades(dash) -> list[dict]:
     cur = await dash.db.conn.execute(
         f"""
         SELECT t.id, t.market_id, t.direction, t.mid_price AS entry_mid,
+               t.entry_fill_price,
                t.size_usdc, t.decided_at, t.decision_path, t.target_mid,
                m.token_yes, m.token_no, m.question,
                m.active AS market_active, m.closed_at AS market_closed_at
@@ -46,8 +47,9 @@ async def _fetch_closed_pairs(dash) -> tuple[list[dict], list[dict], list[dict]]
     cur = await dash.db.conn.execute(
         f"""
         SELECT t.id, t.size_usdc, t.direction, t.mid_price AS entry_mid,
-               t.decision_path,
-               c.exit_mid_price, c.realized_pnl_usdc, c.close_reason,
+               t.entry_fill_price, t.decision_path,
+               c.exit_mid_price, c.exit_fill_price,
+               c.realized_pnl_usdc, c.close_reason,
                c.entry_fee_usdc, c.exit_fee_usdc
         FROM trades t
         JOIN trade_closures c ON c.trade_id = t.id
@@ -87,7 +89,13 @@ async def _current_mid_for_trade(dash, t: dict) -> float | None:
             timeout_seconds=dash.cfg.clob.timeout_seconds,
         )
         dash._clob_for_dashboard = clob
-    return await clob.get_mid(token_id)
+    # Cycle 27: derive the mid from the live book instead of /midpoint —
+    # the latter silently reports the last traded price on wide-spread
+    # books, which is exactly the fiction the wallet-honesty work bans.
+    book = await clob.get_top_of_book(token_id)
+    if book is None:
+        return None
+    return (float(book[0]) + float(book[1])) / 2.0
 
 FILENAME = "dashboard.txt"
 
@@ -262,6 +270,11 @@ async def render(dash) -> str:
         open_with_mid.append({
             "direction": t["direction"],
             "entry_mid": float(t["entry_mid"]),
+            # Cycle 27: fills-based cost basis; wallet helpers prefer it
+            # over entry_mid when non-NULL (legacy rows keep NULL).
+            "entry_fill_price": (
+                float(t["entry_fill_price"]) if t.get("entry_fill_price") is not None else None
+            ),
             "current_mid": cur_mid,
             "target_mid": (float(t["target_mid"]) if t.get("target_mid") is not None else None),
             "size_usdc": float(t["size_usdc"]),
@@ -340,9 +353,14 @@ async def render(dash) -> str:
         rows = by_path_open.get(path, [])
         inv = sum(r["size_usdc"] for r in rows)
         val = sum(
-            wallet.position_value(r["direction"], r["entry_mid"],
-                                  r["current_mid"] if r["current_mid"] is not None else r["entry_mid"],
-                                  r["size_usdc"])
+            wallet.position_value(
+                r["direction"],
+                r["entry_fill_price"] if r.get("entry_fill_price") is not None else r["entry_mid"],
+                r["current_mid"] if r["current_mid"] is not None else (
+                    r["entry_fill_price"] if r.get("entry_fill_price") is not None else r["entry_mid"]
+                ),
+                r["size_usdc"],
+            )
             for r in rows
         )
         closed_pnls = by_path_closed_pnl.get(path, [])
@@ -375,8 +393,13 @@ async def render(dash) -> str:
                     priced = "  no mid "
                 upnl_str = "    -   "
             else:
+                basis = (
+                    t["entry_fill_price"]
+                    if t.get("entry_fill_price") is not None
+                    else t["entry_mid"]
+                )
                 upnl_t = wallet.unrealized_pnl(
-                    t["direction"], t["entry_mid"], cur_mid, t["size_usdc"]
+                    t["direction"], basis, cur_mid, t["size_usdc"]
                 )
                 priced = f"mid {cur_mid:>5.3f}"
                 upnl_str = f"{upnl_t:>+7.3f}"

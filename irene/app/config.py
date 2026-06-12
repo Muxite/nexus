@@ -516,46 +516,27 @@ class TradeSection(BaseModel):
     require_breaking_for_extreme_mid: bool = True
     require_breaking_for_far_future: bool = True
     reject_singleton_on_extreme_mid: bool = True
-    # Cycle 7: Polymarket dynamic taker-fee model. Per-leg fee:
-    #     fee_usdc = shares * fee_rate * p * (1 - p)
-    # where p is the SHARE PRICE (=YES-side price for YES position,
-    # =(1-mid) for NO position) and shares = size_usdc / position_price.
-    # Both legs are taker fees (paper mode assumes we hit the book).
-    # Maker (limit) fees are 0; settlement fee is 0.
-    #
-    # FALLBACK ONLY. Since cycle 10 the canonical fee_rate is fetched
-    # per-market via `app/clob.py:get_market_info` (writes to
-    # `markets.fee_rate`); cycle 15 added a weekly refresh cadence
-    # (`fee_rate_fetched_at`). `closer.py:_resolve_fee_rate` prefers the
-    # per-market value over this category table; the table only fires
-    # when the per-market fetch fails or the row predates cycle 10.
-    #
-    # Category → fee_rate map (per Polymarket's published schedule, as a
-    # fallback for unfetched markets):
-    #   crypto                       — 0.072
-    #   economics/culture/weather    — 0.05 (default category)
-    #   finance/politics/tech        — 0.04
-    #   sports                       — 0.03
-    #   geopolitics                  — 0.00 (free)
-    polymarket_fee_rates: dict = Field(default_factory=lambda: {
-        # 2026-05-25 unstructured RAG batch reports crypto at 0.07; we keep
-        # 0.072 (conservative — over-estimates by ~2.8%) until a
-        # `getClobMarketInfo(conditionID)` call settles it. See
-        # plans/markets-gamma.md for the per-market fee fetcher.
-        "crypto": 0.072,
-        "culture": 0.05, "economics": 0.05, "weather": 0.05, "general": 0.05,
-        "finance": 0.04, "politics": 0.04, "tech": 0.04, "mentions": 0.04,
-        "sports": 0.03,
-        "geopolitics": 0.00,
-    })
-    # 2026-05-25 (cycle 15 audit): top-500 markets by volume24hr split
-    # 82.2% at 1000 bps (10%) / 17.8% at 0 bps. The cycle-7 default of
-    # 0.05 was a guess; the volume-weighted modal value is 10%. Raised
-    # to 0.10 to make the fallback conservative on the trading tail.
-    # Per-market fetch (cycle 10) is still the source of truth — this
-    # default only fires when fetch fails. Report:
-    # `irene/reports/2026-05-25-cycle15-market-floor-audit.md`.
-    default_fee_rate: float = Field(default=0.10, ge=0.0, lt=1.0)
+    # DEPRECATED (cycle 27 — wallet honesty). The category→rate table is
+    # no longer consulted anywhere: `closer.py:_resolve_fee_rate` uses
+    # `markets.fee_rate` (per-market CLOB fetch, weekly refresh) or
+    # `default_fee_rate`, nothing else. The table invented 3–7.2% fees
+    # for markets whose real taker fee is 0 and drove the wallet's
+    # 5.7%-of-size mean fee (2026-06-12 retrospective §3). The field
+    # stays so existing config.yaml files keep parsing; remove once no
+    # deployed config references it.
+    polymarket_fee_rates: dict = Field(default_factory=dict)
+    # Cycle 27: 0.0 — when the per-market fee_rate is unknown, assume
+    # Polymarket's modal taker fee (0%) rather than inventing a positive
+    # one; a paper wallet must not manufacture losses on unknowns. (The
+    # cycle-15 "82% at 1000 bps" survey is reconciled in
+    # scripts/analysis/fee_audit.py — see the cycle-27 report.)
+    # Per-market fetch (cycle 10) is the source of truth; this only
+    # fires when the fetch failed and the weekly refresh hasn't caught
+    # up. The per-leg fee formula is
+    #     fee_usdc = shares * fee_rate * min(p, 1 - p)
+    # with `p` the leg's fill price in position space — see
+    # closer.py:_polymarket_taker_fee.
+    default_fee_rate: float = Field(default=0.0, ge=0.0, lt=1.0)
     # Per-leg gas (entry + exit). Default 0 since paper mode doesn't
     # deduct gas; flip on if you want a more conservative wallet.
     gas_cost_usdc: float = Field(default=0.0, ge=0.0, lt=10.0)

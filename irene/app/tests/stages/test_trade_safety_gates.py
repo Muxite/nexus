@@ -40,8 +40,10 @@ pytestmark = pytest.mark.asyncio
 # ---------------------------------------------------------------------------
 
 
-async def test_mid_unavailable_rejects_when_clob_returns_none(db_seeded):
-    """Empty CLOB → get_mid returns None → reject with mid_unavailable."""
+async def test_book_unavailable_rejects_when_clob_returns_none(db_seeded):
+    """Empty CLOB → get_top_of_book returns None → reject with
+    book_unavailable (cycle 27 — the book gate runs before the cycle-23
+    mid_unavailable gate, which is now unreachable live)."""
     bus = _FakeBus()
     ai = _FakeAI()
     clob = _FakeCLOB(prices={})  # default_mid=None
@@ -50,11 +52,11 @@ async def test_mid_unavailable_rejects_when_clob_returns_none(db_seeded):
         await stage.handle(_payload())
     d = await _single_decision(db_seeded)
     assert d["outcome"] == "reject"
-    assert d["reason"] == "mid_unavailable"
+    assert d["reason"] == "book_unavailable"
 
 
-async def test_mid_unavailable_rejects_when_token_yes_missing(db_seeded):
-    """Market with NULL token_yes → can't price YES → reject."""
+async def test_book_unavailable_rejects_when_token_yes_missing(db_seeded):
+    """Market with NULL token_yes → can't read the YES book → reject."""
     async with db_seeded.batch() as cur:
         await cur.execute("UPDATE markets SET token_yes=NULL WHERE condition_id='m1'")
     bus = _FakeBus()
@@ -64,7 +66,7 @@ async def test_mid_unavailable_rejects_when_token_yes_missing(db_seeded):
         await stage.handle(_payload())
     d = await _single_decision(db_seeded)
     assert d["outcome"] == "reject"
-    assert d["reason"] == "mid_unavailable"
+    assert d["reason"] == "book_unavailable"
 
 
 # ---------------------------------------------------------------------------

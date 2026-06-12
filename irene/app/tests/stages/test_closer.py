@@ -3,8 +3,8 @@
 Strategy:
 - Real in-memory DB (`DB.ephemeral()`); pre-populate `markets`, `trades`,
   and sometimes `trade_closures` with raw SQL.
-- Fake CLOB client: an object exposing `async def get_mid(token_id)` that
-  the test controls per-token.
+- Fake CLOB client: an object exposing `async def get_top_of_book(token_id)`
+  that the test controls per-token (cycle 27 — the closer is book-based).
 - Drive a single iteration of the close loop via the public
   `run_close_cycle()` method — no asyncio.sleep, no real poll task.
 """
@@ -51,16 +51,26 @@ class _FakeBus:
 
 @dataclass
 class _FakeCLOB:
-    """`get_mid` returns whatever the test stuffs into `mids`, keyed by token.
-    A token missing from the dict resolves to `None` — the same shape the
-    real CLOBClient produces on every recoverable failure mode."""
+    """`get_top_of_book` returns whatever the test stuffs into `mids`,
+    keyed by token: a `(bid, ask)` tuple, or a bare float that becomes a
+    zero-spread book (`bid == ask == mid`) so mid-level expectations stay
+    exact. A token missing from the dict resolves to `None` — the same
+    shape the real CLOBClient produces on every recoverable failure mode
+    (network error, empty side, crossed book)."""
 
     mids: dict = field(default_factory=dict)
     calls: list = field(default_factory=list)
 
-    async def get_mid(self, token_id: str) -> Optional[float]:
+    async def get_top_of_book(
+        self, token_id: str
+    ) -> Optional[tuple[float, float]]:
         self.calls.append(token_id)
-        return self.mids.get(token_id)
+        v = self.mids.get(token_id)
+        if v is None:
+            return None
+        if isinstance(v, tuple):
+            return (float(v[0]), float(v[1]))
+        return (float(v), float(v))
 
 
 @dataclass
@@ -78,16 +88,9 @@ class _CloserCfg:
 
 @dataclass
 class _TradeCfg:
-    # Cycle 7: closer now reads fee knobs off cfg.trade. Defaults match
-    # `app/config.py:TradeSection` so tests that don't explicitly set
-    # them see the production fee schedule (parabolic taker model).
-    polymarket_fee_rates: dict = field(default_factory=lambda: {
-        "crypto": 0.072,
-        "culture": 0.05, "economics": 0.05, "weather": 0.05, "general": 0.05,
-        "finance": 0.04, "politics": 0.04, "tech": 0.04, "mentions": 0.04,
-        "sports": 0.03,
-        "geopolitics": 0.00,
-    })
+    # Cycle 27: the fee path is `markets.fee_rate` else `default_fee_rate`
+    # (the category table is gone). 0.05 here is deliberately non-zero so
+    # tests prove the default actually applies; production default is 0.0.
     default_fee_rate: float = 0.05
     gas_cost_usdc: float = 0.0
 
@@ -149,6 +152,9 @@ async def _seed_trade(
     is_tracer: int = 0,
     tracer_id: Optional[str] = None,
     target_mid: Optional[float] = None,
+    entry_best_bid: Optional[float] = None,
+    entry_best_ask: Optional[float] = None,
+    entry_fill_price: Optional[float] = None,
 ) -> None:
     if decided_at is None:
         decided_at = datetime.now(timezone.utc)
@@ -173,14 +179,16 @@ async def _seed_trade(
                 (id, signal_id, decision_id, prediction_id, market_id, direction,
                  confidence, similarity, freshness, p_hat, mid_price, edge,
                  kelly_fraction, size_usdc, decision_path, features_snapshot,
-                 cycle_id, is_tracer, tracer_id, decided_at, target_mid)
+                 cycle_id, is_tracer, tracer_id, decided_at, target_mid,
+                 entry_best_bid, entry_best_ask, entry_fill_price)
             VALUES (?, ?, ?, 1, ?, ?, 0.7, 0.8, 'BREAKING', 0.7, ?, 0.1, 0.1,
-                    ?, 'mvp', '{}', 1, ?, ?, ?, ?)
+                    ?, 'mvp', '{}', 1, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trade_id, signal_id, decision_id, market_id, direction,
                 mid_price, size_usdc, is_tracer, tracer_id,
                 decided_at.isoformat(), target_mid,
+                entry_best_bid, entry_best_ask, entry_fill_price,
             ),
         )
 
@@ -194,7 +202,8 @@ async def _closures(db: DB) -> list[dict]:
     cur = await db.conn.execute(
         "SELECT trade_id, close_reason, exit_mid_price, realized_pnl_usdc, "
         "cycle_id, is_tracer, tracer_id, "
-        "entry_fee_usdc, exit_fee_usdc "
+        "entry_fee_usdc, exit_fee_usdc, "
+        "exit_best_bid, exit_best_ask, exit_fill_price "
         "FROM trade_closures ORDER BY id"
     )
     rows = await cur.fetchall()
@@ -285,9 +294,11 @@ async def test_take_profit_fires_when_gain_exceeds_pct(db):
     rows = await _closures(db)
     assert rows[0]["close_reason"] == "target"
     assert rows[0]["exit_mid_price"] == pytest.approx(0.7)
-    # Cycle 7: net of fees. gross=7.5; shares=25; fees @ default 0.05:
-    # entry 25*0.05*0.4*0.6=0.30, exit 25*0.05*0.7*0.3=0.2625; net=6.9375.
-    assert rows[0]["realized_pnl_usdc"] == pytest.approx(6.9375, rel=1e-3)
+    # Cycle 27: net of fees (min(p,1-p) model). gross=7.5; shares=25;
+    # entry 25*0.05*min(0.4,0.6)=0.50, exit 25*0.05*min(0.7,0.3)=0.375;
+    # net = 7.5 - 0.875 = 6.625. Zero-spread fake book → exit fill = mid.
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(6.625, rel=1e-3)
+    assert rows[0]["exit_fill_price"] == pytest.approx(0.7)
 
 
 async def test_stop_loss_fires_when_loss_exceeds_pct(db):
@@ -340,15 +351,39 @@ async def test_edge_decay_fires_when_yes_mid_reaches_target(db):
     assert rows[0]["close_reason"] == "edge_decay"
 
 
-async def test_edge_decay_fires_when_no_mid_reaches_target(db):
-    # NO bought at 0.6 (i.e. we bet against YES). target_mid=0.40 (price falls).
-    # Current 0.38 → edge_decay.
+async def test_edge_decay_fires_when_no_mid_reaches_target_legacy_row(db):
+    # Legacy NO row (entry_fill_price IS NULL): target_mid was stored in
+    # YES space (p_hat + fee). mid_price / the closer's poll are the NO
+    # token's own price (position space). The closer mirrors the legacy
+    # target (1 - 0.40 = 0.60 in NO space) and fires when the NO token
+    # RISES to it: entry 0.55, current 0.62 ≥ 0.60 → edge_decay.
     await _seed_market(db)
     decided = datetime.now(timezone.utc) - timedelta(minutes=10)
     await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
-                      direction="NO", mid_price=0.6, size_usdc=10.0,
+                      direction="NO", mid_price=0.55, size_usdc=10.0,
                       target_mid=0.40)
-    clob = _FakeCLOB(mids={"tN": 0.38})
+    clob = _FakeCLOB(mids={"tN": 0.62})
+    cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
+    stage = _make_stage(db, clob, cfg=cfg)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+    assert n == 1
+    rows = await _closures(db)
+    assert rows[0]["close_reason"] == "edge_decay"
+
+
+async def test_edge_decay_no_position_space_target_on_fill_rows(db):
+    # Cycle 27 NO row (entry_fill_price set): target_mid is already
+    # position space — the NO token's own target. No mirroring: current
+    # 0.62 ≥ target 0.60 → edge_decay.
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(minutes=10)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="NO", mid_price=0.55, size_usdc=10.0,
+                      target_mid=0.60,
+                      entry_best_bid=0.54, entry_best_ask=0.56,
+                      entry_fill_price=0.56)
+    clob = _FakeCLOB(mids={"tN": 0.62})
     cfg = _Config(closer=_CloserCfg(take_profit_pct=0.50, stop_loss_pct=0.30))
     stage = _make_stage(db, clob, cfg=cfg)
     with cycle_scope(1):
@@ -407,13 +442,14 @@ async def test_stagnation_skipped_when_price_did_move(db):
 
 
 async def test_pnl_yes_formula(db):
-    # Cycle 7: realized_pnl_usdc is NET of Polymarket taker fees.
-    # YES @ entry=0.4, exit=0.6, size=$100, default fee_rate=0.05:
+    # Cycle 27: realized_pnl_usdc is NET of Polymarket taker fees
+    # (min(p, 1-p) model, default fee_rate=0.05 from the test cfg).
+    # YES @ entry=0.4, exit=0.6, size=$100:
     #   shares = 100 / 0.4 = 250
-    #   entry_fee = 250 * 0.05 * 0.4 * 0.6 = 3.00
-    #   exit_fee  = 250 * 0.05 * 0.6 * 0.4 = 3.00
+    #   entry_fee = 250 * 0.05 * min(0.4, 0.6) = 5.00
+    #   exit_fee  = 250 * 0.05 * min(0.6, 0.4) = 5.00
     #   gross_pnl = 100 * (0.6 - 0.4) / 0.4 = 50.0
-    #   net_pnl   = 50.0 - 6.0 = 44.0
+    #   net_pnl   = 50.0 - 10.0 = 40.0
     await _seed_market(db)
     decided = datetime.now(timezone.utc) - timedelta(hours=48)
     await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
@@ -425,22 +461,22 @@ async def test_pnl_yes_formula(db):
         await stage.run_close_cycle()
 
     rows = await _closures(db)
-    assert rows[0]["realized_pnl_usdc"] == pytest.approx(44.0, rel=1e-4)
-    assert rows[0]["entry_fee_usdc"] == pytest.approx(3.0, rel=1e-4)
-    assert rows[0]["exit_fee_usdc"] == pytest.approx(3.0, rel=1e-4)
-    # Sanity-check the gross helper still matches the old formula.
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(40.0, rel=1e-4)
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(5.0, rel=1e-4)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(5.0, rel=1e-4)
     assert _compute_pnl("YES", 0.4, 0.6, 100.0) == pytest.approx(50.0)
 
 
-async def test_pnl_no_formula(db):
-    # Cycle 7: realized_pnl_usdc is NET of fees.
-    # NO @ YES_entry_mid=0.4 (we bought NO at 1-0.4=0.6), YES_exit=0.6,
-    # size=$100, default fee_rate=0.05:
-    #   shares = 100 / 0.6 = 166.667
-    #   entry_fee = 166.667 * 0.05 * 0.6 * 0.4 = 2.0
-    #   exit_fee  = 166.667 * 0.05 * 0.4 * 0.6 = 2.0
-    #   gross_pnl = 100 * (0.4 - 0.6) / (1 - 0.4) = -33.333
-    #   net_pnl   = -33.333 - 4.0 = -37.333
+async def test_pnl_no_formula_position_space(db):
+    # Cycle 27: all prices are the traded token's own (position space).
+    # A NO trade whose NO token rises 0.4 → 0.6 WINS:
+    #   shares = 100 / 0.4 = 250
+    #   entry_fee = 250 * 0.05 * min(0.4, 0.6) = 5.0
+    #   exit_fee  = 250 * 0.05 * min(0.6, 0.4) = 5.0
+    #   gross_pnl = 100 * (0.6 - 0.4) / 0.4 = +50.0
+    #   net_pnl   = 50.0 - 10.0 = 40.0
+    # (The pre-cycle-27 NO branch returned -33.33 here — it assumed
+    # YES-space mids the pipeline never stored; see closer.py spec.)
     await _seed_market(db)
     decided = datetime.now(timezone.utc) - timedelta(hours=48)
     await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
@@ -452,15 +488,16 @@ async def test_pnl_no_formula(db):
         await stage.run_close_cycle()
 
     rows = await _closures(db)
-    assert rows[0]["realized_pnl_usdc"] == pytest.approx(-37.3333333, rel=1e-3)
-    assert rows[0]["entry_fee_usdc"] == pytest.approx(2.0, rel=1e-4)
-    assert rows[0]["exit_fee_usdc"] == pytest.approx(2.0, rel=1e-4)
-    assert _compute_pnl("NO", 0.4, 0.6, 100.0) == pytest.approx(-33.3333333, rel=1e-4)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(40.0, rel=1e-3)
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(5.0, rel=1e-4)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(5.0, rel=1e-4)
+    assert _compute_pnl("NO", 0.4, 0.6, 100.0) == pytest.approx(50.0)
 
 
-async def test_pnl_yes_with_geopolitics_fee_zero(db):
-    """Polymarket's geopolitics tier has fee_rate=0. Net PnL == gross PnL."""
-    # Seed market with category that resolves to 'geopolitics' fee_rate.
+async def test_pnl_yes_with_zero_per_market_fee_rate(db):
+    """A market with a fetched fee_rate of 0 (Polymarket's modal taker
+    fee) pays nothing: net PnL == gross PnL. fee_rate=0.0 is a VALID
+    value, not a missing one — it must not fall back to the default."""
     async with db.batch() as cur:
         await cur.execute(
             """
@@ -468,10 +505,11 @@ async def test_pnl_yes_with_geopolitics_fee_zero(db):
                 (condition_id, slug, question, description, category, end_date,
                  volume_usdc, token_yes, token_no, embedding, embedder_id,
                  embedding_dim, embedding_updated_at, active, closed_at,
-                 first_seen_at, updated_at)
+                 first_seen_at, updated_at, fee_rate)
             VALUES ('m1', 'slug', 'Q?', 'desc', 'geopolitics', '2026-12-31',
                     1000.0, 'tY', 'tN', NULL, NULL, NULL, NULL, 1, NULL,
-                    '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
+                    '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00',
+                    0.0)
             """,
         )
     decided = datetime.now(timezone.utc) - timedelta(hours=48)
@@ -490,21 +528,12 @@ async def test_pnl_yes_with_geopolitics_fee_zero(db):
     assert rows[0]["exit_fee_usdc"] == pytest.approx(0.0)
 
 
-async def test_pnl_yes_with_crypto_higher_fee_rate(db):
-    """Crypto markets pay 0.072 — much higher fees than default 0.05."""
-    async with db.batch() as cur:
-        await cur.execute(
-            """
-            INSERT INTO markets
-                (condition_id, slug, question, description, category, end_date,
-                 volume_usdc, token_yes, token_no, embedding, embedder_id,
-                 embedding_dim, embedding_updated_at, active, closed_at,
-                 first_seen_at, updated_at)
-            VALUES ('m1', 'slug', 'Q?', 'desc', 'crypto', '2026-12-31',
-                    1000.0, 'tY', 'tN', NULL, NULL, NULL, NULL, 1, NULL,
-                    '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
-            """,
-        )
+async def test_pnl_null_fee_rate_falls_back_to_default(db):
+    """Cycle 27: a NULL `markets.fee_rate` (fetch never succeeded) falls
+    back to `cfg.trade.default_fee_rate` — the category column is
+    ignored entirely (the category→rate table is gone). The default
+    `_seed_market` row has category='cat' and no fee_rate."""
+    await _seed_market(db)
     decided = datetime.now(timezone.utc) - timedelta(hours=48)
     await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
                       direction="YES", mid_price=0.4, size_usdc=100.0)
@@ -515,25 +544,16 @@ async def test_pnl_yes_with_crypto_higher_fee_rate(db):
         await stage.run_close_cycle()
 
     rows = await _closures(db)
-    # shares=250; per-leg fee = 250 * 0.072 * 0.4 * 0.6 = 4.32; round-trip 8.64
-    # net = 50 - 8.64 = 41.36
-    assert rows[0]["realized_pnl_usdc"] == pytest.approx(41.36, rel=1e-3)
+    # shares=250; per-leg fee = 250 * 0.05 * min(p, 1-p) = 5.0 both legs
+    # net = 50 - 10 = 40
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(40.0, rel=1e-3)
 
 
-async def test_per_market_fee_rate_overrides_category_lookup(db):
-    """Cycle 10: when `markets.fee_rate` is populated (per-market fetch
-    from `clob.get_market_fee_rate(conditionId)`), the closure uses
-    that value instead of the category lookup in
-    `config.polymarket_fee_rates`. The category fallback only fires
-    when fee_rate is NULL.
-
-    This test puts a market in category='crypto' (which maps to 0.072
-    via category lookup) but stamps fee_rate=0.02 on the row. The
-    closure must use 0.02, not 0.072.
-    """
-    # Seed market with category=crypto BUT per-market fee_rate=0.02.
-    # If the closer wrongly used the category lookup, the per-leg fee
-    # would be ~3.6x larger and the test would fail.
+async def test_per_market_fee_rate_used_when_present(db):
+    """Cycle 10/27: when `markets.fee_rate` is populated (per-market
+    fetch from `clob.get_market_fee_rate(conditionId)`), the closure
+    uses that value instead of `default_fee_rate` (0.05 in the test
+    cfg)."""
     async with db.batch() as cur:
         await cur.execute(
             """
@@ -559,15 +579,15 @@ async def test_per_market_fee_rate_overrides_category_lookup(db):
 
     rows = await _closures(db)
     # shares=100/0.4=250; per-leg fee at fee_rate=0.02:
-    #   entry: 250 * 0.02 * 0.4 * 0.6 = 1.20
-    #   exit:  250 * 0.02 * 0.6 * 0.4 = 1.20
+    #   entry: 250 * 0.02 * min(0.4, 0.6) = 2.00
+    #   exit:  250 * 0.02 * min(0.6, 0.4) = 2.00
     # gross = 100 * (0.6 - 0.4) / 0.4 = 50.0
-    # net   = 50.0 - 2.40 = 47.60
-    # (If the category lookup at 0.072 had fired, net would be ~41.36 —
+    # net   = 50.0 - 4.00 = 46.00
+    # (If the 0.05 default had fired instead, net would be 40.0 —
     #  way outside the 1e-3 tolerance.)
-    assert rows[0]["entry_fee_usdc"] == pytest.approx(1.20, rel=1e-3)
-    assert rows[0]["exit_fee_usdc"] == pytest.approx(1.20, rel=1e-3)
-    assert rows[0]["realized_pnl_usdc"] == pytest.approx(47.60, rel=1e-3)
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(2.00, rel=1e-3)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(2.00, rel=1e-3)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(46.00, rel=1e-3)
 
 
 async def test_market_resolved_charges_no_exit_fee(db):
@@ -597,19 +617,18 @@ async def test_market_resolved_charges_no_exit_fee(db):
             exit_mid=1.0,  # YES resolved true → shares redeem at $1
             close_reason="market_resolved",
             trade_cfg=cfg.trade,
-            category="finance",  # fee_rate = 0.04
         )
     assert ok
 
     rows = await _closures(db)
-    # shares = 100/0.4 = 250; entry_fee = 250 * 0.04 * 0.4 * 0.6 = 2.40
+    # shares = 100/0.4 = 250; entry_fee = 250 * 0.05 * min(0.4, 0.6) = 5.0
     # exit_fee = 0.0 (resolution exception)
     # gross  = 100 * (1.0 - 0.4) / 0.4 = 150.0
-    # net    = 150.0 - 2.40 = 147.60
+    # net    = 150.0 - 5.0 = 145.0
     assert rows[0]["close_reason"] == "market_resolved"
-    assert rows[0]["entry_fee_usdc"] == pytest.approx(2.40, rel=1e-4)
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(5.0, rel=1e-4)
     assert rows[0]["exit_fee_usdc"] == pytest.approx(0.0)
-    assert rows[0]["realized_pnl_usdc"] == pytest.approx(147.60, rel=1e-4)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(145.0, rel=1e-4)
 
 
 async def test_non_market_resolved_still_charges_exit_fee(db):
@@ -636,13 +655,12 @@ async def test_non_market_resolved_still_charges_exit_fee(db):
             exit_mid=0.6,
             close_reason="timeout",
             trade_cfg=cfg.trade,
-            category="finance",
         )
 
     rows = await _closures(db)
-    # entry_fee = exit_fee = 250 * 0.04 * 0.4 * 0.6 = 2.40
-    assert rows[0]["entry_fee_usdc"] == pytest.approx(2.40, rel=1e-4)
-    assert rows[0]["exit_fee_usdc"] == pytest.approx(2.40, rel=1e-4)
+    # entry_fee = exit_fee = 250 * 0.05 * min(p, 1-p) = 5.0 both legs
+    assert rows[0]["entry_fee_usdc"] == pytest.approx(5.0, rel=1e-4)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(5.0, rel=1e-4)
 
 
 async def test_idempotent_double_run(db):
@@ -666,7 +684,7 @@ async def test_skip_on_missing_mid_holds_position(db):
     await _seed_market(db)
     decided = datetime.now(timezone.utc) - timedelta(hours=25)
     await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided)
-    clob = _FakeCLOB(mids={})  # token has no mid
+    clob = _FakeCLOB(mids={})  # token has no book (empty/missing)
 
     stage = _make_stage(db, clob, cfg=_Config(closer=_CloserCfg(skip_on_missing_mid=True)))
     with cycle_scope(1):
@@ -694,9 +712,11 @@ async def test_missing_mid_falls_back_to_entry_when_skip_is_false(db):
     assert written == 1
     rows = await _closures(db)
     assert rows[0]["exit_mid_price"] == pytest.approx(0.4)
-    # Cycle 7: exit==entry → gross=0, but fees still paid both legs.
-    # shares=250; per-leg fee=250*0.05*0.4*0.6=3.0; net=0-6=-6.0.
-    assert rows[0]["realized_pnl_usdc"] == pytest.approx(-6.0, rel=1e-3)
+    # Cycle 27: exit==entry price → gross=0, but fees still paid both
+    # legs. shares=250; per-leg fee=250*0.05*min(0.4,0.6)=5.0; net=-10.0.
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(-10.0, rel=1e-3)
+    # No book → no exit fill recorded.
+    assert rows[0]["exit_fill_price"] is None
 
 
 async def test_tracer_flag_carried_to_closure(db):
@@ -713,3 +733,83 @@ async def test_tracer_flag_carried_to_closure(db):
     rows = await _closures(db)
     assert rows[0]["is_tracer"] == 1
     assert rows[0]["tracer_id"] == "tracer-abc"
+
+
+async def test_spread_aware_fills_round_trip(db):
+    """Cycle 27 tracer: a fill-priced trade closes at the bid, persists
+    the exit book, and the residual between mid-to-mid drift and gross
+    PnL is exactly the spread paid on both legs.
+
+    Entry book (0.38, 0.42): mid 0.40, fill at ask 0.42.
+    Exit book  (0.58, 0.62): mid 0.60, fill at bid 0.58.
+      shares     = 100 / 0.42 = 238.095
+      gross      = 238.095 * (0.58 - 0.42) = 38.095
+      mid drift  = (100 / 0.40) * (0.60 - 0.40) = 50.0   (what the old
+                   wallet would have printed)
+      residual   = 50.0 - 38.095 = 11.905 — the spread, now visible.
+    Fees at default 0.05: entry 238.095*0.05*min(0.42,0.58)=5.0,
+    exit 238.095*0.05*min(0.58,0.42)=5.0; net = 38.095 - 10 = 28.095.
+    """
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(hours=48)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="YES", mid_price=0.40, size_usdc=100.0,
+                      entry_best_bid=0.38, entry_best_ask=0.42,
+                      entry_fill_price=0.42)
+    clob = _FakeCLOB(mids={"tY": (0.58, 0.62)})
+
+    stage = _make_stage(db, clob)
+    with cycle_scope(1):
+        n = await stage.run_close_cycle()
+
+    assert n == 1
+    rows = await _closures(db)
+    assert rows[0]["close_reason"] == "timeout"
+    assert rows[0]["exit_best_bid"] == pytest.approx(0.58)
+    assert rows[0]["exit_best_ask"] == pytest.approx(0.62)
+    assert rows[0]["exit_fill_price"] == pytest.approx(0.58)
+    assert rows[0]["exit_mid_price"] == pytest.approx(0.60)
+    shares = 100.0 / 0.42
+    gross = shares * (0.58 - 0.42)
+    net = gross - 2 * (shares * 0.05 * 0.42)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(net, rel=1e-6)
+    # The spread paid is now a visible residual: mid drift > gross.
+    mid_drift = (100.0 / 0.40) * (0.60 - 0.40)
+    assert mid_drift - gross == pytest.approx(11.9047619, rel=1e-6)
+
+
+async def test_resolution_redeems_at_position_payout_for_fill_rows(db):
+    """A cycle-27 NO trade that wins at resolution redeems the NO token
+    at $1 — entry priced at the fill, no exit fee, no exit book."""
+    await _seed_market(db)
+    decided = datetime.now(timezone.utc) - timedelta(hours=1)
+    await _seed_trade(db, trade_id=1, signal_id=1, decided_at=decided,
+                      direction="NO", mid_price=0.55, size_usdc=100.0,
+                      entry_best_bid=0.54, entry_best_ask=0.56,
+                      entry_fill_price=0.56)
+    trade = {
+        "id": 1,
+        "direction": "NO",
+        "mid_price": 0.55,
+        "entry_fill_price": 0.56,
+        "size_usdc": 100.0,
+        "is_tracer": 0,
+        "tracer_id": None,
+    }
+    cfg = _Config()
+    with cycle_scope(1):
+        ok = await write_trade_closure(
+            db,
+            trade=trade,
+            exit_mid=1.0,  # NO payout (position space) — market resolved NO
+            close_reason="market_resolved",
+            trade_cfg=cfg.trade,
+        )
+    assert ok
+    rows = await _closures(db)
+    shares = 100.0 / 0.56
+    gross = shares * (1.0 - 0.56)
+    entry_fee = shares * 0.05 * min(0.56, 1 - 0.56)
+    assert rows[0]["realized_pnl_usdc"] == pytest.approx(gross - entry_fee, rel=1e-6)
+    assert rows[0]["exit_fee_usdc"] == pytest.approx(0.0)
+    assert rows[0]["exit_fill_price"] is None

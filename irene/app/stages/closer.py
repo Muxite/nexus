@@ -32,15 +32,32 @@ threshold), `market_resolved` (Polymarket has resolved the underlying).
 constraint on `close_reason` already enumerates every future value so a
 later phase only adds the rule, not the schema.
 
-**PnL formulas** (validated to ±1¢ by `scripts/replay/accuracy.py`):
+**Price-space convention (cycle 27 — read this before touching PnL).**
+Every price this stage handles is in **position space**: the traded
+token's own price. `trades.mid_price` is the mid of the token we bought
+(YES token for YES trades, NO token for NO trades — `_resolve_mid` and
+this stage's poll both read the traded side), `entry_fill_price` /
+`exit_fill_price` are that token's ask/bid, and resolution payouts are
+the traded token's redemption value. The pre-cycle-27 NO formula
+(`(entry - exit) / (1 - entry)`) assumed YES-space mids the data
+pipeline never supplied — NO-trade PnL was sign-flipped and rescaled
+(verified against `features_snapshot.edge_components.executable_price`
+on live rows, 2026-06-12).
 
-- `YES`: `pnl = size_usdc * (exit_mid - entry_mid) / entry_mid`
-- `NO`:  `pnl = size_usdc * (entry_mid - exit_mid) / (1 - entry_mid)`
+**PnL formula** (position space, direction-independent):
 
-where `entry_mid = trades.mid_price` and `exit_mid` is the fresh CLOB
-mid fetched at close time (or, when the CLOB returns `None` and
-`cfg.closer.skip_on_missing_mid` is False, the stored entry mid — a
-degenerate but deterministic fallback that produces `pnl == 0`).
+    shares = size_usdc / entry_price
+    pnl    = shares * (exit_price - entry_price)
+
+- Cycle-27+ rows fill honestly: `entry_price = trades.entry_fill_price`
+  (the ask at entry), `exit_price = exit_fill_price` (the bid at close).
+  The bid/ask pair is persisted on both legs for forensics.
+- Legacy rows (`entry_fill_price IS NULL`) close mid-to-mid:
+  `entry_price = trades.mid_price`, `exit_price` = fresh book mid at
+  close (both position space, so the formula is exact for them too).
+- When the book is unavailable at close and
+  `cfg.closer.skip_on_missing_mid` is True (default) the trade is held;
+  when False it closes at its entry price (deterministic `pnl == 0`).
 
 **Invariants.**
 - `trade_closures.trade_id` is `UNIQUE`. A second poll cycle that sees
@@ -52,16 +69,16 @@ degenerate but deterministic fallback that produces `pnl == 0`).
 - `trades` is read-only here. Closer NEVER updates the trade row.
 
 **Side effects.** Reads `trades` and `markets` (token lookup). Calls
-`deps.clob.get_mid(token_id)`. Writes `trade_closures` inside
+`deps.clob.get_top_of_book(token_id)`. Writes `trade_closures` inside
 `db.batch()`. Spawns a background asyncio task in `start()`; cancels it
 in `stop()`.
 
 **Failure modes.**
-- CLOB returns `None` for a trade's token and `cfg.closer.skip_on_missing_mid`
+- CLOB book is `None` for a trade's token and `cfg.closer.skip_on_missing_mid`
   is True (default): the trade is logged at INFO and left open this
   cycle. The next poll retries.
-- CLOB returns `None` and `skip_on_missing_mid` is False: the trade
-  closes at its stored entry mid (pnl ≈ 0).
+- CLOB book is `None` and `skip_on_missing_mid` is False: the trade
+  closes at its entry price (pnl == 0).
 - `markets` row for a trade's `market_id` is missing (a race that
   shouldn't happen in P1 since markets only deactivate, never delete):
   log WARNING and skip the trade.
@@ -152,6 +169,15 @@ _CLOSER_DDL = [
     "CREATE INDEX IF NOT EXISTS idx_trade_closures_close_reason ON trade_closures(close_reason)",
     "CREATE INDEX IF NOT EXISTS idx_trade_closures_closed_at ON trade_closures(closed_at)",
     "CREATE INDEX IF NOT EXISTS idx_trade_closures_cycle_id ON trade_closures(cycle_id)",
+    # Cycle 27 (wallet honesty): spread-aware exits. The traded token's
+    # top-of-book at close time, plus the fill price the exit actually
+    # uses (= exit_best_bid — you sell at the bid). All three NULL on
+    # legacy rows, on resolution/dead-market closes (redemption, no book
+    # fill), and on the skip_on_missing_mid=false degenerate path.
+    # `exit_mid_price` stays NOT NULL and keeps the position-space mid.
+    "ALTER TABLE trade_closures ADD COLUMN exit_best_bid   REAL",
+    "ALTER TABLE trade_closures ADD COLUMN exit_best_ask   REAL",
+    "ALTER TABLE trade_closures ADD COLUMN exit_fill_price REAL",
 ]
 db_module.register_schema("app/stages/closer.py", _CLOSER_DDL)
 
@@ -174,45 +200,41 @@ def _parse_iso(value: str) -> Optional[datetime]:
         return None
 
 
-def _compute_gross_pnl(direction: str, entry_mid: float, exit_mid: float, size_usdc: float) -> float:
-    """Pure mid-to-mid PnL. The two formulas the spec block documents.
-    Kept as a free function so `scripts/replay/accuracy.py` can call it
-    without instantiating the stage."""
-    if direction == "YES":
-        if entry_mid <= 0.0:
-            return 0.0
-        return size_usdc * (exit_mid - entry_mid) / entry_mid
-    # NO
-    denom = 1.0 - entry_mid
-    if denom <= 0.0:
+def _compute_gross_pnl(direction: str, entry_price: float, exit_price: float, size_usdc: float) -> float:
+    """Pure gross PnL in **position space** (both prices are the traded
+    token's own — see the spec block). Direction-independent:
+
+        shares = size_usdc / entry_price
+        pnl    = shares * (exit_price - entry_price)
+
+    Cycle 27: the old NO branch (`(entry - exit) / (1 - entry)`) assumed
+    YES-space mids, but `_resolve_mid` and the closer's poll have always
+    fed the traded token's price — NO-trade PnL came out sign-flipped
+    and rescaled by `entry/(1-entry)`. `direction` stays in the
+    signature so the historical-recompute scripts and call sites don't
+    churn; it is intentionally unused.
+    """
+    del direction  # position-space prices make the formula symmetric
+    if entry_price <= 0.0:
         return 0.0
-    return size_usdc * (entry_mid - exit_mid) / denom
+    return size_usdc * (exit_price - entry_price) / entry_price
 
 
 def _resolve_fee_rate(
-    category: Optional[str],
-    rates: dict,
+    market_fee_rate: Optional[float],
     default: float,
-    *,
-    market_fee_rate: Optional[float] = None,
 ) -> float:
     """Resolve the Polymarket taker fee rate for a trade.
 
-    **Cycle 10 lookup priority** (markets-gamma.md + closer-fees.md):
-      1. `market_fee_rate` — the per-market rate fetched from
-         `GET /markets/<conditionId>:taker_base_fee` and stored in
-         `markets.fee_rate` (authoritative; varies per market — a
-         2026-05-25 live survey found {0.00, 0.02, 0.10} across the
-         universe). Used as-is when present and in `[0.0, 1.0]`.
-      2. `category` → `rates` lookup (case-insensitive, substring-
-         tolerant fallback for categories like "us-politics" /
-         "world-politics" → "politics" base tier).
-      3. `default` when both are missing / unrecognized.
-
-    The category table stays as the fallback — markets without a
-    fetched fee_rate (network miss at discovery, legacy rows from
-    before cycle 10, NULL after migration) still get a sensible
-    fee deduction.
+    Cycle 27: per-market `markets.fee_rate` (CLOB
+    `GET /markets/<conditionId>:taker_base_fee`, refreshed weekly) or
+    `default` — nothing else. The cycle-7 category→rate fallback table
+    is gone: it invented 3–7.2% fees for markets whose real taker fee
+    is 0, and was the main source of the wallet's 5.7%-of-size mean fee
+    (2026-06-12 retrospective §3). `default` should be 0.0 (see
+    `cfg.trade.default_fee_rate`): an unknown fee is far more likely to
+    be Polymarket's modal 0% than any invented positive rate, and a
+    paper wallet must not manufacture losses.
     """
     if market_fee_rate is not None:
         try:
@@ -221,59 +243,42 @@ def _resolve_fee_rate(
             mf = -1.0
         if 0.0 <= mf <= 1.0:
             return mf
-    if not category:
-        return default
-    key = category.strip().lower()
-    if key in rates:
-        return float(rates[key])
-    # Light substring match — Polymarket categories sometimes include
-    # qualifiers like "us-politics" or "world-politics"; collapse to the
-    # base tier.
-    for token, rate in rates.items():
-        if token in key:
-            return float(rate)
     return default
 
 
 def _polymarket_taker_fee(price: float, shares: float, fee_rate: float) -> float:
-    """Per-leg Polymarket taker fee.
-      fee = shares * fee_rate * p * (1 - p)
-    The parabola peaks at p=0.5 and is symmetric — buying NO at YES_mid=0.45
-    (i.e. NO_price = 0.55) and buying YES at 0.55 pay the same per-share fee.
-    Returns 0 when fee_rate=0 (Polymarket's geopolitics tier).
+    """Per-leg Polymarket taker fee, per the published formula:
+      fee = shares * fee_rate * min(p, 1 - p)
+    `p` is the leg's fill price in position space; `min(p, 1-p)` is
+    symmetric across the binary, so YES at 0.55 and NO at 0.45 pay the
+    same per-share fee. Cycle 27 replaced the cycle-7 parabola
+    `p * (1 - p)` — close near the middle but up to 2x off at the tails,
+    and not what Polymarket documents. Returns 0 when fee_rate=0 (the
+    modal market).
     """
     if fee_rate <= 0.0 or shares <= 0.0:
         return 0.0
     p = max(0.0, min(1.0, float(price)))
-    return shares * fee_rate * p * (1.0 - p)
+    return shares * fee_rate * min(p, 1.0 - p)
 
 
 def _compute_round_trip_fees(
-    direction: str,
-    entry_mid: float,
-    exit_mid: float,
+    entry_price: float,
+    exit_price: float,
     size_usdc: float,
     fee_rate: float,
     gas_cost_usdc: float = 0.0,
 ) -> tuple[float, float]:
-    """Cycle 7: faithful Polymarket fee model.
-
-    Returns (entry_fee_usdc, exit_fee_usdc). Each leg uses
-        fee = shares * fee_rate * p * (1 - p)
-    with `p` being the share-side price (=entry/exit mid for YES,
-    =(1-mid) for NO). `shares = size_usdc / position_price`.
-
-    Gas (if configured) is added per leg.
+    """Returns (entry_fee_usdc, exit_fee_usdc). Each leg uses
+        fee = shares * fee_rate * min(p, 1 - p)
+    with `p` the leg's fill price in **position space** (the traded
+    token's own price — cycle 27 dropped the direction-based flip along
+    with the YES-space convention; `min(p, 1-p)` is symmetric anyway).
+    `shares = size_usdc / entry_price`. Gas (if configured) is added
+    per leg.
     """
     if size_usdc <= 0.0:
         return 0.0, 0.0
-    if direction == "YES":
-        entry_price = entry_mid
-        exit_price = exit_mid
-    else:
-        entry_price = 1.0 - entry_mid
-        exit_price = 1.0 - exit_mid
-
     if entry_price <= 0.0:
         # Degenerate entry — no shares purchased. Zero fee model-wise.
         return 0.0, 0.0
@@ -297,57 +302,70 @@ async def write_trade_closure(
     exit_mid: float,
     close_reason: str,
     trade_cfg,
-    category: Optional[str] = None,
     market_fee_rate: Optional[float] = None,
     now_iso: Optional[str] = None,
+    exit_book: Optional[tuple[float, float]] = None,
 ) -> bool:
-    """Cycle 7: free function that writes a trade_closures row with
+    """Free function that writes a trade_closures row with
     Polymarket-fee-deducted PnL. Used by CloserStage._close_trade and
-    by MarketsStage when a market deactivates with an open trade.
+    by MarketsStage when a market resolves/dies with an open trade.
     Returns True iff a closure row was inserted (UNIQUE(trade_id)
     prevents double-fires).
 
-    `trade_cfg` must expose `polymarket_fee_rates`, `default_fee_rate`,
-    and `gas_cost_usdc`. `category` comes from the market row when the
-    caller has it (CloserStage._close_trade fetches it; tests pass it
-    inline). Missing/unknown category falls back to default_fee_rate.
+    All prices are **position space** (traded token's own — spec block).
 
-    Fee model — per-leg parabolic:
-        fee = shares * fee_rate * p * (1 - p)
-    Both legs are taker fees. Maker fees and settlement fees are 0.
-    Exception: `close_reason='market_resolved'` zeros the exit-leg fee
-    (no taker fill at resolution — shares redeem at $1/$0). See
-    app/config.py:TradeSection.polymarket_fee_rates.
+    Pricing (cycle 27, spread-aware):
+      - `exit_book` is the traded token's `(best_bid, best_ask)` at
+        close time, when the caller has one (CloserStage does;
+        resolution/dead-market paths don't — redemption has no book
+        fill). Persisted for forensics.
+      - entry price for PnL/fees = `trade['entry_fill_price']` (the ask
+        paid at entry) when present, else the legacy `trade['mid_price']`.
+      - exit price for PnL/fees = `best_bid` from `exit_book` (you sell
+        at the bid) when present, else `exit_mid` (resolution payout /
+        legacy mid / degenerate entry-price fallback).
+      The residual between mid-to-mid drift and realized PnL is exactly
+      the spread paid — the quantity the pre-cycle-27 wallet modeled
+      as $0.00.
 
-    Paper-mode caveat: `p` in the formula is the *taker fill price*, but
-    we use `entry_mid` / `exit_mid` as the best proxy available in paper
-    mode. The error is bounded by half the spread per leg and is roughly
-    symmetric. The real-money executor (cycle 9+) must swap `mid` for
-    the executed `fill_price` on the trade row.
+    Fee model — per-leg taker fee on the fill price:
+        fee = shares * fee_rate * min(p, 1 - p)
+    `fee_rate` comes from `markets.fee_rate` (per-market fetch) or
+    `cfg.trade.default_fee_rate` (0.0 — see `_resolve_fee_rate`).
+    Exception: `close_reason='market_resolved'` /
+    `'market_dead_unresolved'` zero the exit-leg fee — shares redeem at
+    $1/$0 (no taker fill) or no exit transaction occurred at all. The
+    entry-leg fee still stands.
     """
     exit_mid = max(0.0, min(1.0, float(exit_mid)))
+    size_usdc = float(trade["size_usdc"])
+    entry_fill = trade.get("entry_fill_price")
+    entry_price = float(entry_fill) if entry_fill is not None else float(trade["mid_price"])
+    exit_best_bid: Optional[float] = None
+    exit_best_ask: Optional[float] = None
+    exit_fill: Optional[float] = None
+    if exit_book is not None and close_reason not in (
+        "market_resolved", "market_dead_unresolved",
+    ):
+        exit_best_bid, exit_best_ask = float(exit_book[0]), float(exit_book[1])
+        exit_fill = exit_best_bid
+    exit_price = exit_fill if exit_fill is not None else exit_mid
+
     gross_pnl = _compute_gross_pnl(
         direction=trade["direction"],
-        entry_mid=float(trade["mid_price"]),
-        exit_mid=exit_mid,
-        size_usdc=float(trade["size_usdc"]),
+        entry_price=entry_price,
+        exit_price=exit_price,
+        size_usdc=size_usdc,
     )
     fee_rate = _resolve_fee_rate(
-        category,
-        getattr(trade_cfg, "polymarket_fee_rates", {}),
-        # Cycle 15 audit: top-500 markets by volume24hr are 82% at 10%
-        # taker; raised this defensive fallback from 0.05 to 0.10 to
-        # match the volume-tail modal value. See cfg.trade.default_fee_rate
-        # for the canonical config knob (per-market fetch is preferred).
-        float(getattr(trade_cfg, "default_fee_rate", 0.10)),
-        market_fee_rate=market_fee_rate,
+        market_fee_rate,
+        float(getattr(trade_cfg, "default_fee_rate", 0.0)),
     )
     gas_usdc = float(getattr(trade_cfg, "gas_cost_usdc", 0.0))
     entry_fee, exit_fee = _compute_round_trip_fees(
-        direction=trade["direction"],
-        entry_mid=float(trade["mid_price"]),
-        exit_mid=exit_mid,
-        size_usdc=float(trade["size_usdc"]),
+        entry_price=entry_price,
+        exit_price=exit_price,
+        size_usdc=size_usdc,
         fee_rate=fee_rate,
         gas_cost_usdc=gas_usdc,
     )
@@ -370,8 +388,9 @@ async def write_trade_closure(
             INSERT OR IGNORE INTO trade_closures
                 (trade_id, closed_at, close_reason, exit_mid_price,
                  realized_pnl_usdc, cycle_id, is_tracer, tracer_id,
-                 entry_fee_usdc, exit_fee_usdc)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 entry_fee_usdc, exit_fee_usdc,
+                 exit_best_bid, exit_best_ask, exit_fill_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 trade["id"],
@@ -384,6 +403,9 @@ async def write_trade_closure(
                 trade.get("tracer_id"),
                 entry_fee,
                 exit_fee,
+                exit_best_bid,
+                exit_best_ask,
+                exit_fill,
             ),
         )
         return cur.rowcount == 1
@@ -439,10 +461,15 @@ class CloserStage:
     async def run_close_cycle(self) -> int:
         """Run one close-poll pass. Returns the number of closures written.
 
-        Cycle 2: evaluation order is take_profit → stop_loss → timeout.
-        take_profit + stop_loss need a fresh CLOB mid to compare against
-        entry; we fetch it once per open trade and reuse it as the exit
-        mid if the rule fires (no double round-trip).
+        Cycle 27: the per-trade CLOB read is `get_top_of_book` on the
+        traded token — never `/midpoint`, whose scalar silently degrades
+        to the last traded price on wide-spread books. The rule mid is
+        derived as `(bid + ask) / 2`; the book itself rides along to
+        `_close_trade` so the exit fills at the bid. A missing/empty
+        book leaves `current_mid=None`: price rules are skipped and the
+        trade is held (timeout/stagnation still need a book to actually
+        close under `skip_on_missing_mid=true`) — no more fictional
+        exits on empty books.
         """
         open_trades = await self._fetch_open_trades()
         if not open_trades:
@@ -454,23 +481,26 @@ class CloserStage:
         for trade in open_trades:
             # Try the price-aware rules first — they require a CLOB call.
             tokens = await self._fetch_tokens(trade["market_id"])
+            book: Optional[tuple[float, float]] = None
             current_mid: Optional[float] = None
             if tokens is not None:
                 token_id = tokens["token_yes"] if trade["direction"] == "YES" else tokens["token_no"]
                 if token_id:
-                    current_mid = await self._clob.get_mid(token_id)
+                    book = await self._clob.get_top_of_book(token_id)
+                    if book is not None:
+                        current_mid = (float(book[0]) + float(book[1])) / 2.0
             rule = self._evaluate_rules(
                 trade, now=now, timeout=timeout, current_mid=current_mid
             )
             if rule is None:
                 continue
-            # Re-use the current_mid we just fetched (saves a 2nd CLOB
+            # Re-use the book we just fetched (saves a 2nd CLOB
             # round-trip in `_close_trade`).
             if await self._close_trade(
                 trade,
                 close_reason=rule,
                 now_iso=now.isoformat(),
-                exit_mid_hint=current_mid,
+                exit_book_hint=book,
             ):
                 written += 1
         return written
@@ -491,21 +521,31 @@ class CloserStage:
         stagnation → timeout. edge_decay is the primary exit — once the
         live mid reaches the model's target_mid, the original Kelly edge
         is gone and capital should rotate. The rest are safety nets.
+
+        Cycle 27: `current_mid`, `mid_price` and (on new rows)
+        `target_mid` are all position space, so every rule is "price
+        rose to/past X" regardless of direction. Legacy NO rows
+        (entry_fill_price IS NULL) stored target_mid in YES space —
+        converted via `1 - target` on the fly. take_profit/stop_loss
+        evaluate against the real cost basis (entry fill) when present.
         """
         size = float(trade["size_usdc"])
-        entry = float(trade["mid_price"])
+        entry_fill = trade.get("entry_fill_price")
+        entry = float(entry_fill) if entry_fill is not None else float(trade["mid_price"])
         direction = trade["direction"]
         target = trade.get("target_mid")
 
         if current_mid is not None and size > 0.0:
             cur = float(current_mid)
-            # 1. edge_decay — Kelly target reached. For YES the price
-            # rose to >= target; for NO it fell to <= target. Both
-            # directions: edge = 0, sell.
+            # 1. edge_decay — Kelly target reached: the traded token's
+            # price rose to the model's implied value. Position space →
+            # one comparison for both directions. Legacy NO rows stored
+            # the target in YES space (p_hat + fee); mirror it.
             if target is not None:
-                if direction == "YES" and cur >= float(target):
-                    return "edge_decay"
-                if direction == "NO" and cur <= float(target):
+                target_pos = float(target)
+                if direction == "NO" and entry_fill is None:
+                    target_pos = 1.0 - target_pos
+                if cur >= target_pos:
                     return "edge_decay"
             # 2/3. take_profit + stop_loss — absolute %age thresholds.
             pnl_frac = _compute_pnl(direction, entry, cur, 1.0)
@@ -516,13 +556,16 @@ class CloserStage:
 
         # 4. stagnation — aged past stagnation_minutes AND mid hasn't
         # moved by more than stagnation_drift. Catalyst was priced in
-        # or wasn't real; free the cash.
+        # or wasn't real; free the cash. Drift is mid-vs-entry-MID
+        # (not entry fill — the half-spread paid at entry isn't price
+        # movement).
         decided_at = _parse_iso(trade["decided_at"])
         if decided_at is not None:
             age = now - decided_at
             if current_mid is not None and self._cfg.stagnation_minutes > 0:
                 stag_age = timedelta(minutes=int(self._cfg.stagnation_minutes))
-                if age >= stag_age and abs(float(current_mid) - entry) < float(self._cfg.stagnation_drift):
+                entry_mid = float(trade["mid_price"])
+                if age >= stag_age and abs(float(current_mid) - entry_mid) < float(self._cfg.stagnation_drift):
                     return "stagnation"
             # 5. timeout — catchall.
             if age >= timeout:
@@ -534,7 +577,7 @@ class CloserStage:
             """
             SELECT t.id, t.signal_id, t.market_id, t.direction, t.mid_price,
                    t.size_usdc, t.decided_at, t.is_tracer, t.tracer_id,
-                   t.target_mid
+                   t.target_mid, t.entry_fill_price
             FROM trades t
             LEFT JOIN trade_closures c ON c.trade_id = t.id
             WHERE c.id IS NULL
@@ -554,18 +597,21 @@ class CloserStage:
                 "is_tracer": int(r["is_tracer"] or 0),
                 "tracer_id": r["tracer_id"],
                 "target_mid": (float(r["target_mid"]) if r["target_mid"] is not None else None),
+                "entry_fill_price": (
+                    float(r["entry_fill_price"]) if r["entry_fill_price"] is not None else None
+                ),
             }
             for r in rows
         ]
 
     async def _fetch_tokens(self, market_id: str) -> Optional[dict]:
-        # Cycle 10: also pull `fee_rate` so the closure write can prefer
-        # the per-market Polymarket taker rate over the category lookup.
-        # NULL fee_rate (legacy rows / network miss at first-seen) falls
-        # back to `category` → `config.polymarket_fee_rates` in
-        # `_resolve_fee_rate`.
+        # Cycle 10: also pull `fee_rate` so the closure write can use
+        # the per-market Polymarket taker rate. NULL fee_rate (legacy
+        # rows / network miss at first-seen) falls back to
+        # `cfg.trade.default_fee_rate` in `_resolve_fee_rate` (cycle 27
+        # removed the category table from the fee path).
         cur = await self._db.conn.execute(
-            "SELECT token_yes, token_no, category, fee_rate FROM markets WHERE condition_id = ?",
+            "SELECT token_yes, token_no, fee_rate FROM markets WHERE condition_id = ?",
             (market_id,),
         )
         row = await cur.fetchone()
@@ -575,7 +621,6 @@ class CloserStage:
         return {
             "token_yes": row["token_yes"],
             "token_no": row["token_no"],
-            "category": row["category"],
             "fee_rate": row["fee_rate"],
         }
 
@@ -585,27 +630,29 @@ class CloserStage:
         *,
         close_reason: str,
         now_iso: str,
-        exit_mid_hint: Optional[float] = None,
+        exit_book_hint: Optional[tuple[float, float]] = None,
     ) -> bool:
-        """Resolve exit mid + write the closure row. Returns True iff a
-        closure row was actually inserted (i.e. UNIQUE(trade_id) did not
-        kick in).
+        """Resolve the exit book + write the closure row. Returns True
+        iff a closure row was actually inserted (i.e. UNIQUE(trade_id)
+        did not kick in).
 
-        Cycle 2: callers that already fetched a fresh CLOB mid (the
-        take_profit / stop_loss rules) pass it as `exit_mid_hint` so we
-        don't pay for a second round-trip. Timeout rule passes None and
-        we fetch fresh — its exit mid wasn't needed to evaluate the rule.
+        Cycle 27: the exit is priced off the traded token's
+        `(best_bid, best_ask)` — fill at the bid, mid recorded as
+        `(bid + ask) / 2`. Callers that already fetched the book during
+        rule evaluation pass it as `exit_book_hint` so we don't pay for
+        a second round-trip (timeout passes None and we fetch fresh).
+        No book → hold under `skip_on_missing_mid=true` (default); the
+        resolution / dead-market paths in markets.py are what eventually
+        close positions whose books never come back.
         """
         direction = trade["direction"]
-        exit_mid: Optional[float] = exit_mid_hint
-        # Cycle 7: fetch category alongside tokens so the closure write
-        # can resolve the Polymarket fee_rate. _fetch_tokens always runs
-        # — even when we have exit_mid_hint — because the hint comes
-        # from rule evaluation, not the markets row.
+        book: Optional[tuple[float, float]] = exit_book_hint
+        token_id: Optional[str] = None
+        # Fetch fee metadata always — the hint comes from rule
+        # evaluation, not the markets row.
         market_meta = await self._fetch_tokens(trade["market_id"])
-        category = market_meta.get("category") if market_meta else None
         market_fee_rate = market_meta.get("fee_rate") if market_meta else None
-        if exit_mid is None:
+        if book is None:
             if market_meta is None:
                 logger.warning(
                     "closer: trade_id=%d market %s missing from markets — skipping",
@@ -614,27 +661,37 @@ class CloserStage:
                 return False
             token_id = market_meta["token_yes"] if direction == "YES" else market_meta["token_no"]
             if token_id:
-                exit_mid = await self._clob.get_mid(token_id)
+                book = await self._clob.get_top_of_book(token_id)
 
-        if exit_mid is None:
+        if book is None:
             if self._cfg.skip_on_missing_mid:
                 logger.info(
-                    "closer: trade_id=%d no CLOB mid for %s; holding (skip_on_missing_mid=true)",
+                    "closer: trade_id=%d no CLOB book for %s; holding (skip_on_missing_mid=true)",
                     trade["id"], token_id,
                 )
                 return False
-            # Degenerate fallback: close at the entry mid. PnL is ~0 but the
-            # trade exits the open set deterministically.
-            exit_mid = trade["mid_price"]
+            # Degenerate fallback: close at the entry price. PnL is 0 but
+            # the trade exits the open set deterministically.
+            entry_fill = trade.get("entry_fill_price")
+            exit_mid = float(entry_fill) if entry_fill is not None else float(trade["mid_price"])
             logger.info(
-                "closer: trade_id=%d no CLOB mid; closing at entry mid (skip_on_missing_mid=false)",
+                "closer: trade_id=%d no CLOB book; closing at entry price (skip_on_missing_mid=false)",
                 trade["id"],
+            )
+            return await write_trade_closure(
+                self._db,
+                trade=trade,
+                exit_mid=max(0.0, min(1.0, exit_mid)),
+                close_reason=close_reason,
+                trade_cfg=self._trade_cfg,
+                market_fee_rate=market_fee_rate,
+                now_iso=now_iso,
             )
 
         # Clamp into the CHECK range — a misbehaving CLOB returning a value
         # just outside [0,1] would otherwise trip the constraint and crash
         # the whole poll body.
-        exit_mid = max(0.0, min(1.0, float(exit_mid)))
+        exit_mid = max(0.0, min(1.0, (float(book[0]) + float(book[1])) / 2.0))
 
         return await write_trade_closure(
             self._db,
@@ -642,9 +699,9 @@ class CloserStage:
             exit_mid=exit_mid,
             close_reason=close_reason,
             trade_cfg=self._trade_cfg,
-            category=category,
             market_fee_rate=market_fee_rate,
             now_iso=now_iso,
+            exit_book=book,
         )
 
 

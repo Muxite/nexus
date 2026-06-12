@@ -172,7 +172,6 @@ async def _run(db_path: str, *, dry_run: bool, min_age_hours: float) -> int:
             exit_mid=z["mid_price"],  # gross PnL = 0
             close_reason="market_dead_unresolved",
             trade_cfg=trade_cfg,
-            category=z["category"],
             market_fee_rate=z["market_fee_rate"],
         )
         if ok:

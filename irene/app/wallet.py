@@ -20,13 +20,16 @@ the way a live exchange would: fees actually leave the cash bucket on
 close. `realized_pnl_usdc` is already net of fees (per `closer.py`), so
 once cash is also net the identity holds exactly — no DRIFT line.
 
-**The Polymarket position math** (kept in sync with `closer._compute_pnl`):
-- A YES bet of `size_usdc` at `entry_mid` buys `shares = size_usdc / entry_mid`.
+**The Polymarket position math** (kept in sync with `closer._compute_pnl`;
+cycle 27 — all prices are **position space**, the traded token's own:
+`trades.mid_price` and the dashboard's current-mid poll both read the
+token the bet actually holds, for BOTH directions):
+- A bet of `size_usdc` at `entry_mid` buys `shares = size_usdc / entry_mid`.
   Current value = `current_mid * shares = size_usdc * current_mid / entry_mid`.
   Unrealized PnL = `size_usdc * (current_mid - entry_mid) / entry_mid`.
-- A NO bet of `size_usdc` at `entry_mid` buys NO-shares at `1 - entry_mid`:
-  Current value = `size_usdc * (1 - current_mid) / (1 - entry_mid)`.
-  Unrealized PnL = `size_usdc * (entry_mid - current_mid) / (1 - entry_mid)`.
+- The pre-cycle-27 NO branch (`(1 - current) / (1 - entry)`) assumed
+  YES-space mids the data feed never supplied — NO positions were
+  marked with the wrong sign. See closer.py's spec block.
 
 **Public interface.**
 - `position_value(direction, entry_mid, current_mid, size_usdc) -> float`
@@ -52,23 +55,21 @@ def position_value(
 ) -> float:
     """Return the *current* USDC value of an open position.
 
-    For YES: `size_usdc * current_mid / entry_mid`.
-    For NO:  `size_usdc * (1 - current_mid) / (1 - entry_mid)`.
+    Both prices are position space (the traded token's own — cycle 27),
+    so the formula is direction-independent:
+    `size_usdc * current_mid / entry_mid`. `direction` stays in the
+    signature for call-site stability and to keep rejecting unknown
+    values loudly.
 
-    Degenerate denominators (entry_mid == 0 for YES, == 1 for NO) return
-    `size_usdc` — the position can't be valued, so we conservatively
-    treat it as worth its cost basis.
+    Degenerate denominator (entry_mid == 0) returns `size_usdc` — the
+    position can't be valued, so we conservatively treat it as worth
+    its cost basis.
     """
-    if direction == "YES":
-        if entry_mid <= 0.0:
-            return float(size_usdc)
-        return float(size_usdc) * float(current_mid) / float(entry_mid)
-    if direction == "NO":
-        denom = 1.0 - float(entry_mid)
-        if denom <= 0.0:
-            return float(size_usdc)
-        return float(size_usdc) * (1.0 - float(current_mid)) / denom
-    raise ValueError(f"unknown direction: {direction!r}")
+    if direction not in ("YES", "NO"):
+        raise ValueError(f"unknown direction: {direction!r}")
+    if entry_mid <= 0.0:
+        return float(size_usdc)
+    return float(size_usdc) * float(current_mid) / float(entry_mid)
 
 
 def unrealized_pnl(
@@ -160,12 +161,20 @@ def sum_closed_size_invested(closed_trades: Iterable) -> float:
 
 def sum_closed_exit_value(closed_pairs: Iterable) -> float:
     """`closed_pairs` is an iterable of dicts containing
-    direction/entry_mid/size_usdc/exit_mid_price (one per closed trade)."""
+    direction/entry_mid/size_usdc/exit_mid_price (one per closed trade),
+    plus optionally entry_fill_price/exit_fill_price (cycle 27 rows).
+
+    Fill prices take precedence over mids when present — realized PnL is
+    fills-based on cycle-27 closures, and the accounting identity only
+    holds when the cash-side exit value is priced off the same legs.
+    """
     total = 0.0
     for r in closed_pairs:
-        total += exit_value(
-            r["direction"], float(r["entry_mid"]), float(r["exit_mid_price"]), float(r["size_usdc"])
-        )
+        entry = _row_get(r, "entry_fill_price")
+        entry = float(entry) if entry is not None else float(r["entry_mid"])
+        exit_p = _row_get(r, "exit_fill_price")
+        exit_p = float(exit_p) if exit_p is not None else float(r["exit_mid_price"])
+        total += exit_value(r["direction"], entry, exit_p, float(r["size_usdc"]))
     return total
 
 
@@ -202,14 +211,23 @@ def sum_fees_paid(closures: Iterable) -> float:
     return total
 
 
+def _open_row_entry_basis(row) -> float:
+    """Cost basis of an open position: the entry fill (cycle 27 rows)
+    or the legacy entry mid. Keeps unrealized PnL consistent with the
+    fills-based realized PnL the closer will eventually write."""
+    fill = _row_get(row, "entry_fill_price")
+    return float(fill) if fill is not None else float(row["entry_mid"])
+
+
 def sum_unrealized_pnl(open_with_mid: Iterable) -> float:
-    """Each row needs direction/entry_mid/current_mid/size_usdc. Rows
-    where `current_mid` is None (CLOB miss) fall back to `entry_mid`
-    so unrealized PnL is 0 for that position rather than skipping it."""
+    """Each row needs direction/entry_mid/current_mid/size_usdc (plus
+    optionally entry_fill_price). Rows where `current_mid` is None
+    (CLOB miss) fall back to the entry basis so unrealized PnL is 0
+    for that position rather than skipping it."""
     total = 0.0
     for r in open_with_mid:
         cur: Optional[float] = r["current_mid"]
-        entry = float(r["entry_mid"])
+        entry = _open_row_entry_basis(r)
         if cur is None:
             cur = entry
         total += unrealized_pnl(r["direction"], entry, float(cur), float(r["size_usdc"]))
@@ -220,7 +238,7 @@ def sum_open_positions_value(open_with_mid: Iterable) -> float:
     total = 0.0
     for r in open_with_mid:
         cur: Optional[float] = r["current_mid"]
-        entry = float(r["entry_mid"])
+        entry = _open_row_entry_basis(r)
         if cur is None:
             cur = entry
         total += position_value(r["direction"], entry, float(cur), float(r["size_usdc"]))

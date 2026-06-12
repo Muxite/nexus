@@ -450,10 +450,13 @@ class DKGTradeStage:
                 tracer_id=tracer_id,
             )
             return
-        if direction == "YES":
-            edge = p_hat - mid - self._trade_cfg.fee_buffer
-        else:
-            edge = mid - p_hat - self._trade_cfg.fee_buffer
+        # Cycle 27: `mid` is position space (the traded token's own mid —
+        # `_resolve_mid` reads the traded side), so the edge is P(our
+        # token pays out) minus its price for BOTH directions. The old NO
+        # branch (`mid - p_hat`) assumed a YES-space mid that was never
+        # supplied. Mirrors trade.py:_compute_edge's fallback path.
+        p_win = p_hat if direction == "YES" else (1.0 - p_hat)
+        edge = p_win - mid - self._trade_cfg.fee_buffer
         if edge < self._trade_cfg.min_edge:
             gate_history.append(
                 _gate_entry("edge", "reject", edge, self._trade_cfg.min_edge)
@@ -472,14 +475,10 @@ class DKGTradeStage:
         gate_history.append(_gate_entry("edge", "ok", edge, self._trade_cfg.min_edge))
 
         # 5. size ------------------------------------------------------
-        if direction == "YES":
-            b = (1.0 - mid) / mid
-            kelly_full = (p_hat * b - (1.0 - p_hat)) / b
-        else:
-            p_no = 1.0 - p_hat
-            mid_no = 1.0 - mid
-            b = (1.0 - mid_no) / mid_no
-            kelly_full = (p_no * b - (1.0 - p_no)) / b
+        # Cycle 27: position-space Kelly — (P(our side wins), our token's
+        # price) for both directions. Mirrors trade.py:_compute_kelly_and_size.
+        b = (1.0 - mid) / mid
+        kelly_full = (p_win * b - (1.0 - p_win)) / b
         kelly_capped = max(0.0, kelly_full) * self._trade_cfg.kelly_fraction
         size = min(
             kelly_capped * self._trade_cfg.balance_usdc,

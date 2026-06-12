@@ -237,7 +237,7 @@ def _now_iso() -> str:
 
 def _state3_exit_mid(
     *,
-    direction: str,  # noqa: ARG001 — present for caller symmetry; see note
+    direction: str,
     last_outcome_prices,
 ) -> Optional[float]:
     """Translate a stored `last_outcome_prices` payload into the
@@ -249,15 +249,13 @@ def _state3_exit_mid(
     index 1 = NO payout; both stringified. The pair sums to ~1 for a
     binary market.
 
-    **Direction is ignored on purpose.** `write_trade_closure` /
-    `_compute_gross_pnl` expect `exit_mid` to be the YES-side mid for
-    BOTH directions — the NO sign-flip is applied inside the PnL helper
-    (`(entry - exit) / (1 - entry)`). So a NO trade that won on
-    `outcomePrices=["0","1"]` correctly receives `exit_mid=0.0` here
-    and computes `(0.5 - 0) / (1 - 0.5) = 1.0` shares-worth-redemption
-    inside the closer. We keep `direction` in the signature so a future
-    multi-outcome market (Q5 in resolution-oracle.md) can wire it back in
-    without a signature churn.
+    **Direction picks the payout side (cycle 27).** `write_trade_closure`
+    / `_compute_gross_pnl` work in position space — every price is the
+    traded token's own — so a YES trade redeems at the YES payout and a
+    NO trade at the NO payout. (The pre-cycle-27 version always returned
+    the YES payout, relying on a NO sign-flip inside the PnL helper that
+    assumed YES-space entry mids the pipeline never stored — NO
+    resolutions mixed the two spaces and mis-sized the redemption.)
 
     Accepts either a Python list (in-memory) or a JSON-encoded string
     (as stored in `markets.last_outcome_prices`).
@@ -288,9 +286,8 @@ def _state3_exit_mid(
         return None
     if abs((yes_payout + no_payout) - 1.0) > 1e-6:
         return None
-    # Always return the YES-side payout — closer.write_trade_closure
-    # handles the NO sign flip internally.
-    return yes_payout
+    # Position-space redemption: the payout of the token the trade holds.
+    return yes_payout if direction == "YES" else no_payout
 
 
 def _hours_since(iso_ts: Optional[str], now_dt: datetime) -> Optional[float]:
@@ -307,6 +304,52 @@ def _hours_since(iso_ts: Optional[str], now_dt: datetime) -> Optional[float]:
         ts = ts.replace(tzinfo=timezone.utc)
     delta = now_dt - ts
     return delta.total_seconds() / 3600.0
+
+
+# Cycle 27: gamma stopped emitting a per-market `category` field (both
+# `/markets` and `/events` payloads return None — live probe 2026-06-12),
+# which is why `markets.category` sat at 0 populated rows since launch.
+# Events DO carry tag slugs; this map collapses the common slugs into the
+# coarse category tiers the analytics layer groups by. First match in
+# tag order wins; unmatched-but-tagged events fall back to 'general'.
+# Fees do NOT depend on category (cycle 27 removed the category fee
+# table) — this is analytics-only.
+_TAG_CATEGORY_MAP: dict[str, str] = {
+    "politics": "politics", "us-politics": "politics",
+    "world-politics": "politics", "elections": "politics",
+    "geopolitics": "geopolitics", "world": "geopolitics",
+    "israel": "geopolitics", "ukraine": "geopolitics", "iran": "geopolitics",
+    "crypto": "crypto", "bitcoin": "crypto", "ethereum": "crypto",
+    "crypto-prices": "crypto", "crypto-listings": "crypto",
+    "finance": "finance", "stocks": "finance", "business": "finance",
+    "economy": "economics", "economics": "economics", "fed": "economics",
+    "inflation": "economics", "fed-rates": "economics",
+    "tech": "tech", "ai": "tech", "science": "tech", "exchange": "tech",
+    "sports": "sports", "nba": "sports", "nfl": "sports", "mlb": "sports",
+    "soccer": "sports", "epl": "sports", "tennis": "sports", "f1": "sports",
+    "esports": "sports", "games": "sports", "nhl": "sports", "ufc": "sports",
+    "culture": "culture", "pop-culture": "culture", "movies": "culture",
+    "music": "culture", "celebrities": "culture", "mentions": "culture",
+    "weather": "weather", "climate": "weather",
+}
+
+
+def _category_from_tags(tags) -> Optional[str]:
+    """Derive a coarse category from an event's tag slugs (first match in
+    tag order wins). `None` when there are no usable tags at all (e.g. a
+    `/markets`-endpoint row with no parent event); `'general'` when the
+    event is tagged but nothing maps."""
+    if not tags:
+        return None
+    matched = False
+    for slug in tags:
+        if not isinstance(slug, str):
+            continue
+        matched = True
+        cat = _TAG_CATEGORY_MAP.get(slug.strip().lower())
+        if cat:
+            return cat
+    return "general" if matched else None
 
 
 def _parse_gamma_row(
@@ -358,6 +401,28 @@ def _parse_gamma_row(
     except (TypeError, ValueError):
         volume = None
 
+    # Cycle 27: gamma rows carry the operative fee directly —
+    # `feesEnabled` (bool) + `takerBaseFee` (basis points). Live probe
+    # 2026-06-12: fee-disabled markets report feesEnabled=false /
+    # takerBaseFee=null (and the CLOB agrees with taker_base_fee=0);
+    # fee-enabled ones (sports_fees_v2) report 1000 bps. This is fresher
+    # than the weekly CLOB refetch and free (no extra HTTP), and it
+    # corrects the ~90%-stale 0.10 rates the cycle-15-era fetch left in
+    # `markets.fee_rate` (see scripts/analysis/fee_audit.py). None when
+    # the payload predates the fields — the upsert COALESCEs so an old
+    # payload never clobbers a known rate.
+    fees_enabled = raw.get("feesEnabled")
+    fee_rate: Optional[float] = None
+    if fees_enabled is False:
+        fee_rate = 0.0
+    elif fees_enabled is True:
+        try:
+            bps = float(raw.get("takerBaseFee"))
+            if 0.0 <= bps <= 10000.0:
+                fee_rate = bps / 10000.0
+        except (TypeError, ValueError):
+            fee_rate = None
+
     # Cycle 11: three-state UMA close machine inputs
     # (plans/resolution-oracle.md). `umaResolutionStatus` advances through
     # `proposed` (2h challenge window) → `resolved` (finalized). `resolvedBy`
@@ -408,9 +473,15 @@ def _parse_gamma_row(
         "slug": raw.get("slug") or None,
         "question": str(question),
         "description": raw.get("description") or None,
-        "category": raw.get("category") or None,
+        # Cycle 27: prefer the (now-vestigial) per-market field, else
+        # derive from the parent event's tag slugs. See _TAG_CATEGORY_MAP.
+        "category": (
+            raw.get("category")
+            or _category_from_tags(event_meta.get("tags") if event_meta else None)
+        ),
         "end_date": raw.get("endDate") or raw.get("end_date") or None,
         "volume_usdc": volume,
+        "fee_rate": fee_rate,
         "token_yes": token_yes,
         "token_no": token_no,
         "uma_resolution_status": uma_status,
@@ -1186,6 +1257,15 @@ class MarketsStage:
                 event_meta = {
                     "id": event_row.get("id"),
                     "slug": event_row.get("slug"),
+                    # Cycle 27: tag slugs feed the category derivation in
+                    # `_parse_gamma_row` — Gamma stopped emitting a
+                    # per-market `category` field (live probe 2026-06-12;
+                    # the column had 0 populated rows because of it).
+                    "tags": [
+                        t.get("slug")
+                        for t in (event_row.get("tags") or [])
+                        if isinstance(t, dict) and t.get("slug")
+                    ],
                 }
                 nested = event_row.get("markets")
                 if not isinstance(nested, list):
@@ -1280,19 +1360,27 @@ class MarketsStage:
                 """
                 INSERT INTO markets (
                     condition_id, slug, question, description, category,
-                    end_date, volume_usdc, token_yes, token_no,
+                    end_date, volume_usdc, fee_rate, token_yes, token_no,
                     active, closed_at, first_seen_at, updated_at,
                     last_resolution_status, last_outcome_prices,
                     polymarket_event_id, polymarket_event_slug,
                     events_seen_in_last_poll
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(condition_id) DO UPDATE SET
                     slug = excluded.slug,
                     question = excluded.question,
                     description = excluded.description,
-                    category = excluded.category,
+                    -- Cycle 27: category derives from event tags; a
+                    -- `/markets`-endpoint observation (no event meta →
+                    -- NULL category) must not clobber a tag-derived one.
+                    category = COALESCE(excluded.category, markets.category),
                     end_date = excluded.end_date,
                     volume_usdc = excluded.volume_usdc,
+                    -- Cycle 27: gamma's feesEnabled/takerBaseFee is the
+                    -- operative rate, refreshed every poll. COALESCE so a
+                    -- payload without the fields keeps the CLOB-fetched
+                    -- value (cycle 10/15 path, still wired).
+                    fee_rate = COALESCE(excluded.fee_rate, markets.fee_rate),
                     token_yes = excluded.token_yes,
                     token_no = excluded.token_no,
                     polymarket_event_id = COALESCE(
@@ -1338,6 +1426,7 @@ class MarketsStage:
                     row["category"],
                     row["end_date"],
                     row["volume_usdc"],
+                    row.get("fee_rate"),
                     row["token_yes"],
                     row["token_no"],
                     active_value,
@@ -1695,7 +1784,6 @@ class MarketsStage:
                         exit_mid=exit_mid,
                         close_reason="market_resolved",
                         trade_cfg=self._config.trade,
-                        category=r["category"],
                         market_fee_rate=r["fee_rate"],
                     )
                     if ok:
@@ -1748,7 +1836,6 @@ class MarketsStage:
                         exit_mid=trade["mid_price"],  # entry mid → 0 gross PnL
                         close_reason="market_dead_unresolved",
                         trade_cfg=self._config.trade,
-                        category=r["category"],
                         market_fee_rate=r["fee_rate"],
                     )
                     if ok:

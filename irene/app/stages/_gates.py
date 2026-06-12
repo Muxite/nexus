@@ -348,6 +348,45 @@ def _gate_wide_spread(
     return ("ok", None, None)
 
 
+def _gate_book_unavailable(
+    book: Optional[tuple[float, float]],
+    market_volume,
+) -> tuple[str, Optional[dict], Optional[str]]:
+    """Cycle 27 (wallet honesty): hard-reject entries with no live,
+    tradeable book. Replaces the cycle-10 graceful degrade where a failed
+    book read skipped the wide_spread check and the entry fell back to the
+    `/midpoint` scalar — which is the last traded price on wide-spread
+    books and a pure fiction on empty ones. The 2026-06-12 retrospective
+    found 179 trades on zero-volume markets netting +$1,461 of
+    untradeable "profit"; this gate is what makes that impossible.
+
+    Reject reasons:
+      - `book_unavailable`    — `get_top_of_book` returned None (network
+                                failure, empty side, crossed book): there
+                                is no executable price, so there is no
+                                trade.
+      - `zero_volume_market`  — `markets.volume_usdc` (24h volume) is
+                                NULL or 0: nobody trades this book; any
+                                mid is a ghost quote.
+
+    No gate_history append on pass — mirrors the mid_degenerate /
+    wide_spread family.
+    """
+    if book is None:
+        return (
+            "reject",
+            _gate_entry("book", "reject", None, "book_required"),
+            "book_unavailable",
+        )
+    if not (isinstance(market_volume, (int, float)) and float(market_volume) > 0.0):
+        return (
+            "reject",
+            _gate_entry("book", "reject", market_volume, "volume_usdc>0"),
+            "zero_volume_market",
+        )
+    return ("ok", None, None)
+
+
 def _eval_market_news_imbalance_subrules(
     *,
     market: dict,

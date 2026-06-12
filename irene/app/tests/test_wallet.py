@@ -26,10 +26,10 @@ def test_position_value_yes_loser():
 
 
 def test_position_value_no_winner():
-    # $10 NO @ 0.40 (i.e. NO-shares cost 0.60 each → 16.667 NO-shares).
-    # Mid drops to 0.20 → NO-shares worth 0.80 each. Value = 10 * (1-0.20)/(1-0.40)
-    #                                                       = 10 * 0.80 / 0.60 = $13.333.
-    v = wallet.position_value("NO", entry_mid=0.40, current_mid=0.20, size_usdc=10.0)
+    # Cycle 27 (position space): mids are the NO token's OWN price.
+    # $10 NO @ 0.60 → 16.667 NO-shares. NO token rises to 0.80 (= YES
+    # falling to 0.20) → value = 10 * 0.80 / 0.60 = $13.333.
+    v = wallet.position_value("NO", entry_mid=0.60, current_mid=0.80, size_usdc=10.0)
     assert v == pytest.approx(10.0 * 0.80 / 0.60, abs=1e-6)
 
 
@@ -39,9 +39,10 @@ def test_position_value_unknown_direction_raises():
 
 
 def test_position_value_degenerate_returns_cost():
-    # YES @ entry_mid=0 (can't compute) → returns size as fallback.
+    # entry price 0 (can't compute shares) → returns size as fallback.
+    # Position space: the degenerate case is entry<=0 for BOTH directions.
     assert wallet.position_value("YES", 0.0, 0.5, 10.0) == 10.0
-    assert wallet.position_value("NO", 1.0, 0.5, 10.0) == 10.0
+    assert wallet.position_value("NO", 0.0, 0.5, 10.0) == 10.0
 
 
 def test_unrealized_pnl_is_value_minus_cost():
@@ -87,14 +88,15 @@ def test_identity_holds_one_open_yes_winner():
 
 
 def test_identity_holds_one_closed_no_loser():
-    # $10 NO @ 0.40, exit 0.50 → exit value = 10 * (1-0.50)/(1-0.40) = $8.333
-    # → realized = -$1.667, cash = 990 + 8.333 = $998.333, equity = $998.333.
+    # Position space: $10 NO @ 0.40 (NO token's own price), NO token
+    # falls to 0.30 → exit value = 10 * 0.30 / 0.40 = $7.50
+    # → realized = -$2.50, cash = 990 + 7.50 = $997.50, equity = $997.50.
     # No fees: identity holds with fees_paid_total=0.
     closed_trades = [{"size_usdc": 10.0}]
     closed_pairs = [
-        {"direction": "NO", "entry_mid": 0.40, "exit_mid_price": 0.50, "size_usdc": 10.0}
+        {"direction": "NO", "entry_mid": 0.40, "exit_mid_price": 0.30, "size_usdc": 10.0}
     ]
-    closures = [{"realized_pnl_usdc": 10.0 * (0.40 - 0.50) / (1.0 - 0.40),
+    closures = [{"realized_pnl_usdc": 10.0 * (0.30 - 0.40) / 0.40,
                  "entry_fee_usdc": 0.0, "exit_fee_usdc": 0.0}]
     closed_size = wallet.sum_closed_size_invested(closed_trades)
     closed_exit_value = wallet.sum_closed_exit_value(closed_pairs)
@@ -103,15 +105,16 @@ def test_identity_holds_one_closed_no_loser():
     cash = wallet.cash_balance(1000.0, 0.0, closed_exit_value, closed_size,
                                fees_paid_total=fees)
     eq = wallet.equity(cash, 0.0)
-    assert cash == pytest.approx(1000.0 - 10.0 + 10.0 * 0.50 / 0.60, abs=1e-4)
-    assert realized == pytest.approx(-10.0 * 0.10 / 0.60, abs=1e-6)
+    assert cash == pytest.approx(1000.0 - 10.0 + 7.50, abs=1e-4)
+    assert realized == pytest.approx(-2.50, abs=1e-6)
     _identity_holds(1000.0, realized, 0.0, eq)
 
 
 def test_identity_holds_mixed_open_and_closed():
     # Open: $20 YES @ 0.50, current 0.55 → upnl = 20*(0.55-0.50)/0.50 = $2
-    # Closed: $15 NO @ 0.30, exit 0.20  → realized_gross = 15*(0.30-0.20)/(1-0.30) = $2.143
-    # Fees on the closure: entry $0.05 + exit $0.04 = $0.09 → realized_net = $2.053
+    # Closed (position space): $15 NO @ 0.30 (NO token price), NO token
+    # falls to 0.20 → realized_gross = 15*(0.20-0.30)/0.30 = -$5.0
+    # Fees on the closure: entry $0.05 + exit $0.04 = $0.09 → realized_net = -$5.09
     open_trades = [{"size_usdc": 20.0}]
     open_with_mid = [
         {"direction": "YES", "entry_mid": 0.50, "current_mid": 0.55, "size_usdc": 20.0}
@@ -120,7 +123,7 @@ def test_identity_holds_mixed_open_and_closed():
     closed_pairs = [
         {"direction": "NO", "entry_mid": 0.30, "exit_mid_price": 0.20, "size_usdc": 15.0}
     ]
-    realized_gross = 15.0 * 0.10 / 0.70
+    realized_gross = 15.0 * (0.20 - 0.30) / 0.30
     closures = [{
         "realized_pnl_usdc": realized_gross - 0.09,
         "entry_fee_usdc": 0.05,

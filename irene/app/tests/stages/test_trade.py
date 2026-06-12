@@ -190,21 +190,17 @@ def _make_stage(db, bus, ai, cfg: Optional[_Config] = None, *, clob=None) -> Tra
 
 
 class _FakeCLOB:
-    """Async CLOB stand-in. Returns the price keyed by token_id, else
-    `default_mid` (None by default).
+    """Async CLOB stand-in.
 
-    Cycle 23: pre-cycle-23 a missing token resolved to None and silently
-    fell back to `cfg.trade.default_mid_price=0.5` inside `_resolve_mid`.
-    After cycle 23 that path rejects with `mid_unavailable`. To preserve
-    the test-layer ergonomics, the default `_make_stage` clob passes
-    `default_mid=0.5` so tests that exercise downstream gate logic don't
-    have to enumerate every token. Tests that exercise the
-    `mid_unavailable` path pass `default_mid=None` (the constructor
-    default) and an empty `prices` dict.
-
-    Optionally also supports `get_top_of_book` for the wide-spread gate:
-    pass `books={token_id: (best_bid, best_ask)}`. A token missing from
-    `books` resolves to `None` (no book → gate is skipped).
+    Cycle 27: the entry path is book-only (`get_top_of_book` is the ONE
+    CLOB read; mid derives from the book). To preserve test-layer
+    ergonomics, a token missing from `books` falls back to a zero-spread
+    book built from `prices[token]` / `default_mid` (bid == ask == mid),
+    so "mid = X" tests keep their exact expectations. When that price is
+    also None, the book read returns None and the cascade rejects with
+    `book_unavailable` — the cycle-27 replacement for the cycle-23
+    `mid_unavailable` reject (which is now unreachable live but kept in
+    the cascade for replay symmetry).
     """
 
     def __init__(
@@ -227,7 +223,12 @@ class _FakeCLOB:
 
     async def get_top_of_book(self, token_id: str):
         self.book_calls.append(token_id)
-        return self.books.get(token_id)
+        if token_id in self.books:
+            return self.books[token_id]
+        p = self.prices.get(token_id, self.default_mid)
+        if p is None:
+            return None
+        return (float(p), float(p))
 
 
 def _payload(
@@ -372,16 +373,18 @@ async def test_freshness_stale_rejects_without_ai_call(db_seeded):
 
 
 async def test_target_mid_computed_correctly_for_yes_and_no(db_seeded):
-    """Regression for the cycle-3 sign bug. target_mid is always in YES-mid
-    terms (Polymarket's primary price). p_hat is the model's implied
-    P(YES). fee_buffer is the cushion to lock profit before fees.
+    """Cycle 27: target_mid is in POSITION SPACE — the traded token's own
+    price (matching `mid_price` and the closer's poll). p_hat is the
+    model's implied P(YES); P(our token pays out) is p_hat for YES and
+    1 - p_hat for NO. Both directions sell when their token RISES to its
+    modeled value minus the fee buffer:
 
-      - YES bet → sell when YES rises to p_hat - fee_buffer
-      - NO  bet → sell when YES falls to p_hat + fee_buffer
+      - YES bet → target = p_hat - fee_buffer
+      - NO  bet → target = (1 - p_hat) - fee_buffer
 
-    The original v6 code had `target = (1 - p_hat) + fee_buffer` for NO,
-    which double-flipped the probability and made edge_decay fire on
-    every NO trade's first poll. This test locks the correct formula.
+    (The cycle-3..26 code stored the NO target in YES-space terms,
+    `p_hat + fee_buffer`; the closer mirrors those legacy rows via
+    `1 - target` when `entry_fill_price` is NULL.)
     """
     # Default _Config has fee_buffer=0.02, min_confidence=0.55.
     # _FakeAI default = YES @ confidence 0.7 → p_hat=0.7 → target=0.68.
@@ -402,8 +405,8 @@ async def test_target_mid_computed_correctly_for_yes_and_no(db_seeded):
     assert row["target_mid"] == pytest.approx(0.68)   # 0.70 - 0.02 fee buffer
 
     # Now fire a NO trade on a different (article, market). p_hat for NO = 1 - conf = 0.3.
-    # Correct target = p_hat + fee_buffer = 0.32.
-    # WRONG target would be (1 - p_hat) + fee = 0.72.
+    # Position-space target = (1 - p_hat) - fee_buffer = 0.70 - 0.02 = 0.68
+    # (the NO token's modeled value minus the cushion).
     async with db_seeded.batch() as cur:
         await cur.execute(
             """
@@ -442,9 +445,9 @@ async def test_target_mid_computed_correctly_for_yes_and_no(db_seeded):
     assert row is not None
     assert row["direction"] == "NO"
     assert row["p_hat"] == pytest.approx(0.3)         # 1 - 0.7
-    assert row["target_mid"] == pytest.approx(0.32)   # 0.30 + 0.02 fee buffer
-    # If the bug were back, target_mid would be 0.72 (= 0.70 + 0.02).
-    assert row["target_mid"] != pytest.approx(0.72)
+    assert row["target_mid"] == pytest.approx(0.68)   # (1 - 0.30) - 0.02 fee buffer
+    # The legacy YES-space convention would have stored 0.32 (= p_hat + fee).
+    assert row["target_mid"] != pytest.approx(0.32)
 
 
 async def _seed_entities_for_article(db, article_id: int, entity_names: list[str]) -> None:
@@ -832,13 +835,13 @@ async def test_edge_uses_executable_side_when_book_available(db_seeded):
     assert ec["taker_fee_buffer"] == pytest.approx(0.01, abs=1e-9)
 
 
-async def test_edge_falls_back_to_mid_when_book_unavailable(db_seeded):
-    """Cycle 10: with no live book, the edge gate falls back to the
-    legacy `p_hat - mid - fee_buffer` formula. `features_snapshot.
-    edge_components.fallback` must be True so we can audit how often
-    the fallback path fires. With p_hat=0.7, mid=0.5, fee_buffer=0.02,
-    edge = 0.18 > min_edge."""
-    clob = _FakeCLOB(prices={"ty": 0.50, "tn": 0.50})  # no `books`
+async def test_book_unavailable_hard_rejects(db_seeded):
+    """Cycle 27: with no live book there is no executable price and no
+    trade — the cycle-10 graceful degrade (fall back to /midpoint and
+    skip wide_spread) is what minted mid-price ghosts on dead books.
+    An explicit `books={"ty": None}` simulates the book read failing
+    while a /midpoint price would still exist."""
+    clob = _FakeCLOB(prices={"ty": 0.50, "tn": 0.50}, books={"ty": None})
     bus = _FakeBus()
     ai = _FakeAI(next_result=DirectionResult(
         direction="YES", confidence=0.7, prediction_id=102,
@@ -849,20 +852,32 @@ async def test_edge_falls_back_to_mid_when_book_unavailable(db_seeded):
         await stage.handle(_payload())
 
     d = await _single_decision(db_seeded)
-    assert d["outcome"] == "execute", d
-    cur = await db_seeded.conn.execute(
-        "SELECT edge, features_snapshot FROM trades WHERE prediction_id=102"
-    )
-    row = await cur.fetchone()
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "book_unavailable"
+    cur = await db_seeded.conn.execute("SELECT COUNT(*) AS n FROM trades")
+    assert (await cur.fetchone())["n"] == 0
     await cur.close()
-    assert row is not None
-    # Legacy formula: 0.7 - 0.5 - 0.02 = 0.18.
-    assert row["edge"] == pytest.approx(0.18, abs=1e-9)
-    snap = json.loads(row["features_snapshot"])
-    ec = snap["edge_components"]
-    assert ec["fallback"] is True
-    assert ec["fee_buffer"] == pytest.approx(0.02, abs=1e-9)
-    assert "executable_price" not in ec
+
+
+async def test_zero_volume_market_hard_rejects(db_seeded):
+    """Cycle 27: a live book on a market with 0 (or NULL) 24h volume is
+    a ghost quote — refuse the fill. 179 such trades minted +$1,461 of
+    untradeable profit in the retro window."""
+    async with db_seeded.batch() as cur:
+        await cur.execute("UPDATE markets SET volume_usdc=0 WHERE condition_id='m1'")
+    clob = _FakeCLOB(prices={"ty": 0.50, "tn": 0.50})
+    bus = _FakeBus()
+    ai = _FakeAI(next_result=DirectionResult(
+        direction="YES", confidence=0.7, prediction_id=112,
+        cached=False, raw_response="{}",
+    ))
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
+    with cycle_scope(1):
+        await stage.handle(_payload())
+
+    d = await _single_decision(db_seeded)
+    assert d["outcome"] == "reject"
+    assert d["reason"] == "zero_volume_market"
 
 
 async def test_edge_rejects_when_executable_side_eats_budget(db_seeded):
@@ -1001,13 +1016,15 @@ async def test_market_news_imbalance_near_expiry_rejects(db_seeded):
 
 
 async def test_edge_below_min_rejects(db_seeded):
-    # YES@0.55, mid=0.5, fee_buffer=0.02 -> edge = 0.55-0.5-0.02 = 0.03 < 0.04
+    # Cycle 27 book path on a zero-spread fake book at 0.52:
+    # YES@0.55 → edge = 0.55 - 0.52 - taker_fee_buffer(0.01) - 0 = 0.02 < 0.04
     bus = _FakeBus()
     ai = _FakeAI(next_result=DirectionResult(
         direction="YES", confidence=0.55, prediction_id=9,
         cached=False, raw_response="{}",
     ))
-    stage = _make_stage(db_seeded, bus, ai)
+    clob = _FakeCLOB(prices={"ty": 0.52, "tn": 0.48})
+    stage = _make_stage(db_seeded, bus, ai, clob=clob)
     with cycle_scope(1):
         await stage.handle(_payload())
 
@@ -1196,17 +1213,20 @@ async def test_clob_supplies_real_mid_when_set(db_seeded):
     await cur.close()
     assert row is not None
     assert row["mid_price"] == pytest.approx(0.42)
-    assert clob.calls == ["ty"], "YES direction should query the token_yes side"
+    # Cycle 27: the entry path reads the BOOK of the traded side (one
+    # CLOB read); /midpoint is never called.
+    assert clob.book_calls == ["ty"], "YES direction should query the token_yes side"
+    assert clob.calls == []
 
 
-async def test_clob_returning_none_rejects_with_mid_unavailable(db_seeded):
-    """Cycle 23: pre-cycle-23 this returned mid_price=0.5 (the silent
-    fallback bug that produced 21/39 stub trades). Now: a None mid from
-    CLOB rejects the decision with reason='mid_unavailable' and no trade
-    row is written. The bot is no longer allowed to buy blind."""
+async def test_clob_returning_none_rejects_with_book_unavailable(db_seeded):
+    """Cycle 23 banned the silent mid fallback (21/39 stub trades at
+    0.5); cycle 27 moved the hard stop even earlier — an empty CLOB
+    means no book, and no book means reason='book_unavailable' with no
+    trade row. The bot is still not allowed to buy blind."""
     bus = _FakeBus()
     ai = _FakeAI()
-    # Empty CLOB → get_mid returns None for every token.
+    # Empty CLOB → get_top_of_book returns None for every token.
     clob = _FakeCLOB(prices={})
     stage = _make_stage(db_seeded, bus, ai, clob=clob)
     with cycle_scope(1):
@@ -1218,7 +1238,7 @@ async def test_clob_returning_none_rejects_with_mid_unavailable(db_seeded):
     row = await cur.fetchone()
     await cur.close()
     assert row["n"] == 0
-    # Decision row exists with the mid_unavailable reason.
+    # Decision row exists with the book_unavailable reason.
     cur = await db_seeded.conn.execute(
         "SELECT outcome, reason FROM decisions WHERE signal_id=1"
     )
@@ -1226,7 +1246,7 @@ async def test_clob_returning_none_rejects_with_mid_unavailable(db_seeded):
     await cur.close()
     assert drow is not None
     assert drow["outcome"] == "reject"
-    assert drow["reason"] == "mid_unavailable"
+    assert drow["reason"] == "book_unavailable"
 
 
 # ---------------------------------------------------------------------------
@@ -1289,7 +1309,8 @@ async def test_executed_trade_records_latency_ms(db_seeded):
         "fetch_article",
         "fetch_market",
         "ai_direction",
-        "resolve_mid",
+        # Cycle 27: resolve_mid is gone — the book read is the ONE
+        # CLOB step on the entry path (mid derives from it).
         "resolve_book",
         "imbalance_check",
         "db_insert",
@@ -1374,9 +1395,9 @@ async def test_similarity_reject_records_latency_with_partial_breakdown(db_seede
 
 async def test_edge_reject_records_latency_with_more_steps(db_seeded):
     """An `edge_below_min` reject is gate 4 — fetch_article, fetch_market,
-    ai_direction, resolve_mid, resolve_book, imbalance_check all run
-    before it fires. The breakdown should contain those keys but NOT
-    `db_insert` (only execute paths reach the trade-row INSERT).
+    ai_direction, resolve_book, imbalance_check all run before it fires.
+    The breakdown should contain those keys but NOT `db_insert` (only
+    execute paths reach the trade-row INSERT).
     """
     # Configure: high min_edge so the edge gate rejects.
     cfg = _Config()
@@ -1408,7 +1429,6 @@ async def test_edge_reject_records_latency_with_more_steps(db_seeded):
     assert "ai_direction" in breakdown, (
         f"ai_direction expected in edge_below_min breakdown; got {breakdown}"
     )
-    assert "resolve_mid" in breakdown
     assert "resolve_book" in breakdown
     # Reject paths NEVER reach the trade-row INSERT — so db_insert must
     # NOT be in the dict. (db_insert is appended by _record_execute only.)
@@ -1450,9 +1470,10 @@ async def test_execute_path_still_records_latency(db_seeded):
     assert raw is not None
     breakdown = json.loads(raw)
     assert isinstance(breakdown, dict)
-    # Full execute-path keys present.
+    # Full execute-path keys present (cycle 27: no resolve_mid — the
+    # book read is the single CLOB step).
     assert {"fetch_article", "fetch_market", "ai_direction",
-            "resolve_mid", "resolve_book", "imbalance_check",
+            "resolve_book", "imbalance_check",
             "db_insert"} <= set(breakdown)
     # And the matching `decisions` row for the same execute path
     # leaves the latency columns NULL — the canonical numbers live on

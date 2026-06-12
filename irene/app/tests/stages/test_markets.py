@@ -1446,20 +1446,21 @@ async def test_close_machine_state3_resolved_yes_closes_at_one(
     assert row["exit_fee_usdc"] == pytest.approx(0.0)
     # entry_mid=0.5, size=100 → shares=200. YES wins at 1.0:
     #   gross = 200 * (1.0 - 0.5) = 100
-    #   entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0
-    #   net = 100 - 2.0 - 0 = 98.0
-    assert row["entry_fee_usdc"] == pytest.approx(2.0, rel=1e-3)
-    assert row["realized_pnl_usdc"] == pytest.approx(98.0, rel=1e-3)
+    #   entry_fee = 200 * 0.04 * min(0.5, 0.5) = 4.0
+    #   (cycle 27 fee model; 0.04 is the seeded per-market fee_rate)
+    #   net = 100 - 4.0 - 0 = 96.0
+    assert row["entry_fee_usdc"] == pytest.approx(4.0, rel=1e-3)
+    assert row["realized_pnl_usdc"] == pytest.approx(96.0, rel=1e-3)
 
 
 async def test_close_machine_state3_resolved_no_closes_at_zero(
     db_ready, bus, embedder,
 ):
     """State 3 + NO winner: outcomePrices=["0","1"] (YES payout=0, NO
-    payout=1). `exit_mid_price` stored in the closure is always the YES
-    side (closer.write_trade_closure convention — the NO sign flip is
-    applied inside _compute_gross_pnl, not by the caller). On this
-    market: YES position loses, NO position wins."""
+    payout=1). Cycle 27 (position space): `exit_mid_price` is the
+    redemption value of the token the trade HOLDS — the YES position
+    redeems at 0, the NO position at 1. On this market: YES loses, NO
+    wins."""
     from app.cycle import cycle_scope
     stage = _make_stage(db_ready, bus, embedder)
     await _seed_market_row(
@@ -1490,26 +1491,25 @@ async def test_close_machine_state3_resolved_no_closes_at_zero(
     rows = await cur.fetchall()
     by_id = {r["trade_id"]: r for r in rows}
 
-    # YES position on a NO-winning market — exit_mid (YES side) = 0.
-    # _compute_gross_pnl(YES) = size * (exit - entry) / entry
+    # YES position on a NO-winning market — its token redeems at 0.
+    # _compute_gross_pnl = size * (exit - entry) / entry
     #   = 100 * (0.0 - 0.5) / 0.5 = -100
-    # entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0; exit_fee = 0 (market_resolved)
-    # net = -100 - 2 = -102
+    # entry_fee = 200 * 0.04 * min(0.5, 0.5) = 4.0 (seeded per-market
+    # rate); exit_fee = 0 (market_resolved); net = -100 - 4 = -104
     assert by_id[204]["close_reason"] == "market_resolved"
     assert by_id[204]["exit_mid_price"] == pytest.approx(0.0)
     assert by_id[204]["exit_fee_usdc"] == pytest.approx(0.0)
-    assert by_id[204]["realized_pnl_usdc"] == pytest.approx(-102.0, rel=1e-3)
+    assert by_id[204]["realized_pnl_usdc"] == pytest.approx(-104.0, rel=1e-3)
 
-    # NO position on a NO-winning market — exit_mid (YES side) = 0 too,
-    # but _compute_gross_pnl flips the sign for NO:
-    #   gross = size * (entry - exit) / (1 - entry)
-    #         = 100 * (0.5 - 0.0) / 0.5 = +100   (full $1 NO redemption)
-    # entry_fee = 200 * 0.04 * 0.5 * 0.5 = 2.0; exit_fee = 0
-    # net = 100 - 2 = 98
+    # NO position on a NO-winning market — its token redeems at 1
+    # (cycle 27 position space; the old code stored the YES payout and
+    # relied on a sign-flip that mixed price spaces):
+    #   gross = 100 * (1.0 - 0.5) / 0.5 = +100   (full $1 NO redemption)
+    # entry_fee = 4.0; exit_fee = 0; net = 96
     assert by_id[205]["close_reason"] == "market_resolved"
-    assert by_id[205]["exit_mid_price"] == pytest.approx(0.0)
+    assert by_id[205]["exit_mid_price"] == pytest.approx(1.0)
     assert by_id[205]["exit_fee_usdc"] == pytest.approx(0.0)
-    assert by_id[205]["realized_pnl_usdc"] == pytest.approx(98.0, rel=1e-3)
+    assert by_id[205]["realized_pnl_usdc"] == pytest.approx(96.0, rel=1e-3)
 
 
 async def test_close_machine_human_review_timeout_logs_warning(
