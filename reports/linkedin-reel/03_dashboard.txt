@@ -1,0 +1,31 @@
+# tmux: IRENE — live telemetry (real numbers, simplified layout)
+
+┌─ 0:gates ────────────────────────┐┌─ 1:verify ───────────────────────┐
+│ stage 1              market_open ││ tests collected            1,397 │
+│ stage 2            dkg_threshold ││ irene / seulgi         775 / 509 │
+│ stage 3                llm_batch ││ replay suite       0 row-id gaps │
+│ every reject      full audit row ││ tracer templates              15 │
+│ silent skips                   0 ││ invariant           tracer≠trade │
+│ migration          +2,940 / -179 ││ test containers        ephemeral │
+│                                  ││                                  │
+│                                  ││                                  │
+│ configurable gate pipeline       ││ replay prod DB read-only         │
+└──────────────────────────────────┘└──────────────────────────────────┘
+┌─ 2:latency ──────────────────────┐┌─ 3:llm ──────────────────────────┐
+│ p50 ▇                   1,506 ms ││ calls (audited)           76,274 │
+│ p95 ▇▇▇▇                7,732 ms ││ parse failures     0.26% / 2.93% │
+│ p99 ▇▇▇▇▇▇▇▇           13,837 ms ││ ensemble           N=3, 2/3 vote │
+│ samples                    n=190 ││ disagree →          hard NEUTRAL │
+│ breakdown            7-step JSON ││ budget watch     OK [flag clear] │
+│                                  ││ cache hit (replay)           78% │
+│                                  ││                                  │
+│                                  ││                                  │
+│ fetch→ai→resolve→insert          ││ pause-before-spend governor      │
+└──────────────────────────────────┘└──────────────────────────────────┘
+
+[IRENE] 0:gates 1:verify 2:latency* 3:llm                  "gen-2" 09:41
+
+
+
+
+

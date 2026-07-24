@@ -1,0 +1,31 @@
+  ONE BUS, EVERY STAGE AUDITED
+  IRENE (gen-2) · event-driven · contract-first pub/sub
+
+  ~120 news sources              Polymarket CLOB
+  (scraper-v2, FastAPI)          (sharded WS pool, ~18k tokens)
+        │                              │
+        ▼                              ▼
+  ╔══════════════ async pub/sub bus ═══════════════╗
+  ║ strict JSON · backpressure · fault isolation   ║
+  ╚═╤══════╤═══════╤════════╤════════╤═════════════╝
+    │      │       │        │        │
+    ▼      ▼       ▼        ▼        ▼
+  ingest→dedupe→ match → gates → paper trade
+          SBERT    cosine   market_open
+          Chroma   top-K    →dkg_threshold
+                          →llm_batch
+                            │
+              every reject ─┘ full per-gate
+              audit row — no silent skips
+                     │
+                     ▼
+  ┌────────────────────────────────────────────────┐
+  │ SQLite (WAL) — 34 tables, atomic batch writes  │
+  │ decisions · gates · llm calls · latency · stats│
+  └───────────────────────┬────────────────────────┘
+                          ▼
+        dashboard — 15 pages · 10 plot modules
+
+
+
+

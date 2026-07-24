@@ -1,0 +1,29 @@
+$ jennie status --all
+                 ██╗███████╗███╗   ██╗███╗   ██╗██╗███████╗
+                 ██║██╔════╝████╗  ██║████╗  ██║██║██╔════╝
+                 ██║█████╗  ██╔██╗ ██║██╔██╗ ██║██║█████╗
+            ██   ██║██╔══╝  ██║╚██╗██║██║╚██╗██║██║██╔══╝
+            ╚█████╔╝███████╗██║ ╚████║██║ ╚████║██║███████╗
+             ╚════╝ ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═══╝╚═╝╚══════╝
+  news → 100k markets → LLM paper trades · SEULGI gen-1 / IRENE gen-2
+
+┌─ 0:news ─────────────────────────┐┌─ 1:universe ─────────────────────┐
+│ articles                 153,848 ││ markets indexed          100,084 │
+│ avg rate                 ~2k/day ││ distinct events           22,343 │
+│ sources            ~120 (was 33) ││ events coverage            99.1% │
+│ dedup ratio                12.7x ││ vs gen-1                    9.3x │
+│                                  ││                                  │
+│ SBERT 384-dim · 4-label fresh    ││ dual-read /events + /markets     │
+└──────────────────────────────────┘└──────────────────────────────────┘
+┌─ 2:engine ───────────────────────┐┌─ 3:ledger ───────────────────────┐
+│ decisions                 62,490 ││ rows                      10.98M │
+│ llm calls                 76,274 ││ db size                   8.6 GB │
+│ parse failures             0.26% ││ pnl (paper)             -$124.88 │
+│ latency p50/p99     1.5s / 13.8s ││ roi (paper)              -12.49% │
+│                                  ││                                  │
+│ every reject: full gate chain    ││ edge ≈ 0 · friction-bound        │
+└──────────────────────────────────┘└──────────────────────────────────┘
+[IRENE] 0:news 1:universe 2:engine 3:ledger     126.9k LOC · 1,397 tests
+
+
+

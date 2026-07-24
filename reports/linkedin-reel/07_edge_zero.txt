@@ -1,0 +1,25 @@
+# reports/2026-05-29-trading-viability-synthesis.md
+
+        ███████╗██████╗  ██████╗ ███████╗         ██████╗
+        ██╔════╝██╔══██╗██╔════╝ ██╔════╝        ██╔═████╗
+        █████╗  ██║  ██║██║  ███╗█████╗          ██║██╔██║
+        ██╔══╝  ██║  ██║██║   ██║██╔══╝          ████╔╝██║
+        ███████╗██████╔╝╚██████╔╝███████╗        ╚██████╔╝
+        ╚══════╝╚═════╝  ╚═════╝ ╚══════╝         ╚═════╝
+
+        the most rigorous output was knowing when to stop
+
+  [x] post-news directional edge ≈ 0
+  [x] losses are friction — fees + spread, not predictions
+  [x] even a perfect-foresight exit cannot cross zero
+  [x] validated by 4-way loss attribution that reconstructs
+      realized PnL exactly, per trade
+
+  WHY: adverse selection (n≈2,090 news events)
+  post-news repricing  ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇ 6.1¢
+  median half-spread   ▇▇ 0.5¢
+  → the market reprices 12x deeper than you can quote
+
+$ # a negative result, instrumented well enough
+  # to be trusted, is an engineering outcome.
+$ █
