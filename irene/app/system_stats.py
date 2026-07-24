@@ -2,8 +2,8 @@
 ## Specification
 
 **Purpose.** Periodic per-container CPU and memory sampler. Targets a
-fixed set of sibling containers (irene, irene-explorer,
-jennie-scraper-v2), reads `/containers/{name}/stats?stream=false` over
+fixed set of sibling containers (irene, jennie-scraper-v2), reads
+`/containers/{name}/stats?stream=false` over
 the Docker Engine API UDS, and appends one row per target per tick to
 the `container_stats` SQLite table so the dashboard page + plot can
 render the last hour without hitting the docker socket on render.
@@ -55,7 +55,6 @@ logger = logging.getLogger(__name__)
 
 TARGETS: tuple[str, ...] = (
     "irene",
-    "irene-explorer",
     "jennie-scraper-v2",
 )
 

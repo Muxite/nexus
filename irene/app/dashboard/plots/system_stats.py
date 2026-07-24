@@ -17,7 +17,6 @@ FILENAME = "system_stats.png"
 # renders. Anything not listed falls back to the default cycle.
 _COLORS = {
     "irene":             "#5cb085",
-    "irene-explorer":    "#d09844",
     "jennie-scraper-v2": "#6aa3d4",
 }
 
