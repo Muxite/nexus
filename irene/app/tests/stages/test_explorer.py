@@ -32,6 +32,7 @@ from app.cycle import cycle_scope
 from app.db import DB
 from app.deps import StageDeps
 from app.stages.explorer import ExplorerStage
+from app.tests._dates import open_end_date
 from app.topics import TOPIC_EXPLORATION_CREATED
 
 
@@ -182,11 +183,12 @@ async def db_seeded():
                  embedding_dim, embedding_updated_at, active, closed_at,
                  first_seen_at, updated_at)
             VALUES ('cond-1', 'slug-1', 'Will Trump strike Iran?',
-                    'Resolution details.', 'politics', '2026-12-31T00:00:00+00:00',
+                    'Resolution details.', 'politics', ?,
                     50000.0,
                     'ty', 'tn', NULL, NULL, NULL, NULL, 1, NULL,
                     '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
             """,
+            (open_end_date(),),
         )
         await cur.execute(
             """

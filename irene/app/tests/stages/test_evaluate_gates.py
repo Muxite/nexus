@@ -34,6 +34,7 @@ from app.stages.trade import (
     _gate_size,
     _gate_wide_spread,
 )
+from app.tests._dates import open_end_date
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +86,7 @@ def _market(
         "token_yes": "ty",
         "token_no": "tn",
         "category": "politics",
-        "end_date": "2026-12-31",
+        "end_date": open_end_date(),
         "volume_usdc": volume_usdc,
         "min_order_size": min_order_size,
         "_days_to_expiry": days_to_expiry,

@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pytest
@@ -30,6 +29,7 @@ from app.cycle import cycle_scope
 from app.db import DB
 from app.deps import StageDeps
 from app.stages.trade import TradeStage
+from app.tests._dates import far_future_end_date, iso_days_from_now, open_end_date
 from app.topics import TOPIC_TRADE_DECIDED
 
 
@@ -151,10 +151,11 @@ async def db_seeded():
                  embedding_dim, embedding_updated_at, active, closed_at,
                  first_seen_at, updated_at)
             VALUES ('m1', 'slug-1', 'Will X happen by end of year?',
-                    'Resolution details.', 'politics', '2026-12-31', 50000.0,
+                    'Resolution details.', 'politics', ?, 50000.0,
                     'ty', 'tn', NULL, NULL, NULL, NULL, 1, NULL,
                     '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
             """,
+            (open_end_date(),),
         )
         await cur.execute(
             """
@@ -417,10 +418,11 @@ async def test_target_mid_computed_correctly_for_yes_and_no(db_seeded):
                  volume_usdc, token_yes, token_no, embedding, embedder_id,
                  embedding_dim, embedding_updated_at, active, closed_at,
                  first_seen_at, updated_at)
-            VALUES ('m2', 'slug-2', 'Will Y happen?', 'd2', 'p', '2026-12-31',
+            VALUES ('m2', 'slug-2', 'Will Y happen?', 'd2', 'p', ?,
                     50000.0, 'tY2', 'tN2', NULL, NULL, NULL, NULL, 1, NULL,
                     '2026-05-23T00:00:00+00:00', '2026-05-23T00:00:00+00:00')
-            """
+            """,
+            (open_end_date(),),
         )
         await cur.execute(
             """
@@ -939,11 +941,14 @@ async def test_market_news_imbalance_thin_market_rejects(db_seeded):
 
 async def test_market_news_imbalance_far_future_evolving_rejects(db_seeded):
     # Cycle 7: end_date > 180 days AND freshness != BREAKING rejects.
-    # Fixture has end_date='2026-12-31'; treat the test "now" as far enough
-    # back that 2026-12-31 is > 180 days away. Force end_date to 2030 so
-    # the test is robust to time-of-clock drift.
+    # The shared fixture is deliberately inside the far-future threshold, so
+    # push this one past it. Relative, not a literal — the previous '2030-12-31'
+    # was the same clock-drift bug with a longer fuse.
     async with db_seeded.batch() as cur:
-        await cur.execute("UPDATE markets SET end_date='2030-12-31T00:00:00Z' WHERE condition_id='m1'")
+        await cur.execute(
+            "UPDATE markets SET end_date=? WHERE condition_id='m1'",
+            (far_future_end_date(),),
+        )
     bus = _FakeBus()
     ai = _FakeAI(next_result=DirectionResult(
         direction="YES", confidence=0.7, prediction_id=52,
@@ -960,7 +965,10 @@ async def test_market_news_imbalance_far_future_evolving_rejects(db_seeded):
 async def test_market_news_imbalance_far_future_breaking_allows(db_seeded):
     # Same far-future market BUT freshness=BREAKING bypasses the rule.
     async with db_seeded.batch() as cur:
-        await cur.execute("UPDATE markets SET end_date='2030-12-31T00:00:00Z' WHERE condition_id='m1'")
+        await cur.execute(
+            "UPDATE markets SET end_date=? WHERE condition_id='m1'",
+            (far_future_end_date(),),
+        )
     bus = _FakeBus()
     ai = _FakeAI(next_result=DirectionResult(
         direction="YES", confidence=0.7, prediction_id=53,
@@ -987,11 +995,10 @@ async def test_market_news_imbalance_extreme_mid_evolving_rejects(db_seeded):
     #
     # This was a fixed '2026-06-15T00:00:00Z' — chosen to be near-but-not-past
     # when written, which made the test start failing once that date went by.
-    end_dt = datetime.now(timezone.utc) + timedelta(days=30)
     async with db_seeded.batch() as cur:
         await cur.execute(
             "UPDATE markets SET end_date=? WHERE condition_id='m1'",
-            (end_dt.isoformat().replace("+00:00", "Z"),),
+            (iso_days_from_now(30),),
         )
     clob = _FakeCLOB({"ty": 0.95, "tn": 0.05})
     bus = _FakeBus()
