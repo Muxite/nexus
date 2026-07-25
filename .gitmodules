@@ -1,4 +1,4 @@
 [submodule "services/ujin"]
 	path = services/ujin
-	url = git@github.com:Muxite/ujin.git
+	url = https://github.com/Muxite/ujin.git
 	branch = master
