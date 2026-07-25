@@ -86,7 +86,7 @@ docker compose -f irene/docker-compose.yml  --profile test run --rm irene-test
 docker compose -f seulgi/docker-compose.yml --profile test run --rm seulgi-test
 ```
 
-Current state — **irene 863 passed / 0 failed**, **seulgi 476 passed / 3 failed**
+Current state — **irene 956 passed / 0 failed**, **seulgi 476 passed / 3 failed**
 (11 `live` tests deselected; they need running containers).
 
 The three seulgi failures predate the extraction and reproduce identically
@@ -104,16 +104,21 @@ against the pre-migration source:
 200 articles against a hard `timeout_seconds=30.0`. It fails on a loaded
 machine and passes on an idle one — wall-clock, not correctness.
 
-### Latent time bomb
+### Fixture dates are relative, deliberately
 
-The shared market fixture hard-codes `end_date='2026-12-31'` across 13 irene
-test files. On **2026-12-30** that falls inside the 6-hour
-`min_hours_to_expiry` buffer and `market_near_expiry` will start firing in all
-of them. Its meaning has already drifted once — written in May 2026 it was
-~222 days out, past the 180-day `far_future` threshold, and it silently
-stopped being "far future" on 2026-07-04. The fix is the same one applied to
-`test_market_news_imbalance_extreme_mid_evolving_rejects`: compute the date
-relative to `datetime.now(timezone.utc)` instead of pinning a literal.
+Market `end_date` fixtures are computed from `datetime.now(timezone.utc)` via
+`app/tests/_dates.py`, never pinned. Four production paths read `end_date`
+against the current time, so a literal silently changes meaning as the clock
+moves: the old `'2026-12-31'` was written in May 2026 beyond the 180-day
+`far_future` threshold, drifted inside it on 2026-07-04, and would have fallen
+inside the 6-hour `min_hours_to_expiry` buffer on 2026-12-30 — breaking 71
+tests under `app/tests` plus 9 under `scripts/replay/tests`.
+
+If you add a market fixture, use `open_end_date()` or `far_future_end_date()`.
+
+`scripts/replay/tests` is in `testpaths`. It was not, which is why the replay
+half of that bomb went unnoticed — a plain `pytest` run collected 863 of 956
+tests and reported green.
 
 ## History
 

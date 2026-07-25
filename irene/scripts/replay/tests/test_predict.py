@@ -218,25 +218,33 @@ def test_run_inproc_tighter_edge_pushes_to_bucket_b(snapshot_dir):
     fixture's stored `trade.edge` value is *original* and doesn't
     constrain the counterfactual.
 
-    Per-fixture recomputed edges (fee_buffer=0.02):
+    Recomputed edges are `p_win - mid - fee_buffer`, where `p_win` is
+    `p_hat` for YES and `1 - p_hat` for NO (`_compute_edge`, cycle 27 —
+    the book-unavailable branch treats `mid` as position space):
       trade 1 YES p_hat=0.80 mid=0.40 → 0.80 - 0.40 - 0.02 = 0.38
-      trade 2 NO  p_hat=0.25 mid=0.60 → 0.60 - 0.25 - 0.02 = 0.33
+      trade 2 NO  p_hat=0.25 mid=0.60 → 0.75 - 0.60 - 0.02 = 0.13
       trade 3 YES p_hat=0.65 mid=0.50 → 0.65 - 0.50 - 0.02 = 0.13
 
-    A min_edge override of 0.30 displaces trade 3 only."""
+    Trades 2 and 3 therefore tie at 0.13, so no threshold displaces one
+    without the other — any min_edge in (0.13, 0.38] partitions 1 | 2+3.
+    This docstring previously used the pre-cycle-27 NO formula
+    (`mid - p_hat` = 0.33) and expected a 2 | 3 split; the fixture's own
+    `edge=0.13` on trade 2 already agreed with the current code."""
     rep = run_inproc(str(snapshot_dir), {"trade.min_edge": 0.30})
-    assert rep.bucket_a.n == 2  # trades 1+2 still fire
-    assert rep.bucket_b.n == 1  # trade 3 displaced
-    # Trade 3 was open (no closure) so displaced PnL is 0.
-    assert rep.bucket_b.original_pnl == pytest.approx(0.0)
-    # Trade 3 implied notional = 50 (size_usdc on the open trade).
-    assert rep.bucket_b.implied_notional == pytest.approx(50.0)
+    assert rep.bucket_a.n == 1  # trade 1 still fires
+    assert rep.bucket_b.n == 2  # trades 2+3 displaced
+    # Trade 2 closed at +10; trade 3 is open so contributes 0.
+    assert rep.bucket_b.original_pnl == pytest.approx(10.0)
+    # Implied notional sums size_usdc over every displaced trade, open or
+    # closed: trade 2 (80) + trade 3 (50).
+    assert rep.bucket_b.implied_notional == pytest.approx(130.0)
 
 
 def test_run_inproc_aggressive_edge_displaces_all_but_one(snapshot_dir):
-    """Pushing min_edge above trade 2's edge (0.33) displaces trades 2+3,
-    leaves only trade 1 firing. Trade 2 is closed with +10 PnL → that's
-    the bucket_b.original_pnl."""
+    """Pushing min_edge above trade 2's edge (0.13, see the recomputation
+    note on the 0.30 case above) displaces trades 2+3 and leaves only
+    trade 1 firing. Trade 2 is closed with +10 PnL → that's the
+    bucket_b.original_pnl."""
     rep = run_inproc(str(snapshot_dir), {"trade.min_edge": 0.35})
     assert rep.bucket_a.n == 1
     assert rep.bucket_b.n == 2
