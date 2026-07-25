@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pytest
@@ -976,9 +977,22 @@ async def test_market_news_imbalance_far_future_breaking_allows(db_seeded):
 
 
 async def test_market_news_imbalance_extreme_mid_evolving_rejects(db_seeded):
-    # Mid 0.95 + EVOLVING → reject. Bring end_date close so far_future doesn't fire.
+    # Mid 0.95 + EVOLVING → reject.
+    #
+    # end_date has to sit inside the window where neither neighbouring gate
+    # fires: more than `min_hours_to_expiry` (6h) away so the earlier
+    # `market_near_expiry` gate stays quiet, and within `far_future_days`
+    # (180) so the far_future branch doesn't mask the extreme_mid branch
+    # under test. 30 days from now is comfortably inside both bounds.
+    #
+    # This was a fixed '2026-06-15T00:00:00Z' — chosen to be near-but-not-past
+    # when written, which made the test start failing once that date went by.
+    end_dt = datetime.now(timezone.utc) + timedelta(days=30)
     async with db_seeded.batch() as cur:
-        await cur.execute("UPDATE markets SET end_date='2026-06-15T00:00:00Z' WHERE condition_id='m1'")
+        await cur.execute(
+            "UPDATE markets SET end_date=? WHERE condition_id='m1'",
+            (end_dt.isoformat().replace("+00:00", "Z"),),
+        )
     clob = _FakeCLOB({"ty": 0.95, "tn": 0.05})
     bus = _FakeBus()
     ai = _FakeAI(next_result=DirectionResult(

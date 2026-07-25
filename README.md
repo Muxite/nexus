@@ -86,17 +86,34 @@ docker compose -f irene/docker-compose.yml  --profile test run --rm irene-test
 docker compose -f seulgi/docker-compose.yml --profile test run --rm seulgi-test
 ```
 
-Current state — **irene 862 passed / 1 failed**, **seulgi 476 passed / 3 failed**
-(11 `live` tests deselected; they need running containers). All four failures
-predate the extraction and reproduce identically against the pre-migration
-source:
+Current state — **irene 863 passed / 0 failed**, **seulgi 476 passed / 3 failed**
+(11 `live` tests deselected; they need running containers).
+
+The three seulgi failures predate the extraction and reproduce identically
+against the pre-migration source:
 
 | Test | Cause |
 |---|---|
-| `irene …test_trade.py::test_market_news_imbalance_extreme_mid_evolving_rejects` | Time bomb. Hard-codes `end_date='2026-06-15'`, chosen to be near-but-not-past when written. That date is now in the past, so `market_near_expiry` fires before the gate under test. |
 | `seulgi …test_news_memory.py::test_dissimilar_headline_not_republish` | chromadb behaviour under the installed 0.6.x. |
 | `seulgi …test_news_memory.py::test_size_increments_on_new_headline` | Same. |
 | `seulgi tests/test_debug_cli.py::test_inspect_engine_runs` | Assertion failure in the debug CLI inspector. |
+
+### Known flake
+
+`irene scripts/tests/test_tracer.py::test_stress_200_count_finishes_fast` runs
+200 articles against a hard `timeout_seconds=30.0`. It fails on a loaded
+machine and passes on an idle one — wall-clock, not correctness.
+
+### Latent time bomb
+
+The shared market fixture hard-codes `end_date='2026-12-31'` across 13 irene
+test files. On **2026-12-30** that falls inside the 6-hour
+`min_hours_to_expiry` buffer and `market_near_expiry` will start firing in all
+of them. Its meaning has already drifted once — written in May 2026 it was
+~222 days out, past the 180-day `far_future` threshold, and it silently
+stopped being "far future" on 2026-07-04. The fix is the same one applied to
+`test_market_news_imbalance_extreme_mid_evolving_rejects`: compute the date
+relative to `datetime.now(timezone.utc)` instead of pinning a literal.
 
 ## History
 
