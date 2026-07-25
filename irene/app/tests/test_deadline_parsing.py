@@ -27,6 +27,7 @@ import pytest
 # module loads cleanly.
 import app.stages.trade  # noqa: F401
 from app.stages.trade import TradeStage
+from app.tests._dates import iso_days_from_now
 
 
 # ---------------------------------------------------------------------------
@@ -130,15 +131,19 @@ def test_title_fallback_returns_none_when_no_match():
 
 
 def test_days_to_accepts_dict_payload():
-    """The new call site passes the full market dict so title-fallback can fire."""
-    market = {"end_date": "2099-01-01T00:00:00Z", "question": "Q?"}
+    """The new call site passes the full market dict so title-fallback can fire.
+
+    `_days_to` measures against `datetime.now()`, so the date is relative — a
+    pinned literal would eventually go past and flip `days > 0`.
+    """
+    market = {"end_date": iso_days_from_now(90), "question": "Q?"}
     days = TradeStage._days_to(market)
     assert days is not None and days > 0
 
 
 def test_days_to_accepts_legacy_string():
     """Legacy callers that still pass a raw end_date string keep working."""
-    days = TradeStage._days_to("2099-01-01T00:00:00Z")
+    days = TradeStage._days_to(iso_days_from_now(90))
     assert days is not None and days > 0
 
 

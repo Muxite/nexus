@@ -9,6 +9,13 @@ from typing import Iterable
 
 import pytest
 
+# `market_at_trade["end_date"]` reaches `_gate_market_state` via
+# predict.py -> GateFeatures -> evaluate_gates, which compares it to
+# datetime.now(). A pinned literal is a time bomb here exactly as it was in
+# app/tests. Note these tests are NOT in pytest.ini's `testpaths`, so a plain
+# `pytest` run does not collect them — they must be named explicitly.
+from app.tests._dates import open_end_date
+
 
 def _write_jsonl(path: Path, rows: Iterable[dict]) -> None:
     with path.open("w") as f:
@@ -53,7 +60,7 @@ def _make_trade(
         "market_at_trade": market_at_trade or {
             "fee_rate": None, "volume_usdc": 50000.0,
             "category": "politics", "min_order_size": None,
-            "end_date": "2026-12-31",
+            "end_date": open_end_date(),
         },
     }
     return {
@@ -224,7 +231,7 @@ def snapshot_dir(tmp_path: Path) -> Path:
                     freshness="BREAKING", market_at_trade={
                         "fee_rate": 0.072, "volume_usdc": 100000.0,
                         "category": "crypto", "min_order_size": None,
-                        "end_date": "2026-12-31",
+                        "end_date": open_end_date(),
                     }),
     ]
 
