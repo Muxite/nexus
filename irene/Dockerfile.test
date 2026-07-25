@@ -12,6 +12,11 @@ RUN pip install --no-cache-dir -r requirements.txt -r requirements.test.txt
 COPY app/ /app/app/
 COPY scripts/ /app/scripts/
 COPY pytest.ini /app/pytest.ini
+# app/config.py imports this at module scope, so every test that reaches
+# app.config fails collection without it. The production Dockerfile already
+# copies it — omitting it here is the same gap that took the container down
+# for 8 days (2026-05-30 → 06-07); it just failed silently in the test image.
+COPY capture_schedule.py /app/
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1

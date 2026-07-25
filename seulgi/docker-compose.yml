@@ -47,6 +47,24 @@ services:
         max-size: "50m"
         max-file: "3"
 
+  # ── Test runner (profile=test) ─────────────────────────────────────────────
+  #   docker compose -f seulgi/docker-compose.yml --profile test run --rm seulgi-test
+  #
+  # Before the nexus extraction this service lived in the repo-root compose
+  # and reused the production image. It now builds Dockerfile.test, matching
+  # irene's arrangement, so each agent's tests are runnable from that agent's
+  # own compose file. No DB volume and no network: the tests mock all DB and
+  # HTTP IO, so they need neither a scraper nor nexus_default.
+  seulgi-test:
+    profiles: ["test"]
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    container_name: seulgi-test
+    environment:
+      - PYTHONPATH=/app
+      - LOG_LEVEL=WARNING
+
 volumes:
   seulgi_model_cache:
 

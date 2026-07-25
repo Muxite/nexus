@@ -6,9 +6,26 @@ COPY requirements.txt .
 COPY requirements.test.txt .
 RUN pip install --no-cache-dir -r requirements.txt -r requirements.test.txt
 
-COPY app/ /app/
+# Preserve the source layout rather than flattening app/ into /app/.
+# tests/test_backtest.py resolves its imports relative to the test file
+# (`<tests>/../..` then `scripts/replay`), so flattening made it resolve to
+# `/scripts/replay` and fail collection. This mirrors irene/Dockerfile.test.
+COPY app/ /app/app/
+COPY tests/ /app/tests/
+COPY scripts/ /app/scripts/
+COPY rules/ /app/rules/
+# Without pytest.ini, asyncio_mode defaults to STRICT and every async test
+# errors out.
+COPY pytest.ini /app/pytest.ini
 
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONPATH=/app
+ENV PYTHONPATH=/app/app
 
-CMD ["python", "-m", "pytest", "tests/", "-v", "--tb=short"]
+# `live` tests need running seulgi/scraper containers and network (see the
+# marker declared in pytest.ini) — deselected in the offline test runner.
+# --import-mode=importlib: app/ has no __init__.py, so pytest derives the
+# module name for BOTH app/tests/ and tests/ as `tests.*` and the second one
+# fails to import. importlib mode drops the sys.path/module-name coupling.
+# `live` tests need running seulgi/scraper containers and network (see the
+# marker declared in pytest.ini) — deselected in the offline test runner.
+CMD ["python", "-m", "pytest", "-q", "--tb=short", "--import-mode=importlib", "-m", "not live"]

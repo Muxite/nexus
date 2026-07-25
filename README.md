@@ -86,6 +86,18 @@ docker compose -f irene/docker-compose.yml  --profile test run --rm irene-test
 docker compose -f seulgi/docker-compose.yml --profile test run --rm seulgi-test
 ```
 
+Current state — **irene 862 passed / 1 failed**, **seulgi 476 passed / 3 failed**
+(11 `live` tests deselected; they need running containers). All four failures
+predate the extraction and reproduce identically against the pre-migration
+source:
+
+| Test | Cause |
+|---|---|
+| `irene …test_trade.py::test_market_news_imbalance_extreme_mid_evolving_rejects` | Time bomb. Hard-codes `end_date='2026-06-15'`, chosen to be near-but-not-past when written. That date is now in the past, so `market_near_expiry` fires before the gate under test. |
+| `seulgi …test_news_memory.py::test_dissimilar_headline_not_republish` | chromadb behaviour under the installed 0.6.x. |
+| `seulgi …test_news_memory.py::test_size_increments_on_new_headline` | Same. |
+| `seulgi tests/test_debug_cli.py::test_inspect_engine_runs` | Assertion failure in the debug CLI inspector. |
+
 ## History
 
 203 commits, all of them mine, spanning both agents from first scaffold to
