@@ -4,7 +4,7 @@ Description=Irene soak health check + backtest preflight
 
 [Service]
 Type=oneshot
-WorkingDirectory=%h/projects/jennie/irene
+WorkingDirectory=%h/projects/nexus/irene
 # Preflight first: replay-accuracy gate. Non-blocking ('-' prefix) so
 # stored-pnl drift gets logged without suppressing the soak summary.
 ExecStartPre=-/usr/bin/python3 -m scripts.replay.preflight

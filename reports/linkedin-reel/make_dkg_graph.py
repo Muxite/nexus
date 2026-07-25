@@ -30,7 +30,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 
-DB = "/home/muk/projects/jennie/irene/data/irene.db"
+DB = "/home/muk/projects/nexus/irene/data/irene.db"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 PX = 2048
@@ -505,7 +505,7 @@ def draw_chrome(ax, G, theme, n_edges):
     ax.text(-1.45, 1.405, "DYNAMIC KNOWLEDGE GRAPH", color=theme["fg"],
             fontsize=116 * FS, fontfamily=MONO, fontweight="bold",
             ha="left", va="center", zorder=9)
-    ax.text(-1.45, 1.31, "JENNIE · IRENE · GEN-2", color=accent,
+    ax.text(-1.45, 1.31, "NEXUS · IRENE · GEN-2", color=accent,
             fontsize=40 * FS, fontfamily=MONO, fontweight="bold",
             ha="left", va="center", zorder=9, alpha=0.95)
 

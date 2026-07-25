@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LinkedIn hype-reel generator for Jennie.
+"""LinkedIn hype-reel generator for Nexus.
 
 Renders 1080x1080 slides that look like terminal screenshots / matplotlib
 charts. Every number comes from reports/2026-05-31-resume-achievements.md
@@ -89,13 +89,13 @@ def window_chrome(ax, title, y=28):
 # =============================================================================
 def slide_title():
     fig, ax = new_fig()
-    window_chrome(ax, "muk@jennie: ~/projects/jennie")
+    window_chrome(ax, "muk@nexus: ~/projects/nexus")
 
     y = 130
     y = draw_block(ax, 56, y, [[("$ ", GREEN), ("cat", FG), (" MOTD", BLUE)]], 20)
     y += 28
 
-    banner = pyfiglet.figlet_format("JENNIE", font="ansi_shadow").rstrip("\n").split("\n")
+    banner = pyfiglet.figlet_format("NEXUS", font="ansi_shadow").rstrip("\n").split("\n")
     bw = max(len(l) for l in banner)
     fs_b = 21
     x0 = (PX - bw * char_w(fs_b)) / 2
@@ -152,7 +152,7 @@ def slide_title():
 # =============================================================================
 def slide_numbers():
     fig, ax = new_fig()
-    window_chrome(ax, "jennie — by the numbers")
+    window_chrome(ax, "nexus — by the numbers")
 
     head = pyfiglet.figlet_format("SHIPPED", font="ansi_shadow").rstrip("\n").split("\n")
     fs_b = 14
@@ -547,7 +547,7 @@ def _odds_curve(eid, lo_min=-60, hi_min=60):
     """Mid-price samples for one exploration, as (minutes_from_news, mid)."""
     import sqlite3
     con = sqlite3.connect(
-        "file:/home/muk/projects/jennie/irene/data/irene.db?mode=ro", uri=True)
+        "file:/home/muk/projects/nexus/irene/data/irene.db?mode=ro", uri=True)
     rows = con.execute(
         """SELECT offset_seconds, mid FROM odds_observations
            WHERE exploration_id=? AND mid IS NOT NULL
@@ -599,7 +599,7 @@ def slide_real_plots():
              "IRENE live (top) + SEULGI gen-1 frozen (bottom)",
              fontsize=12.5, fontfamily=MONO, color=DIM, ha="center")
 
-    root = "/home/muk/projects/jennie"
+    root = "/home/muk/projects/nexus"
     panels = [
         (f"{OUT}/_panels/throughput_overlay.png",
          "IRENE · live per-stage throughput (24h, log)", GREEN),
@@ -713,7 +713,7 @@ def slide_funnel():
 def _odds_curve_full(eid, lo_s=-7200, hi_s=None):
     import sqlite3
     con = sqlite3.connect(
-        "file:/home/muk/projects/jennie/irene/data/irene.db?mode=ro", uri=True)
+        "file:/home/muk/projects/nexus/irene/data/irene.db?mode=ro", uri=True)
     hi = hi_s if hi_s is not None else 10 ** 9
     rows = con.execute(
         """SELECT offset_seconds, mid FROM odds_observations

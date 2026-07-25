@@ -110,7 +110,7 @@ Anything in the table above marked `(TBD)` does not exist yet; see `master-plan.
 
 ## Hard rules irene follows from day 1
 
-1. **No DB sharing with seulgi.** A runtime assertion in `db.py` will refuse to connect if the resolved path matches any known seulgi DB path. The dual-container hazard memo (`~/.claude/projects/-home-muk-projects-jennie/memory/project_dual_container.md`) describes the chroma corruption that proves this matters.
+1. **No DB sharing with seulgi.** A runtime assertion in `db.py` will refuse to connect if the resolved path matches any known seulgi DB path. The dual-container hazard memo (`~/.claude/projects/-home-muk-projects-nexus/memory/project_dual_container.md`) describes the chroma corruption that proves this matters.
 2. **Standalone docker-compose only.** The root `docker-compose.yml` is **not** touched. Run irene from `irene/docker-compose.yml` directly.
 3. **Single-decision-per-headline.** No multi-engine variant fan-out. The comparison axis is `trades.decision_path` (mvp vs dkg), starting P3.
 4. **Tracers and live trades cannot mix.** `db.insert_trade()` will reject any row with `is_tracer=1 AND paper=0`. A tracer can never become a live trade.

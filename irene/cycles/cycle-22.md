@@ -6,7 +6,7 @@
 ## What landed
 
 ### Durable soak timer
-- `irene/scripts/systemd/irene-soak.service` — oneshot, `WorkingDirectory=%h/projects/jennie/irene`, journal-logged. `ExecStartPre=-/usr/bin/python3 -m scripts.replay.preflight` runs the backtest preflight non-blocking before each soak tick.
+- `irene/scripts/systemd/irene-soak.service` — oneshot, `WorkingDirectory=%h/projects/nexus/irene`, journal-logged. `ExecStartPre=-/usr/bin/python3 -m scripts.replay.preflight` runs the backtest preflight non-blocking before each soak tick.
 - `irene/scripts/systemd/irene-soak.timer` — `OnBootSec=2min`, `OnUnitActiveSec=2h`, `Persistent=true` (catches missed ticks across machine-off windows).
 - `irene/scripts/systemd/install.sh` — idempotent symlink-into-`~/.config/systemd/user/` + `daemon-reload` + `enable --now`. The user runs this once; the units live in-repo.
 

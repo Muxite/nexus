@@ -2,7 +2,7 @@
 # Periodic audit driver. Plan §4 / Step 4.
 #
 # Schedule from user crontab (every 4 hours):
-#     0 */4 * * * /home/muk/projects/jennie/seulgi/scripts/audit/run_periodic.sh
+#     0 */4 * * * /home/muk/projects/nexus/seulgi/scripts/audit/run_periodic.sh
 #
 # Writes a per-run directory under /home/muk/seulgi-audits/<UTC-timestamp>/
 # (NOT data/dashboard/audit/ because that path is root-owned by the docker
@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-REPO_ROOT="/home/muk/projects/jennie/seulgi"
+REPO_ROOT="/home/muk/projects/nexus/seulgi"
 OUT_ROOT="/home/muk/seulgi-audits"
 STAMP=$(date -u +%Y-%m-%dT%H-%M-%SZ)
 OUT_DIR="${OUT_ROOT}/${STAMP}"

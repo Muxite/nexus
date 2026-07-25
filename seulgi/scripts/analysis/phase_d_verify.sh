@@ -5,17 +5,17 @@
 # won't fire again.
 #
 # Plan: /home/muk/.claude/plans/code-shipped-all-137-tranquil-turtle.md
-# Handoff: /home/muk/projects/jennie/seulgi/HANDOFF_2026-05-21.md
+# Handoff: /home/muk/projects/nexus/seulgi/HANDOFF_2026-05-21.md
 
 set -uo pipefail
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 REPORT=/tmp/phase_d_verify_${TS}.md
 LATEST=/tmp/phase_d_verify_latest.md
-JENNIE=/home/muk/projects/jennie
-SNAP=$JENNIE/seulgi/snapshots/pre_phase_b_deploy_20260520T234808Z
+NEXUS=/home/muk/projects/nexus
+SNAP=$NEXUS/seulgi/snapshots/pre_phase_b_deploy_20260520T234808Z
 # Cron starts in $HOME — child scripts use relative paths.
-cd "$JENNIE"
+cd "$NEXUS"
 
 # Baseline gap numbers captured at deploy time
 BASELINE_GAP_SIGNALS=2138
@@ -40,7 +40,7 @@ p ""
 # ── Check 1: db_health_audit (capture current state) ──────────────────────
 p "## 1. db_health_audit"
 p '```'
-python3 $JENNIE/seulgi/scripts/analysis/db_health_audit.py >> "$REPORT" 2>&1
+python3 $NEXUS/seulgi/scripts/analysis/db_health_audit.py >> "$REPORT" 2>&1
 RC=$?
 p '```'
 if [[ $RC -eq 0 ]]; then mark_pass "db_health_audit ran"
@@ -48,7 +48,7 @@ else mark_fail "db_health_audit exit $RC"; fi
 p ""
 
 # Re-run silently to parse numbers
-AUDIT=$(python3 $JENNIE/seulgi/scripts/analysis/db_health_audit.py 2>/dev/null)
+AUDIT=$(python3 $NEXUS/seulgi/scripts/analysis/db_health_audit.py 2>/dev/null)
 
 # Helper: row "| signals | 77,072 | 79,210 | ..." → strip commas, split
 get_count() { echo "$AUDIT" | awk -v t="$1" -F'|' '$0~"^\\| "t" " {gsub(/[, ]/,"",$3); print $3; exit}'; }
@@ -102,7 +102,7 @@ p ""
 
 # ── Check 4: zero crashes / locks / failures in last 30m ─────────────────
 p "## 4. Container log cleanliness (last 30 min)"
-ERR_COUNT=$(docker logs jennie-seulgi --since 30m 2>&1 | grep -cE "task .*crashed|database is locked|\[db\].*failed")
+ERR_COUNT=$(docker logs nexus-seulgi --since 30m 2>&1 | grep -cE "task .*crashed|database is locked|\[db\].*failed")
 p "  - error/lock/crash lines: $ERR_COUNT"
 if [[ "$ERR_COUNT" -eq 0 ]]; then mark_pass "no crashes / locks / db failures in 30m"
 else
@@ -110,7 +110,7 @@ else
   p ""
   p "  Recent error context:"
   p '```'
-  docker logs jennie-seulgi --since 30m 2>&1 | grep -E "task .*crashed|database is locked|\[db\].*failed" | head -10 >> "$REPORT"
+  docker logs nexus-seulgi --since 30m 2>&1 | grep -E "task .*crashed|database is locked|\[db\].*failed" | head -10 >> "$REPORT"
   p '```'
 fi
 p ""
@@ -118,7 +118,7 @@ p ""
 # ── Check 5: writer-lock probe (p95 < 200ms) ────────────────────────────
 p "## 5. Writer-lock probe (p95 should be < 200ms)"
 p '```'
-python3 $JENNIE/seulgi/scripts/analysis/writer_lock_probe.py --samples 30 >> "$REPORT" 2>&1
+python3 $NEXUS/seulgi/scripts/analysis/writer_lock_probe.py --samples 30 >> "$REPORT" 2>&1
 PROBE_RC=$?
 p '```'
 if [[ $PROBE_RC -eq 0 ]]; then mark_pass "writer_lock_probe ran"
@@ -127,8 +127,8 @@ p ""
 
 # ── Check 6: bump_market_heat + metrics_minutely fresh ──────────────────
 p "## 6. Phase A3 + Phase C live signals"
-if grep -q "bump_market_heat" $JENNIE/seulgi/data/dashboard/db_health.txt 2>/dev/null; then
-  bmh_line=$(grep "bump_market_heat" $JENNIE/seulgi/data/dashboard/db_health.txt | head -1)
+if grep -q "bump_market_heat" $NEXUS/seulgi/data/dashboard/db_health.txt 2>/dev/null; then
+  bmh_line=$(grep "bump_market_heat" $NEXUS/seulgi/data/dashboard/db_health.txt | head -1)
   p "  - bump_market_heat: $bmh_line"
   mark_pass "bump_market_heat counter present (Phase A3 instrumentation)"
 else

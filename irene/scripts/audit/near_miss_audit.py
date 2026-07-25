@@ -26,10 +26,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DEFAULT_DB = "/home/muk/projects/jennie/irene/data/irene.db"
-DEFAULT_REPORTS_DIR = "/home/muk/projects/jennie/irene/reports"
+DEFAULT_DB = "/home/muk/projects/nexus/irene/data/irene.db"
+DEFAULT_REPORTS_DIR = "/home/muk/projects/nexus/irene/reports"
 DEFAULT_CSV_PATH = (
-    "/home/muk/projects/jennie/irene/data/dashboard/plots/"
+    "/home/muk/projects/nexus/irene/data/dashboard/plots/"
     "near_miss_breakdown.csv"
 )
 

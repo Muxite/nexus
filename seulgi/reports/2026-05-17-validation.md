@@ -1,6 +1,6 @@
 # Seulgi Validation Report — 2026-05-17 05:04 UTC
 
-_DB: `/home/muk/projects/jennie/seulgi/data/seulgi.db` · friction-mode: `raw` · filters: since=none variant=all_
+_DB: `/home/muk/projects/nexus/seulgi/data/seulgi.db` · friction-mode: `raw` · filters: since=none variant=all_
 
 
 ## Verdict

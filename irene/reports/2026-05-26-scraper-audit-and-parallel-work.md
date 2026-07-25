@@ -38,7 +38,7 @@ Both scrapers live under `services/`; both are running today.
 
 ### scraper-v1 (`services/scraper/`)
 
-- **Image:** `jennie-scraper:latest`, container `jennie-scraper`, port **9000**.
+- **Image:** `nexus-ujin:latest`, container `nexus-ujin`, port **9000**.
 - **Code:** single `app.py` (~300 lines). FastAPI + aiohttp + feedparser.
 - **Endpoints:** `POST /fetch`, `POST /twitter/search`, `POST /feed`.
 - **Dependencies:** wraps the `obscura` headless browser binary + Brave Search API.
@@ -47,11 +47,11 @@ Both scrapers live under `services/`; both are running today.
 
 ### scraper-v2 (`services/scraper-v2/`)
 
-- **Image:** `jennie-scraper-v2:latest`, container `jennie-scraper-v2`, port **9001**.
+- **Image:** `nexus-ujin:latest`, container `nexus-ujin`, port **9001**.
 - **Code:** proper module structure (`app/{main,service,config,host_overrides,metrics,…}.py`), `config/per_host.yaml`, comprehensive `tests/` suite (15+ test files).
 - **Endpoints:** `/health`, `/scrape` (mode=`links|article|auto|combined`), `/feed`, `/sitemap`, `/discover`, `/social/{twitter,mastodon,truth}`, plus admin.
 - **Improvements over v1:** HTTP fast-path with obscura fallback only when needed; trafilatura boilerplate stripping; fingerprint-based change detection; per-host concurrency + backoff; sitemap + discover endpoints; clean article-body extraction.
-- **Consumer:** **irene only** (via `SCRAPER_URL=http://jennie-scraper-v2:9001` in `irene/.env` + `irene/docker-compose.yml`).
+- **Consumer:** **irene only** (via `SCRAPER_URL=http://nexus-ujin:9001` in `irene/.env` + `irene/docker-compose.yml`).
 - **Status:** Up 21 hours.
 
 ### Irene's consumption pattern
@@ -66,7 +66,7 @@ The high noise-source articles in the audit (repubblica.it+html: 397 articles �
 
 ## Parallel-work pattern — recommended setup
 
-**Constraint:** the live soak must keep accumulating data (this is the cycle-22 backtest-data requirement). Restarting `jennie-scraper-v2` would briefly starve irene of new articles.
+**Constraint:** the live soak must keep accumulating data (this is the cycle-22 backtest-data requirement). Restarting `nexus-ujin` would briefly starve irene of new articles.
 
 **Recommendation: dev sibling container, separate image tag, separate port.** Live and dev share the same Dockerfile + source tree but run as independent containers.
 
@@ -76,21 +76,21 @@ Create `services/scraper-v2/docker-compose.dev.yml`:
 
 ```yaml
 services:
-  jennie-scraper-v2-dev:
+  nexus-ujin-dev:
     build:
       context: .
       dockerfile: Dockerfile
-    image: jennie-scraper-v2:dev
-    container_name: jennie-scraper-v2-dev
+    image: nexus-ujin:dev
+    container_name: nexus-ujin-dev
     ports:
       - "9002:9001"   # host 9002 → container 9001 (same internal port)
     networks:
-      - jennie_default
+      - nexus_default
     environment:
       - LOG_LEVEL=DEBUG
     # No `restart: unless-stopped` — dev container may crash on experiments.
 networks:
-  jennie_default:
+  nexus_default:
     external: true
 ```
 
@@ -110,7 +110,7 @@ Bring it up: `docker compose -f services/scraper-v2/docker-compose.dev.yml up --
      -d '{"url":"https://www.aljazeera.com/xml/rss/all.xml"}' > /tmp/dev.json
    diff <(jq -S . /tmp/live.json) <(jq -S . /tmp/dev.json)
    ```
-5. **Run the test suite** in dev for unit-level confidence: `docker compose -f services/scraper-v2/docker-compose.dev.yml exec jennie-scraper-v2-dev pytest -q`.
+5. **Run the test suite** in dev for unit-level confidence: `docker compose -f services/scraper-v2/docker-compose.dev.yml exec nexus-ujin-dev pytest -q`.
 6. **Promote to live** when ready:
    ```bash
    # Build the :latest tag from your verified branch
@@ -134,7 +134,7 @@ Worth writing once you have a concrete change to test.
 
 ### What NOT to do
 
-- Don't edit `services/scraper-v2/` files and restart `jennie-scraper-v2` directly — that's the live container, and one bad change starves irene of news for as long as the regression takes to detect.
+- Don't edit `services/scraper-v2/` files and restart `nexus-ujin` directly — that's the live container, and one bad change starves irene of news for as long as the regression takes to detect.
 - Don't reuse the `:latest` image tag during experiments. Tag dev iterations as `:dev` (or `:exp-2026-05-26`) so a rollback is just a container recreate.
 - Don't share the `9001` port between live and dev. Different ports keep both reachable, which is the whole point.
 

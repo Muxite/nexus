@@ -1,11 +1,17 @@
-# NOTE: Seulgi is included in the root jennie/docker-compose.yml and should
-# normally be started from there so it can depend on the scraper:
+# This file is the ONE WAY to start seulgi.
 #
-#   docker compose up scraper seulgi        (from jennie/)
+#   docker compose -f seulgi/docker-compose.yml up -d seulgi
 #
-# This standalone file is provided for local development only (e.g. when
-# the scraper is already running separately).  It does NOT enforce scraper
-# readiness — start the scraper first.
+# The root nexus/docker-compose.yml deliberately does NOT define a seulgi
+# service. On 2026-05-21 a container started from the root compose and one
+# started from this file ran at the same time against the same data/seulgi.db
+# and data/news_chroma, corrupting the chromadb HNSW index. One canonical
+# container per agent is the fix.
+#
+# Prerequisites:
+#   - The shared scraper must already be up on the `nexus_default` network:
+#     `docker compose up -d ujin` from the repo root. That command also
+#     creates the network. This file does NOT enforce scraper readiness.
 
 services:
   seulgi:
@@ -20,7 +26,8 @@ services:
       - seulgi_model_cache:/root/.cache/torch/sentence_transformers
     environment:
       - SEULGI_CONFIG=/config/config.yaml
-      - SCRAPER_URL=${SCRAPER_URL:-http://scraper:9000}
+      # nexus: ujin (services/ujin) replaces the old v1 scraper on :9000.
+      - SCRAPER_URL=${SCRAPER_URL:-http://nexus-ujin:8901}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       - SEULGI__TRADING__BALANCE_USDC=${SEULGI__TRADING__BALANCE_USDC:-1000.0}
       - SEULGI__TRADING__MAX_POSITION_USDC=${SEULGI__TRADING__MAX_POSITION_USDC:-100.0}
@@ -33,7 +40,7 @@ services:
       - path: ./.env
         required: false
     networks:
-      - jennie_default
+      - nexus_default
     logging:
       driver: json-file
       options:
@@ -44,5 +51,5 @@ volumes:
   seulgi_model_cache:
 
 networks:
-  jennie_default:
+  nexus_default:
     external: true

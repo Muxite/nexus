@@ -61,8 +61,8 @@ def txt_main():
         ("roi (paper)", "-12.49%"),
     ], "edge ≈ 0 · friction-bound", iw, ih)
 
-    L = ["$ jennie status --all"]
-    L += center_block(banner("JENNIE"), tot)
+    L = ["$ nexus status --all"]
+    L += center_block(banner("NEXUS"), tot)
     L += center_block(["news → 100k markets → LLM paper trades · SEULGI gen-1 / IRENE gen-2"], tot)
     L.append("")
     for a, b in zip(p0, p1):
@@ -82,7 +82,7 @@ def txt_title():
     L = []
     L.append("$ cat MOTD")
     L.append("")
-    L += center_block(banner("JENNIE"), W)
+    L += center_block(banner("NEXUS"), W)
     L.append("")
     L += center_block(["a news-driven prediction-market research platform"], W)
     L.append("")

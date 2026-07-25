@@ -37,8 +37,8 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta, timezone
 
-DB_PATH = "/home/muk/projects/jennie/irene/data/irene.db"
-PLOTS_DIR = Path("/home/muk/projects/jennie/irene/data/dashboard/plots")
+DB_PATH = "/home/muk/projects/nexus/irene/data/irene.db"
+PLOTS_DIR = Path("/home/muk/projects/nexus/irene/data/dashboard/plots")
 CSV_PATH = PLOTS_DIR / "signal_source_breakdown.csv"
 
 WINDOW_HOURS = 24

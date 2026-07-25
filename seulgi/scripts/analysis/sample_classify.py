@@ -40,7 +40,7 @@ from typing import Optional
 
 # Need the app package on sys.path so we can import ai's prompt template
 # without duplicating it. The bot lives at /app inside the container, but
-# the host-side checkout is `/home/muk/projects/jennie/seulgi/app`.
+# the host-side checkout is `/home/muk/projects/nexus/seulgi/app`.
 _APP_DIR = Path(__file__).resolve().parents[2] / "app"
 if str(_APP_DIR) not in sys.path:
     sys.path.insert(0, str(_APP_DIR))

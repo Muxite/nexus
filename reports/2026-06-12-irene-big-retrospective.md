@@ -39,7 +39,7 @@ explorations and 2.18M odds observations** in 16 days — the dataset reframe is
 
 | period | what happened |
 |---|---|
-| 2026-03-14 | jennie project starts (Tkinter GUI, paper trading framework) |
+| 2026-03-14 | predecessor repo starts — Tkinter GUI + paper-trading framework, written by collaborators and **not part of nexus** (see `docs/rename-from-jennie.md`) |
 | 2026-04-01 | "irene is the next big thing trust" — clean-slate bot branch |
 | 2026-05-14 → 05-23 | P0 scaffold: master-plan, philosophy lock, modularization rules |
 | 2026-05-23 → 05-24 | P1 MVP (article→embed→match→LLM→paper-trade), P2 extraction (shadow), P3 DKG chunks 1–3 |

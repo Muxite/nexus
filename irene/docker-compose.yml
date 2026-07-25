@@ -2,14 +2,15 @@
 #
 # Per the user decision 2026-05-22 ("Standalone only — no root compose
 # edits ever") this file is the ONE WAY to start irene. The root
-# jennie/docker-compose.yml is NEVER edited by irene PRs.
+# nexus/docker-compose.yml is NEVER edited by irene PRs.
 #
 #   docker compose -f irene/docker-compose.yml up --build
 #
 # Prerequisites:
-#   - The shared scraper must already be up on the `jennie_default` network
-#     (root compose: `docker compose up scraper`). Irene only consumes it
-#     over HTTP — it does not start or own that container.
+#   - The shared scraper must already be up on the `nexus_default` network
+#     (root compose: `docker compose up -d ujin`, which also creates the
+#     network). Irene only consumes it over HTTP — it does not start or own
+#     that container.
 #   - irene/config.yaml must exist (copy from config.example.yaml in a
 #     later PR; not present yet — P1 doesn't read config beyond a stub).
 
@@ -33,9 +34,10 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - IRENE_CONFIG=/config/config.yaml
-      # Cycle 4: default to scraper-v2 (port 9001). Override via env
-      # if you want to point back at v1.
-      - SCRAPER_URL=${SCRAPER_URL:-http://jennie-scraper-v2:9001}
+      # Cycle 4 defaulted to scraper-v2 (:9001). nexus: that service is
+      # superseded by ujin (services/ujin) on :8901 — strict superset,
+      # same request models.
+      - SCRAPER_URL=${SCRAPER_URL:-http://nexus-ujin:8901}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
       # Per-cycle name. main.py calls db.ensure_current_cycle(name) on boot.
       - IRENE_CYCLE=${IRENE_CYCLE:-cycle-0}
@@ -43,7 +45,7 @@ services:
       - path: ./.env
         required: false
     networks:
-      - jennie_default
+      - nexus_default
     logging:
       driver: json-file
       options:
@@ -70,11 +72,11 @@ services:
     environment:
       - PYTHONPATH=/app
     networks:
-      - jennie_default
+      - nexus_default
 
 volumes:
   irene_model_cache:
 
 networks:
-  jennie_default:
+  nexus_default:
     external: true

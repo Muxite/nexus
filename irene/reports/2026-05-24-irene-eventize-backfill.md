@@ -114,7 +114,7 @@ This report closes chunk 2a. The path to profitability requires:
 
 ```bash
 PYTHONPATH=. python3 -m scripts.dkg.run_eventize_backfill \
-    --irene-db /home/muk/projects/jennie/irene/data/irene.db
+    --irene-db /home/muk/projects/nexus/irene/data/irene.db
 
 python3 -c "import sqlite3; c=sqlite3.connect('file:data/irene.db?mode=ro',uri=True); \
   print('events:', c.execute('SELECT COUNT(*) FROM events').fetchone()[0]); \

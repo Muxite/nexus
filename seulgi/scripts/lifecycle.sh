@@ -2,7 +2,7 @@
 # seulgi container lifecycle helper — start / stop / status.
 #
 # Use this instead of raw `docker compose` so we standardise on:
-#   - canonical container name: `seulgi`  (NOT `jennie-seulgi`)
+#   - canonical container name: `seulgi`  (NOT `nexus-seulgi`)
 #   - canonical compose file:   seulgi/docker-compose.yml
 #   - pre-stop snapshot:        scripts.snapshot.snapshot save
 #
@@ -25,8 +25,8 @@ DB="$SEULGI_DIR/data/seulgi.db"
 HEALTH="$SEULGI_DIR/data/dashboard/db_health.txt"
 
 assert_no_dual() {
-    if docker ps -a --format '{{.Names}}' | grep -qE '^jennie-seulgi$'; then
-        echo "ERROR: jennie-seulgi container exists. Run 'docker rm jennie-seulgi' first." >&2
+    if docker ps -a --format '{{.Names}}' | grep -qE '^nexus-seulgi$'; then
+        echo "ERROR: nexus-seulgi container exists. Run 'docker rm nexus-seulgi' first." >&2
         echo "Dual-container hazard: memory/project_dual_container.md" >&2
         exit 1
     fi

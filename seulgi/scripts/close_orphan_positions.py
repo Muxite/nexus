@@ -5,7 +5,7 @@ no engine is monitoring them. This script closes them at the most recent
 mid (positions.last_price), records realized_pnl honestly on the trade row,
 and removes them from the open-positions table. Run inside the container:
 
-    docker exec jennie-seulgi python /app/scripts/close_orphan_positions.py
+    docker exec nexus-seulgi python /app/scripts/close_orphan_positions.py
 """
 from __future__ import annotations
 

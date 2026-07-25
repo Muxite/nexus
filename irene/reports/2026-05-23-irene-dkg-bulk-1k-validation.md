@@ -214,7 +214,7 @@ follow-up run is $0.05 — trivial to extend.
 ## Reproducing
 
 ```bash
-cd /home/muk/projects/jennie/irene
+cd /home/muk/projects/nexus/irene
 set -a; source ../seulgi/.env; set +a
 PYTHONPATH=. python3 -m scripts.migrate.dkg_bulk_sample \
     --target 1000 --concurrency 15 --budget-cap-usd 1.0 \

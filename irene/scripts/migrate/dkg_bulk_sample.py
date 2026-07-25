@@ -677,8 +677,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Random-sample seulgi.signals and run DKG bulk extraction."
     )
-    parser.add_argument("--seulgi-db", default="/home/muk/projects/jennie/seulgi/data/seulgi.db")
-    parser.add_argument("--irene-db", default="/home/muk/projects/jennie/irene/data/irene_dkg_migration.db")
+    parser.add_argument("--seulgi-db", default="/home/muk/projects/nexus/seulgi/data/seulgi.db")
+    parser.add_argument("--irene-db", default="/home/muk/projects/nexus/irene/data/irene_dkg_migration.db")
     parser.add_argument("--target", type=int, required=True,
                         help="How many headlines to sample.")
     parser.add_argument("--concurrency", type=int, default=15)

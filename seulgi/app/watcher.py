@@ -2,11 +2,11 @@
 Seulgi news site watcher — scraper-backed polling.
 
 Instead of running a headless Chromium tab, each SiteWatcher periodically
-calls the jennie scraper container (POST /fetch) to extract links.
+calls the ujin scraping service (POST /scrape, mode=links) to extract links.
 
 Flow:
   1. Poll the scraper every ~change_wait_seconds (Gaussian jitter ±20%).
-  2. Extract links from resp.extraction.links.
+  2. Extract links from resp.links.
   3. Filter junk, dedup against _seen set.
   4. Emit new RawHeadline objects into the shared queue.
   5. On repeated failures, enter exponential backoff (up to 30 min).
@@ -20,7 +20,15 @@ Recovery model:
 This means a temporary scraper outage no longer permanently kills watchers.
 
 The scraper container address is read from SCRAPER_URL env var
-(default: http://scraper:9000).
+(default: http://nexus-ujin:8901).
+
+nexus extraction (2026-07-25): the old in-tree scraper (v1, :9000) was
+replaced by ujin (services/ujin submodule). Two call sites moved:
+  POST /fetch          → POST /scrape with {"mode": "links"}
+  POST /twitter/search → POST /social/twitter   (identical request/response)
+ujin returns links at the top level (`data["links"]`) rather than nested
+under `data["extraction"]["links"]` as v1 did. Item fields (`url`, `text`)
+are unchanged; `tier` and `breaking_score` remain optional, as they were.
 """
 
 from __future__ import annotations
@@ -44,7 +52,7 @@ from profiler import prof
 
 logger = logging.getLogger(__name__)
 
-_SCRAPER_URL = os.getenv("SCRAPER_URL", "http://scraper:9000")
+_SCRAPER_URL = os.getenv("SCRAPER_URL", "http://nexus-ujin:8901")
 
 # Exponential backoff sequence (seconds) applied after max_failures are hit.
 # Each additional bout of failures moves one level up; success resets to 0.
@@ -180,7 +188,7 @@ def _clean_url(url: str) -> str:
 
 class SiteWatcher:
     """
-    Watches a single news site by polling the jennie scraper container.
+    Watches a single news site by polling the nexus scraper container.
 
     Lifecycle:
         watcher = SiteWatcher(url="https://apnews.com", ...)
@@ -472,14 +480,16 @@ class SiteWatcher:
         work happens.
         """
         import hashlib
+        # ujin's ScrapeRequest takes {url, mode}; the v1 scraper's
+        # extract_links/extract_text booleans have no equivalent and are
+        # expressed by mode="links".
         payload = {
-            "url":           self._url,
-            "extract_links": True,
-            "extract_text":  False,
+            "url":  self._url,
+            "mode": "links",
         }
         try:
             async with self._session.post(
-                f"{self._scraper_url}/fetch",
+                f"{self._scraper_url}/scrape",
                 json=payload,
             ) as resp:
                 if resp.status >= 500:
@@ -494,8 +504,14 @@ class SiteWatcher:
 
         links = []
         try:
-            extraction = data.get("extraction") or {}
-            links = extraction.get("links") or []
+            # ujin returns links at the top level. The v1 scraper nested them
+            # under data["extraction"]["links"]. Accept both shapes so old
+            # test fixtures and a v1 instance still parse.
+            links = (
+                data.get("links")
+                or (data.get("extraction") or {}).get("links")
+                or []
+            )
         except Exception:
             pass
 
@@ -655,7 +671,9 @@ class TwitterAccountWatcher:
 
     async def _fetch_tweets(self) -> list[RawHeadline]:
         session = self._get_session()
-        url = f"{self._scraper_url}/twitter/search"
+        # ujin: /social/twitter — same TwitterRequest {username, count} and
+        # same SocialResponse {posts: [{url, text}]} as the v1 route.
+        url = f"{self._scraper_url}/social/twitter"
         payload = {"username": self._username, "count": 10}
         try:
             async with session.post(

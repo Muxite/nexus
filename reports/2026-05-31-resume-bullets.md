@@ -1,4 +1,4 @@
-# Jennie — Resume Bullets (paste-ready)
+# Nexus — Resume Bullets (paste-ready)
 
 **Generated:** 2026-05-31. Every number here traces to a citation in
 `2026-05-31-resume-achievements.md`. **No money/P&L/ROI/win-rate numbers** (excluded as

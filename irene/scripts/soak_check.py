@@ -18,7 +18,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB = "/home/muk/projects/jennie/irene/data/irene.db"
+DB = "/home/muk/projects/nexus/irene/data/irene.db"
 LOG = Path("/tmp/irene_soak_24h.log")
 
 

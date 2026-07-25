@@ -88,7 +88,7 @@ small and the panels are the primary surface.
 1. `pytest app/tests/test_dashboard_pages.py` — both new panel tests
    pass (empty-DB + seeded paths).
 2. Run `python3 -m app.dashboard.core` (or restart the container) and
-   `cat /home/muk/projects/jennie/irene/data/dashboard/market_info_status.txt`
+   `cat /home/muk/projects/nexus/irene/data/dashboard/market_info_status.txt`
    — verify the numbers match a manually-run sqlite query.
 3. **Failure-mode check:** simulate the cycle-22 Gamma break by
    stopping the container, manually setting `markets.updated_at` 2 days

@@ -105,7 +105,7 @@ Key non-findings:
 
 ## How to reproduce
 
-From `/home/muk/projects/jennie/`:
+From `/home/muk/projects/nexus/`:
 
 ```bash
 # Load API key

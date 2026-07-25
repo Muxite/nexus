@@ -16,7 +16,7 @@ busy_timeout, and silently abort in-flight `insert_trade` calls
 (B-WRITES root cause).
 
 Usage:
-    docker exec jennie-seulgi python /app/scripts/reset_cycle.py NEW_CYCLE_NAME
+    docker exec nexus-seulgi python /app/scripts/reset_cycle.py NEW_CYCLE_NAME
 """
 from __future__ import annotations
 

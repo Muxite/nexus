@@ -59,7 +59,7 @@ This single bug explains:
 2. After restart, **observe markets table repopulating**:
    ```python
    import sqlite3
-   db = sqlite3.connect('/home/muk/projects/jennie/irene/data/irene.db')
+   db = sqlite3.connect('/home/muk/projects/nexus/irene/data/irene.db')
    print(db.execute("SELECT COUNT(*) FROM markets WHERE active=1 AND volume_usdc > 0").fetchone())
    ```
    Expect non-zero within one 2-minute poll cycle.

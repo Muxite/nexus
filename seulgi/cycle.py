@@ -41,7 +41,7 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent           # the seulgi/ directory
-PROJECT_ROOT = REPO.parent                       # /home/muk/projects/jennie
+PROJECT_ROOT = REPO.parent                       # /home/muk/projects/nexus
 ENV_FILE = REPO / ".env"
 
 
@@ -93,7 +93,7 @@ def _bot_is_running() -> bool:
         ["docker", "ps", "--format", "{{.Names}}"],
         cwd=PROJECT_ROOT, capture_output=True, text=True,
     )
-    return "jennie-seulgi" in out.stdout
+    return "nexus-seulgi" in out.stdout
 
 
 def _wait_for_bot_ready(timeout: float = 90.0) -> bool:

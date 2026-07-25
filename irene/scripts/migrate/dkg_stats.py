@@ -379,7 +379,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
         "--db",
-        default="/home/muk/projects/jennie/irene/data/irene_dkg_migration.db",
+        default="/home/muk/projects/nexus/irene/data/irene_dkg_migration.db",
     )
     parser.add_argument("--batch-id", default=None,
                         help="Defaults to the most recent batch.")

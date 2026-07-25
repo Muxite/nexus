@@ -28,7 +28,7 @@ from app.db import DB, IreneDBPathError, _assert_not_seulgi
     "bad_path",
     [
         "/data/seulgi.db",
-        "/home/muk/projects/jennie/seulgi/data/seulgi.db",
+        "/home/muk/projects/nexus/seulgi/data/seulgi.db",
         "seulgi.db",
         "/var/lib/seulgi/whatever.db",
         "",
@@ -43,7 +43,7 @@ def test_path_assertion_rejects_seulgi_shapes(bad_path):
     "ok_path",
     [
         "/data/irene.db",
-        "/home/muk/projects/jennie/irene/data/irene.db",
+        "/home/muk/projects/nexus/irene/data/irene.db",
         "irene.db",
         ":memory:",
     ],

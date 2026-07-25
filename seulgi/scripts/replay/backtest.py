@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Optional
 
 # Resolve seulgi/app imports whether invoked via `-m seulgi.scripts.replay.backtest`
-# (cwd=jennie) or `-m scripts.replay.backtest` (cwd=seulgi).
+# (cwd=nexus) or `-m scripts.replay.backtest` (cwd=seulgi).
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _SEULGI = os.path.normpath(os.path.join(_HERE, "..", ".."))
 sys.path.insert(0, os.path.join(_SEULGI, "app"))

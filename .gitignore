@@ -1,0 +1,112 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Credentials — never commit
+.env
+*.env
+
+# Python caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+
+# Build / dist
+dist/
+build/
+*.egg-info/
+*.egg
+
+# Type-checker / linter caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+
+# Coverage
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# Misc dev scripts
+actvenv.bash
+
+# Runtime logs
+*.log
+irene/logs/
+
+# Runtime data — SQLite DBs, dashboards, ChromaDB, plots, and the sandbox
+# backtest outputs (irene/data/sandbox/{runs,cache,sets,eval,verdicts}).
+# These are generated/reproducible and large (irene.db ~6.7GB). The sandbox
+# *source* is tracked separately under irene/sandbox + irene/scripts/sandbox.
+# See data/README.md for how backtest data is shared between the two agents.
+seulgi/data/
+irene/data/
+
+# Seulgi snapshot zips — large binaries, manually backed up
+seulgi/snapshots/*.zip
+.claude/scheduled_tasks.lock
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Any sidecar/derived copy of a SQLite DB. `*.db` alone does NOT match
+# names like `seulgi.db.bak` or `irene.db.pre-cycle24` — a 4.8GB
+# seulgi.db.bak slipped past it, got staged, went dangling, and then
+# `git fsck --lost-found` materialised it into .git/lost-found where it
+# sat unreclaimable by `git gc`. Match anything suffixed after `.db`.
+*.db.*
+*.sqlite
+*.sqlite3
+*.db.bak
+
+# Seulgi snapshots — SQLite backups + dashboard captures. These were
+# stripped from history during the nexus extraction (246MB across 1139
+# blobs, ~89% of the repo's weight) because chroma stores are derived
+# artifacts. See data/README.md and docs/rename-from-jennie.md.
+seulgi/snapshots/*/
+!seulgi/snapshots/.gitkeep
+
+# Loose root-level dashboard/report files at seulgi/ — historical
+# location only. New docs live under docs/, handoffs/, reports/,
+# questions/, changelogs/. Block the old uppercase pattern so a stray
+# REPORT_*.md doesn't get committed back into root.
+seulgi/REPORT_*.md
+seulgi/HANDOFF_*.md
+
+# Generated renders. The scripts that produce these are tracked; the PNGs
+# are reproducible output and total ~53MB, which is heavier than the whole
+# packed history. Rerun the reel scripts to regenerate.
+reports/linkedin-reel/*.png
+reports/linkedin-reel/_panels/
+seulgi/ARCHITECTURE.md
+seulgi/CHANGES.md
+seulgi/CYCLE_METHODOLOGY.md
+seulgi/DECISION_FUNNEL.md
+seulgi/ERRORS_AND_FIXES.md
+seulgi/PITFALLS.md
+seulgi/QUANT_GUIDE.md
+seulgi/QUANT_QUESTIONS.md
+seulgi/QUERIES.md
+
+# Replay harness output — Markdown reports + test DBs land in /tmp,
+# never in repo. Guard against accidental local writes.
+seulgi/scripts/replay/*.db
+seulgi/scripts/replay/*.db-*
+seulgi/scripts/replay/reports/
+
+# Phase-D verify cron outputs (host /tmp; never repo).
+phase_d_verify_*.md
+phase_d_verify_*.log
+
+# Claude Code worktree workspaces
+.claude/worktrees/

@@ -16,7 +16,7 @@ import sqlite3
 from datetime import datetime, timezone
 
 
-DEFAULT_DB = "/home/muk/projects/jennie/irene/data/irene.db"
+DEFAULT_DB = "/home/muk/projects/nexus/irene/data/irene.db"
 DEFAULT_LIMIT = 100
 
 

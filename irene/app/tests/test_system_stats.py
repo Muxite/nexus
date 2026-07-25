@@ -155,7 +155,7 @@ async def test_page_renders_latest_per_container(db_ready, tmp_path):
             "INSERT INTO container_stats "
             "(ts, container, cpu_pct, mem_bytes, mem_limit_bytes) "
             "VALUES (?, ?, ?, ?, ?)",
-            ("2026-05-27T10:00:30+00:00", "jennie-scraper-v2", 31.7,
+            ("2026-05-27T10:00:30+00:00", "nexus-ujin", 31.7,
              178 << 20, 4 << 30),
         )
     dash = Dashboard(data_dir=tmp_path, db=db_ready, interval_secs=60)
@@ -166,7 +166,7 @@ async def test_page_renders_latest_per_container(db_ready, tmp_path):
     assert "12.4" in body
     assert "  5.0" not in body  # leading space avoids matching '12.4'-suffix
     assert "irene" in body
-    assert "jennie-scraper-v2" in body
+    assert "nexus-ujin" in body
     assert "31.7" in body
 
 

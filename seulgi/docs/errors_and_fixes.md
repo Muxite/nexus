@@ -134,7 +134,7 @@ c.execute("SELECT ... WHERE decided_at >= ?", (last_hour,))
 the host file was edited. New variants don't appear in the
 "built N engines" log line; thresholds remain at the old values.
 
-**Detection signal**: `docker exec jennie-seulgi wc -l
+**Detection signal**: `docker exec nexus-seulgi wc -l
 /config/config.yaml` shows a smaller line count than `wc -l
 seulgi/config.yaml`. Same inode binding looks valid but content
 differs.

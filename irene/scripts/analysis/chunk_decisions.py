@@ -10,7 +10,7 @@ Don't change it without updating downstream analysis docs that quote
 "N decisions per chunk".
 
 Usage:
-    cd /home/muk/projects/jennie/irene
+    cd /home/muk/projects/nexus/irene
     PYTHONPATH=. python3 -m scripts.analysis.chunk_decisions \\
         --output-dir data/decisions_chunks
 

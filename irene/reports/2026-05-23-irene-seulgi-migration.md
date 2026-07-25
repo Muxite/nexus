@@ -165,11 +165,11 @@ PYTHONPATH=. python3 -m scripts.lint.no_facts_in_trade_path
 
 # Run the importer (idempotent — safe to repeat)
 PYTHONPATH=. python3 -m scripts.migrate.from_seulgi \
-    --seulgi-db /home/muk/projects/jennie/seulgi/data/seulgi.db \
-    --irene-db /home/muk/projects/jennie/irene/data/irene.db
+    --seulgi-db /home/muk/projects/nexus/seulgi/data/seulgi.db \
+    --irene-db /home/muk/projects/nexus/irene/data/irene.db
 
 # Post-import sanity
-python3 -c "import sqlite3; c=sqlite3.connect('file:/home/muk/projects/jennie/irene/data/irene.db?mode=ro',uri=True); \
+python3 -c "import sqlite3; c=sqlite3.connect('file:/home/muk/projects/nexus/irene/data/irene.db?mode=ro',uri=True); \
   print('articles', c.execute(\"SELECT COUNT(*) FROM articles WHERE source='seulgi_migration'\").fetchone()[0]); \
   print('markets', c.execute('SELECT COUNT(*) FROM markets').fetchone()[0])"
 ```

@@ -15,7 +15,7 @@ import datetime as dt
 import sqlite3
 from typing import Optional
 
-DEFAULT_DB = "/home/muk/projects/jennie/irene/data/irene.db"
+DEFAULT_DB = "/home/muk/projects/nexus/irene/data/irene.db"
 
 
 def _con(path: str) -> sqlite3.Connection:

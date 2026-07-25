@@ -85,9 +85,13 @@ class DBSection(BaseModel):
 
 
 class ScraperSection(BaseModel):
-    """The ONLY thing shared with seulgi — an HTTP service we both poll."""
+    """The ONLY thing shared with seulgi — an HTTP service we both poll.
 
-    url: str = "http://scraper:9000"
+    nexus: this is `services/ujin` (submodule), served by the root
+    docker-compose as `nexus-ujin` on :8901.
+    """
+
+    url: str = "http://nexus-ujin:8901"
     timeout_seconds: float = Field(default=8.0, gt=0)
 
 
@@ -152,7 +156,8 @@ class IngestSection(BaseModel):
     """News ingest poller — feed + HTML site URLs and cadence.
     See stages/ingest.py.
 
-    Cycle 4: irene migrated from scraper:9000 to jennie-scraper-v2:9001.
+    Cycle 4: irene migrated from the v1 scraper (:9000) to v2 (:9001).
+    nexus (2026-07-25) moved again, to ujin on :8901.
     The /feed endpoint is shape-compatible; new in v2 is /scrape which
     extracts headline link-sets from HTML homepages (trafilatura
     boilerplate-stripped). `html_sites` drives the new HTML watcher

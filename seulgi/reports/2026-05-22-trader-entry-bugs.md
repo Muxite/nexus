@@ -238,10 +238,10 @@ Cross-cues for sibling agents:
 * §8 ↔ A0.1 (empirical 6.6M:498 ratio).
 
 Files (absolute):
-* `/home/muk/projects/jennie/seulgi/app/trader.py` (600–1108)
-* `/home/muk/projects/jennie/seulgi/app/ai.py` (650–742)
-* `/home/muk/projects/jennie/seulgi/app/engine.py` (199–250, 769–805)
-* `/home/muk/projects/jennie/seulgi/app/db.py` (991–1205, 1461–1525)
-* `/home/muk/projects/jennie/seulgi/app/simulate.py` (27–37, 65–189)
-* `/home/muk/projects/jennie/seulgi/app/config.py` (260–271)
-* `/home/muk/projects/jennie/seulgi/config.yaml` (488–660)
+* `/home/muk/projects/nexus/seulgi/app/trader.py` (600–1108)
+* `/home/muk/projects/nexus/seulgi/app/ai.py` (650–742)
+* `/home/muk/projects/nexus/seulgi/app/engine.py` (199–250, 769–805)
+* `/home/muk/projects/nexus/seulgi/app/db.py` (991–1205, 1461–1525)
+* `/home/muk/projects/nexus/seulgi/app/simulate.py` (27–37, 65–189)
+* `/home/muk/projects/nexus/seulgi/app/config.py` (260–271)
+* `/home/muk/projects/nexus/seulgi/config.yaml` (488–660)

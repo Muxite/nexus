@@ -22,7 +22,7 @@ live shape (cycle 31)
 ═════════════════════
 
    ┌─────────────────────────────┐
-   │  jennie-scraper-v2:9001     │  shared HTTP, ~120 sources (RSS + combined HTML + sitemap_news)
+   │  nexus-ujin:9001     │  shared HTTP, ~120 sources (RSS + combined HTML + sitemap_news)
    │   /feed  /scrape  /healthz  │
    └──────────────┬──────────────┘
                   │ jittered poll
@@ -148,14 +148,14 @@ Schema DDL is owned by each stage's `register_schema()` call; the registry lives
 
 | Service | Use | Endpoints | Rate-limit behaviour | Failure mode | Retry / fallback |
 |---|---|---|---|---|---|
-| `jennie-scraper-v2:9001` | News ingestion | `/feed?source=…`, `/scrape?source=…&mode=combined`, `/healthz` | none documented; we jitter per-feed | HTTP error / timeout | logged + skipped; next poll picks up |
+| `nexus-ujin:9001` | News ingestion | `/feed?source=…`, `/scrape?source=…&mode=combined`, `/healthz` | none documented; we jitter per-feed | HTTP error / timeout | logged + skipped; next poll picks up |
 | `gamma-api.polymarket.com` | Market discovery + metadata | `/markets?active=true&closed=false&limit=…&offset=…` | not formally documented (`research_questions.md#B4`) | 5xx / timeout / shape change | logged + per-poll skip; embeddings retained |
 | `clob.polymarket.com` | Live mid prices | `/midpoint?token_id=<id>`, internally via `app/clob.py` | not formally documented | `None` mid when token is dark (post-resolution); recoverable errors → `None` | `closer.py` `skip_on_missing_mid=True` holds the trade; cycle-7 auto-close fires from `markets._deactivate_missing` instead |
 | `openrouter.ai/api/v1` | LLM direction + extraction | `/chat/completions`, `/key` (budget poll) | provider-side; we use budget polling + 402-streak watcher | 402 (out of credit) → `budget_paused` flag, NEUTRAL short-circuit; parse error → `llm_parse_failures` row | NEUTRAL → trade rejected at direction gate (no false fires); call cached by `prompt_sha` on success |
 | ChromaDB (local) | News freshness / dedupe | embedded library at `irene/data/news_chroma/` | n/a (local) | missing collection → all-BREAKING degrade mode | intentional dev fallback |
 | sentence-transformers | Article + market embeddings | local model | n/a | model load error → app exits at boot | n/a — boot dependency |
 
-**No shared cache** with seulgi — separate Gamma poller, separate CLOB client, separate Chroma store, separate OpenRouter budget. The only shared external dependency is `jennie-scraper-v2:9001`, which is read-only.
+**No shared cache** with seulgi — separate Gamma poller, separate CLOB client, separate Chroma store, separate OpenRouter budget. The only shared external dependency is `nexus-ujin:9001`, which is read-only.
 
 ---
 

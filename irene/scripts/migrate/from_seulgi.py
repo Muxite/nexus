@@ -530,11 +530,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--seulgi-db",
-        default="/home/muk/projects/jennie/seulgi/data/seulgi.db",
+        default="/home/muk/projects/nexus/seulgi/data/seulgi.db",
     )
     parser.add_argument(
         "--irene-db",
-        default="/home/muk/projects/jennie/irene/data/irene.db",
+        default="/home/muk/projects/nexus/irene/data/irene.db",
     )
     parser.add_argument(
         "--limit", type=int, default=None,

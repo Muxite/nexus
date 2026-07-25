@@ -156,7 +156,7 @@ docker logs irene --since 24h 2>&1 | grep -c "clob.polymarket.com/midpoint"
 # Confirm State 1/2 has no actionable rows
 python3 -c "
 import sqlite3
-db = sqlite3.connect('/home/muk/projects/jennie/irene/data/irene.db')
+db = sqlite3.connect('/home/muk/projects/nexus/irene/data/irene.db')
 cur = db.cursor()
 cur.execute('''
   SELECT COUNT(*) FROM trades t

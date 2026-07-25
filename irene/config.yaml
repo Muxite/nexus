@@ -11,10 +11,13 @@ db:
   path: /data/irene.db
 
 scraper:
-  # Cycle 4: switched from v1 (scraper:9000) to v2 (jennie-scraper-v2:9001).
+  # Cycle 4: switched from v1 (scraper:9000) to v2 (:9001).
   # v2 keeps /feed shape-compatible and adds /scrape for HTML headline
   # extraction with trafilatura boilerplate stripping.
-  url: http://jennie-scraper-v2:9001
+  # nexus extraction (2026-07-25): v2 is superseded by ujin (services/ujin),
+  # which is a strict superset — same ScrapeRequest/FeedRequest models, and
+  # mode=links/combined are both native. Only the host:port changed.
+  url: http://nexus-ujin:8901
   timeout_seconds: 12
 
 openrouter:

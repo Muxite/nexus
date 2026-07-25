@@ -9,7 +9,7 @@ record). Each cycle's per-cycle data is also archived to
 durable record per cycle even if we later truncate live tables.
 
 Usage:
-    cd /home/muk/projects/jennie/irene
+    cd /home/muk/projects/nexus/irene
     # Snapshot a specific cycle:
     PYTHONPATH=. python3 -m scripts.analysis.snapshot_cycle --cycle-id 20
 

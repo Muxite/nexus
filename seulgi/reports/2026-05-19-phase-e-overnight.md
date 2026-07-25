@@ -2,7 +2,7 @@
 
 **Window**: 2026-05-19T10:13 UTC → 2026-05-19T18:33 UTC (8h post-restart)
 **Live commits at start**: `86825bc` (E.9 docs + backtest), `7fad922` (E.9b cluster_factor fix), `2f445c7` (E.9 `min_edge` 0.03 → 0.015)
-**Container**: `jennie-seulgi`, restarted 10:13 UTC, Up 8h continuously
+**Container**: `nexus-seulgi`, restarted 10:13 UTC, Up 8h continuously
 **Bankroll**: $800 baseline; drift **+$0.11 throughout**; 0 open positions
 
 ---

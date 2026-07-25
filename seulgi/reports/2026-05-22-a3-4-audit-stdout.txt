@@ -1,5 +1,5 @@
 # paper_accuracy_audit
-db=/home/muk/projects/jennie/seulgi/data/seulgi.db
+db=/home/muk/projects/nexus/seulgi/data/seulgi.db
 since=2026-04-22T00:00:00+00:00 until=2026-05-22T23:42:57.069663+00:00
 n_closed_trades=501
 close_reason_counts={'TRAIL': 67, 'TP': 135, 'engine_retired': 197, 'cycle_reset': 58, 'SL': 37, 'TIMEOUT_BLEED': 3, 'RESOLVE_LOSS': 4}

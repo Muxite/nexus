@@ -17,7 +17,7 @@ FILENAME = "system_stats.png"
 # renders. Anything not listed falls back to the default cycle.
 _COLORS = {
     "irene":             "#5cb085",
-    "jennie-scraper-v2": "#6aa3d4",
+    "nexus-ujin": "#6aa3d4",
 }
 
 

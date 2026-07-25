@@ -146,7 +146,7 @@ Once both are done, the master-plan §"P5 — Cutover candidates" gate kicks in:
 
 ```bash
 PYTHONPATH=. python3 -m scripts.dkg.run_link_backfill \
-    --irene-db /home/muk/projects/jennie/irene/data/irene.db
+    --irene-db /home/muk/projects/nexus/irene/data/irene.db
 
 # Inspect the top of the distribution
 python3 -c "import sqlite3; c=sqlite3.connect('file:data/irene.db?mode=ro',uri=True); \

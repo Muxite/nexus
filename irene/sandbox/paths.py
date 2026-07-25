@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-REPO_ROOT = "/home/muk/projects/jennie"
+REPO_ROOT = "/home/muk/projects/nexus"
 DB_PATH = os.path.join(REPO_ROOT, "irene/data/irene.db")
 
 PKG_ROOT = os.path.join(REPO_ROOT, "irene/sandbox")

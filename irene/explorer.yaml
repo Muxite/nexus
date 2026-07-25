@@ -23,7 +23,7 @@ db:
   path: /data/irene.db
 
 scraper:
-  url: http://jennie-scraper-v2:9001
+  url: http://nexus-ujin:9001
   timeout_seconds: 12
 
 openrouter:

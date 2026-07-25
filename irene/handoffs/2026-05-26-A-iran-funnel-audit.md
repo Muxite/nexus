@@ -14,13 +14,13 @@ This document captures the SQL evidence behind that observation so future sessio
 
 ## Reproducible queries
 
-Run from anywhere on the host (the DB is bind-mounted at `/home/muk/projects/jennie/irene/data/irene.db`).
+Run from anywhere on the host (the DB is bind-mounted at `/home/muk/projects/nexus/irene/data/irene.db`).
 
 ### Q1 — Iran-themed article count
 
 ```python
 import sqlite3
-db = sqlite3.connect('/home/muk/projects/jennie/irene/data/irene.db')
+db = sqlite3.connect('/home/muk/projects/nexus/irene/data/irene.db')
 db.execute("""SELECT COUNT(*) FROM articles
   WHERE ingested_at >= datetime('now','-24 hours')
   AND (title LIKE '%Iran%' OR title LIKE '%missile%' OR title LIKE '%Tehran%'

@@ -1,7 +1,7 @@
-# Jennie — Resume Achievements (evidence-backed)
+# Nexus — Resume Achievements (evidence-backed)
 
 **Generated:** 2026-05-31
-**What this is:** A catalog of resume-worthy engineering achievements from the Jennie
+**What this is:** A catalog of resume-worthy engineering achievements from the Nexus
 project (a news-driven Polymarket paper-trading bot), each tied to a verifiable source —
 a `file:line`, a commit SHA, a committed report, or a read-only query against the live
 databases. **Profitability is deliberately out of scope** (the system is not profitable;
@@ -304,7 +304,7 @@ The deployment is split deliberately: a **root `docker-compose.yml`** owns the s
 surface (tkinter GUI via noVNC :6080, FastAPI trading server :8000, React frontend
 :3000, scraper v1 :9000, scraper-v2 :9001, plus `test`/`build-only` profiles), while
 each bot runs from its **own standalone compose file** joined to a shared external
-`jennie_default` network. This boundary is a hard rule ("standalone only — no root
+`nexus_default` network. This boundary is a hard rule ("standalone only — no root
 compose edits ever") born from the dual-writer incident (B4): bot lifecycle changes can
 never accidentally resurrect a second writer from the root file.
 - `docker-compose.yml`, `irene/docker-compose.yml`, `seulgi/docker-compose.yml`. *(verified)*

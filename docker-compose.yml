@@ -1,0 +1,62 @@
+# nexus — shared services for the prediction-market agents.
+#
+# This file defines ONLY the shared scraping service and, implicitly, the
+# `nexus_default` network that both agents attach to. It deliberately does
+# NOT define `irene` or `seulgi`.
+#
+# Why: on 2026-05-21 a seulgi container started from the root compose and
+# another started from seulgi/docker-compose.yml ran simultaneously against
+# the same data/seulgi.db and data/news_chroma. That corrupted the chromadb
+# HNSW index. The fix was "one canonical container per agent, started from
+# its own compose file" — see the note at the top of seulgi/docker-compose.yml.
+# Re-adding agent services here would reintroduce that hazard.
+#
+# Startup order:
+#
+#   docker compose up -d ujin                             # shared scraper + network
+#   docker compose -f irene/docker-compose.yml up -d irene
+#   docker compose -f seulgi/docker-compose.yml up -d seulgi
+#
+# Both agents declare `nexus_default` as an external network, so `ujin` must
+# be up first. Project directory name must be `nexus` for the implicit
+# default network to resolve to `nexus_default`.
+
+services:
+
+  # ── Shared scraping service ────────────────────────────────────────────────
+  # ujin (services/ujin, submodule) supersedes the old services/scraper and
+  # services/scraper-v2. It is a strict superset of both: irene consumes
+  # POST /scrape (mode=links, mode=combined) and POST /feed; seulgi consumes
+  # POST /feed and GET /health. All four are native ujin routes.
+  ujin:
+    build:
+      context: ./services/ujin
+      target: ujin
+    image: nexus-ujin:latest
+    container_name: nexus-ujin
+    command: ["scrape-serve", "--host", "0.0.0.0", "--port", "8901"]
+    environment:
+      # News-trading scoring — both agents rank on breaking-news signal, so
+      # this is on by default here (ujin's own compose leaves it generic).
+      - UJIN_BREAKING_SCORER=${UJIN_BREAKING_SCORER:-1}
+      # Optional: enables the Brave-backed social legs (/social/*, /trends/*).
+      - SEARCH_API_KEY=${SEARCH_API_KEY:-}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    ports:
+      - "8901:8901"
+    init: true              # reap obscura/browser <defunct> subprocesses
+    env_file:
+      - path: ./.env
+        required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8901/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"

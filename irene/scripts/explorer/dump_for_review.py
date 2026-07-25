@@ -20,8 +20,8 @@ from collections import Counter
 from irene.scripts.explorer._common import connect_readonly
 
 
-DEFAULT_DB = "/home/muk/projects/jennie/irene/data/irene.db"
-DEFAULT_OUT_DIR = "/home/muk/projects/jennie/irene/data/explorer"
+DEFAULT_DB = "/home/muk/projects/nexus/irene/data/irene.db"
+DEFAULT_OUT_DIR = "/home/muk/projects/nexus/irene/data/explorer"
 
 COLS = [
     "id", "t0_iso", "capture_status",

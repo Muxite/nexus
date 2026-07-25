@@ -22,7 +22,7 @@ from typing import Optional
 
 from scripts.replay.accuracy import TOLERANCE_DEFAULT, run_inproc
 
-DEFAULT_DB = "/home/muk/projects/jennie/irene/data/irene.db"
+DEFAULT_DB = "/home/muk/projects/nexus/irene/data/irene.db"
 
 
 def main(argv: Optional[list[str]] = None) -> int:

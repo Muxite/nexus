@@ -53,7 +53,7 @@ runs to T+4h.
 # Trades count + per-engine breakdown over the F1 window
 python3 - << 'PY'
 import sqlite3
-con = sqlite3.connect('file:/home/muk/projects/jennie/seulgi/data/seulgi.db?mode=ro', uri=True)
+con = sqlite3.connect('file:/home/muk/projects/nexus/seulgi/data/seulgi.db?mode=ro', uri=True)
 con.row_factory = sqlite3.Row
 window_start = '2026-05-23T23:58'
 n = con.execute(

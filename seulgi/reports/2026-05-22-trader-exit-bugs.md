@@ -2,7 +2,7 @@
 
 Scope: `seulgi/app/trader.py::monitor_positions` (and the COLD_CULL pre-pass).
 Companion: A0.3 wrote the module-level spec; A0.1 audits realized PnL in parallel.
-DB sampled: `/home/muk/projects/jennie/seulgi/data/seulgi.db` (live, offline).
+DB sampled: `/home/muk/projects/nexus/seulgi/data/seulgi.db` (live, offline).
 
 ## TL;DR (highest impact first)
 

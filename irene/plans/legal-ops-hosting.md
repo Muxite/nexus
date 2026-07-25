@@ -21,7 +21,7 @@ legal/tax side is confirmed.
 
 This plan is **gated** on three pieces of user input (jurisdiction
 confirm, preferred CEX, go-live date) and on resolution of the
-**dual-container hazard** from auto-memory (`jennie-seulgi` root
+**dual-container hazard** from auto-memory (`nexus-seulgi` root
 compose vs `seulgi` standalone, both writing the same DB —
 `architecture.md:318-319` bakes a "standalone-only" rule for irene,
 but VPS migration is exactly when that hazard can re-emerge).

@@ -1,6 +1,6 @@
 # Market-tracking audit (2026-05-26T21:17:42.477969+00:00)
 
-DB: `/home/muk/projects/jennie/irene/data/irene.db`
+DB: `/home/muk/projects/nexus/irene/data/irene.db`
 ## markets table state
 
 - **TOTAL**: 11064

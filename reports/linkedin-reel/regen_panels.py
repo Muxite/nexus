@@ -16,7 +16,7 @@ import sys
 
 import aiosqlite
 
-ROOT = "/home/muk/projects/jennie"
+ROOT = "/home/muk/projects/nexus"
 sys.path.insert(0, os.path.join(ROOT, "irene"))
 
 from app.dashboard.plots import per_gate_rejection, throughput_overlay  # noqa: E402
