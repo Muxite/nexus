@@ -1,4 +1,4 @@
-# Nexus
+# nexus
 
 Two paper-trading bots for Polymarket, a shared scraping service, and the full
 record of what they were built to test and what the data actually said.
