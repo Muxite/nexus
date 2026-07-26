@@ -1,83 +1,213 @@
 # nexus
 
-Prediction-market research: two paper-trading agents for Polymarket, a shared
-scraping service, and the full cycle-by-cycle record of how they were built.
+Two paper-trading bots for Polymarket, a shared scraping service, and the full
+record of what they were built to test and what the data actually said.
 
-Everything here is one project. The two agents attack the same problem —
-turning breaking news into a probability estimate faster and better than the
-market — from different directions, and they share a scraper, a data layout,
-and a methodology.
+The headline result is a negative one. There is no reliable directional edge in
+trading prediction markets off breaking news at retail latency. That conclusion
+is the product here, and most of this repository exists to show the work behind
+it.
+
+![Dynamic Knowledge Graph](docs/images/dkg-graph.png)
+
+That picture is the knowledge graph irene built while looking for the edge.
+Every white dot in the middle is a news item, every coloured dot in the ring is
+an entity it mentioned, and every orange dot on the outside is a Polymarket
+market. 112,202 nodes and 153,875 edges, rendered directly from the live
+database by `reports/linkedin-reel/make_dkg_graph.py`.
+
+## The two bots
+
+**seulgi** came first. It reads news, embeds each headline with SBERT, matches
+it against an in-memory index of Polymarket markets using cosine similarity,
+asks an LLM for a direction, and paper-trades the result through a stack of
+filters.
+
+**irene** is a clean-slate rebuild that replaces the cosine matcher with a
+dynamic knowledge graph. Instead of asking "is this headline numerically close
+to this market question", it extracts entities and events from the article,
+resolves them into a graph, and matches on structure. Everything else was
+rebuilt too: its own database, its own config, its own dashboard, its own
+gates.
+
+They ran side by side on purpose. seulgi is the working baseline the newer
+approach had to beat.
+
+## How irene is put together
+
+![irene architecture](docs/images/architecture.png)
+
+One async pub/sub bus, strict JSON payloads between stages, and a rule that no
+gate may ever skip silently. Every rejected candidate writes a row explaining
+which gate stopped it and why. That rule is the reason the analysis further
+down was possible at all.
+
+Storage is a single SQLite database in WAL mode, 34 tables, currently about
+6.8 GB. The dashboard renders 15 pages from 10 plot modules against that same
+database.
+
+## What the funnel looks like
+
+![decision funnel](docs/images/decision-funnel.png)
+
+176,605 articles came in. 1,475 paper trades came out, which is about a third
+of one percent of the gate decisions evaluated. The single biggest filter is
+the LLM being asked one question with three possible answers, yes, no, or
+unclear, and answering unclear most of the time.
+
+That one-token answer format was a deliberate cost decision. It cut the LLM
+bill by roughly two orders of magnitude, and the savings were spent on
+evaluating five times more candidates instead. Total spend on every LLM call
+irene has ever made is about 39 dollars.
+
+## What the data said
+
+![edge is zero](docs/images/edge-zero.png)
+
+The thesis was "speed, not prediction". Read decisive news, form a view faster
+than the market reprices, take the other side. It was tested in stages and it
+failed in stages.
+
+A 54-run backtest sweep found exactly one profitable configuration. On 3.4
+times more data that winner turned into a 9.2 percent loss. It had looked good
+because six of its nine wins were the same Iran and oil story wearing different
+headlines.
+
+Then the losses were decomposed. Roughly 99 percent of the residual loss is
+friction, meaning fees and spread, sitting on top of a directional signal of
+about zero. An oracle exit, one that knows the future and sells at the best
+possible moment, still loses money.
+
+The obvious next thought is to stop paying the spread and quote instead. That
+fails differently. Post-news repricing runs about 6.1 cents per share against a
+median half-spread of half a cent, so the market moves roughly twelve times
+deeper than you can quote. Both sides of the book are closed at retail latency.
+
+![what irene captures](docs/images/market-moves.png)
+
+This is the clearest picture of why. Six real repricings, each lined up on the
+moment the headline broke. Look at how many of them were already moving before
+the dashed line. News does not move prediction markets so much as it increments
+a narrative that was already in motion, and a model reading headlines is
+structurally last in line.
+
+There is one lane that survived. Slow, document-heavy catalysts, where
+repricing is delayed because somebody has to actually read a filing or a
+ruling. That is the only place where reading beats speed.
+
+## What actually came out of it
+
+![dataset growth](docs/images/dataset-growth.png)
+
+The trading thesis failed, but the machine built to test it kept running, and
+what it accumulated turned out to be more valuable than the trades. Nearly 4.8
+million order-book observations across 274,521 gated captures, every row
+labeled with its gate status, the market state at the time, and the model's
+verdict and reasoning.
+
+It costs about two dollars a day to run. The eight-day gap in that curve is a
+container outage caused by a missing file in a Dockerfile, which it recovered
+from without intervention.
+
+## Live operation
+
+The system is still running. These two panels were regenerated from the live
+database while writing this README.
+
+![throughput](docs/images/throughput.png)
+
+![gate rejections](docs/images/gate-rejections.png)
+
+## seulgi, and what it taught
+
+![calibration](docs/images/calibration.png)
+
+seulgi's most useful contribution was a measurement rather than a profit. Its
+model reported a confidence number with every prediction, and that number was
+worse than useless: it correlated negatively with whether the prediction turned
+out to be right. Fitting Platt scaling and isotonic regression per direction
+flipped the sign and roughly halved the Brier score.
+
+The lesson generalised. A model's self-reported confidence is a raw output, not
+a probability, and it has to be measured against outcomes before anything is
+allowed to depend on it.
+
+seulgi also supplied most of irene's hard-won rules. The runtime assertion in
+`irene/app/db.py` that refuses to open a database path containing the word
+seulgi exists because two containers once wrote to the same chroma directory
+and corrupted the index.
+
+## Shared services
+
+`services/ujin` is a submodule pointing at
+[Muxite/ujin](https://github.com/Muxite/ujin), which handles fetching,
+extraction, RSS, sitemaps, per-host politeness policy, and social sources. Both
+bots talk to it over HTTP and neither imports it.
+
+That boundary is why ujin could replace the two earlier in-tree scrapers
+without either bot changing more than a hostname. irene uses `POST /scrape` and
+`POST /feed`. seulgi uses `POST /scrape`, `POST /social/twitter`, and
+`POST /feed`.
 
 ## Layout
 
 | Path | What it is |
-|------|-----------|
-| `seulgi/` | News-driven trading agent. Cosine similarity over a news corpus, cross-encoder reranking, learned-MLP matcher, LLM direction classifier. The older and more heavily cycled of the two. |
-| `irene/` | Clean-slate rebuild around a **dynamic knowledge graph**. Extracts entities and events from articles, resolves them into a graph, and matches markets against graph structure instead of raw cosine distance. |
-| `services/ujin` | Shared scraping service (submodule → [`Muxite/ujin`](https://github.com/Muxite/ujin)). Fetching, extraction, RSS, sitemaps, social sources, per-host policy. |
-| `reports/` | Presentation material — written results, retrospectives, and the generators that render them. |
-| `data/` | Convention for backtest data shared between agents. See `data/README.md`. |
-| `docs/` | Repo-level notes, including the extraction history. |
+|---|---|
+| `irene/` | The knowledge-graph bot. Start with `irene/architecture.md`. |
+| `seulgi/` | The cosine-similarity bot it was built to beat. |
+| `services/ujin` | Shared scraping service, as a submodule. |
+| `reports/` | Written results, the big retrospective, and the scripts that render every image above. |
+| `docs/` | Repo-level notes, including how this was extracted from its original repository. |
+| `data/` | Conventions for the runtime data, which is not tracked. |
 
-Each agent keeps its own `architecture.md`, `master-plan.md`, `config.yaml`,
-`cycles/`, `handoffs/`, and `reports/`. Those are the primary documentation —
-this README is only the map.
+Each bot keeps its own `architecture.md`, `master-plan.md`, `cycles/`,
+`handoffs/`, and `reports/`. Those are the real documentation. This file is
+just the map.
 
-## Why two agents
+The single best document in here is
+`reports/2026-06-12-irene-big-retrospective.md`, which goes through every
+hypothesis, what the evidence said, and which claims did not survive contact
+with more data.
 
-seulgi's matcher is cosine-similarity over embeddings. That works until it
-doesn't: two headlines about different entities can sit close together in
-vector space, and the model has no way to know that "Iran" in one and "Iran" in
-another refer to different events. irene was started as a parallel rebuild to
-attack that specific bottleneck with a knowledge graph, rather than patching
-seulgi's ranking in place.
-
-Keeping both is deliberate. seulgi is the working baseline the newer approach
-has to beat, and it holds the longer run of live cycle results.
-
-## Shared services
-
-Both agents consume the scraper over HTTP — never as an import — which is why
-the implementation could be swapped without touching agent code:
-
-| Agent | Endpoints used |
-|-------|----------------|
-| irene | `POST /scrape` (`mode=links`, `mode=combined`), `POST /feed` |
-| seulgi | `POST /feed`, `GET /health` |
-
-`services/ujin` supersedes the two earlier in-tree scrapers (`scraper` on
-:9000, `scraper-v2` on :9001). ujin is derived from them and is a strict
-superset — same request models, more routes, per-host policy, plugin-loadable
-scorers, and a job control plane.
-
-## Quickstart
+## Running it
 
 ```bash
-git clone --recurse-submodules git@github.com:Muxite/nexus.git
+git clone --recurse-submodules https://github.com/Muxite/nexus.git
 cd nexus
 
-docker compose up -d ujin                              # shared scraper (:8901)
+docker compose up -d ujin                              # shared scraper on :8901
 docker compose -f irene/docker-compose.yml  up -d irene
 docker compose -f seulgi/docker-compose.yml up -d seulgi
 ```
 
-Start `ujin` first: it creates the `nexus_default` network that both agents
-attach to as external. The directory must be named `nexus` for that network
-name to resolve.
+Start ujin first, because it creates the `nexus_default` network both bots
+attach to. The directory has to be named `nexus` for that network name to come
+out right.
 
-Each agent is started from **its own** compose file, never from the root one.
-Running an agent from two compose files at once corrupted a chromadb HNSW
-index on 2026-05-21; the root compose deliberately defines only shared
-services so that cannot happen again.
+Each bot is started from its own compose file and never from the root one. The
+root compose deliberately defines only shared services. Running a bot from two
+compose files at once is what corrupted that chroma index in May.
 
-### Submodule note
-
-ujin pins its own nested submodule (`obscura`) via an SSH URL. The repository
-is public, but anonymous `--recurse-submodules` clones need:
+ujin pins its own nested submodule over SSH. It is a public repository, but
+anonymous clones need this first:
 
 ```bash
 git config --global url."https://github.com/".insteadOf git@github.com:
 ```
+
+## Regenerating the images
+
+Everything above is rendered from the live database, not drawn by hand. The
+PNGs in `docs/images/` are downscaled copies of the full-resolution output.
+
+```bash
+python3 reports/linkedin-reel/make_dkg_graph.py   # the knowledge graph
+python3 reports/linkedin-reel/regen_panels.py     # live dashboard panels
+python3 reports/linkedin-reel/make_reel.py        # funnel, architecture, findings
+```
+
+These need a populated `irene/data/irene.db`, which is not in the repository
+because it is large and reproducible.
 
 ## Tests
 
@@ -86,46 +216,39 @@ docker compose -f irene/docker-compose.yml  --profile test run --rm irene-test
 docker compose -f seulgi/docker-compose.yml --profile test run --rm seulgi-test
 ```
 
-Current state — **irene 956 passed / 0 failed**, **seulgi 476 passed / 3 failed**
-(11 `live` tests deselected; they need running containers).
+irene is at 956 passing. seulgi is at 476 passing with 3 failures that predate
+the extraction and reproduce against the original source, two in chromadb
+behaviour and one in a debug CLI assertion. 11 tests marked `live` are
+deselected because they need running containers.
 
-The three seulgi failures predate the extraction and reproduce identically
-against the pre-migration source:
+One irene test, `test_stress_200_count_finishes_fast`, is a known flake. It
+runs 200 articles against a hard 30 second budget and fails on a loaded
+machine.
 
-| Test | Cause |
-|---|---|
-| `seulgi …test_news_memory.py::test_dissimilar_headline_not_republish` | chromadb behaviour under the installed 0.6.x. |
-| `seulgi …test_news_memory.py::test_size_increments_on_new_headline` | Same. |
-| `seulgi tests/test_debug_cli.py::test_inspect_engine_runs` | Assertion failure in the debug CLI inspector. |
+### A note on fixture dates
 
-### Known flake
+Market `end_date` values in test fixtures are computed relative to now, through
+`irene/app/tests/_dates.py`. They are never pinned to a literal.
 
-`irene scripts/tests/test_tracer.py::test_stress_200_count_finishes_fast` runs
-200 articles against a hard `timeout_seconds=30.0`. It fails on a loaded
-machine and passes on an idle one — wall-clock, not correctness.
+Four production paths compare `end_date` against the current time, so a fixed
+date silently changes meaning as the clock moves. The previous literal was
+written in May 2026, sat beyond the 180 day far-future threshold at the time,
+drifted inside it in July, and would have crossed into the 6 hour near-expiry
+buffer on 2026-12-30, breaking 80 tests on a day nobody would have connected to
+a code change. If you add a market fixture, use `open_end_date()` or
+`far_future_end_date()`.
 
-### Fixture dates are relative, deliberately
-
-Market `end_date` fixtures are computed from `datetime.now(timezone.utc)` via
-`app/tests/_dates.py`, never pinned. Four production paths read `end_date`
-against the current time, so a literal silently changes meaning as the clock
-moves: the old `'2026-12-31'` was written in May 2026 beyond the 180-day
-`far_future` threshold, drifted inside it on 2026-07-04, and would have fallen
-inside the 6-hour `min_hours_to_expiry` buffer on 2026-12-30 — breaking 71
-tests under `app/tests` plus 9 under `scripts/replay/tests`.
-
-If you add a market fixture, use `open_end_date()` or `far_future_end_date()`.
-
-`scripts/replay/tests` is in `testpaths`. It was not, which is why the replay
-half of that bomb went unnoticed — a plain `pytest` run collected 863 of 956
+`scripts/replay/tests` is included in `testpaths`. It was not, which is how
+half of that problem stayed hidden: a plain `pytest` run collected 863 of 956
 tests and reported green.
 
 ## History
 
-203 commits, all of them mine, spanning both agents from first scaffold to
-cycle 30. The tree was extracted from a larger multi-project repository; see
-`docs/rename-from-jennie.md` for what changed and what the old names were.
+209 commits, all mine, covering both bots from first scaffold through cycle 30.
+The tree was extracted from a larger private repository that also held work by
+collaborators, none of which is here. `docs/rename-from-jennie.md` records
+exactly what moved, what did not, and why.
 
-Runtime data — SQLite databases, chroma vector stores, dashboard renders — is
-not tracked. It is derived, and it is large (`irene.db` alone is ~6.7 GB).
-`data/README.md` describes the layout and how to rebuild it.
+Runtime data is not tracked. It is derived and it is large, with `irene.db`
+alone at about 6.8 GB. See `data/README.md` for the layout and how to rebuild
+it.

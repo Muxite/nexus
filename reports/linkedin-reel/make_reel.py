@@ -337,7 +337,7 @@ def slide_arch():
                                     shrinkA=1, shrinkB=1, mutation_scale=22))
 
     # --- nodes ---
-    box(28, 79, 38, 11, "236 news feeds", "scraper-v2 · FastAPI", edge=BLUE)
+    box(28, 79, 38, 11, "236 news feeds", "ujin · FastAPI", edge=BLUE)
     box(72, 79, 38, 11, "Polymarket CLOB", "sharded WS · ~18k tokens", edge=BLUE)
     box(50, 61, 84, 11, "async pub/sub bus",
         "strict JSON · backpressure · fault isolation", edge=PURPLE, ptc=PURPLE)
