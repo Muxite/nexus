@@ -60,6 +60,7 @@ DDL follows the helper. `db.capture(cur, ...)` is the public surface.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -195,7 +196,6 @@ class DB:
         return cls(path=":memory:", journal_mode="MEMORY", synchronous="OFF")
 
     async def connect(self) -> None:
-        import asyncio
         _assert_not_seulgi(self.path)
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)

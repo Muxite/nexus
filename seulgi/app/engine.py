@@ -79,7 +79,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 from urllib.parse import urlparse
 
 import aiohttp
@@ -90,6 +90,12 @@ from db import SeulgiDB
 from markets import MarketIndex, Embedder, MarketMatch
 from trader import PaperTrader, TradeDecision, _fetch_mid_price
 from watcher import RawHeadline
+
+if TYPE_CHECKING:
+    # Imported lazily at the call site (see `_prefetch_prices`); this makes
+    # the module name resolvable to type checkers without pulling it in at
+    # import time.
+    import impact_tracker
 
 # Defensive — engine.py runs in tests that don't initialise app.metrics.
 try:
