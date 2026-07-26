@@ -152,8 +152,16 @@ class AsyncTelemetryQueue(TelemetryQueue):
             self._worker.cancel()
             try:
                 await self._worker
-            except BaseException:  # noqa: BLE001
-                pass
+            except asyncio.CancelledError:
+                # Only our own cancel of the worker is expected here. A
+                # pending cancellation request on *this* task means the
+                # caller is being cancelled and the error is just passing
+                # through — re-raise rather than discard it.
+                current = asyncio.current_task()
+                if current is not None and current.cancelling() > 0:
+                    raise
+            except Exception:  # noqa: BLE001
+                logger.exception("[telemetry] worker raised during shutdown")
             await self._spill_remaining()
 
     @property
