@@ -75,6 +75,7 @@ import httpx
 import numpy as np
 
 from app import db as db_module
+from app.aioutil import cancel_and_join
 from app.db import DB
 from app.deps import StageDeps
 from app.topics import TOPIC_MARKETS_REFRESHED
@@ -711,15 +712,13 @@ class MarketsStage:
             self._resolution_poll_task,
             self._index_refresh_task,
         )
+        # Cancel everything first so the tasks wind down concurrently,
+        # then join them one by one.
         for task in tasks:
             if task is not None:
                 task.cancel()
         for task in tasks:
-            if task is not None:
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+            await cancel_and_join(task, log=logger)
         self._poll_task = None
         self._embed_task = None
         self._resolution_poll_task = None

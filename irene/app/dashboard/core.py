@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from app.aioutil import cancel_and_join
 from app.db import DB
 
 from .io import _atomic_write
@@ -67,13 +68,7 @@ class Dashboard:
             return
         self._stopped = True
         for task in (self._task, self._plot_task):
-            if task is None:
-                continue
-            task.cancel()
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+            await cancel_and_join(task, log=logger)
         self._task = None
         self._plot_task = None
 

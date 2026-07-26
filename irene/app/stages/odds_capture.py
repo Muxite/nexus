@@ -91,6 +91,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from app import db as db_module
+from app.aioutil import cancel_and_join
 from app.deps import StageDeps
 from app.topics import TOPIC_EXPLORATION_CREATED
 
@@ -280,12 +281,7 @@ class OddsCaptureStage:
         for attr in ("_task", "_long_task"):
             task = getattr(self, attr)
             setattr(self, attr, None)
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                    pass
+            await cancel_and_join(task, log=logger)
 
     async def handle(self, payload: dict) -> None:
         exploration_id = payload.get("exploration_id")

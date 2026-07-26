@@ -57,6 +57,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Protocol
 
+from app.aioutil import cancel_and_join
 from app.topics import is_telemetry
 
 logger = logging.getLogger(__name__)
@@ -126,13 +127,12 @@ class InProcBus:
         if self._stopped:
             return
         self._stopped = True
+        # Cancel everything first so the workers wind down concurrently,
+        # then join them one by one.
         for task in self._tasks:
             task.cancel()
         for task in self._tasks:
-            try:
-                await task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 — drain quietly
-                pass
+            await cancel_and_join(task, log=logger)
         self._tasks.clear()
 
     # ---- publish --------------------------------------------------------

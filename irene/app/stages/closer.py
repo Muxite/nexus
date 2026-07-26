@@ -99,6 +99,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from app import db as db_module
+from app.aioutil import cancel_and_join
 from app.cycle import current_cycle_id
 from app.deps import StageDeps
 
@@ -434,11 +435,7 @@ class CloserStage:
             return
         self._stopped = True
         if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+            await cancel_and_join(self._task, log=logger)
             self._task = None
 
     async def handle(self, payload: dict) -> None:  # noqa: ARG002

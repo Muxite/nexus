@@ -52,6 +52,7 @@ from typing import Optional
 from app import db as db_module
 from app import system_stats as system_stats_module
 from app.ai import AIClient
+from app.aioutil import cancel_and_join
 from app.budget import Budget
 from app.bus import InProcBus
 from app.clob import CLOBClient
@@ -535,12 +536,7 @@ async def main() -> int:
         await stop
     finally:
         logger.info("irene shutting down")
-        if system_stats_task is not None:
-            system_stats_task.cancel()
-            try:
-                await system_stats_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+        await cancel_and_join(system_stats_task, log=logger)
         if dashboard is not None:
             await dashboard.stop()
         for stage in pipeline.stop_order:

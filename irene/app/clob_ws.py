@@ -50,6 +50,8 @@ from typing import Awaitable, Callable, Optional
 
 import aiohttp
 
+from app.aioutil import cancel_and_join
+
 logger = logging.getLogger(__name__)
 
 CLOB_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -121,11 +123,7 @@ class ClobWsClient:
     async def stop(self) -> None:
         self._stopped = True
         if self._reader_task is not None:
-            self._reader_task.cancel()
-            try:
-                await self._reader_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
+            await cancel_and_join(self._reader_task, log=logger)
             self._reader_task = None
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()

@@ -76,6 +76,8 @@ from typing import Optional
 
 import httpx
 
+from app.aioutil import cancel_and_join
+
 logger = logging.getLogger(__name__)
 
 
@@ -142,11 +144,7 @@ class Budget:
     async def stop(self) -> None:
         self._stopping.set()
         if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):
-                pass
+            await cancel_and_join(self._task, log=logger)
             self._task = None
         if self._client is not None:
             await self._client.aclose()
