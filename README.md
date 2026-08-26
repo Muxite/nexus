@@ -8,6 +8,10 @@ trading prediction markets off breaking news at retail latency. That conclusion
 is the product here, and most of this repository exists to show the work behind
 it.
 
+The full writeup, with the metric breakdown, the calibration charts, and the
+architecture diagram, lives at
+[muk.systems/projects/nexus](https://muk.systems/projects/nexus).
+
 ![Dynamic Knowledge Graph](docs/images/dkg-graph.png)
 
 That picture is the knowledge graph irene built while looking for the edge.
