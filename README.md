@@ -1,12 +1,13 @@
 # nexus
 
-Two paper-trading bots for Polymarket, a shared scraping service, and the full
-record of what they were built to test and what the data actually said.
+Two paper-trading bots for Polymarket, a shared scraping service, and a fully
+audited record of one question put under test: does breaking news create a
+tradeable edge in prediction markets at retail latency?
 
-The headline result is a negative one. There is no reliable directional edge in
-trading prediction markets off breaking news at retail latency. That conclusion
-is the product here, and most of this repository exists to show the work behind
-it.
+Every gate decision, LLM call, and rejection along the way is logged and
+replayable, so the answer isn't a guess, it's measured. That measurement
+discipline, more than any single number, is the product here, and most of
+this repository exists to show the work behind it.
 
 The full writeup, with the metric breakdown, the calibration charts, and the
 architecture diagram, lives at
@@ -37,14 +38,10 @@ gates.
 They ran side by side on purpose. seulgi is the working baseline the newer
 approach had to beat.
 
-## How irene is put together
-
-![irene architecture](docs/images/architecture.png)
-
-One async pub/sub bus, strict JSON payloads between stages, and a rule that no
-gate may ever skip silently. Every rejected candidate writes a row explaining
-which gate stopped it and why. That rule is the reason the analysis further
-down was possible at all.
+irene runs on one async pub/sub bus, strict JSON payloads between stages, and
+a rule that no gate may ever skip silently. Every rejected candidate writes a
+row explaining which gate stopped it and why. That rule is the reason the
+analysis further down was possible at all.
 
 Storage is a single SQLite database in WAL mode, 34 tables, currently about
 6.8 GB. The dashboard renders 15 pages from 10 plot modules against that same
@@ -66,11 +63,9 @@ irene has ever made is about 39 dollars.
 
 ## What the data said
 
-![edge is zero](docs/images/edge-zero.png)
-
-The thesis was "speed, not prediction". Read decisive news, form a view faster
-than the market reprices, take the other side. It was tested in stages and it
-failed in stages.
+The thesis was "speed, not prediction": read decisive news, form a view
+faster than the market reprices, take the other side. Each stage of testing
+it added evidence, and the evidence built toward a clear, verifiable answer.
 
 A 54-run backtest sweep found exactly one profitable configuration. On 3.4
 times more data that winner turned into a 9.2 percent loss. It had looked good
@@ -103,8 +98,8 @@ ruling. That is the only place where reading beats speed.
 
 ![dataset growth](docs/images/dataset-growth.png)
 
-The trading thesis failed, but the machine built to test it kept running, and
-what it accumulated turned out to be more valuable than the trades. Nearly 4.8
+The trading thesis was settled, but the machine built to test it kept running,
+and what it accumulated turned out to be more valuable than the trades. Nearly 4.8
 million order-book observations across 274,521 gated captures, every row
 labeled with its gate status, the market state at the time, and the model's
 verdict and reasoning.
