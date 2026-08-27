@@ -10,7 +10,7 @@ discipline, more than any single number, is the product here, and most of
 this repository exists to show the work behind it.
 
 The full writeup, with the metric breakdown, the calibration charts, and the
-architecture diagram, lives at
+component-by-component architecture, lives at
 [muk.systems/projects/nexus](https://muk.systems/projects/nexus).
 
 ![Dynamic Knowledge Graph](docs/images/dkg-graph.png)
@@ -38,13 +38,29 @@ gates.
 They ran side by side on purpose. seulgi is the working baseline the newer
 approach had to beat.
 
-irene runs on one async pub/sub bus, strict JSON payloads between stages, and
-a rule that no gate may ever skip silently. Every rejected candidate writes a
-row explaining which gate stopped it and why. That rule is the reason the
-analysis further down was possible at all.
+## Architecture
 
-Storage is a single SQLite database in WAL mode, 34 tables, currently about
-6.8 GB. The dashboard renders 15 pages from 10 plot modules against that same
+irene is built as seven pieces wired together, each with one job:
+
+- **Ingestion**: a FastAPI scraper service pulling RSS, HTML, and sitemaps
+  into the pipeline.
+- **Bus**: one in-process async pub/sub bus wiring 17 stages together with
+  strict JSON payloads between them, and a rule that no gate may ever skip
+  silently. Every rejected candidate writes a row explaining which gate
+  stopped it and why; that rule is the reason the analysis further down was
+  possible at all.
+- **Market data**: a sharded WebSocket pool tracking roughly 18,000 live
+  Polymarket subscriptions.
+- **Knowledge graph**: dedup and entity linking across news, entities, and
+  markets, on Chroma and SQLite.
+- **Decision engine**: a configurable gate pipeline (`market_open`,
+  `dkg_threshold`, `llm_batch`, and more) with a full audit trail.
+- **Data layer**: a single SQLite database in WAL mode, 34 tables, atomic
+  batch writes, currently about 6.8 GB.
+- **Verification**: tracer injection plus a capture/replay regression suite
+  run against production images.
+
+The dashboard renders 15 pages from 10 plot modules against that same
 database.
 
 ## What the funnel looks like
@@ -200,9 +216,10 @@ Everything above is rendered from the live database, not drawn by hand. The
 PNGs in `docs/images/` are downscaled copies of the full-resolution output.
 
 ```bash
-python3 reports/linkedin-reel/make_dkg_graph.py   # the knowledge graph
-python3 reports/linkedin-reel/regen_panels.py     # live dashboard panels
-python3 reports/linkedin-reel/make_reel.py        # funnel, architecture, findings
+python3 reports/linkedin-reel/make_dkg_graph.py       # the knowledge graph
+python3 reports/linkedin-reel/regen_panels.py         # live dashboard panels
+python3 reports/linkedin-reel/make_readme_funnel.py   # the decision funnel
+python3 reports/linkedin-reel/make_reel.py            # remaining findings panels
 ```
 
 These need a populated `irene/data/irene.db`, which is not in the repository
