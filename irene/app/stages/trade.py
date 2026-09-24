@@ -113,6 +113,7 @@ from app.stages._gates import (
     _gate_binary_dedup,
     _gate_book_unavailable,
     _gate_cash,
+    _gate_category_exposure,
     _gate_cluster_dedup,
     _gate_direction,
     _gate_edge,
@@ -127,6 +128,7 @@ from app.stages._gates import (
     _gate_similarity_floor,
     _gate_size,
     _gate_wide_spread,
+    query_open_category_exposure,
     query_open_cluster_trades,
 )
 from app.topics import TOPIC_TRADE_DECIDED
@@ -580,6 +582,11 @@ class GateFeatures:
     cluster_size: int = 1
     # Paper-wallet cash at decision time.
     cash_available: Optional[float] = None
+    # Cycle 36: sum of open (un-closed, non-tracer) trade sizes in the
+    # candidate market's category, EXCLUDING this trade. None treated as
+    # 0.0 — replay of pre-cycle-36 snapshots has no bookkeeping for this,
+    # so it defaults permissive rather than raising.
+    category_open_exposure_usdc: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -785,6 +792,23 @@ def evaluate_gates(features: GateFeatures, cfg) -> GateResult:
         effective_floor=effective_floor, market_floor_usdc=market_floor_usdc, cfg=cfg,
     )
     history.extend(entries)
+    if status == "reject":
+        return GateResult(
+            "reject", reason, history,
+            market_floor_usdc=market_floor_usdc,
+            effective_floor=effective_floor,
+            prediction_id=features.prediction_id,
+        )
+
+    # Gate 8 — category_exposure (cycle 36 concentration cap).
+    category = features.market.get("category") if features.market else None
+    status, entry, reason = _gate_category_exposure(
+        category=category,
+        open_exposure_usdc=features.category_open_exposure_usdc or 0.0,
+        size=final_size,
+        cfg=cfg,
+    )
+    history.append(entry)
     if status == "reject":
         return GateResult(
             "reject", reason, history,
@@ -1338,6 +1362,37 @@ class TradeStage:
             return
         # Adopt the (possibly clipped) size for downstream feature/PnL math.
         size = final_size
+
+        # 7. category_exposure (cycle 36) -------------------------------------
+        # cluster_dedup (2.1) and binary_dedup stop stacking bets on one news
+        # event / one binary's opposite legs; neither sees concentration
+        # across many unrelated trades sharing a market category. Cap total
+        # open exposure per category at `max_category_exposure_fraction` of
+        # balance.
+        category = market.get("category")
+        open_category_exposure = await query_open_category_exposure(
+            self._db.conn, category
+        )
+        status, entry, reason = _gate_category_exposure(
+            category=category,
+            open_exposure_usdc=open_category_exposure,
+            size=size,
+            cfg=self._cfg,
+        )
+        gate_history.append(entry)
+        if status == "reject":
+            await self._record_reject(
+                signal_id=int(signal_id),
+                reason=reason,
+                gate_history=gate_history,
+                prediction_id=result.prediction_id,
+                cycle_id=cycle_id,
+                is_tracer=is_tracer,
+                tracer_id=tracer_id,
+                decision_latency_ms=(time.perf_counter() - t_start) * 1000.0,
+                decision_latency_breakdown=dict(breakdown),
+            )
+            return
 
         # Execute path --------------------------------------------------------
         # PR-B: `market_at_trade` pins the subset of the market dict that
