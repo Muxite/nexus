@@ -114,6 +114,7 @@ class _TradeCfg:
     # Cycle 23: kill switch + market-state buffer. Defaults mirror config.py.
     execution_enabled: bool = True
     min_hours_to_expiry: float = 6.0
+    max_category_exposure_fraction: float = 0.35
 
 
 @dataclass
@@ -322,10 +323,11 @@ async def test_happy_path_writes_trade_decision_and_features(db_seeded):
     assert t["decision_path"] == "mvp"
     snap = json.loads(t["features_snapshot"])
     assert snap["direction"] == "YES" and snap["confidence"] == 0.7
-    # 8 gates: similarity_floor, freshness, cluster_dedup (cycle 28),
-    # entity_overlap, direction, edge, size, cash
-    assert "gate_history" in snap and len(snap["gate_history"]) == 8
+    # 9 gates: similarity_floor, freshness, cluster_dedup (cycle 28),
+    # entity_overlap, direction, edge, size, cash, category_exposure (cycle 36)
+    assert "gate_history" in snap and len(snap["gate_history"]) == 9
     assert snap["gate_history"][2]["gate"] == "cluster_dedup"
+    assert snap["gate_history"][-1]["gate"] == "category_exposure"
 
     cur = await db_seeded.conn.execute(
         "SELECT feature_name FROM trade_features ORDER BY feature_name"
@@ -569,7 +571,12 @@ async def test_cash_clips_when_cash_below_requested_size(db_seeded):
         )
     bus = _FakeBus()
     ai = _FakeAI()  # YES@0.7 → would size ~$99 by default config
-    stage = _make_stage(db_seeded, bus, ai)
+    # This test is about the cash-clip gate specifically; the pre-seeded
+    # $995 trade shares m1's "politics" category, which would otherwise
+    # trip the (cycle 36) category_exposure cap before cash even clips.
+    # Widen the cap out of the way here.
+    cfg = _Config(trade=_TradeCfg(max_category_exposure_fraction=1.0))
+    stage = _make_stage(db_seeded, bus, ai, cfg)
     with cycle_scope(1):
         await stage.handle(_payload())
     # The pre-seeded decision (id=99) is already in the table; look up

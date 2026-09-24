@@ -24,6 +24,7 @@ from app.stages.trade import (
     _compute_kelly_and_size,
     _eval_market_news_imbalance_subrules,
     _gate_cash,
+    _gate_category_exposure,
     _gate_direction,
     _gate_edge,
     _gate_entity_overlap,
@@ -69,6 +70,7 @@ class _Cfg:
     # Cycle 23: market-state buffer + kill switch. Defaults mirror config.py.
     execution_enabled: bool = True
     min_hours_to_expiry: float = 6.0
+    max_category_exposure_fraction: float = 0.35
 
 
 def _market(
@@ -491,13 +493,14 @@ def test_evaluate_gates_executes_on_clean_path():
     assert result.mid == 0.50
     assert result.size_usdc > 0
     assert result.prediction_id == 42
-    # Same 7-gate count the integration test asserts (similarity_floor,
-    # freshness, entity_overlap, direction, edge, size, cash).
-    assert len(result.gate_history) == 7
+    # Same 8-gate count the integration test asserts (similarity_floor,
+    # freshness, entity_overlap, direction, edge, size, cash,
+    # category_exposure).
+    assert len(result.gate_history) == 8
     names = [g["gate"] for g in result.gate_history]
     assert names == [
         "similarity_floor", "freshness", "entity_overlap",
-        "direction", "edge", "size", "cash",
+        "direction", "edge", "size", "cash", "category_exposure",
     ]
 
 
@@ -546,7 +549,7 @@ def test_evaluate_gates_skips_entity_gate_when_unset():
     # entity_overlap absent from gate_history when caller didn't compute it.
     names = [g["gate"] for g in result.gate_history]
     assert "entity_overlap" not in names
-    assert len(result.gate_history) == 6  # 7 - entity_overlap
+    assert len(result.gate_history) == 7  # 8 - entity_overlap
 
 
 def test_evaluate_gates_propagates_neutral_direction():
@@ -659,3 +662,67 @@ def test_evaluate_gates_no_direction_executes_correctly():
     assert result.direction == "NO"
     assert result.p_hat == pytest.approx(0.30)
     assert result.edge == pytest.approx(0.18)
+
+
+# ---------------------------------------------------------------------------
+# category_exposure (cycle 36) — concentration cap across unrelated trades
+# sharing a market category.
+# ---------------------------------------------------------------------------
+
+
+def test_gate_category_exposure_passes_with_no_category():
+    cfg = _Cfg()
+    status, entry, reason = _gate_category_exposure(
+        category=None, open_exposure_usdc=10_000.0, size=500.0, cfg=cfg,
+    )
+    assert status == "ok"
+    assert reason is None
+    assert entry["threshold"] == "no_category"
+
+
+def test_gate_category_exposure_passes_at_exactly_the_cap():
+    # balance 1000 * fraction 0.35 = cap 350. existing 250 + size 100 = 350.
+    cfg = _Cfg(balance_usdc=1000.0, max_category_exposure_fraction=0.35)
+    status, entry, reason = _gate_category_exposure(
+        category="politics", open_exposure_usdc=250.0, size=100.0, cfg=cfg,
+    )
+    assert status == "ok"
+    assert reason is None
+    assert entry["value"] == pytest.approx(350.0)
+    assert entry["threshold"] == pytest.approx(350.0)
+
+
+def test_gate_category_exposure_rejects_over_the_cap():
+    cfg = _Cfg(balance_usdc=1000.0, max_category_exposure_fraction=0.35)
+    status, entry, reason = _gate_category_exposure(
+        category="politics", open_exposure_usdc=300.0, size=100.0, cfg=cfg,
+    )
+    assert status == "reject"
+    assert reason == "category_exposure_exceeded"
+    assert entry["value"] == pytest.approx(400.0)
+    assert entry["threshold"] == pytest.approx(350.0)
+
+
+def test_evaluate_gates_propagates_category_exposure_exceeded():
+    # Default fixture's computed size is 100 (YES/0.70/mid 0.50 — see
+    # test_evaluate_gates_clips_to_cash_when_above_floor for the same
+    # Kelly math). cap = 1000 * 0.35 = 350; 300 existing + 100 > 350.
+    cfg = _Cfg()
+    result = evaluate_gates(
+        _execute_features(category_open_exposure_usdc=300.0), cfg,
+    )
+    assert result.outcome == "reject"
+    assert result.reason == "category_exposure_exceeded"
+
+
+def test_evaluate_gates_category_exposure_default_zero_executes():
+    # No override → category_open_exposure_usdc defaults to None → treated
+    # as 0.0 (permissive default for pre-cycle-36 replay snapshots).
+    cfg = _Cfg()
+    result = evaluate_gates(_execute_features(), cfg)
+    assert result.outcome == "execute"
+    category_entries = [
+        g for g in result.gate_history if g["gate"] == "category_exposure"
+    ]
+    assert len(category_entries) == 1
+    assert category_entries[0]["outcome"] == "ok"
