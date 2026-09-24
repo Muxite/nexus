@@ -636,6 +636,14 @@ class TradeSection(BaseModel):
     kelly_fraction: float = Field(default=0.25, gt=0.0, le=1.0)
     max_position_fraction: float = Field(default=0.20, gt=0.0, le=1.0)
     min_position_usdc: float = Field(default=1.0, gt=0)
+    # Cycle 36: cluster_dedup / binary_dedup cap concentration on one news
+    # event or one binary's opposite legs, but nothing capped concentration
+    # across many *unrelated* trades in the same market category (e.g. a
+    # dozen independent "politics" bets that all move on the same macro
+    # news day). Total open exposure in a category — existing + this trade
+    # — must stay under this fraction of balance, else the entry is
+    # rejected with `category_exposure_exceeded`. See _gates.py::_gate_category_exposure.
+    max_category_exposure_fraction: float = Field(default=0.35, gt=0.0, le=1.0)
     # P1 stub: no CLOB integration yet. Trade.py reads markets.last_mid_price
     # if populated; otherwise falls back to this value. Replace with real
     # mid-price fetching in a follow-up.

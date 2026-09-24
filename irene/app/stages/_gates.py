@@ -287,6 +287,74 @@ async def query_open_sibling_markets(db_conn, market_id: str) -> list[str]:
     return [r["market_id"] for r in rows]
 
 
+async def query_open_category_exposure(db_conn, category: Optional[str]) -> float:
+    """Cycle 36 helper: total USDC in OPEN (un-closed, non-tracer) trades
+    whose market shares `category` with the candidate.
+
+    `category` is read from `markets.category` (cycle-27 tag-derived tiers,
+    e.g. "politics", "crypto"). `None`/`"(uncategorized)"` markets are
+    excluded from the sum — an uncategorized market shares no meaningful
+    correlation bucket with anything, so it neither contributes to nor is
+    capped by any category's exposure. Lives in `_gates.py` per the
+    no-stage-import rule (mirrors `query_open_sibling_markets`).
+    """
+    if not category:
+        return 0.0
+    cur = await db_conn.execute(
+        """
+        SELECT COALESCE(SUM(t.size_usdc), 0) AS exposure
+        FROM trades t
+        LEFT JOIN trade_closures c ON c.trade_id = t.id
+        JOIN markets m ON m.condition_id = t.market_id
+        WHERE c.id IS NULL
+          AND t.is_tracer = 0
+          AND m.category = ?
+        """,
+        (category,),
+    )
+    row = await cur.fetchone()
+    await cur.close()
+    return float(row["exposure"] or 0.0)
+
+
+def _gate_category_exposure(
+    *, category: Optional[str], open_exposure_usdc: float, size: float, cfg,
+) -> tuple[str, Optional[dict], Optional[str]]:
+    """Cycle 36: cap total concurrent exposure to a single market category.
+
+    `cluster_dedup` (cycle 28) and `binary_dedup` (cycle 25-B) each stop
+    the bot from stacking bets on one news event or one binary's opposite
+    legs, but nothing stopped it from opening a dozen *unrelated* trades
+    that are all "politics" and all move together on the same macro
+    news day — concentration risk the per-trade `max_position_fraction`
+    cap can't see because it only looks at one trade at a time.
+
+    Permissive when the candidate market has no category (`None` /
+    "(uncategorized)") — there is no concentration bucket to check against,
+    same convention as `query_open_category_exposure`. Uses the PRE-clip
+    `size` (the cash gate's clip already narrows exposure to what cash
+    allows; this gate additionally narrows it to what the category budget
+    allows) and rejects rather than clips — a category near its cap should
+    surface as `category_exposure_exceeded` in the funnel, not silently
+    shrink into a token position.
+    """
+    if not category:
+        return ("ok", _gate_entry("category_exposure", "ok", None, "no_category"), None)
+    cap = float(cfg.balance_usdc) * float(cfg.max_category_exposure_fraction)
+    projected = open_exposure_usdc + size
+    if projected > cap:
+        return (
+            "reject",
+            _gate_entry("category_exposure", "reject", projected, cap),
+            "category_exposure_exceeded",
+        )
+    return (
+        "ok",
+        _gate_entry("category_exposure", "ok", projected, cap),
+        None,
+    )
+
+
 async def query_open_cluster_trades(db_conn, cluster_id) -> list[int]:
     """Cycle 28 helper: ids of OPEN (un-closed, non-tracer) trades whose
     article cluster matches `cluster_id`.
