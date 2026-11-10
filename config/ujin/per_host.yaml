@@ -1,0 +1,275 @@
+# Per-host strategy overrides for scraper-v2.
+#
+# Each entry pins a host to a specific fetch strategy so we don't waste
+# obscura renders on sites we know are 403-locked, or HTTP fetches on
+# sites we know need rendering.
+#
+# Strategies (note: `combined` is consumed by mode=combined on the
+# /scrape endpoint and reuses `rss_url` as the pinned feed):
+#   http          — HTTP fast-path only, never obscura or altpath
+#   obscura       — obscura render only, no HTTP attempt
+#   sitemap_news  — fetch sitemap_url (or auto-probe) directly
+#   rss           — fetch rss_url directly
+#   auto          — default behavior (HTTP → obscura → altpath chain)
+#
+# Hostname matching is suffix-aware: an entry for `nytimes.com` also
+# matches `www.nytimes.com` and `markets.nytimes.com`.
+#
+# Run the audit script (`scripts/audit.py`) to regenerate suggested
+# overrides at config/per_host.suggested.yaml, then promote the entries
+# you trust.
+
+hosts:
+  # ── Tier-1 wires — RSS pins verified live (probed 2026-05-25). ──
+  # `rss_url` is consumed by /scrape mode=combined as the parallel RSS
+  # source. Sites without a working public RSS are pinned to a fetch
+  # strategy that doesn't try one (auto / obscura) — combined mode
+  # gracefully degenerates to HTML-only for those.
+  #
+  # Broken-as-of-2026-05-25 (kept for HTML-only combined): apnews.com,
+  # reuters.com, washingtonpost.com, ft.com, axios.com, bloomberg.com,
+  # cnbc.com — all 401/403/paywalled their public RSS in the last year.
+  # Cycle 6a (2026-05-25): AP and Reuters killed their public RSS but
+  # publish Google News sitemaps. AP returns 761 entries / poll, Reuters
+  # 50. Pin to sitemap_news so combined mode's HTML side short-circuits
+  # to _direct_sitemap; the RSS side stays unset and skips.
+  apnews.com:
+    strategy: sitemap_news
+    sitemap_url: https://apnews.com/news-sitemap-content.xml
+    tier: wire
+    extract:
+      link_selectors:
+        - "main a[href*='/article/']"
+        - "section[data-key='feed'] a"
+      link_excludes:
+        - "[data-key='related']"
+        - "nav a"
+        - "footer a"
+      url_path_must_match: "^/article/[a-z0-9-]+-[0-9a-f]+$"
+      # Drop sports, lottery, weather, quiz, recipe — none drive prediction markets.
+      # Topic tokens may appear anywhere in the slug, so use word-boundary
+      # substring matching (regex `\b` works for alphanumeric/hyphen edges
+      # given the slug-shape of these URLs).
+      url_path_deny_patterns:
+        - "\\b(lotter(y|ies)|powerball|mega-?millions|pick-?\\d)\\b"
+        - "\\b(nba|nfl|mlb|nhl|wnba|nhra|nascar|formula-?1)\\b"
+        - "\\b(softball|baseball|football|basketball|hockey|tennis|golf|soccer)\\b"
+        - "\\b(college-sports|premier-league|champions-league|playoff|super-bowl|world-series|stanley-cup|french-open|us-open|wimbledon|masters-golf)\\b"
+        - "\\b(mets|marlins|dodgers|yankees|red-sox|astros|cubs|orioles|braves|phillies|rays|rangers|tigers|warriors|lakers|celtics|knicks|heat-basketball)\\b"
+        - "\\b(world-cup|olympic|paralympic)\\b"
+        - "\\b(recipe|cooking|wine|cocktail|food-and-drink|chef-)\\b"
+        - "\\b(horoscope|crossword|sudoku|quiz|america250|game-of-the-day)\\b"
+        - "\\b(red-carpet|royal-wedding|kardashian|taylor-swift-tour|met-gala|grammys|oscars|emmys)\\b"
+        - "/article/(weather|forecast|hurricane-season-outlook)"
+      title_deny_patterns:
+        - "(Winning numbers|Lottery|Powerball|Mega Millions)"
+        - "(box score|stat[s]?-of-the-day|standings glance|super regionals|game preview)"
+      title_strip_suffixes: [" | AP News", " — AP News"]
+      min_title_chars: 30
+      article:
+        body: "div.RichTextStoryBody"
+        title: "h1"
+        published_meta: "article:published_time"
+  reuters.com:
+    strategy: sitemap_news
+    sitemap_url: https://www.reuters.com/arc/outboundfeeds/news-sitemap/?outputType=xml
+    tier: wire
+    extract:
+      link_selectors:
+        - "main a[href*='/world/']"
+        - "main a[href*='/business/']"
+        - "main a[href*='/markets/']"
+        - "main a[href*='/legal/']"
+      link_excludes:
+        - "nav a"
+        - "footer a"
+        - "[data-testid='related-stories'] a"
+      url_path_must_match: "^/(world|business|markets|legal|technology|sustainability)/[a-z0-9-]+-?\\d{4}-\\d{2}-\\d{2}/?$"
+      url_path_deny_patterns:
+        - "/(sports|lifestyle|graphics-on-screen)/"
+      title_strip_suffixes: [" | Reuters"]
+      min_title_chars: 30
+      article:
+        body: "div[data-testid='paragraph-0'] ~ div, article div[class*='ArticleBody']"
+        title: "h1"
+        published_meta: "article:published_time"
+  washingtonpost.com:
+    strategy: auto
+    rss_url: https://feeds.washingtonpost.com/rss/world
+  axios.com:
+    # 2026-05-26: RAG (`irene/questions/unstructured answers.md` line 88)
+    # identifies axios.com/feeds/feed.rss as a free, publisher-served RSS.
+    # Pinning it makes combined mode parallel-fetch RSS+HTML instead of
+    # degenerating to HTML-only. HTML fallback (strategy: auto) unchanged.
+    strategy: auto
+    rss_url: https://axios.com/feeds/feed.rss
+  cnbc.com:
+    strategy: auto
+  ft.com:
+    strategy: auto  # was obscura: the renderer returns nothing here; the feed works
+    rss_url: https://www.ft.com/rss/home
+  bloomberg.com:
+    strategy: obscura
+
+  # ── RSS-pinned tier-1 (combined mode = RSS+HTML fan-out) ──
+  bbc.com:
+    strategy: auto
+    rss_url: https://feeds.bbci.co.uk/news/world/rss.xml
+    tier: wire
+    extract:
+      link_selectors:
+        - "main a[href*='/news/']"
+        - "[data-testid='card-headline']"
+      link_excludes:
+        - "nav a"
+        - "footer a"
+      url_path_must_match: "^/news/(articles|world|us-canada|business|technology)/[a-z0-9-]+$|^/news/[a-z0-9-]+-\\d+$"
+      url_path_deny_patterns:
+        - "/news/(sport|football|cricket|rugby|tennis|golf|formula1|formula-?1|olympics)"
+        - "/news/(entertainment-arts|in-pictures|magazine|weather)"
+        - "/news/videos/"  # short-form video listings, not prediction-market signal
+        - "\\b(ted-lasso|footy|cricket|rugby|wimbledon|world-cup|olympic|paralympic|premier-league)\\b"
+      title_deny_patterns:
+        - "(Ted Lasso|football is life|red carpet|quiz of the week|in pictures)"
+      title_strip_suffixes: [" - BBC News", " | BBC News"]
+      min_title_chars: 30
+      article:
+        body: "article, main"
+        title: "h1"
+        published_meta: "article:published_time"
+  bbc.co.uk:
+    strategy: auto
+    rss_url: https://feeds.bbci.co.uk/news/world/rss.xml
+    tier: wire
+  theguardian.com:
+    strategy: auto
+    rss_url: https://www.theguardian.com/world/rss
+    tier: mainstream
+    extract:
+      link_selectors:
+        - "main a.dcr-lv2v9o"
+        - "main a[data-link-name*='article']"
+        - "[data-component='snap'] a"
+      link_excludes:
+        - "nav a"
+        - "footer a"
+      url_path_must_match: "^/[a-z0-9-]+/\\d{4}/[a-z]{3}/\\d{2}/[a-z0-9-]+$"
+      title_strip_suffixes: [" | The Guardian", " — The Guardian"]
+      min_title_chars: 25
+      article:
+        body: "div[data-gu-name='body'], #maincontent"
+        title: "h1"
+        byline: "[rel='author']"
+        published_meta: "article:published_time"
+  nytimes.com:
+    strategy: auto
+    rss_url: https://rss.nytimes.com/services/xml/rss/nyt/HomePage.xml
+    tier: mainstream
+    extract:
+      link_selectors:
+        - "main a[href*='/202']"
+        - "section a[href*='/202']"
+      link_excludes:
+        - "nav a"
+        - "footer a"
+        - "[aria-label='Most popular'] a"
+      url_path_must_match: "^/\\d{4}/\\d{2}/\\d{2}/[a-z-]+/[a-z0-9-]+\\.html$"
+      title_strip_suffixes: [" - The New York Times"]
+      min_title_chars: 25
+      article:
+        body: "section[name='articleBody'], article#story"
+        title: "h1"
+        published_meta: "article:published_time"
+  cnn.com:
+    strategy: auto
+    rss_url: http://rss.cnn.com/rss/edition.rss
+  aljazeera.com:
+    strategy: auto
+    rss_url: https://www.aljazeera.com/xml/rss/all.xml
+  wsj.com:
+    strategy: sitemap_news
+    sitemap_url: https://www.wsj.com/news-sitemap.xml
+    rss_url: https://feeds.a.dj.com/rss/RSSWorldNews.xml
+  thehill.com:
+    strategy: auto
+    rss_url: https://thehill.com/feed/
+  politico.com:
+    strategy: auto
+    rss_url: https://rss.politico.com/politics-news.xml
+  npr.org:
+    strategy: auto
+    rss_url: https://feeds.npr.org/1001/rss.xml
+  cbsnews.com:
+    strategy: auto
+    rss_url: https://www.cbsnews.com/latest/rss/world
+  abcnews.go.com:
+    strategy: auto
+    rss_url: https://abcnews.go.com/abcnews/internationalheadlines
+  skynews.com:
+    strategy: auto
+    rss_url: https://feeds.skynews.com/feeds/rss/world.xml
+  timesofisrael.com:
+    strategy: auto
+    rss_url: https://www.timesofisrael.com/feed/
+
+  # ── Tier-2 (cycle 6a, RSS verified live 2026-05-25) ──
+  motherjones.com:
+    strategy: auto
+    rss_url: https://www.motherjones.com/feed/
+  propublica.org:
+    strategy: auto
+    rss_url: https://www.propublica.org/feeds/propublica/main
+  theatlantic.com:
+    strategy: auto
+    rss_url: https://www.theatlantic.com/feed/channel/politics/
+  slate.com:
+    strategy: auto
+    rss_url: https://slate.com/feeds/news-and-politics.rss
+  realclearpolitics.com:
+    strategy: auto
+    rss_url: https://www.realclearpolitics.com/index.xml
+  marketwatch.com:
+    strategy: auto
+    rss_url: http://feeds.marketwatch.com/marketwatch/topstories/
+  finance.yahoo.com:
+    strategy: auto
+    rss_url: https://finance.yahoo.com/news/rssindex
+  techcrunch.com:
+    strategy: auto
+    rss_url: https://techcrunch.com/feed/
+  arstechnica.com:
+    strategy: auto
+    rss_url: https://feeds.arstechnica.com/arstechnica/index
+  theverge.com:
+    strategy: auto
+    rss_url: https://www.theverge.com/rss/index.xml
+  wired.com:
+    strategy: auto
+    rss_url: https://www.wired.com/feed/rss
+  indianexpress.com:
+    strategy: auto
+    rss_url: https://indianexpress.com/feed/
+  timesofindia.indiatimes.com:
+    strategy: auto
+    rss_url: https://timesofindia.indiatimes.com/rssfeedstopstories.cms
+  english.elpais.com:
+    strategy: auto
+    rss_url: https://feeds.elpais.com/mrss-s/pages/ep/site/english.elpais.com/portada
+  repubblica.it:
+    strategy: auto
+    rss_url: https://www.repubblica.it/rss/homepage/rss2.0.xml
+  sueddeutsche.de:
+    strategy: auto
+    rss_url: https://rss.sueddeutsche.de/rss/Topthemen
+  politico.eu:
+    strategy: auto
+    rss_url: https://www.politico.eu/feed/
+  dw.com:
+    strategy: auto
+    rss_url: https://rss.dw.com/rdf/rss-en-all
+  france24.com:
+    strategy: auto
+    rss_url: https://www.france24.com/en/rss
+  channelnewsasia.com:
+    strategy: auto
+    rss_url: https://www.channelnewsasia.com/rssfeeds/8395986

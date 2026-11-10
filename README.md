@@ -164,6 +164,19 @@ without either bot changing more than a hostname. irene uses `POST /scrape` and
 `POST /feed`. seulgi uses `POST /scrape`, `POST /social/twitter`, and
 `POST /feed`.
 
+How each news site is fetched is configuration, not code. `config/ujin/per_host.yaml`
+is mounted into the ujin container and pins, per host, a strategy and, where one
+exists, the publisher's own feed. Homepages are fetched together with that feed, and
+the feed's items come back even if the homepage is slow or blocks scrapers. Adding or
+fixing a site means editing that file and restarting the container; neither bot
+changes. As measured against the 91 sources irene polls, feeds are reliable and
+homepages are the hard part: `apnews.com` and `reuters.com` still return nothing
+because they refuse automated clients.
+
+Dates matter to irene's staleness logic, so ujin returns every feed date as ISO-8601
+UTC. If a date ever arrives unparseable, eventize now logs a warning before falling
+back to the ingest time, instead of doing it silently.
+
 ## Layout
 
 | Path | What it is |

@@ -473,6 +473,10 @@ class EventizeStage:
             try:
                 pub_dt = datetime.fromisoformat(published_at_iso)
             except (TypeError, ValueError):
+                logger.warning(
+                    "eventize: unparseable published_at %r; using now() for staleness",
+                    published_at_iso,
+                )
                 pub_dt = datetime.now(timezone.utc)
             stale_cutoff = (pub_dt - timedelta(hours=stale_hours)).isoformat()
             window_cutoff = (pub_dt - timedelta(hours=window_hours)).isoformat()

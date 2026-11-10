@@ -42,6 +42,14 @@ services:
       # Optional: enables the Brave-backed social legs (/social/*, /trends/*).
       - SEARCH_API_KEY=${SEARCH_API_KEY:-}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Per-host fetch strategy pins (config only, no ujin code): see
+      # config/ujin/per_host.yaml. Suffix-matched; `rss_url` also feeds
+      # mode=combined.
+      - PER_HOST_CONFIG_PATH=/config/per_host.yaml
+      # mode=combined: don't hold a pinned feed's items hostage to a slow homepage.
+      - UJIN_COMBINED_HTML_TIMEOUT_SECS=${UJIN_COMBINED_HTML_TIMEOUT_SECS:-10}
+    volumes:
+      - ./config/ujin/per_host.yaml:/config/per_host.yaml:ro
     ports:
       - "8901:8901"
     init: true              # reap obscura/browser <defunct> subprocesses
