@@ -164,6 +164,20 @@ without either bot changing more than a hostname. irene uses `POST /scrape` and
 `POST /feed`. seulgi uses `POST /scrape`, `POST /social/twitter`, and
 `POST /feed`.
 
+```mermaid
+flowchart LR
+    I["irene"] -->|"POST /feed, /scrape"| U
+    S["seulgi"] -->|"POST /feed, /scrape"| U
+    subgraph U["ujin (shared service, :8901)"]
+        direction TB
+        A["feed parser<br/>ISO-8601 dates"]
+        B["combined mode<br/>homepage + pinned feed"]
+        C["fallback chain<br/>HTTP, renderer, sitemap, RSS"]
+    end
+    P["config/ujin/per_host.yaml<br/>41 hosts, plain YAML"] -.->|mounted read-only| U
+    U --> W["News sites<br/>59 feeds, 32 homepages"]
+```
+
 How each news site is fetched is configuration, not code. `config/ujin/per_host.yaml`
 is mounted into the ujin container and pins, per host, a strategy and, where one
 exists, the publisher's own feed. Homepages are fetched together with that feed, and
