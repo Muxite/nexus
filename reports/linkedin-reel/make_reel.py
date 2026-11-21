@@ -16,12 +16,21 @@ from matplotlib.patches import Rectangle, FancyBboxPatch, Circle
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)))
 
+# Read-only DB path for the two slides (real_plots, market_moves) that pull
+# live odds curves. Defaults to this repo's own archived copy; the 08-23
+# regeneration pass overrode this via IRENE_DB_PATH to point at the live
+# jennie/irene.db (the nexus archive itself is metadata-only after the
+# 2026-08-02 archival, see irene/data/ARCHIVED.txt) without ever writing to
+# either database.
+IRENE_DB_PATH = os.environ.get(
+    "IRENE_DB_PATH", "/home/muk/projects/nexus/irene/data/irene.db")
+
 # ---- palette (GitHub-dark-ish) ----------------------------------------------
 BG      = "#0d1117"
 PANEL   = "#10161d"
 BORDER  = "#30363d"
 FG      = "#c9d1d9"
-DIM     = "#8b949e"
+DIM     = "#a8b3c2"
 GREEN   = "#3fb950"
 BLUE    = "#58a6ff"
 AMBER   = "#d29922"
@@ -152,7 +161,7 @@ def slide_title():
 # =============================================================================
 def slide_numbers():
     fig, ax = new_fig()
-    window_chrome(ax, "nexus — by the numbers")
+    window_chrome(ax, "nexus, by the numbers")
 
     head = pyfiglet.figlet_format("SHIPPED", font="ansi_shadow").rstrip("\n").split("\n")
     fs_b = 14
@@ -174,8 +183,8 @@ def slide_numbers():
         ("1,578", "automated tests", "collected by pytest", GREEN),
         ("215", "commits", "30 numbered dev cycles", BLUE),
         ("10.98M", "result rows", "in one SQLite table", BLUE),
-        ("334k", "LLM calls", "~$98 total · gemini-2.5-flash", AMBER),
-        ("4.77M", "odds samples", "live CLOB market-data capture", AMBER),
+        ("434k", "LLM calls", "~$128 total · gemini-2.5-flash", AMBER),
+        ("5.69M", "odds samples", "live CLOB market-data capture", AMBER),
         ("231k", "markets indexed", "across 60.6k events · 21x gen-1", CYAN),
         ("~18k", "WS subscriptions", "sharded CLOB pool", CYAN),
     ]
@@ -231,9 +240,9 @@ def slide_tmux():
     x, y = m, top
     pane(ax, x, y, w, h, "0:universe", GREEN)
     kv_rows(ax, x + 24, y + 62, [
-        ("markets indexed", "230,581", GREEN),
-        ("distinct events", "60,594", FG),
-        ("active markets", "5,852", FG),
+        ("markets indexed", "230,854", GREEN),
+        ("distinct events", "60,596", FG),
+        ("active markets", "5,592", FG),
         ("events coverage", "99.6%", GREEN),
         ("legacy cap", "10,761 (capped)", RED),
         ("universe gain", "21x", AMBER),
@@ -244,10 +253,10 @@ def slide_tmux():
     x = m + w + gap
     pane(ax, x, y, w, h, "1:news", BLUE)
     kv_rows(ax, x + 24, y + 62, [
-        ("feeds", "236  (was 33)", FG),
-        ("articles stored", "176,603", FG),
-        ("semantic clusters", "7,915", BLUE),
-        ("dedup ratio", "18.1x", AMBER),
+        ("feeds", "237  (was 33)", FG),
+        ("articles stored", "234,966", FG),
+        ("semantic clusters", "8,695", BLUE),
+        ("dedup ratio", "22.7x", AMBER),
         ("first-poll burst", "1,112 in 2 min", FG),
         ("freshness", "BRK/EVO/REH/STALE", DIM),
     ])
@@ -256,17 +265,22 @@ def slide_tmux():
     # pane 2: decision latency
     x, y = m, top + h + gap
     pane(ax, x, y, w, h, "2:latency", AMBER)
-    bars = [("p50", 578, GREEN), ("p95", 3060, AMBER), ("p99", 9868, RED)]
+    # p99 now runs ~452s (was 9.9s at 07-09) — dominated by the budget-governor
+    # pausing the pipeline before the spend wall (a deliberate stall, not a
+    # slow path, same caveat as the 07-09 snapshot). Bar length is capped on
+    # p95 so the pause-dominated p99 doesn't flatten the p50/p95 bars to
+    # nothing; the real value is still printed as text.
+    bars = [("p50", 608, GREEN), ("p95", 7913, AMBER), ("p99", 452466, RED)]
     yy = y + 66
-    maxb = 9868
+    maxb = 7913 * 1.15
     for lab, v, c in bars:
-        n = max(2, round(v / maxb * 16))
+        n = max(2, min(20, round(v / maxb * 16)))
         draw_text(ax, x + 24, yy, [
             (lab.ljust(5), DIM), ("▇" * n, c), (" " + f"{v:,} ms", FG)], 15)
         yy += line_h(15, 1.9)
     yy += 8
     yy = kv_rows(ax, x + 24, yy, [
-        ("samples", "n=125,130", FG),
+        ("samples", "n=155,668", FG),
         ("breakdown", "7-step JSON", DIM),
     ])
     draw_text(ax, x + 24, y + h - 56,
@@ -276,8 +290,8 @@ def slide_tmux():
     x = m + w + gap
     pane(ax, x, y, w, h, "3:llm", PURPLE)
     kv_rows(ax, x + 24, y + 62, [
-        ("calls (audited)", "333,516", FG),
-        ("total spend", "~$98 (gemini)", GREEN),
+        ("calls (audited)", "433,966", FG),
+        ("total spend", "~$128 (gemini)", GREEN),
         ("ensemble", "N=3, 2/3-vote gate", FG),
         ("disagree →", "hard NEUTRAL", AMBER),
         ("budget watch", "OK [flag: clear]", GREEN),
@@ -293,7 +307,7 @@ def slide_tmux():
         ("[IRENE] ", CYAN), ("0:universe ", FG), ("1:news ", FG),
         ("2:latency", FG), ("* ", GREEN), ("3:llm", FG),
     ], 15)
-    right = '"gen-2" 09:41 2026-07-09'
+    right = '"gen-2" 21:04 2026-08-23'
     draw_text(ax, PX - 20 - len(right) * char_w(15), sy + 6, [(right, DIM)], 15)
 
     fig.savefig(f"{OUT}/03_dashboard.png", dpi=DPI, facecolor=BG)
@@ -314,47 +328,34 @@ def slide_arch():
 
     ax.text(50, 95, "IRENE · ARCHITECTURE", ha="center", va="center",
             color=FG, fontsize=27, fontfamily=MONO, fontweight="bold")
-    ax.text(50, 89.5, "one event-driven bus  ·  every stage audited",
+    ax.text(50, 89.5, "the shape of the pipeline, top to bottom",
             ha="center", va="center", color=DIM, fontsize=14.5, fontfamily=MONO)
 
-    def box(cx, cy, w, h, primary, secondary=None, edge=BLUE, ptc=FG, pfs=15.5):
+    def box(cx, cy, w, h, primary, edge=BLUE, ptc=FG, pfs=17):
         ax.add_patch(FancyBboxPatch(
             (cx - w / 2, cy - h / 2), w, h,
             boxstyle="round,pad=0.4,rounding_size=1.6",
             linewidth=2.4, edgecolor=edge, facecolor=PANEL, zorder=2))
-        if secondary:
-            ax.text(cx, cy + 1.7, primary, ha="center", va="center",
-                    color=ptc, fontsize=pfs, fontfamily=MONO, fontweight="bold", zorder=3)
-            ax.text(cx, cy - 2.4, secondary, ha="center", va="center",
-                    color=DIM, fontsize=11, fontfamily=MONO, zorder=3)
-        else:
-            ax.text(cx, cy, primary, ha="center", va="center",
-                    color=ptc, fontsize=pfs, fontfamily=MONO, fontweight="bold", zorder=3)
+        ax.text(cx, cy, primary, ha="center", va="center",
+                color=ptc, fontsize=pfs, fontfamily=MONO, fontweight="bold", zorder=3)
 
     def arrow(x0, y0, x1, y1, color=BLUE):
         ax.annotate("", xy=(x1, y1), xytext=(x0, y0), zorder=1,
                     arrowprops=dict(arrowstyle="-|>", color=color, lw=2.6,
                                     shrinkA=1, shrinkB=1, mutation_scale=22))
 
-    # --- nodes ---
-    box(28, 79, 38, 11, "236 news feeds", "ujin · FastAPI", edge=BLUE)
-    box(72, 79, 38, 11, "Polymarket CLOB", "sharded WS · ~18k tokens", edge=BLUE)
-    box(50, 61, 84, 11, "async pub/sub bus",
-        "strict JSON · backpressure · fault isolation", edge=PURPLE, ptc=PURPLE)
-    box(50, 43, 84, 12, "ingest → dedupe → match → gates → paper trade",
-        "SBERT / Chroma  ·  cosine top-K  ·  per-gate audit, no silent skips",
-        edge=CYAN, ptc=FG, pfs=15)
-    box(50, 25, 74, 11, "SQLite (WAL) · 34 tables",
-        "decisions · gates · llm calls · latency · stats", edge=GREEN, ptc=GREEN)
-    box(50, 9, 60, 9, "dashboard · 15 pages · 10 plot modules",
-        edge=CYAN, ptc=CYAN, pfs=14)
+    # --- nodes: 5 highest-level stages, no implementation detail ---
+    box(50, 78, 78, 13, "news + market ingest", edge=BLUE)
+    box(50, 60, 78, 13, "dedupe + match", edge=PURPLE, ptc=PURPLE)
+    box(50, 42, 78, 13, "gate + decide", edge=CYAN, ptc=FG)
+    box(50, 24, 78, 13, "audit store", edge=GREEN, ptc=GREEN)
+    box(50, 8, 60, 10, "dashboard", edge=CYAN, ptc=CYAN, pfs=15)
 
     # --- arrows ---
-    arrow(31, 73.5, 41, 66.7)
-    arrow(69, 73.5, 59, 66.7)
-    arrow(50, 55.5, 50, 49.2)
-    arrow(50, 37, 50, 30.7)
-    arrow(50, 19.5, 50, 13.7)
+    arrow(50, 71.2, 50, 66.9)
+    arrow(50, 53.2, 50, 48.9)
+    arrow(50, 35.2, 50, 30.9)
+    arrow(50, 17.2, 50, 13.2)
 
     fig.savefig(f"{OUT}/04_architecture.png", dpi=DPI, facecolor=BG)
     plt.close(fig)
@@ -386,7 +387,7 @@ def slide_universe():
              fontsize=15, fontfamily=MONO, color=DIM, ha="center")
 
     labels = ["SEULGI (gen-1)\nlegacy /markets", "IRENE (gen-2)\n/events + /markets"]
-    vals = [10761, 230581]
+    vals = [10761, 230854]
     colors = [RED, GREEN]
     bars = ax.bar([0, 1], vals, width=0.52, color=colors, zorder=3)
     ax.set_xticks([0, 1])
@@ -408,7 +409,7 @@ def slide_universe():
             ha="center", fontweight="bold")
 
     fig.text(0.5, 0.065,
-             "60,594 distinct events · 99.6% discoverable via /events\n"
+             "60,596 distinct events · 99.6% discoverable via /events\n"
              "promotion gated on only_markets < 1% telemetry (measured: 0.37%)",
              fontsize=14, fontfamily=MONO, color=DIM, ha="center")
 
@@ -425,7 +426,7 @@ def slide_calibration():
 
     fig.text(0.5, 0.93, "THE MODEL'S CONFIDENCE WAS A LIE", fontsize=25,
              fontfamily=MONO, color=FG, ha="center", fontweight="bold")
-    fig.text(0.5, 0.875, "measured, then calibrated — SEULGI engine, n=501 closed decisions",
+    fig.text(0.5, 0.875, "measured, then calibrated: SEULGI engine, n=501 closed decisions",
              fontsize=14, fontfamily=MONO, color=DIM, ha="center")
 
     # left: Brier score
@@ -503,7 +504,7 @@ def slide_ending():
     fs = 16
     findings = [
         [("  [x] ", GREEN), ("post-news directional edge ≈ 0", FG)],
-        [("  [x] ", GREEN), ("losses are friction — fees + spread, not predictions", FG)],
+        [("  [x] ", GREEN), ("losses are friction: fees + spread, not predictions", FG)],
         [("  [x] ", GREEN), ("even a perfect-foresight exit cannot cross zero", FG)],
         [("  [x] ", GREEN), ("validated by 4-way loss attribution that reconstructs", FG)],
         [("      ", FG),    ("realized PnL exactly, per trade", DIM)],
@@ -514,20 +515,32 @@ def slide_ending():
         y += line_h(fs, 1.7)
     y += 30
 
-    # adverse selection mini-chart
-    draw_text(ax, x0, y, [("WHY: adverse selection (n≈2,090 news events)", AMBER)], 15, bold=True)
-    y += line_h(15, 1.9)
+    # adverse selection mini-chart: the deck's key piece of evidence, sized
+    # and boxed to compete with the EDGE=0 banner for attention
+    panel_top = y - 14
+    fs_hdr = 18
+    draw_text(ax, x0, y, [("WHY: adverse selection (n≈2,090 news events)", AMBER)],
+              fs_hdr, bold=True)
+    y += line_h(fs_hdr, 1.9)
     rows = [
         ("post-news repricing", 6.1, RED),
         ("median half-spread", 0.5, BLUE),
     ]
+    fs_bar = 17
     for lab, v, c in rows:
-        n = max(1, round(v / 6.1 * 30))
-        draw_text(ax, x0, y, [(lab.ljust(22), DIM), ("▇" * n, c),
-                              (f" {v}¢/share", FG)], 15)
-        y += line_h(15, 1.9)
-    draw_text(ax, x0, y, [("→ the market reprices 12x deeper than you can quote", DIM)], 14)
-    y += line_h(14) + 64
+        n = max(1, round(v / 6.1 * 26))
+        draw_text(ax, x0, y, [(lab.ljust(22), DIM), ("█" * n, c),
+                              (f"  {v}¢/share", FG)], fs_bar, bold=True)
+        y += line_h(fs_bar, 1.85)
+    fs_gloss = 15
+    draw_text(ax, x0, y, [("post-news moves 12x deeper than the quoted spread", FG)],
+              fs_gloss, bold=True)
+    y += line_h(fs_gloss)
+    ax.add_patch(FancyBboxPatch(
+        (x0 - 26, panel_top), PX - 2 * (x0 - 26), y - panel_top + 18,
+        boxstyle="round,pad=0.4,rounding_size=6",
+        linewidth=1.8, edgecolor=AMBER, facecolor=PANEL, alpha=0.94, zorder=1))
+    y += 64
 
     closing = [
         [("$ ", GREEN), ("# a negative result, instrumented well enough", DIM)],
@@ -547,7 +560,7 @@ def _odds_curve(eid, lo_min=-60, hi_min=60):
     """Mid-price samples for one exploration, as (minutes_from_news, mid)."""
     import sqlite3
     con = sqlite3.connect(
-        "file:/home/muk/projects/nexus/irene/data/irene.db?mode=ro", uri=True)
+        f"file:{IRENE_DB_PATH}?mode=ro", uri=True)
     rows = con.execute(
         """SELECT offset_seconds, mid FROM odds_observations
            WHERE exploration_id=? AND mid IS NOT NULL
@@ -600,10 +613,13 @@ def slide_real_plots():
              fontsize=12.5, fontfamily=MONO, color=DIM, ha="center")
 
     root = "/home/muk/projects/nexus"
+    # _panels_live/ (regen_panels_live.py, 2026-08-23) supersedes the older
+    # _panels/ dir here — it's driven off jennie's live DB rather than
+    # nexus's own archived-and-emptied irene/data/.
     panels = [
-        (f"{OUT}/_panels/throughput_overlay.png",
+        (f"{OUT}/_panels_live/throughput_overlay.png",
          "IRENE · live per-stage throughput (24h, log)", GREEN),
-        (f"{OUT}/_panels/per_gate_rejection.png",
+        (f"{OUT}/_panels_live/per_gate_rejection.png",
          "IRENE · per-gate rejection audit (24h)", AMBER),
         (f"{root}/seulgi/data/dashboard/plots/equity_curve.png",
          "SEULGI gen-1 · paper equity curve — friction wins", RED),
@@ -659,19 +675,24 @@ def slide_funnel():
 
     fig.text(0.5, 0.945, "THE DECISION FUNNEL", fontsize=30, fontfamily=MONO,
              color=FG, ha="center", fontweight="bold")
-    fig.text(0.5, 0.905, "176,605 articles in  →  1,475 paper trades out  ·  every "
+    fig.text(0.5, 0.905, "234,966 articles in  →  1,833 paper trades out  ·  every "
              "rejection audited", fontsize=14.5, fontfamily=MONO, color=DIM,
              ha="center")
 
     # (label, surviving-count-after-this-stage, color, sublabel)
+    # Re-derived 2026-08-23 straight from decisions.reason (live DB), same
+    # methodology as the 07-09 snapshot: bucket the 20 distinct reject reasons
+    # into the same 4 funnel stages. Final stage lands exactly on the live
+    # `trades` row count (1,833), which is the cross-check that the bucketing
+    # is right.
     levels = [
-        ("articles ingested",         176605, BLUE,   "236 feeds · RSS+HTML"),
-        ("article→market signals",    137554, BLUE,   "SBERT cosine top-K"),
-        ("gate decisions evaluated",  426481, PURPLE, "each signal re-scored per gate"),
-        ("− direction neutral",       260341, CYAN,   "166,140 cut · LLM Y/N/U"),
-        ("− market inactive / expiry", 36627, CYAN,   "223,714 cut"),
-        ("− freshness / entity / imbalance", 11881, AMBER, "24,746 cut"),
-        ("− price-sanity / edge / other", 1475, GREEN, "executed: 0.35% of decisions"),
+        ("articles ingested",         234966, BLUE,   "237 feeds · RSS+HTML"),
+        ("article→market signals",    164360, BLUE,   "SBERT cosine top-K"),
+        ("gate decisions evaluated",  552571, PURPLE, "each signal re-scored per gate"),
+        ("− direction neutral",       337590, CYAN,   "214,981 cut · LLM Y/N/U"),
+        ("− market inactive / expiry", 42824, CYAN,   "294,766 cut"),
+        ("− freshness / entity / imbalance", 13550, AMBER, "29,274 cut"),
+        ("− price-sanity / edge / other", 1833, GREEN, "executed: 0.33% of decisions"),
     ]
     cnts = [l[1] for l in levels]
     wmax = max(c ** 0.5 for c in cnts)
@@ -698,9 +719,17 @@ def slide_funnel():
                 color=FG, ha="left", va="center", zorder=4, fontweight="bold")
         ax.text(lx, y + band_h * 0.74, sub, fontsize=11.5, fontfamily=MONO,
                 color=DIM, ha="left", va="center", zorder=4)
+        if i == 2:
+            # inline callout: explain why this stage's count exceeds the
+            # article count above it, right under its own label (not just
+            # buried in the small footer line)
+            ax.text(lx, y + band_h + 8,
+                    "since one article can trigger many gate checks",
+                    fontsize=10.5, fontfamily=MONO, color=AMBER, ha="left",
+                    va="top", zorder=5, fontweight="bold")
 
     fig.text(0.5, 0.055,
-             "426,481 gate decisions · 11 ordered gates · 0 silent skips\n"
+             "552,571 gate decisions · 11 ordered gates · 0 silent skips\n"
              "every rejected candidate persists its full per-gate decision chain",
              fontsize=13.5, fontfamily=MONO, color=DIM, ha="center")
     fig.savefig(f"{OUT}/10_funnel.png", dpi=DPI, facecolor=BG)
@@ -713,7 +742,7 @@ def slide_funnel():
 def _odds_curve_full(eid, lo_s=-7200, hi_s=None):
     import sqlite3
     con = sqlite3.connect(
-        "file:/home/muk/projects/nexus/irene/data/irene.db?mode=ro", uri=True)
+        f"file:{IRENE_DB_PATH}?mode=ro", uri=True)
     hi = hi_s if hi_s is not None else 10 ** 9
     rows = con.execute(
         """SELECT offset_seconds, mid FROM odds_observations
@@ -789,7 +818,7 @@ def slide_market_moves():
                  color=DIM, ha="center")
 
     fig.text(0.5, 0.052,
-             "4.8M mid/bid/ask samples across 274,521 captures · y = implied "
+             "5.7M mid/bid/ask samples across 362,258 captures · y = implied "
              "probability (%)\nthe dataset behind the verdict: news increments "
              "narratives already in motion", fontsize=12, fontfamily=MONO,
              color=DIM, ha="center")
@@ -806,22 +835,15 @@ def slide_dataset():
     fig.patch.set_facecolor(BG)
     fig.text(0.5, 0.945, "A LABELED RESEARCH DATASET", fontsize=26,
              fontfamily=MONO, color=FG, ha="center", fontweight="bold")
-    fig.text(0.5, 0.905, "4.8M order-book samples banked in ~44 days, ~$2/day — "
-             "the real deliverable", fontsize=13.5, fontfamily=MONO,
+    fig.text(0.5, 0.905, "5.7M order-book samples banked in ~89 days, ~$0.70/day "
+             "recent — the real deliverable", fontsize=13.5, fontfamily=MONO,
              color=DIM, ha="center")
 
-    # cumulative odds observations by day (from irene.db, 2026-07-09)
-    days = ["05-27", "05-28", "05-29", "05-30", "06-05", "06-06", "06-07",
-            "06-08", "06-09", "06-10", "06-11", "06-12", "06-13", "06-14",
-            "06-15", "06-16", "06-17", "06-18", "06-19", "06-20", "06-21",
-            "06-22", "06-23", "06-24", "06-25", "06-26", "06-27", "06-28",
-            "06-29", "06-30", "07-01", "07-02", "07-03", "07-04", "07-05",
-            "07-06", "07-07", "07-08", "07-09"]
-    cum = [0.192, 0.662, 1.199, 1.413, 1.414, 1.415, 1.415, 1.464, 1.668,
-           2.005, 2.302, 2.583, 2.802, 3.000, 3.100, 3.250, 3.352, 3.401,
-           3.409, 3.411, 3.512, 3.676, 3.787, 3.897, 4.036, 4.156, 4.305,
-           4.427, 4.512, 4.605, 4.655, 4.681, 4.700, 4.718, 4.732, 4.744,
-           4.761, 4.774, 4.775]  # millions
+    # cumulative odds observations by calendar day (forward-filled across
+    # zero-capture days), re-measured 2026-08-23 straight from
+    # odds_observations.sampled_at on the live jennie/irene.db.
+    days = ["05-27", "05-28", "05-29", "05-30", "05-31", "06-01", "06-02", "06-03", "06-04", "06-05", "06-06", "06-07", "06-08", "06-09", "06-10", "06-11", "06-12", "06-13", "06-14", "06-15", "06-16", "06-17", "06-18", "06-19", "06-20", "06-21", "06-22", "06-23", "06-24", "06-25", "06-26", "06-27", "06-28", "06-29", "06-30", "07-01", "07-02", "07-03", "07-04", "07-05", "07-06", "07-07", "07-08", "07-09", "07-10", "07-11", "07-12", "07-13", "07-14", "07-15", "07-16", "07-17", "07-18", "07-19", "07-20", "07-21", "07-22", "07-23", "07-24", "07-25", "07-26", "07-27", "07-28", "07-29", "07-30", "07-31", "08-01", "08-02", "08-03", "08-04", "08-05", "08-06", "08-07", "08-08", "08-09", "08-10", "08-11", "08-12", "08-13", "08-14", "08-15", "08-16", "08-17", "08-18", "08-19", "08-20", "08-21", "08-22", "08-23"]
+    cum = [0.192, 0.662, 1.199, 1.413, 1.413, 1.413, 1.413, 1.413, 1.413, 1.414, 1.415, 1.415, 1.464, 1.668, 2.005, 2.302, 2.583, 2.802, 3.0, 3.1, 3.25, 3.352, 3.401, 3.409, 3.411, 3.512, 3.676, 3.787, 3.897, 4.036, 4.156, 4.305, 4.427, 4.512, 4.605, 4.655, 4.682, 4.703, 4.722, 4.737, 4.75, 4.769, 4.786, 4.807, 4.823, 4.844, 4.865, 4.888, 4.911, 4.928, 4.944, 4.962, 4.98, 4.991, 5.007, 5.022, 5.044, 5.065, 5.113, 5.179, 5.241, 5.304, 5.343, 5.381, 5.414, 5.466, 5.512, 5.552, 5.581, 5.611, 5.644, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.666, 5.677, 5.693]  # millions
     x = np.arange(len(days))
 
     ax = fig.add_axes([0.135, 0.17, 0.80, 0.62])
@@ -830,32 +852,40 @@ def slide_dataset():
     ax.plot(x, cum, color=AMBER, lw=2.6, zorder=3, solid_capstyle="round")
     ax.scatter([len(days) - 1], [cum[-1]], s=60, color=AMBER, zorder=4)
 
-    # mark the 8-day container outage (Dockerfile bug) as a shaded gap
-    ax.axvspan(3, 7, color=RED, alpha=0.10, zorder=0)
-    ax.text(5, 3.55, "8-day outage\n(recovered, no\nintervention)", color=RED,
-            fontsize=11, fontfamily=MONO, ha="center", va="center")
-
-    # capture pace slowed markedly in July (H8 slow-catalyst lane: fewer,
-    # longer-horizon captures rather than high-frequency short-window ones)
-    ax.axvspan(30, len(days) - 1, color=BLUE, alpha=0.06, zorder=0)
-    ax.text(34, 1.0, "H8 lane:\nfewer, longer\ncaptures", color=BLUE,
+    # mark the original 8-day container outage (Dockerfile bug) as a shaded gap
+    ax.axvspan(3, 8, color=RED, alpha=0.10, zorder=0)
+    ax.text(5.5, 3.9, "outage #1\n(recovered, no\nintervention)", color=RED,
             fontsize=10, fontfamily=MONO, ha="center", va="center")
 
-    ax.set_ylim(0, 5.4)
-    ax.set_yticks([0, 1, 2, 3, 4, 5])
-    ax.set_yticklabels(["0", "1M", "2M", "3M", "4M", "5M"])
-    ticks = [0, 4, 9, 14, 19, 25, 30, 34, 38]
+    # a second, longer capture gap appears in the live data: 08-07 -> 08-21,
+    # 15 days flat. Not investigated as part of this pass — flagged here
+    # rather than silently smoothed over, same "audit, don't hide" ethos as
+    # the rest of the dashboard.
+    ax.axvspan(72, 87, color=RED, alpha=0.10, zorder=0)
+    ax.text(79.5, 2.0, "outage #2\n15 days flat\n(unexplained,\nflagged)", color=RED,
+            fontsize=9.5, fontfamily=MONO, ha="center", va="center")
+
+    # capture pace slowed markedly from late July on (H8 slow-catalyst lane:
+    # fewer, longer-horizon captures rather than high-frequency short ones)
+    ax.axvspan(56, 71, color=BLUE, alpha=0.06, zorder=0)
+    ax.text(63.5, 1.0, "H8 lane:\nfewer, longer\ncaptures", color=BLUE,
+            fontsize=9.5, fontfamily=MONO, ha="center", va="center")
+
+    ax.set_ylim(0, 6.2)
+    ax.set_yticks([0, 1, 2, 3, 4, 5, 6])
+    ax.set_yticklabels(["0", "1M", "2M", "3M", "4M", "5M", "6M"])
+    ticks = [0, 8, 17, 26, 35, 44, 53, 62, 71, 80, 88]
     ax.set_xticks(ticks)
-    ax.set_xticklabels([days[i] for i in ticks], fontsize=10.5)
+    ax.set_xticklabels([days[i] for i in ticks], fontsize=9.5, rotation=0)
     ax.grid(axis="y", color=BORDER, lw=0.7, zorder=0)
     ax.set_ylabel("cumulative odds observations", fontsize=13,
                   fontfamily=MONO, color=DIM)
-    ax.text(len(days) - 1.4, cum[-1] + 0.22, "4.78M", color=AMBER,
+    ax.text(len(days) - 1.4, cum[-1] + 0.28, "5.69M", color=AMBER,
             fontsize=17, fontfamily=MONO, ha="right", fontweight="bold")
 
     # stat strip under the chart
-    stats = [("274,521", "gated captures"), ("10,081", "passed gates"),
-             ("~$2/day", "LLM cost"), ("100%", "rows labeled")]
+    stats = [("362,258", "gated captures"), ("12,003", "passed gates"),
+             ("~$0.70/day", "LLM cost (recent)"), ("100%", "rows labeled")]
     y = 0.115
     cellw = 0.225
     x0 = 0.5 - cellw * len(stats) / 2
